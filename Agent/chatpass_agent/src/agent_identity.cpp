@@ -499,6 +499,84 @@ AgentIdentity loadAgentIdentityFromDir(
     );
 
     AgentState state = readStateIfExists(statePath);
+
+    // A fresh enrollment package supplied by the installer must be able to replace
+    // stale development/legacy identity state. Do this transactionally: the old
+    // state.dat is left untouched unless enrollment succeeds and the replacement
+    // state has been DPAPI-protected successfully.
+    const auto bootstrapConfig = parseIniIfExists(legacyConfigPath);
+    std::string bootstrapToken = getenvString("HI5_ENROLLMENT_TOKEN");
+    if (bootstrapToken.empty()) {
+        bootstrapToken = getFirst(bootstrapConfig, { "enrollment_token", "provision_token", "token" });
+    }
+
+    std::string forceEnrollmentValue = getenvString("HI5_FORCE_ENROLLMENT");
+    if (forceEnrollmentValue.empty()) {
+        forceEnrollmentValue = getFirst(bootstrapConfig, { "force_enrollment", "forceenrollment" });
+    }
+    forceEnrollmentValue = lower(trim(forceEnrollmentValue));
+    const bool forceEnrollment = !bootstrapToken.empty() &&
+        (forceEnrollmentValue == "1" || forceEnrollmentValue == "true" ||
+         forceEnrollmentValue == "yes" || forceEnrollmentValue == "on");
+
+    const std::string bootstrapPackageId = getFirst(bootstrapConfig, {
+        "package_id", "packageid", "enrollment_package_id"
+    });
+    const bool packageAlreadyApplied = isValidState(state) && !bootstrapPackageId.empty() &&
+        state.enrollmentPackageId == bootstrapPackageId;
+
+    if (forceEnrollment && !packageAlreadyApplied) {
+        std::string apiBase = envApiBase;
+        if (apiBase.empty()) {
+            apiBase = normalizedUrlNoTrailingSlash(getFirst(bootstrapConfig, {
+                "api_base_url", "api_base", "apibase", "api_url"
+            }));
+        }
+        if (apiBase.empty()) apiBase = kDefaultApiBase;
+
+        std::string agentWsBase = envWsBase;
+        if (agentWsBase.empty()) {
+            agentWsBase = getFirst(bootstrapConfig, {
+                "agent_ws_base_url", "agent_ws_base", "wss_url", "ws_url", "control_url"
+            });
+        }
+        if (agentWsBase.empty()) {
+            agentWsBase = defaultAgentWsBaseUrl.empty() ? kDefaultAgentWsBase : defaultAgentWsBaseUrl;
+        }
+
+        std::string hostname = getFirst(bootstrapConfig, { "hostname", "host_name", "computer_name" });
+        if (hostname.empty()) hostname = hi5::GetPlatformHostname();
+        std::string fingerprint = getFirst(bootstrapConfig, { "fingerprint", "device_fingerprint" });
+        if (fingerprint.empty()) fingerprint = getMachineFingerprint();
+
+        const EnrollResult enrolled = enrollWindowsDevice(
+            apiBase, bootstrapToken, hostname, fingerprint, "", "", bootstrapConfig
+        );
+
+        AgentState replacementState;
+        replacementState.deviceId = enrolled.deviceId;
+        replacementState.deviceKey = enrolled.deviceKey;
+        replacementState.apiBaseUrl = apiBase;
+        replacementState.agentWsBaseUrl = agentWsBase;
+        replacementState.tenantId = enrolled.tenantId.empty()
+            ? getFirst(bootstrapConfig, { "tenant_id", "tenantid" }) : enrolled.tenantId;
+        replacementState.groupId = enrolled.groupId.empty()
+            ? getFirst(bootstrapConfig, { "group_id", "groupid" }) : enrolled.groupId;
+        replacementState.enrollmentPackageId = enrolled.enrollmentPackageId.empty()
+            ? bootstrapPackageId : enrolled.enrollmentPackageId;
+        replacementState.fingerprint = fingerprint;
+
+        writeState(statePath, replacementState);
+        moveAsideIfExists(legacyConfigPath, ".migrated");
+        moveAsideIfExists(legacySecretsPath, ".migrated");
+
+        AgentIdentity ident;
+        ident.deviceId = replacementState.deviceId;
+        ident.deviceKey = replacementState.deviceKey;
+        ident.agentWsBaseUrl = replacementState.agentWsBaseUrl;
+        return ident;
+    }
+
     if (isValidState(state)) {
         if (!envApiBase.empty()) state.apiBaseUrl = envApiBase;
         if (!envWsBase.empty()) state.agentWsBaseUrl = envWsBase;

@@ -128,20 +128,18 @@ begin
   SetIniString('agent', 'install_source', InstallSource, ConfigPath);
   SetIniString('agent', 'installer_version', '{#MyAppVersion}', ConfigPath);
 
+  { Always overwrite bootstrap fields so an ordinary upgrade cannot leave a stale token active. }
+  SetIniString('agent', 'enrollment_token', EnrollmentToken, ConfigPath);
+  SetIniString('agent', 'tenant_id', TenantId, ConfigPath);
+  SetIniString('agent', 'group_id', GroupId, ConfigPath);
+  SetIniString('agent', 'package_id', PackageId, ConfigPath);
+  SetIniString('agent', 'provision_blob', ProvisionBlob, ConfigPath);
+
+  { A token supplied on this installer invocation is an explicit request to enroll/re-enroll. }
   if EnrollmentToken <> '' then
-    SetIniString('agent', 'enrollment_token', EnrollmentToken, ConfigPath);
-
-  if TenantId <> '' then
-    SetIniString('agent', 'tenant_id', TenantId, ConfigPath);
-
-  if GroupId <> '' then
-    SetIniString('agent', 'group_id', GroupId, ConfigPath);
-
-  if PackageId <> '' then
-    SetIniString('agent', 'package_id', PackageId, ConfigPath);
-
-  if ProvisionBlob <> '' then
-    SetIniString('agent', 'provision_blob', ProvisionBlob, ConfigPath);
+    SetIniString('agent', 'force_enrollment', '1', ConfigPath)
+  else
+    SetIniString('agent', 'force_enrollment', '0', ConfigPath);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

@@ -1827,6 +1827,8 @@ LogI(
                     };
 
                 signaling_->onOpen([this, ident]() {
+                    signalingConnected_.store(true);
+                    signalingReconnectRequested_.store(false);
                     LogI("websocket connected");
                     if (signaling_) {
                         signaling_->send(R"({"type":"hello"})");
@@ -2082,7 +2084,8 @@ LogI(
                     });
 
                 signaling_->onClosed([this]() {
-                    LogW("websocket closed; stopping active remote sessions and streamer helpers");
+                    signalingConnected_.store(false);
+                    LogW("websocket closed; stopping active remote sessions and scheduling reconnect");
                     for (;;) {
                         std::string nextId;
                         {
@@ -2093,9 +2096,13 @@ LogI(
                         StopSession(nextId);
                     }
                     CleanupOrphanStreamerProcesses();
-                    stop_.store(true);
+                    if (!stop_.load()) {
+                        signalingReconnectRequested_.store(true);
+                    }
                     });
 
+                signalingReconnectRequested_.store(false);
+                signalingConnected_.store(false);
                 signaling_->connect();
                 StartInventoryLoop(ident);
 
@@ -2124,9 +2131,30 @@ LogI(
                 }
 
                 auto nextUiCleanupSweep = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                auto nextSignalingReconnect = std::chrono::steady_clock::now();
+                int signalingReconnectBackoffSeconds = 2;
                 while (!stop_.load()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     const auto now = std::chrono::steady_clock::now();
+
+                    if (signalingConnected_.load()) {
+                        signalingReconnectBackoffSeconds = 2;
+                    }
+                    else if (signalingReconnectRequested_.load() && now >= nextSignalingReconnect) {
+                        signalingReconnectRequested_.store(false);
+                        LogI("websocket reconnect attempt backoff_seconds=" +
+                            std::to_string(signalingReconnectBackoffSeconds));
+                        try {
+                            if (signaling_) signaling_->connect();
+                        }
+                        catch (const std::exception& e) {
+                            LogW(std::string("websocket reconnect attempt failed: ") + e.what());
+                            signalingReconnectRequested_.store(true);
+                        }
+                        nextSignalingReconnect = now + std::chrono::seconds(signalingReconnectBackoffSeconds);
+                        signalingReconnectBackoffSeconds = std::min(signalingReconnectBackoffSeconds * 2, 60);
+                    }
+
                     if (now >= nextUiCleanupSweep) {
                         nextUiCleanupSweep = now + std::chrono::seconds(5);
                         bool hasSessions = false;
@@ -6337,6 +6365,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             std::map<std::string, std::shared_ptr<TerminalSession>> terminals_;
 
             std::atomic<bool> stop_{ false };
+            std::atomic<bool> signalingConnected_{ false };
+            std::atomic<bool> signalingReconnectRequested_{ false };
 
             SessionBridge sessionBridge_;
             AgentPresenceController presenceController_;

@@ -27,6 +27,7 @@ public:
 private:
     std::string m_url;
     std::shared_ptr<rtc::WebSocket> m_ws;
+    std::mutex m_wsMu;
 
     OpenHandler m_openHandler;
     MessageHandler m_messageHandler;
