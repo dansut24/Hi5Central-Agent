@@ -26,19 +26,20 @@ jobs:
           curl -fL --retry 3 --retry-delay 2 \
             https://downloads.hi5central.com/bootstrap-agent-sync/agent-hardening-source.zip \
             -o /tmp/agent-hardening-source.zip
-          echo "d80e5d3423db5a153d55400d7e31987fb93959098652d69d13ec21229df2b25e  /tmp/agent-hardening-source.zip" | sha256sum -c -
+          echo "abbd7af5bad3957e94a7ff7280a0084a10210d4fca1c8a82a37b5bd09a337b05  /tmp/agent-hardening-source.zip" | sha256sum -c -
 
-      - name: Replace source tree while preserving bootstrap workflow
+      - name: Replace source tree while preserving workflows
         shell: bash
         run: |
           mkdir -p /tmp/agent-hardening-source
           unzip -q /tmp/agent-hardening-source.zip -d /tmp/agent-hardening-source
-          cp .github/workflows/bootstrap-sync.yml /tmp/bootstrap-sync.yml
+          cp -a .github/workflows /tmp/existing-workflows
           rm -rf /tmp/agent-hardening-source/.github/workflows
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -a /tmp/agent-hardening-source/. .
-          mkdir -p .github/workflows
-          cp /tmp/bootstrap-sync.yml .github/workflows/bootstrap-sync.yml
+          mkdir -p .github
+          rm -rf .github/workflows
+          cp -a /tmp/existing-workflows .github/workflows
           git add -A
           git status --short
 
@@ -51,5 +52,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Sync hardened Agent source"
+          git commit -m "Sync Agent enrollment and reconnect fix"
           git push origin HEAD:hardening-mobile-viewer
