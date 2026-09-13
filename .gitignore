@@ -88,3 +88,7 @@ secrets.dat
 # OS
 Thumbs.db
 .DS_Store
+
+# Local/CI extracted dependency scratch
+.ci/
+**/.ci/

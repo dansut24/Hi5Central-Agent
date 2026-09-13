@@ -10,7 +10,7 @@ param(
     [string]$Platform = "x64",
     [string]$VcpkgRoot = "",
     [string]$VcpkgTriplet = "x64-windows-static",
-    [string]$LibDataChannelRoot = "C:\\Users\\Dan\\Desktop\\libdatachannel-install-static",
+    [string]$LibDataChannelRoot = "C:\Users\Dan\Desktop\libdatachannel-install-static",
     [switch]$FetchLibDataChannel,
 
     # Safety checks
@@ -21,9 +21,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoRoot = (Resolve-Path (Join-Path $scriptDir "..\\..")).Path
+$repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $buildPath = Join-Path $repoRoot $BuildDir
-$distPath = Join-Path $repoRoot "dist\\installer"
+$distPath = Join-Path $repoRoot "dist\installer"
 $issPath = Join-Path $scriptDir "Hi5CentralAgentSetup.iss"
 
 function Resolve-ToolPath {
@@ -91,11 +91,11 @@ Run this from:
 x64 Native Tools Command Prompt for VS 2026
 
 Then invoke this script through PowerShell, for example:
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location 'C:\\Users\\Dan\\Downloads\\hi5tech-chat-pass\\chatpass_agent'; & '.\\installer\\windows\\Build-AgentInstaller.ps1' -Clean -InnoSetupCompiler 'C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe' -VcpkgRoot 'C:\\vcpkg' -VcpkgTriplet 'x64-windows-static' -Generator 'Visual Studio 18 2026' -Platform 'x64' -LibDataChannelRoot 'C:\\Users\\Dan\\Desktop\\libdatachannel-install-static'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location 'C:\Users\Dan\Downloads\hi5tech-chat-pass\chatpass_agent'; & '.\installer\windows\Build-AgentInstaller.ps1' -Clean -InnoSetupCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' -VcpkgRoot 'C:\vcpkg' -VcpkgTriplet 'x64-windows-static' -Generator 'Visual Studio 18 2026' -Platform 'x64' -LibDataChannelRoot 'C:\Users\Dan\Desktop\libdatachannel-install-static'"
 "@
     }
 
-    if ($clPath -match "Hostx86\\\\x86" -or $linkPath -match "Hostx86\\\\x86") {
+    if ($clPath -match "Hostx86\\x86" -or $linkPath -match "Hostx86\\x86") {
         throw @"
 The current MSVC toolchain is x86, but this agent must be built x64.
 
@@ -107,8 +107,8 @@ Open "x64 Native Tools Command Prompt for VS 2026" and run the build command fro
 "@
     }
 
-    if ($clPath -notmatch "Hostx64\\\\x64" -and $linkPath -notmatch "Hostx64\\\\x64") {
-        Write-Warning "Could not clearly confirm Hostx64\\x64 toolchain from PATH. Continuing, but linker may fail if the environment is not x64."
+    if ($clPath -notmatch "Hostx64\\x64" -and $linkPath -notmatch "Hostx64\\x64") {
+        Write-Warning "Could not clearly confirm Hostx64\x64 toolchain from PATH. Continuing, but linker may fail if the environment is not x64."
     }
 }
 
@@ -215,15 +215,15 @@ if ($Clean -and (Test-Path $buildPath)) {
 if ([string]::IsNullOrWhiteSpace($VcpkgRoot)) {
     if ($env:VCPKG_ROOT) {
         $VcpkgRoot = $env:VCPKG_ROOT
-    } elseif (Test-Path "C:\\vcpkg") {
-        $VcpkgRoot = "C:\\vcpkg"
+    } elseif (Test-Path "C:\vcpkg") {
+        $VcpkgRoot = "C:\vcpkg"
     }
 }
 
 $cmakeExe = Resolve-ToolPath "cmake.exe"
 
 if ([string]::IsNullOrWhiteSpace($cmakeExe) -or -not (Test-Path $cmakeExe)) {
-    $cmakeExe = "C:\\Program Files\\CMake\\bin\\cmake.exe"
+    $cmakeExe = "C:\Program Files\CMake\bin\cmake.exe"
 }
 
 if (-not (Test-Path $cmakeExe)) {
@@ -257,7 +257,7 @@ if ($FetchLibDataChannel) {
 }
 
 if (-not [string]::IsNullOrWhiteSpace($VcpkgRoot)) {
-    $toolchainFile = Join-Path $VcpkgRoot "scripts\\buildsystems\\vcpkg.cmake"
+    $toolchainFile = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
 
     if (Test-Path $toolchainFile) {
         $cmakeArgs += "-DCMAKE_TOOLCHAIN_FILE=$toolchainFile"
@@ -314,8 +314,8 @@ New-Item -ItemType Directory -Force -Path $distPath | Out-Null
 
 if ([string]::IsNullOrWhiteSpace($InnoSetupCompiler)) {
     $candidates = @(
-        "C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe",
-        "C:\\Program Files\\Inno Setup 6\\ISCC.exe"
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "C:\Program Files\Inno Setup 6\ISCC.exe"
     )
 
     foreach ($candidate in $candidates) {
@@ -327,7 +327,7 @@ if ([string]::IsNullOrWhiteSpace($InnoSetupCompiler)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($InnoSetupCompiler) -or -not (Test-Path $InnoSetupCompiler)) {
-    throw "Inno Setup Compiler was not found. Install Inno Setup 6 or pass -InnoSetupCompiler 'C:\\Path\\To\\ISCC.exe'."
+    throw "Inno Setup Compiler was not found. Install Inno Setup 6 or pass -InnoSetupCompiler 'C:\Path\To\ISCC.exe'."
 }
 
 Write-Host ""

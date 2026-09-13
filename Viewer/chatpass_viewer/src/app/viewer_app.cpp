@@ -1230,18 +1230,13 @@ textarea:focus{border-color:rgba(99,102,241,.7);box-shadow:0 0 0 3px rgba(99,102
         LogInfo("Viewer starting");
         LogInfo("argc=" + std::to_string(argc));
 
-        for (int i = 0; i < argc; ++i) {
-            LogInfo("argv[" + std::to_string(i) + "]=" + std::string(argv[i] ? argv[i] : ""));
-        }
-
         DeepLinkLaunch launch{};
         if (argc >= 2 && argv[1]) {
             launch = ParseDeepLink(argv[1]);
             LogInfo("Deep link provided via argv");
-            LogInfo("Normalized deep link: " + launch.raw);
+            LogInfo("Deep link parsed successfully");
             LogInfo("Deep link session_id=" + launch.sessionId);
             LogInfo("Deep link device_id=" + launch.deviceId);
-            LogInfo("Deep link wss_url=" + launch.wssUrl);
             LogInfo("Deep link mode=" + launch.mode);
         }
         else {

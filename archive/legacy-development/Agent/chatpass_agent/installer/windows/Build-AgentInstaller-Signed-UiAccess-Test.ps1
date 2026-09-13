@@ -1,7 +1,7 @@
 param(
   [string]$RepoRoot = "C:\Users\Dan\Downloads\hi5tech-chat-pass\chatpass_agent",
   [string]$CertPath = "C:\Users\Dan\Desktop\Hi5Central-Test-CodeSigning.pfx",
-  [string]$CertPassword = "Hi5TestSigning123!",
+  [string]$CertPassword = $env:HI5_CODESIGN_PASSWORD,
   [string]$TimestampUrl = "http://timestamp.digicert.com",
   [string]$InnoSetupCompiler = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
   [string]$VcpkgRoot = "C:\vcpkg",
@@ -9,6 +9,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($CertPassword)) {
+  throw "Set HI5_CODESIGN_PASSWORD or pass -CertPassword explicitly before using the optional signing test build."
+}
 
 function Find-SignTool {
   $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue

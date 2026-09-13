@@ -102,18 +102,28 @@ let overlayMode = "hard";
    TURN / ICE config
 ------------------------------------------ */
 
-const ICE_SERVERS = [
+const FALLBACK_ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
-  {
-    urls: [
-      "turn:141.147.77.36:3478?transport=udp",
-      "turn:141.147.77.36:3478?transport=tcp",
-    ],
-    username: "hi5user",
-    credential: "SuperSecret123",
-  },
 ];
+
+function normalizeIceServers(value) {
+  if (!Array.isArray(value)) return [...FALLBACK_ICE_SERVERS];
+  const safe = value.filter((server) => {
+    if (!server || typeof server !== "object") return false;
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    return urls.some((url) => typeof url === "string" && /^(stun|stuns|turn|turns):/i.test(url));
+  }).map((server) => ({
+    urls: server.urls,
+    ...(typeof server.username === "string" ? { username: server.username } : {}),
+    ...(typeof server.credential === "string" ? { credential: server.credential } : {})
+  }));
+  return safe.length ? safe : [...FALLBACK_ICE_SERVERS];
+}
+
+function activeIceServers() {
+  return normalizeIceServers(currentSession?.iceServers);
+}
 
 const FRAME_STALL_MS = 950;
 const MONITOR_SWITCH_GRACE_MS = 1800;
@@ -1171,7 +1181,7 @@ async function pollStatsOnce() {
   if (elDiagFrames) elDiagFrames.textContent = String(framesDecoded ?? "—");
   if (elDiagPacketsLost) elDiagPacketsLost.textContent = String(packetsLost ?? "—");
   if (elDiagRtt) elDiagRtt.textContent = rttMs != null ? `${rttMs}ms` : "—";
-  if (elDiagIceServers) elDiagIceServers.textContent = ICE_SERVERS.map(s => Array.isArray(s.urls) ? s.urls.join(",") : s.urls).join(" | ");
+  if (elDiagIceServers) elDiagIceServers.textContent = activeIceServers().map(s => Array.isArray(s.urls) ? s.urls.join(",") : s.urls).join(" | ");
 
   updateSelectedCodecFromStats();
   console.log("[stats]", { state, bitrate: brStr, fps, framesDecoded, packetsLost, rttMs });
@@ -1261,6 +1271,117 @@ function bindRemoteInput() {
 
     ev.preventDefault();
   }, { passive: false });
+
+  // Mobile/tablet direct-touch controls. Mouse listeners above remain the
+  // desktop path; touch/pen pointer events are handled separately so browsers
+  // do not synthesize duplicate mouse clicks.
+  const touchPointers = new Map();
+  let touchPrimaryId = null;
+  let touchStart = null;
+  let touchDragging = false;
+  let touchLongPressTimer = null;
+  let touchLongPressFired = false;
+  let twoFingerLastY = null;
+
+  const clearTouchLongPress = () => {
+    if (touchLongPressTimer) clearTimeout(touchLongPressTimer);
+    touchLongPressTimer = null;
+  };
+
+  const touchDistance = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+
+  elVideo.addEventListener("pointerdown", (ev) => {
+    if (ev.pointerType !== "touch" && ev.pointerType !== "pen") return;
+    ev.preventDefault();
+    try { elVideo.setPointerCapture(ev.pointerId); } catch {}
+    enterRemoteControlMode();
+    touchPointers.set(ev.pointerId, { clientX: ev.clientX, clientY: ev.clientY });
+
+    if (touchPointers.size === 1) {
+      touchPrimaryId = ev.pointerId;
+      touchStart = { clientX: ev.clientX, clientY: ev.clientY };
+      touchDragging = false;
+      touchLongPressFired = false;
+      const p = getNormalizedPointer(ev);
+      moveRemoteCursorByNorm(p.x_norm, p.y_norm);
+      sendInput("mouse_move", p);
+      clearTouchLongPress();
+      touchLongPressTimer = setTimeout(() => {
+        if (!touchDragging && touchPointers.size === 1 && touchPrimaryId === ev.pointerId) {
+          sendInput("mouse_down", { button: 2 });
+          sendInput("mouse_up", { button: 2 });
+          touchLongPressFired = true;
+        }
+      }, 650);
+    } else if (touchPointers.size === 2) {
+      clearTouchLongPress();
+      if (touchDragging) {
+        sendInput("mouse_up", { button: 0 }, true);
+        touchDragging = false;
+      }
+      const pts = Array.from(touchPointers.values());
+      twoFingerLastY = (pts[0].clientY + pts[1].clientY) / 2;
+    }
+  }, { passive: false });
+
+  elVideo.addEventListener("pointermove", (ev) => {
+    if (ev.pointerType !== "touch" && ev.pointerType !== "pen") return;
+    if (!touchPointers.has(ev.pointerId)) return;
+    ev.preventDefault();
+    touchPointers.set(ev.pointerId, { clientX: ev.clientX, clientY: ev.clientY });
+
+    if (touchPointers.size >= 2) {
+      clearTouchLongPress();
+      const pts = Array.from(touchPointers.values()).slice(0, 2);
+      const y = (pts[0].clientY + pts[1].clientY) / 2;
+      if (twoFingerLastY != null) {
+        const delta = Math.round((twoFingerLastY - y) * 2.2);
+        if (Math.abs(delta) >= 2) sendInput("wheel", { delta_x: 0, delta_y: delta, delta_mode: 0 }, true);
+      }
+      twoFingerLastY = y;
+      return;
+    }
+
+    if (ev.pointerId !== touchPrimaryId) return;
+    const p = getNormalizedPointer(ev);
+    moveRemoteCursorByNorm(p.x_norm, p.y_norm);
+    sendInput("mouse_move", p);
+    if (touchStart && touchDistance(ev, touchStart) > 8) {
+      clearTouchLongPress();
+      if (!touchDragging && !touchLongPressFired) {
+        sendInput("mouse_down", { button: 0 }, true);
+        touchDragging = true;
+      }
+    }
+  }, { passive: false });
+
+  const finishTouchPointer = (ev) => {
+    if (ev.pointerType !== "touch" && ev.pointerType !== "pen") return;
+    if (!touchPointers.has(ev.pointerId)) return;
+    ev.preventDefault();
+    const wasPrimary = ev.pointerId === touchPrimaryId;
+    touchPointers.delete(ev.pointerId);
+    clearTouchLongPress();
+
+    if (wasPrimary) {
+      if (touchDragging) sendInput("mouse_up", { button: 0 }, true);
+      else if (!touchLongPressFired && touchPointers.size === 0) {
+        const p = getNormalizedPointer(ev);
+        moveRemoteCursorByNorm(p.x_norm, p.y_norm);
+        sendInput("mouse_move", p, true);
+        sendInput("mouse_down", { button: 0 }, true);
+        sendInput("mouse_up", { button: 0 }, true);
+      }
+      touchPrimaryId = null;
+      touchStart = null;
+      touchDragging = false;
+      touchLongPressFired = false;
+    }
+    if (touchPointers.size < 2) twoFingerLastY = null;
+  };
+
+  elVideo.addEventListener("pointerup", finishTouchPointer, { passive: false });
+  elVideo.addEventListener("pointercancel", finishTouchPointer, { passive: false });
 
   window.addEventListener("blur", () => {
     if (remoteAltTabActive) {
@@ -1550,7 +1671,7 @@ async function handleOffer(msg) {
 
   setStatus("", "Negotiating…");
 
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  pc = new RTCPeerConnection({ iceServers: activeIceServers() });
 
   let transceiver = null;
   try {
@@ -1880,7 +2001,7 @@ async function onSignalMessage(raw) {
 }
 
 function startSession(params) {
-  console.log("[viewer] startSession params:", params);
+  console.log("[viewer] starting authorised remote session");
 
   disconnect(undefined, { silent: true });
 
@@ -1890,9 +2011,10 @@ function startSession(params) {
   const token = params.token || params.viewer_token || params.viewerToken || "";
   const deviceId = params.device_id || params.deviceId || "";
   const wssUrl = params.wss_url || params.wssUrl || params.signaling_url || params.signalingUrl || "";
+  const iceServers = normalizeIceServers(params.ice_servers || params.iceServers || []);
 
   if (!sessionId || !deviceId || !token || !wssUrl) {
-    console.error("[viewer] invalid connect params:", params);
+    console.error("[viewer] invalid connection parameters");
     disconnect("Invalid connection parameters");
     return;
   }
@@ -1901,7 +2023,8 @@ function startSession(params) {
     sessionId,
     token,
     deviceId,
-    wssUrl
+    wssUrl,
+    iceServers
   };
 
   remoteMonitors = [];
@@ -1926,7 +2049,7 @@ function startSession(params) {
     `${wssUrl}?session_id=${encodeURIComponent(sessionId)}` +
     `&device_id=${encodeURIComponent(deviceId)}` +
     (token ? `&token=${encodeURIComponent(token)}` : "");
-  console.log("[viewer] websocket url:", url);
+  console.log(`[viewer] opening signaling socket session=${sessionId} device=${deviceId}`);
 
   ws = new WebSocket(url);
 
@@ -1971,12 +2094,20 @@ updateMonitorButton();
 
 try {
   window.hi5?.onConnect((params) => {
-    console.log("[viewer] onConnect fired:", params);
+    console.log("[viewer] native launch received");
     startSession(params);
   });
 } catch (e) {
   console.error("[viewer] failed to bind hi5 connect hook:", e);
 }
+
+// Browser/mobile shells can start the same WebRTC viewer without the native
+// WebView host. The server supplies a short-lived session token and per-session ICE credentials.
+window.hi5RemoteViewer = Object.freeze({
+  start: (params) => startSession(params),
+  disconnect: () => disconnect("Disconnected by user"),
+  isConnected: () => !!(pc && pc.connectionState === "connected")
+});
 
 if (elBtnFiles) elBtnFiles.addEventListener("click", () => { toggleFilesPanel(); if (elFilesPanel.classList.contains("visible")) requestRemoteFileList(elFilePath?.value || "/"); });
 if (elBtnChat) elBtnChat.addEventListener("click", () => toggleChatPanel(true));

@@ -7,7 +7,8 @@ set "LIBDATACHANNEL_ROOT=C:\Users\Dan\Desktop\libdatachannel-install-static"
 set "INNO=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 
 set "CERT=C:\Users\Dan\Desktop\Hi5Central-Test-CodeSigning.pfx"
-set "CERT_PASS=Hi5TestSigning123!"
+set "CERT_PASS=%HI5_CODESIGN_PASSWORD%"
+if "%CERT_PASS%"=="" goto fail_cert_pass
 set "TIMESTAMP=http://timestamp.digicert.com"
 
 set "CONFIG=Release"
@@ -150,6 +151,10 @@ goto fail
 :fail_inno
 echo ERROR: Inno Setup compiler not found.
 goto fail
+:fail_cert_pass
+echo ERROR: HI5_CODESIGN_PASSWORD environment variable is not set.
+goto end
+
 :fail_cert
 echo ERROR: Certificate PFX not found.
 goto fail
