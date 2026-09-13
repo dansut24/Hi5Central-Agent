@@ -28,17 +28,21 @@ jobs:
             -o /tmp/agent-hardening-source.zip
           echo "d80e5d3423db5a153d55400d7e31987fb93959098652d69d13ec21229df2b25e  /tmp/agent-hardening-source.zip" | sha256sum -c -
 
-      - name: Replace branch tree with hardened snapshot
+      - name: Replace source tree while preserving bootstrap workflow
         shell: bash
         run: |
           mkdir -p /tmp/agent-hardening-source
           unzip -q /tmp/agent-hardening-source.zip -d /tmp/agent-hardening-source
+          cp .github/workflows/bootstrap-sync.yml /tmp/bootstrap-sync.yml
+          rm -rf /tmp/agent-hardening-source/.github/workflows
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -a /tmp/agent-hardening-source/. .
+          mkdir -p .github/workflows
+          cp /tmp/bootstrap-sync.yml .github/workflows/bootstrap-sync.yml
           git add -A
           git status --short
 
-      - name: Commit and push synced tree
+      - name: Commit and push synced source
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -47,5 +51,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Sync hardened Agent source and CI build"
+          git commit -m "Sync hardened Agent source"
           git push origin HEAD:hardening-mobile-viewer
