@@ -50,6 +50,18 @@ jobs:
             throw 'Local libdatachannel default path was removed.'
           }
 
+      - name: Verify enrollment and reconnect safeguards
+        shell: pwsh
+        run: |
+          $installer = Get-Content 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss' -Raw
+          $identity = Get-Content 'Agent/chatpass_agent/src/agent_identity.cpp' -Raw
+          $service = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
+          if ($installer -notmatch 'force_enrollment') { throw 'Installer no longer marks explicit enrollment.' }
+          if ($identity -notmatch 'packageAlreadyApplied') { throw 'Enrollment replacement guard is missing.' }
+          if ($identity -notmatch 'bootstrapToken') { throw 'Bootstrap enrollment override is missing.' }
+          if ($service -notmatch 'signalingReconnectRequested_') { throw 'Signaling reconnect state is missing.' }
+          if ($service -notmatch 'scheduling reconnect') { throw 'WebSocket close no longer schedules reconnect.' }
+
       - name: Ensure Inno Setup is available
         shell: pwsh
         run: |
