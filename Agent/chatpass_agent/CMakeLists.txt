@@ -30,6 +30,8 @@ function(hi5_use_static_msvc_runtime target_name)
 endfunction()
 
 set(LIBDATACHANNEL_ROOT "C:/Users/Dan/Desktop/libdatachannel-install-static" CACHE PATH "Path to local static libdatachannel install")
+option(HI5_FETCH_LIBDATACHANNEL "Fetch a pinned libdatachannel source tree for reproducible CI builds" OFF)
+set(HI5_LIBDATACHANNEL_VERSION "v0.24.5" CACHE STRING "Pinned libdatachannel release used for reproducible builds")
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -42,27 +44,47 @@ if(NOT VPX_INCLUDE_DIRS OR NOT VPX_LIBRARIES)
   message(FATAL_ERROR "libvpx not found")
 endif()
 
-set(LIBDATACHANNEL_INCLUDE_DIR "${LIBDATACHANNEL_ROOT}/include")
-set(LIBDATACHANNEL_LIB_DIR "${LIBDATACHANNEL_ROOT}/lib")
+set(HI5_LIBDATACHANNEL_LINK_LIBS)
+set(HI5_LIBDATACHANNEL_INCLUDE_DIRS)
 
-set(LIBDATACHANNEL_LIB "${LIBDATACHANNEL_LIB_DIR}/datachannel.lib")
-set(LIBDATACHANNEL_USRSCTP_LIB "${LIBDATACHANNEL_LIB_DIR}/usrsctp.lib")
-set(LIBDATACHANNEL_SRTP2_LIB "${LIBDATACHANNEL_LIB_DIR}/srtp2.lib")
-set(LIBDATACHANNEL_JUICE_LIB "${LIBDATACHANNEL_LIB_DIR}/juice.lib")
-
-foreach(req
-    LIBDATACHANNEL_INCLUDE_DIR
-    LIBDATACHANNEL_LIB
-    LIBDATACHANNEL_USRSCTP_LIB
-    LIBDATACHANNEL_SRTP2_LIB
-    LIBDATACHANNEL_JUICE_LIB)
-  if(NOT EXISTS "${${req}}")
-    message(FATAL_ERROR "Missing required libdatachannel component: ${req} -> ${${req}}")
+if(HI5_FETCH_LIBDATACHANNEL)
+  include(FetchContent)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_DEPS_LIBS OFF CACHE BOOL "" FORCE)
+  set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+  set(NO_TESTS ON CACHE BOOL "" FORCE)
+  set(USE_SYSTEM_JSON ON CACHE BOOL "" FORCE)
+  set(USE_SYSTEM_SRTP OFF CACHE BOOL "" FORCE)
+  set(USE_SYSTEM_JUICE OFF CACHE BOOL "" FORCE)
+  set(USE_SYSTEM_USRSCTP OFF CACHE BOOL "" FORCE)
+  set(USE_SYSTEM_PLOG OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(libdatachannel GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git GIT_TAG ${HI5_LIBDATACHANNEL_VERSION} GIT_SHALLOW TRUE GIT_SUBMODULES_RECURSE TRUE)
+  FetchContent_MakeAvailable(libdatachannel)
+  if(NOT TARGET LibDataChannel::LibDataChannelStatic)
+    message(FATAL_ERROR "Fetched libdatachannel did not provide LibDataChannel::LibDataChannelStatic")
   endif()
-endforeach()
+  list(APPEND HI5_LIBDATACHANNEL_LINK_LIBS LibDataChannel::LibDataChannelStatic)
+  message(STATUS "Hi5Central Agent: fetched libdatachannel ${HI5_LIBDATACHANNEL_VERSION}")
+elseif(LIBDATACHANNEL_ROOT)
+  set(LIBDATACHANNEL_INCLUDE_DIR "${LIBDATACHANNEL_ROOT}/include")
+  set(LIBDATACHANNEL_LIB_DIR "${LIBDATACHANNEL_ROOT}/lib")
+  set(LIBDATACHANNEL_LIB "${LIBDATACHANNEL_LIB_DIR}/datachannel.lib")
+  set(LIBDATACHANNEL_USRSCTP_LIB "${LIBDATACHANNEL_LIB_DIR}/usrsctp.lib")
+  set(LIBDATACHANNEL_SRTP2_LIB "${LIBDATACHANNEL_LIB_DIR}/srtp2.lib")
+  set(LIBDATACHANNEL_JUICE_LIB "${LIBDATACHANNEL_LIB_DIR}/juice.lib")
 
-message(STATUS "Hi5Tech Agent: LIBDATACHANNEL_ROOT=${LIBDATACHANNEL_ROOT}")
-message(STATUS "Hi5Tech Agent: datachannel lib=${LIBDATACHANNEL_LIB}")
+  foreach(req LIBDATACHANNEL_INCLUDE_DIR LIBDATACHANNEL_LIB LIBDATACHANNEL_USRSCTP_LIB LIBDATACHANNEL_SRTP2_LIB LIBDATACHANNEL_JUICE_LIB)
+    if(NOT EXISTS "${${req}}")
+      message(FATAL_ERROR "Missing required libdatachannel component: ${req} -> ${${req}}")
+    endif()
+  endforeach()
+
+  list(APPEND HI5_LIBDATACHANNEL_INCLUDE_DIRS "${LIBDATACHANNEL_INCLUDE_DIR}")
+  list(APPEND HI5_LIBDATACHANNEL_LINK_LIBS "${LIBDATACHANNEL_LIB}" "${LIBDATACHANNEL_USRSCTP_LIB}" "${LIBDATACHANNEL_SRTP2_LIB}" "${LIBDATACHANNEL_JUICE_LIB}")
+  message(STATUS "Hi5Central Agent: using local libdatachannel install at ${LIBDATACHANNEL_ROOT}")
+else()
+  message(FATAL_ERROR "Set LIBDATACHANNEL_ROOT to a local static install or enable HI5_FETCH_LIBDATACHANNEL=ON")
+endif()
 
 # WebView2 SDK lookup. Recommended quick setup:
 #   nuget install Microsoft.Web.WebView2 -OutputDirectory external
@@ -149,7 +171,7 @@ add_executable(native_vp8_stream
 hi5_use_static_msvc_runtime(native_vp8_stream)
 
 target_include_directories(native_vp8_stream BEFORE PRIVATE
-  ${LIBDATACHANNEL_INCLUDE_DIR}
+  ${HI5_LIBDATACHANNEL_INCLUDE_DIRS}
   ${WEBVIEW2_INCLUDE_DIR}
   src
   ${VPX_INCLUDE_DIRS}
@@ -200,10 +222,7 @@ target_compile_definitions(native_vp8_stream PRIVATE
 )
 
 target_link_libraries(native_vp8_stream PRIVATE
-  ${LIBDATACHANNEL_LIB}
-  ${LIBDATACHANNEL_USRSCTP_LIB}
-  ${LIBDATACHANNEL_SRTP2_LIB}
-  ${LIBDATACHANNEL_JUICE_LIB}
+  ${HI5_LIBDATACHANNEL_LINK_LIBS}
   ${WEBVIEW2_LOADER_STATIC}
   nlohmann_json::nlohmann_json
   Threads::Threads
