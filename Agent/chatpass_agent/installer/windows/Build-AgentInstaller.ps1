@@ -10,7 +10,8 @@ param(
     [string]$Platform = "x64",
     [string]$VcpkgRoot = "",
     [string]$VcpkgTriplet = "x64-windows-static",
-    [string]$LibDataChannelRoot = "C:\Users\Dan\Desktop\libdatachannel-install-static",
+    [string]$LibDataChannelRoot = "C:\\Users\\Dan\\Desktop\\libdatachannel-install-static",
+    [switch]$FetchLibDataChannel,
 
     # Safety checks
     [switch]$Clean,
@@ -20,9 +21,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
+$repoRoot = (Resolve-Path (Join-Path $scriptDir "..\\..")).Path
 $buildPath = Join-Path $repoRoot $BuildDir
-$distPath = Join-Path $repoRoot "dist\installer"
+$distPath = Join-Path $repoRoot "dist\\installer"
 $issPath = Join-Path $scriptDir "Hi5CentralAgentSetup.iss"
 
 function Resolve-ToolPath {
@@ -90,11 +91,11 @@ Run this from:
 x64 Native Tools Command Prompt for VS 2026
 
 Then invoke this script through PowerShell, for example:
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location 'C:\Users\Dan\Downloads\hi5tech-chat-pass\chatpass_agent'; & '.\installer\windows\Build-AgentInstaller.ps1' -Clean -InnoSetupCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' -VcpkgRoot 'C:\vcpkg' -VcpkgTriplet 'x64-windows-static' -Generator 'Visual Studio 18 2026' -Platform 'x64' -LibDataChannelRoot 'C:\Users\Dan\Desktop\libdatachannel-install-static'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location 'C:\\Users\\Dan\\Downloads\\hi5tech-chat-pass\\chatpass_agent'; & '.\\installer\\windows\\Build-AgentInstaller.ps1' -Clean -InnoSetupCompiler 'C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe' -VcpkgRoot 'C:\\vcpkg' -VcpkgTriplet 'x64-windows-static' -Generator 'Visual Studio 18 2026' -Platform 'x64' -LibDataChannelRoot 'C:\\Users\\Dan\\Desktop\\libdatachannel-install-static'"
 "@
     }
 
-    if ($clPath -match "Hostx86\\x86" -or $linkPath -match "Hostx86\\x86") {
+    if ($clPath -match "Hostx86\\\\x86" -or $linkPath -match "Hostx86\\\\x86") {
         throw @"
 The current MSVC toolchain is x86, but this agent must be built x64.
 
@@ -106,8 +107,8 @@ Open "x64 Native Tools Command Prompt for VS 2026" and run the build command fro
 "@
     }
 
-    if ($clPath -notmatch "Hostx64\\x64" -and $linkPath -notmatch "Hostx64\\x64") {
-        Write-Warning "Could not clearly confirm Hostx64\x64 toolchain from PATH. Continuing, but linker may fail if the environment is not x64."
+    if ($clPath -notmatch "Hostx64\\\\x64" -and $linkPath -notmatch "Hostx64\\\\x64") {
+        Write-Warning "Could not clearly confirm Hostx64\\x64 toolchain from PATH. Continuing, but linker may fail if the environment is not x64."
     }
 }
 
@@ -201,6 +202,7 @@ Write-Host "Generator: $Generator"
 Write-Host "Platform: $Platform"
 Write-Host "VcpkgTriplet: $VcpkgTriplet"
 Write-Host "LibDataChannelRoot: $LibDataChannelRoot"
+Write-Host "FetchLibDataChannel: $FetchLibDataChannel"
 
 Assert-X64Toolchain
 
@@ -213,15 +215,15 @@ if ($Clean -and (Test-Path $buildPath)) {
 if ([string]::IsNullOrWhiteSpace($VcpkgRoot)) {
     if ($env:VCPKG_ROOT) {
         $VcpkgRoot = $env:VCPKG_ROOT
-    } elseif (Test-Path "C:\vcpkg") {
-        $VcpkgRoot = "C:\vcpkg"
+    } elseif (Test-Path "C:\\vcpkg") {
+        $VcpkgRoot = "C:\\vcpkg"
     }
 }
 
 $cmakeExe = Resolve-ToolPath "cmake.exe"
 
 if ([string]::IsNullOrWhiteSpace($cmakeExe) -or -not (Test-Path $cmakeExe)) {
-    $cmakeExe = "C:\Program Files\CMake\bin\cmake.exe"
+    $cmakeExe = "C:\\Program Files\\CMake\\bin\\cmake.exe"
 }
 
 if (-not (Test-Path $cmakeExe)) {
@@ -243,12 +245,19 @@ $cmakeArgs += @(
     "-DCMAKE_BUILD_TYPE=$Configuration",
     "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
     "-DHI5_REQUIRE_STATIC_CRT=ON",
-    "-DVCPKG_TARGET_TRIPLET=$VcpkgTriplet",
-    "-DLIBDATACHANNEL_ROOT=$LibDataChannelRoot"
+    "-DVCPKG_TARGET_TRIPLET=$VcpkgTriplet"
 )
 
+if ($FetchLibDataChannel) {
+    $cmakeArgs += "-DHI5_FETCH_LIBDATACHANNEL=ON"
+} elseif (-not [string]::IsNullOrWhiteSpace($LibDataChannelRoot)) {
+    $cmakeArgs += "-DLIBDATACHANNEL_ROOT=$LibDataChannelRoot"
+} else {
+    throw "Provide -LibDataChannelRoot for a local static build or use -FetchLibDataChannel for the pinned CI build."
+}
+
 if (-not [string]::IsNullOrWhiteSpace($VcpkgRoot)) {
-    $toolchainFile = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
+    $toolchainFile = Join-Path $VcpkgRoot "scripts\\buildsystems\\vcpkg.cmake"
 
     if (Test-Path $toolchainFile) {
         $cmakeArgs += "-DCMAKE_TOOLCHAIN_FILE=$toolchainFile"
@@ -284,14 +293,19 @@ if (-not $SkipBuild) {
         -ErrorMessage "CMake build failed."
 }
 
-$agentExe = Join-Path $buildPath "native_vp8_stream.exe"
-
-if (-not (Test-Path $agentExe)) {
-    $agentExe = Join-Path (Join-Path $buildPath $Configuration) "native_vp8_stream.exe"
+$agentCandidates = @(
+    (Join-Path $buildPath "Hi5CentralAgent.exe"),
+    (Join-Path (Join-Path $buildPath $Configuration) "Hi5CentralAgent.exe"),
+    (Join-Path $buildPath "native_vp8_stream.exe"),
+    (Join-Path (Join-Path $buildPath $Configuration) "native_vp8_stream.exe")
+)
+$agentExe = $agentCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $agentExe) {
+    $found = Get-ChildItem -Path $buildPath -Filter "Hi5CentralAgent.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) { $agentExe = $found.FullName }
 }
-
-if (-not (Test-Path $agentExe)) {
-    throw "Agent executable not found. Checked: $buildPath\native_vp8_stream.exe and $buildPath\$Configuration\native_vp8_stream.exe"
+if (-not $agentExe -or -not (Test-Path $agentExe)) {
+    throw "Agent executable not found under build directory: $buildPath"
 }
 
 Assert-NoDynamicVcRuntimeDependency -ExePath $agentExe
@@ -300,8 +314,8 @@ New-Item -ItemType Directory -Force -Path $distPath | Out-Null
 
 if ([string]::IsNullOrWhiteSpace($InnoSetupCompiler)) {
     $candidates = @(
-        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-        "C:\Program Files\Inno Setup 6\ISCC.exe"
+        "C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe",
+        "C:\\Program Files\\Inno Setup 6\\ISCC.exe"
     )
 
     foreach ($candidate in $candidates) {
@@ -313,7 +327,7 @@ if ([string]::IsNullOrWhiteSpace($InnoSetupCompiler)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($InnoSetupCompiler) -or -not (Test-Path $InnoSetupCompiler)) {
-    throw "Inno Setup Compiler was not found. Install Inno Setup 6 or pass -InnoSetupCompiler 'C:\Path\To\ISCC.exe'."
+    throw "Inno Setup Compiler was not found. Install Inno Setup 6 or pass -InnoSetupCompiler 'C:\\Path\\To\\ISCC.exe'."
 }
 
 Write-Host ""
@@ -346,4 +360,4 @@ Write-Host ""
 Write-Host "== Done =="
 Write-Host "Installer: $outFile"
 Write-Host ""
-Write-Host "Static CRT check passed. This installer should not require the VC++ Redistributable for native_vp8_stream.exe."
+Write-Host "Static CRT check passed. This installer should not require the VC++ Redistributable for Hi5CentralAgent.exe."
