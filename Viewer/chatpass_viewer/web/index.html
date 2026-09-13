@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hi5Central Viewer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #05070b;
+      --surface: rgba(13, 18, 28, 0.92);
+      --surface-2: rgba(18, 25, 38, 0.96);
+      --border: rgba(255,255,255,0.10);
+      --border-strong: rgba(255,255,255,0.16);
+      --accent: 99, 102, 241;
+      --text: #e6edf3;
+      --muted: rgba(230,237,243,0.58);
+      --danger: #f87171;
+      --success: #34d399;
+      --warning: #fbbf24;
+      --overlay-strong: rgba(5, 7, 11, 0.92);
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #topbar {
+      height: 54px;
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) auto minmax(180px, 1fr);
+      align-items: center;
+      gap: 16px;
+      padding: 8px 14px;
+      background: linear-gradient(180deg, rgba(18, 25, 38, 0.98), rgba(11, 15, 23, 0.96));
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      -webkit-app-region: drag;
+      position: relative;
+      z-index: 20;
+    }
+    #topbar * { -webkit-app-region: no-drag; }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .brand-mark {
+      width: 28px;
+      height: 28px;
+      border-radius: 9px;
+      display: grid;
+      place-items: center;
+      font-size: 14px;
+      font-weight: 900;
+      letter-spacing: -0.5px;
+      color: white;
+      background:
+        radial-gradient(circle at 20% 15%, rgba(255,255,255,0.32), transparent 28px),
+        linear-gradient(135deg, rgb(var(--accent)), #06b6d4);
+      box-shadow: 0 10px 22px rgba(99,102,241,0.28);
+    }
+
+    #logo {
+      font-weight: 800;
+      font-size: 14px;
+      letter-spacing: -0.3px;
+      white-space: nowrap;
+    }
+    #logo span { color: rgb(var(--accent)); }
+
+    .session-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    #status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+    #status-dot.online { background: var(--success); box-shadow: 0 0 8px rgba(52,211,153,0.65); }
+    #status-dot.error  { background: var(--danger);  box-shadow: 0 0 8px rgba(248,113,113,0.65); }
+
+    #status-label {
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #device-label {
+      font-size: 12px;
+      color: var(--muted);
+      justify-self: end;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 280px;
+    }
+
+    .topbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      position: relative;
+      justify-content: center;
+    }
+
+    .right-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      justify-content: flex-end;
+      min-width: 0;
+    }
+
+    .icon-btn,
+    #btn-monitor,
+    #btn-disconnect {
+      height: 34px;
+      min-width: 34px;
+      padding: 0 10px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      border-radius: 11px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.035);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 14px;
+      transition: background 0.15s, border-color 0.15s, transform 0.15s, opacity 0.15s;
+    }
+
+    .icon-btn:hover,
+    #btn-monitor:hover,
+    #btn-disconnect:hover {
+      background: rgba(255,255,255,0.075);
+      border-color: var(--border-strong);
+    }
+
+    .icon-btn:active,
+    #btn-monitor:active,
+    #btn-disconnect:active { transform: translateY(1px); }
+
+    .icon-btn:disabled,
+    #btn-monitor:disabled,
+    #btn-disconnect:disabled {
+      opacity: 0.35;
+      cursor: default;
+      transform: none;
+    }
+
+    .icon-btn .label,
+    #btn-monitor .label {
+      display: none;
+    }
+
+    #btn-monitor {
+      width: 34px;
+      padding: 0;
+      overflow: hidden;
+      color: transparent;
+      position: relative;
+    }
+    #btn-monitor::before {
+      content: "▣";
+      color: var(--text);
+      font-size: 16px;
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+    }
+
+    #btn-disconnect {
+      color: #fecaca;
+      border-color: rgba(248,113,113,0.25);
+      background: rgba(248,113,113,0.08);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 0 13px;
+    }
+    #btn-disconnect:hover { background: rgba(248,113,113,0.15); }
+
+    #monitor-menu {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      width: 260px;
+      max-height: 320px;
+      overflow-y: auto;
+      background: #11161d;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 18px 38px rgba(0,0,0,0.45);
+      padding: 8px;
+      display: none;
+      z-index: 100;
+    }
+    #monitor-menu.visible { display: block; }
+
+    .monitor-item {
+      display: block;
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 9px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      text-align: left;
+      margin-bottom: 6px;
+    }
+    .monitor-item:last-child { margin-bottom: 0; }
+    .monitor-item:hover { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.08); }
+    .monitor-title { font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 2px; }
+    .monitor-sub { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    #main {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+    }
+
+    #remote-video,
+    #remote-image {
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+      display: none;
+      background: #000;
+    }
+    #remote-video.visible,
+    #remote-image.visible { display: block; }
+
+    #overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+      padding: 32px;
+      text-align: center;
+      opacity: 1;
+      transition: opacity 180ms ease, background 180ms ease, backdrop-filter 180ms ease;
+      background: var(--overlay-strong);
+      z-index: 10;
+    }
+    #overlay.hidden { opacity: 0; pointer-events: none; }
+    #overlay.passive {
+      background: linear-gradient(to bottom, rgba(8, 10, 14, 0.22), rgba(8, 10, 14, 0.48));
+      backdrop-filter: blur(2px);
+      -webkit-backdrop-filter: blur(2px);
+    }
+    #overlay.secure-black,
+    #overlay.secure-black-silent { background: #000; backdrop-filter: none; -webkit-backdrop-filter: none; }
+    #overlay.silent .overlay-icon,
+    #overlay.silent .overlay-title,
+    #overlay.silent .overlay-sub,
+    #overlay.silent .spinner,
+    #overlay.silent #error-detail,
+    #overlay.secure-black-silent .overlay-icon,
+    #overlay.secure-black-silent .overlay-title,
+    #overlay.secure-black-silent .overlay-sub,
+    #overlay.secure-black-silent .spinner,
+    #overlay.secure-black-silent #error-detail { display: none !important; }
+
+    .overlay-icon {
+      width: 72px;
+      height: 72px;
+      border-radius: 24px;
+      background: rgba(var(--accent), 0.11);
+      border: 1px solid rgba(var(--accent), 0.25);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: opacity 180ms ease, transform 180ms ease;
+    }
+    .overlay-icon svg { width: 36px; height: 36px; opacity: 0.78; }
+    .overlay-title { font-size: 21px; font-weight: 800; letter-spacing: -0.3px; }
+    .overlay-sub { color: var(--muted); font-size: 13px; max-width: 440px; line-height: 1.6; }
+
+    .spinner {
+      width: 28px;
+      height: 28px;
+      border: 3px solid rgba(255,255,255,0.1);
+      border-top-color: rgba(var(--accent), 0.9);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #error-detail {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      color: var(--danger);
+      background: rgba(248,113,113,0.08);
+      border: 1px solid rgba(248,113,113,0.22);
+      border-radius: 10px;
+      padding: 10px 14px;
+      max-width: 520px;
+      word-break: break-word;
+      display: none;
+    }
+
+    /* Stats are no longer shown as a bottom bar; the same IDs live in Settings. */
+    #statsbar { display: none !important; }
+
+    .side-panel {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 360px;
+      background: rgba(17,22,29,0.98);
+      border-left: 1px solid var(--border);
+      border-right: 1px solid var(--border);
+      z-index: 12;
+      display: none;
+      flex-direction: column;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }
+    .side-panel.visible { display: flex; }
+    #chat-panel { right: 0; }
+    #files-panel { left: 0; }
+
+    .settings-popout {
+      position: absolute;
+      top: 18px;
+      right: 18px;
+      width: min(420px, calc(100vw - 36px));
+      max-height: calc(100% - 36px);
+      background: rgba(17,22,29,0.96);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 18px;
+      z-index: 90;
+      display: none;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 24px 70px rgba(0,0,0,0.55);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+    }
+    .settings-popout.visible { display: flex; }
+    .settings-popout::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(320px 180px at 85% 0%, rgba(var(--accent),0.18), transparent 62%),
+        linear-gradient(to bottom, rgba(255,255,255,0.055), transparent 45%);
+    }
+    .settings-popout > * { position: relative; z-index: 1; }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 800;
+    }
+    .panel-close {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+
+    #chat-log, #file-list {
+      flex: 1;
+      overflow: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .chat-bubble { padding: 10px 12px; border-radius: 10px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.06); }
+    .chat-bubble.tech { background: rgba(var(--accent),0.16); }
+    .chat-meta { font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+    .chat-body { white-space: pre-wrap; line-height: 1.45; }
+    .chat-compose { padding: 12px; border-top: 1px solid var(--border); display: flex; gap: 8px; }
+    #chat-input, #file-path {
+      flex: 1;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 9px;
+      padding: 10px 12px;
+    }
+    #chat-send, #file-refresh { background: rgb(var(--accent)); color: white; border: 0; border-radius: 9px; padding: 10px 12px; cursor: pointer; }
+    .file-toolbar { padding: 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+    .file-entry { padding: 10px 12px; border-radius: 9px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); cursor: pointer; }
+    .file-entry:hover { background: rgba(255,255,255,0.07); }
+    .file-entry .file-meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    .settings-body {
+      padding: 16px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .settings-card {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .settings-card h3 {
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+    .diag-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 7px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      font-size: 12px;
+    }
+    .diag-row:last-child { border-bottom: 0; }
+    .diag-row span:first-child { color: var(--muted); }
+    .diag-row span:last-child { color: var(--text); font-weight: 700; text-align: right; word-break: break-word; }
+
+    .settings-control {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      font-size: 12px;
+    }
+    .settings-control:last-child { border-bottom: 0; }
+    .settings-control label { color: var(--muted); }
+    .settings-select {
+      min-width: 150px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: var(--text);
+      border-radius: 9px;
+      padding: 7px 9px;
+      outline: none;
+    }
+    .settings-select option { background: #11161d; color: var(--text); }
+  </style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="brand">
+    <div class="brand-mark">H5</div>
+    <div>
+      <div id="logo">Hi5<span>Central</span> Viewer</div>
+      <div class="session-meta">
+        <div id="status-dot"></div>
+        <div id="status-label">Waiting for connection…</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="topbar-actions" aria-label="Session actions">
+    <button id="btn-files" class="icon-btn" disabled title="Files" aria-label="Files">📁<span class="label">Files</span></button>
+    <button id="btn-chat" class="icon-btn" disabled title="Chat" aria-label="Chat">💬<span class="label">Chat</span></button>
+    <button id="btn-backstage" class="icon-btn" disabled title="Backstage Desktop" aria-label="Backstage Desktop">🧰<span class="label">Backstage</span></button>
+    <button id="btn-console" class="icon-btn" disabled title="Console Desktop" aria-label="Console Desktop">🖥️<span class="label">Console</span></button>
+    <button id="btn-start-menu" class="icon-btn" disabled title="Start Menu" aria-label="Start Menu">⊞<span class="label">Start</span></button>
+    <button id="btn-cad" class="icon-btn" disabled title="Ctrl+Alt+Del" aria-label="Ctrl+Alt+Del">⌘<span class="label">CAD</span></button>
+    <button id="btn-monitor" disabled title="Monitors" aria-label="Monitors">Monitors</button>
+    <button id="btn-settings" class="icon-btn" title="About and diagnostics" aria-label="About and diagnostics">⚙<span class="label">Settings</span></button>
+    <div id="monitor-menu"></div>
+  </div>
+
+  <div class="right-actions">
+    <div id="device-label"></div>
+    <button id="btn-disconnect" disabled>Disconnect</button>
+  </div>
+</div>
+
+<div id="main">
+  <video id="remote-video" autoplay playsinline></video>
+  <img id="remote-image" alt="Remote desktop stream" />
+
+  <div id="files-panel" class="side-panel">
+    <div class="panel-head">
+      <span>Remote files</span>
+      <button id="files-close" class="panel-close">Close</button>
+    </div>
+    <div class="file-toolbar">
+      <input id="file-path" value="/" />
+      <button id="file-refresh">Open</button>
+    </div>
+    <div id="file-list"></div>
+  </div>
+
+  <div id="chat-panel" class="side-panel">
+    <div class="panel-head">
+      <span>Session chat</span>
+      <button id="chat-close" class="panel-close">Close</button>
+    </div>
+    <div id="chat-log"></div>
+    <div class="chat-compose">
+      <input id="chat-input" placeholder="Send a message to the remote user" />
+      <button id="chat-send">Send</button>
+    </div>
+  </div>
+
+  <div id="settings-panel" class="settings-popout" role="dialog" aria-modal="false" aria-label="About and diagnostics">
+    <div class="panel-head">
+      <span>About & diagnostics</span>
+      <button id="settings-close" class="panel-close" title="Close" aria-label="Close settings">×</button>
+    </div>
+    <div class="settings-body">
+      <div class="settings-card">
+        <h3>Display</h3>
+        <div class="settings-control">
+          <label for="viewer-scale-mode">Viewer scale</label>
+          <select id="viewer-scale-mode" class="settings-select">
+            <option value="stretch">Stretch to window</option>
+            <option value="fit">Fit to window</option>
+          </select>
+        </div>
+        <div class="settings-control">
+          <label for="remote-resolution-pref">Remote resolution</label>
+          <select id="remote-resolution-pref" class="settings-select">
+            <option value="auto">Auto</option>
+            <option value="native">Native</option>
+            <option value="1080p">1080p</option>
+            <option value="720p">720p</option>
+          </select>
+        </div>
+      </div>
+      <div class="settings-card">
+        <h3>Session</h3>
+        <div class="diag-row"><span>Resolution</span><span id="stat-res">—</span></div>
+        <div class="diag-row"><span>Codec</span><span id="stat-codec">VP8</span></div>
+        <div class="diag-row"><span>State</span><span id="stat-state">—</span></div>
+      </div>
+      <div class="settings-card">
+        <h3>WebRTC</h3>
+        <div class="diag-row"><span>ICE state</span><span id="diag-ice-state">—</span></div>
+        <div class="diag-row"><span>Connection state</span><span id="diag-connection-state">—</span></div>
+        <div class="diag-row"><span>Candidate pair</span><span id="diag-candidate-pair">—</span></div>
+        <div class="diag-row"><span>Bitrate</span><span id="diag-bitrate">—</span></div>
+        <div class="diag-row"><span>FPS</span><span id="diag-fps">—</span></div>
+        <div class="diag-row"><span>Frames decoded</span><span id="diag-frames">—</span></div>
+        <div class="diag-row"><span>Packets lost</span><span id="diag-packets-lost">—</span></div>
+        <div class="diag-row"><span>RTT</span><span id="diag-rtt">—</span></div>
+        <div class="diag-row"><span>ICE servers</span><span id="diag-ice-servers">—</span></div>
+      </div>
+      <div class="settings-card">
+        <h3>Hi5Central Viewer</h3>
+        <div class="diag-row"><span>Build</span><span>Development</span></div>
+        <div class="diag-row"><span>Mode</span><span>WebRTC VP8</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="overlay">
+    <div class="overlay-icon">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+          d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+      </svg>
+    </div>
+    <div class="overlay-title" id="overlay-title">Hi5Central Viewer</div>
+    <div class="overlay-sub" id="overlay-sub">
+      Launch this app from Hi5Central to start a remote desktop session.
+    </div>
+    <div class="spinner" id="spinner" style="display:none"></div>
+    <div id="error-detail"></div>
+  </div>
+</div>
+
+<div id="statsbar"></div>
+
+<script src="renderer.js"></script>
+</body>
+</html>

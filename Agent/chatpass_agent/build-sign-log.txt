@@ -1,0 +1,12 @@
+Build started at 05/24/2026 00:26:03
+
+================================
+Clean build folder
+================================
+
+================================
+Configure CMake
+================================
+> cmake 
+
+FAILED: Configure CMake failed with exit code 

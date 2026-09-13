@@ -1,0 +1,90 @@
+
+# Secrets / local configuration
+
+.env
+
+.env.*
+
+*.pem
+
+*.pfx
+
+*.key
+
+secrets.dat
+
+
+
+# Dependencies
+
+node_modules/
+
+
+
+# IDE / OS
+
+.vs/
+
+.vscode/
+
+.DS_Store
+
+Thumbs.db
+
+
+
+# Common build/cache directories
+
+__pycache__/
+
+*.pyc
+
+.turbo/
+
+.next/
+
+
+
+# Logs
+
+*.log
+
+
+# Build output
+build/
+**/build/
+dist/
+**/dist/
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Next / Turbo
+.next/
+**/.next/
+.turbo/
+**/.turbo/
+
+# Visual Studio / IDE
+.vs/
+**/.vs/
+.vscode/
+
+# Secrets / machine-specific configuration
+.env
+.env.*
+**/.env
+**/.env.*
+secrets.dat
+**/secrets.dat
+*.pem
+*.pfx
+*.key
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
