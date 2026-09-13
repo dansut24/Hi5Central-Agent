@@ -1,0 +1,114 @@
+name: Windows Agent and Viewer installers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, hardening-mobile-viewer]
+    paths:
+      - "Agent/**"
+      - "Viewer/**"
+      - "ci/**"
+      - ".github/workflows/windows-installers.yml"
+  pull_request:
+    paths:
+      - "Agent/**"
+      - "Viewer/**"
+      - "ci/**"
+      - ".github/workflows/windows-installers.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      VCPKG_FEATURE_FLAGS: manifests,binarycaching
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify local Windows build path is preserved
+        shell: pwsh
+        run: |
+          $required = @(
+            'Agent/chatpass_agent/CMakeLists.txt',
+            'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1',
+            'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss',
+            'Viewer/chatpass_viewer/CMakeLists.txt',
+            'Viewer/chatpass_viewer/installer/windows/Build-ViewerInstaller.ps1',
+            'Viewer/chatpass_viewer/installer/windows/Hi5CentralViewerSetup.iss'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) { throw "Missing local Windows build file: $path" }
+          }
+          $agentBuild = Get-Content 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1' -Raw
+          if ($agentBuild -notmatch 'Visual Studio 18 2026') { throw 'Local VS 2026 generator default was removed.' }
+          if ($agentBuild -notmatch 'C:\\Users\\Dan\\Desktop\\libdatachannel-install-static') {
+            throw 'Local libdatachannel default path was removed.'
+          }
+
+      - name: Ensure Inno Setup is available
+        shell: pwsh
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          if (-not (Test-Path $iscc)) { throw 'Inno Setup compiler not found.' }
+
+      - name: Build unsigned Windows installers
+        shell: pwsh
+        run: |
+          ./ci/Build-WindowsInstallers.ps1 -Version "0.1.${{ github.run_number }}"
+
+      - name: Upload Agent installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-Agent-Windows
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe
+            Agent/chatpass_agent/build/Release/Hi5CentralAgent.exe
+
+      - name: Upload Viewer installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-Viewer-Windows
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            Viewer/chatpass_viewer/dist/installer/Hi5CentralViewerSetup.exe
+            Viewer/chatpass_viewer/dist/viewer/Hi5CentralViewer.exe
+            Viewer/chatpass_viewer/dist/viewer/web/**
+
+      - name: Publish latest test installers
+        if: github.event_name == 'push' && github.ref == 'refs/heads/hardening-mobile-viewer'
+        shell: pwsh
+        run: |
+          $publish = Join-Path $env:RUNNER_TEMP 'hi5central-publish'
+          New-Item -ItemType Directory -Force -Path $publish | Out-Null
+          Copy-Item 'Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe' $publish
+          Copy-Item 'Viewer/chatpass_viewer/dist/installer/Hi5CentralViewerSetup.exe' $publish
+          Get-FileHash "$publish\Hi5CentralAgentSetup.exe" -Algorithm SHA256 | ForEach-Object { $_.Hash } | Set-Content "$publish\Hi5CentralAgentSetup.exe.sha256"
+          Get-FileHash "$publish\Hi5CentralViewerSetup.exe" -Algorithm SHA256 | ForEach-Object { $_.Hash } | Set-Content "$publish\Hi5CentralViewerSetup.exe.sha256"
+          $meta = @{
+            build = "0.1.${{ github.run_number }}"
+            commit = "${{ github.sha }}"
+            generated_at = (Get-Date).ToUniversalTime().ToString('o')
+          } | ConvertTo-Json
+          $meta | Set-Content "$publish\build.json"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --orphan build-output
+          git rm -rf .
+          Get-ChildItem -Force | Where-Object { $_.Name -ne '.git' } | Remove-Item -Recurse -Force
+          New-Item -ItemType Directory -Force -Path latest | Out-Null
+          Copy-Item "$publish\*" latest -Force
+          git add latest
+          git commit -m "Publish Windows test build 0.1.${{ github.run_number }}"
+          git push --force origin HEAD:build-output
