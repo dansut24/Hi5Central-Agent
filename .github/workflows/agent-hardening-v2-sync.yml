@@ -1,4 +1,4 @@
-name: Sync persistent handoff checkpoint
+name: Sync console handoff stability checkpoint
 
 on:
   push:
@@ -20,24 +20,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download and verify persistent handoff snapshot
+      - name: Download and verify console handoff stability snapshot
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/persistent-handoff-a6e432e.tar.gz \
-            -o /tmp/persistent-handoff-a6e432e.tar.gz
-          echo "35c24d30b31fc6c661a7bb446a6a206dd897d3d93e47de4bf9ad73c5641c3bfd  /tmp/persistent-handoff-a6e432e.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/handoff-stability-178101f.tar.gz \
+            -o /tmp/handoff-stability-178101f.tar.gz
+          echo "8fdc1feed9ddc96b965c176a94ffe54c3a49f863e0f5be747d3c3364342bf678  /tmp/handoff-stability-178101f.tar.gz" | sha256sum -c -
 
-      - name: Apply exact changed files
+      - name: Apply exact changed file
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/persistent-handoff
-          tar -xzf /tmp/persistent-handoff-a6e432e.tar.gz -C /tmp/persistent-handoff
-          cp -a /tmp/persistent-handoff/. .
-          rm -f Agent/.ci-vp9-quality-1b37598
-          git add -A
+          mkdir -p /tmp/handoff-stability
+          tar -xzf /tmp/handoff-stability-178101f.tar.gz -C /tmp/handoff-stability
+          cp -a /tmp/handoff-stability/. .
+          git add Agent/chatpass_agent/src/platform/windows/windows_service.cpp
           git status --short
 
       - name: Commit synced checkpoint
@@ -50,5 +49,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Sync persistent Windows session handoff checkpoint"
+          git commit -m "Sync console handoff stability checkpoint"
           git push origin HEAD:agent-hardening-v2
