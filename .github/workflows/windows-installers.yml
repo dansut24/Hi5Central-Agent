@@ -3,7 +3,7 @@ name: Windows Agent and Viewer installers
 on:
   workflow_dispatch:
   push:
-    branches: [main, hardening-mobile-viewer]
+    branches: [main, hardening-mobile-viewer, agent-hardening-v2]
     paths:
       - "Agent/**"
       - "Viewer/**"
