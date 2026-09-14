@@ -60,6 +60,8 @@ if (elVideo) {
 let ws = null;
 let pc = null;
 let inputDc = null;
+let mouseMoveDc = null;
+let mouseMoveSeq = 0;
 
 let currentSession = null;
 let remoteDescSet = false;
@@ -794,9 +796,33 @@ function enterRemoteControlMode() {
   refreshRemoteCursorPosition();
 }
 
+function sendFastMouseMove(extra = {}) {
+  if (!mouseMoveDc || mouseMoveDc.readyState !== "open") return false;
+  const x = Number(extra.x_norm);
+  const y = Number(extra.y_norm);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+
+  try {
+    const buffer = new ArrayBuffer(21);
+    const view = new DataView(buffer);
+    mouseMoveSeq = (mouseMoveSeq + 1) >>> 0;
+    view.setUint8(0, 1);
+    view.setUint32(1, mouseMoveSeq, true);
+    view.setFloat32(5, Math.max(0, Math.min(1, x)), true);
+    view.setFloat32(9, Math.max(0, Math.min(1, y)), true);
+    view.setFloat64(13, performance.now(), true);
+    mouseMoveDc.send(buffer);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function sendInput(kind, extra = {}, force = false) {
   if (!currentSession) return;
   if (!force && !controlActive) return;
+
+  if (kind === "mouse_move" && sendFastMouseMove(extra)) return;
 
   const payload = JSON.stringify({ kind, ...extra });
 
@@ -1009,6 +1035,11 @@ function disconnect(reason, options = {}) {
     try { inputDc.close(); } catch {}
     inputDc = null;
   }
+  if (mouseMoveDc) {
+    try { mouseMoveDc.close(); } catch {}
+    mouseMoveDc = null;
+  }
+  mouseMoveSeq = 0;
 
   if (pc) {
     try { pc.close(); } catch {}
@@ -1673,6 +1704,17 @@ async function handleOffer(msg) {
 
   pc = new RTCPeerConnection({ iceServers: activeIceServers() });
 
+  try {
+    mouseMoveDc = pc.createDataChannel("viewer-mouse-move", { ordered: false, maxRetransmits: 0 });
+    mouseMoveDc.binaryType = "arraybuffer";
+    mouseMoveDc.onopen = () => console.log("[dc] fast mouse channel open");
+    mouseMoveDc.onclose = () => { mouseMoveDc = null; };
+    mouseMoveDc.onerror = () => {};
+  } catch (e) {
+    mouseMoveDc = null;
+    console.warn("[dc] fast mouse channel unavailable:", e?.message || e);
+  }
+
   let transceiver = null;
   try {
     transceiver = pc.addTransceiver("video", { direction: "recvonly" });
@@ -1854,6 +1896,14 @@ async function onSignalMessage(raw) {
     case "viewer_connected":
       break;
 
+    case "session_config": {
+      if (currentSession) {
+        currentSession.iceServers = normalizeIceServers(msg.ice_servers || msg.iceServers || []);
+        if (elDiagIceServers) elDiagIceServers.textContent = activeIceServers().map((server) => Array.isArray(server.urls) ? server.urls.join(",") : server.urls).join(" | ");
+      }
+      break;
+    }
+
     case "start_webrtc_sent":
       break;
 
@@ -2012,6 +2062,7 @@ function startSession(params) {
   const deviceId = params.device_id || params.deviceId || "";
   const wssUrl = params.wss_url || params.wssUrl || params.signaling_url || params.signalingUrl || "";
   const iceServers = normalizeIceServers(params.ice_servers || params.iceServers || []);
+  const viewerClient = params.viewer_client || params.viewerClient || '';
 
   if (!sessionId || !deviceId || !token || !wssUrl) {
     console.error("[viewer] invalid connection parameters");
@@ -2024,7 +2075,8 @@ function startSession(params) {
     token,
     deviceId,
     wssUrl,
-    iceServers
+    iceServers,
+    viewerClient
   };
 
   remoteMonitors = [];
@@ -2048,7 +2100,8 @@ function startSession(params) {
   const url =
     `${wssUrl}?session_id=${encodeURIComponent(sessionId)}` +
     `&device_id=${encodeURIComponent(deviceId)}` +
-    (token ? `&token=${encodeURIComponent(token)}` : "");
+    (token ? `&token=${encodeURIComponent(token)}` : "") +
+    (viewerClient ? `&client=${encodeURIComponent(viewerClient)}` : "");
   console.log(`[viewer] opening signaling socket session=${sessionId} device=${deviceId}`);
 
   ws = new WebSocket(url);

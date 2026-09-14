@@ -45,6 +45,8 @@ namespace hi5 {
         void HideOnUiThread();
         void ClearOnUiThread();
         void HandleSendClicked();
+        void LayoutChildren();
+        void ClampToCurrentWorkArea(bool preferBottomRight);
 
         struct PendingUiMessage {
             enum class Type {

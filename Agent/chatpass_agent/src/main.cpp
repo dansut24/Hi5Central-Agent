@@ -33,6 +33,7 @@ using json = nlohmann::json;
 namespace hi5 {
     int RunStreamerMain(int argc, char** argv);
     int RunChatOverlayMain(int argc, char** argv);
+    int RunNativeChatMain(int argc, char** argv);
     int RunNativeBannerMain(int argc, char** argv);
     int RunBackstageHostMain(int argc, char** argv);
     int RunBackstageBrowserMain(int argc, char** argv);
@@ -296,7 +297,6 @@ int main(int argc, char** argv) {
 
     std::cout << "[main] process start\n";
     LogInfo("[main] process start");
-    LogPlatformInfo();
 
     std::string mode = "direct-agent";
     for (int i = 1; i < argc; ++i) {
@@ -334,6 +334,12 @@ int main(int argc, char** argv) {
                 return hi5::RunChatOverlayMain(argc, argv);
             }
 
+            if (next == "native-chat") {
+                std::cout << "[main] mode=native-chat\n";
+                LogInfo("[main] mode=native-chat");
+                return hi5::RunNativeChatMain(argc, argv);
+            }
+
             if (next == "banner") {
                 std::cout << "[main] mode=banner\n";
                 LogInfo("[main] mode=banner");
@@ -361,5 +367,6 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[main] mode=direct-agent\n";
+    LogPlatformInfo();
     return RunDirectAgent(argc, argv);
 }

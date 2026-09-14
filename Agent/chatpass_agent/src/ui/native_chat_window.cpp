@@ -1,7 +1,11 @@
 #include "native_chat_window.h"
+#include "util/log.h"
 
 #include <windowsx.h>
+#include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <sstream>
 
 namespace hi5 {
@@ -168,11 +172,11 @@ namespace hi5 {
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             kChatWindowClass,
             L"Hi5Central Support Chat",
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
+            440,
             420,
-            360,
             nullptr,
             nullptr,
             hinst,
@@ -230,6 +234,8 @@ namespace hi5 {
             SendMessageW(sendButton_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
         }
 
+        LayoutChildren();
+        ClampToCurrentWorkArea(true);
         ShowWindow(hwnd_, SW_HIDE);
         UpdateWindow(hwnd_);
         return true;
@@ -261,8 +267,9 @@ namespace hi5 {
 
     void NativeChatWindow::ShowOnUiThread() {
         if (!hwnd_) return;
+        ClampToCurrentWorkArea(false);
         ShowWindow(hwnd_, SW_SHOWNORMAL);
-        SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
         SetForegroundWindow(hwnd_);
     }
 
@@ -276,6 +283,51 @@ namespace hi5 {
         SendMessageW(listBox_, LB_RESETCONTENT, 0, 0);
     }
 
+    void NativeChatWindow::LayoutChildren() {
+        if (!hwnd_) return;
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const int width = std::max(1L, client.right - client.left);
+        const int height = std::max(1L, client.bottom - client.top);
+        const int margin = 12;
+        const int composerHeight = 32;
+        const int buttonWidth = 84;
+        const int listHeight = std::max(80, height - (margin * 3) - composerHeight);
+        if (listBox_) MoveWindow(listBox_, margin, margin, std::max(80, width - margin * 2), listHeight, TRUE);
+        if (editBox_) MoveWindow(editBox_, margin, margin * 2 + listHeight,
+            std::max(80, width - margin * 3 - buttonWidth), composerHeight, TRUE);
+        if (sendButton_) MoveWindow(sendButton_, std::max(margin, width - margin - buttonWidth),
+            margin * 2 + listHeight, buttonWidth, composerHeight, TRUE);
+    }
+
+    void NativeChatWindow::ClampToCurrentWorkArea(bool preferBottomRight) {
+        if (!hwnd_) return;
+        HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (!monitor || !GetMonitorInfoW(monitor, &info)) return;
+
+        RECT current{};
+        GetWindowRect(hwnd_, &current);
+        const int workW = std::max(320L, info.rcWork.right - info.rcWork.left);
+        const int workH = std::max(260L, info.rcWork.bottom - info.rcWork.top);
+        int width = std::min(current.right - current.left, std::max(320, workW - 32));
+        int height = std::min(current.bottom - current.top, std::max(260, workH - 32));
+        width = std::max(320, width);
+        height = std::max(260, height);
+
+        int x = current.left;
+        int y = current.top;
+        if (preferBottomRight) {
+            x = info.rcWork.right - width - 18;
+            y = info.rcWork.bottom - height - 18;
+        }
+        x = std::max(info.rcWork.left, std::min(x, info.rcWork.right - width));
+        y = std::max(info.rcWork.top, std::min(y, info.rcWork.bottom - height));
+        SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        LayoutChildren();
+    }
+
     void NativeChatWindow::HandleSendClicked() {
         if (!editBox_) return;
 
@@ -284,8 +336,9 @@ namespace hi5 {
             return;
         }
 
-        std::wstring text(static_cast<size_t>(len), L'\0');
+        std::wstring text(static_cast<size_t>(len) + 1, L'\0');
         GetWindowTextW(editBox_, text.data(), len + 1);
+        text.resize(static_cast<size_t>(len));
 
         std::string body = WideToUtf8(text);
         if (body.empty()) {
@@ -366,8 +419,38 @@ namespace hi5 {
             return 0;
         }
 
+        case WM_SIZE:
+            LayoutChildren();
+            return 0;
+
+        case WM_DISPLAYCHANGE:
+        case WM_SETTINGCHANGE:
+            ClampToCurrentWorkArea(false);
+            return 0;
+
+        case WM_DPICHANGED: {
+            const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+            if (suggested) {
+                SetWindowPos(hwnd, HWND_TOPMOST, suggested->left, suggested->top,
+                    suggested->right - suggested->left, suggested->bottom - suggested->top,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+            ClampToCurrentWorkArea(false);
+            return 0;
+        }
+
+        case WM_GETMINMAXINFO: {
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            if (mmi) {
+                mmi->ptMinTrackSize.x = 320;
+                mmi->ptMinTrackSize.y = 260;
+            }
+            return 0;
+        }
+
         case WM_CLOSE:
-            ShowWindow(hwnd, SW_HIDE);
+            if (!running_.load()) DestroyWindow(hwnd);
+            else ShowWindow(hwnd, SW_HIDE);
             return 0;
 
         case WM_DESTROY:
@@ -376,6 +459,121 @@ namespace hi5 {
         }
 
         return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    namespace {
+        std::string ChatHelperArg(int argc, char** argv, const std::string& key) {
+            for (int i = 1; i + 1 < argc; ++i) {
+                if (std::string(argv[i]) == key) return std::string(argv[i + 1]);
+            }
+            return {};
+        }
+
+        HANDLE OpenChatPipeClient(const std::string& name, DWORD access) {
+            if (name.empty()) return INVALID_HANDLE_VALUE;
+            for (int attempt = 0; attempt < 60; ++attempt) {
+                HANDLE pipe = CreateFileA(name.c_str(), access, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (pipe != INVALID_HANDLE_VALUE) {
+                    DWORD mode = PIPE_READMODE_MESSAGE;
+                    SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);
+                    return pipe;
+                }
+                if (GetLastError() != ERROR_PIPE_BUSY && GetLastError() != ERROR_FILE_NOT_FOUND) break;
+                WaitNamedPipeA(name.c_str(), 100);
+            }
+            return INVALID_HANDLE_VALUE;
+        }
+
+        bool WriteChatHelperLine(HANDLE pipe, const nlohmann::json& payload) {
+            if (!pipe || pipe == INVALID_HANDLE_VALUE) return false;
+            const std::string line = payload.dump() + "\n";
+            DWORD written = 0;
+            return WriteFile(pipe, line.data(), static_cast<DWORD>(line.size()), &written, nullptr) && written == line.size();
+        }
+    }
+
+    int RunNativeChatMain(int argc, char** argv) {
+        const std::string sessionId = ChatHelperArg(argc, argv, "--session");
+        const std::string inPipeName = ChatHelperArg(argc, argv, "--pipe-in");
+        const std::string outPipeName = ChatHelperArg(argc, argv, "--pipe-out");
+        if (sessionId.empty() || inPipeName.empty() || outPipeName.empty()) {
+            LogError("[native-chat] missing session/pipe arguments");
+            return 2;
+        }
+
+        HANDLE inPipe = OpenChatPipeClient(inPipeName, GENERIC_READ);
+        HANDLE outPipe = OpenChatPipeClient(outPipeName, GENERIC_WRITE);
+        if (inPipe == INVALID_HANDLE_VALUE || outPipe == INVALID_HANDLE_VALUE) {
+            if (inPipe != INVALID_HANDLE_VALUE) CloseHandle(inPipe);
+            if (outPipe != INVALID_HANDLE_VALUE) CloseHandle(outPipe);
+            LogError("[native-chat] failed to connect service pipes session=" + sessionId);
+            return 3;
+        }
+
+        std::mutex outMu;
+        NativeChatWindow window;
+        if (!window.Start(sessionId, [&](const std::string& body) {
+            std::lock_guard<std::mutex> lock(outMu);
+            WriteChatHelperLine(outPipe, {
+                {"type", "chat_message"}, {"session_id", sessionId},
+                {"sender", "user"}, {"display_name", "Remote user"}, {"body", body}
+            });
+        })) {
+            CloseHandle(inPipe);
+            CloseHandle(outPipe);
+            LogError("[native-chat] failed to create native window session=" + sessionId);
+            return 4;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(outMu);
+            WriteChatHelperLine(outPipe, {{"type", "overlay_ready"}, {"session_id", sessionId}});
+        }
+        LogInfo("[native-chat] ready session=" + sessionId);
+
+        std::string pending;
+        char buffer[8192];
+        bool running = true;
+        while (running) {
+            DWORD read = 0;
+            BOOL ok = ReadFile(inPipe, buffer, sizeof(buffer), &read, nullptr);
+            const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+            if (read > 0) pending.append(buffer, buffer + read);
+
+            for (;;) {
+                const auto pos = pending.find('\n');
+                if (pos == std::string::npos) break;
+                std::string line = pending.substr(0, pos);
+                pending.erase(0, pos + 1);
+                auto msg = nlohmann::json::parse(line, nullptr, false);
+                if (msg.is_discarded()) continue;
+                const std::string type = msg.value("type", std::string());
+                if (type == "close") {
+                    running = false;
+                    break;
+                }
+                if (type == "chat_message") {
+                    ChatMessage chat{};
+                    chat.sessionId = sessionId;
+                    chat.sender = msg.value("sender", std::string("tech"));
+                    chat.displayName = msg.value("display_name", std::string("Technician"));
+                    chat.body = msg.value("body", std::string());
+                    if (!chat.body.empty()) window.AppendMessage(chat);
+                }
+            }
+
+            if (!ok && err != ERROR_MORE_DATA) break;
+        }
+
+        window.Stop();
+        {
+            std::lock_guard<std::mutex> lock(outMu);
+            WriteChatHelperLine(outPipe, {{"type", "closed"}, {"session_id", sessionId}});
+        }
+        CloseHandle(inPipe);
+        CloseHandle(outPipe);
+        LogInfo("[native-chat] stopped session=" + sessionId);
+        return 0;
     }
 
 } // namespace hi5

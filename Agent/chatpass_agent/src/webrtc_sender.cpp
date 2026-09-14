@@ -782,6 +782,12 @@ void WebRtcSender::createPeerConnection() {
     else {
         media.addVP8Codec(m_payloadType);
     }
+
+    const std::string selectedCodecName =
+        m_videoCodec == VideoCodec::H264 ? "H.264" :
+        (m_videoCodec == VideoCodec::VP9 ? "VP9" : "VP8");
+    LogSupportEvent("Codec: " + selectedCodecName);
+
     media.addSSRC(m_ssrc, "video-stream");
     media.setBitrate(m_bitrateKbps * 1000);
 
@@ -809,6 +815,9 @@ void WebRtcSender::createPeerConnection() {
     m_pc->onStateChange([this](rtc::PeerConnection::State state) {
         std::cout << "[pc] state=" << static_cast<int>(state)
             << " session=" << m_sessionId << "\n";
+        if (state == rtc::PeerConnection::State::Connected) {
+            LogSupportEvent("Connected - WebRTC");
+        }
         if (state == rtc::PeerConnection::State::Disconnected ||
             state == rtc::PeerConnection::State::Failed ||
             state == rtc::PeerConnection::State::Closed) {

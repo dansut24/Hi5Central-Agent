@@ -23,6 +23,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <psapi.h>
 #include <sddl.h>
 #include <wtsapi32.h>
 #include <userenv.h>
@@ -1248,8 +1249,8 @@ namespace hi5 {
             const std::wstring ps =
                 L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \""
                 L"$ErrorActionPreference='SilentlyContinue'; "
-                L"Get-CimInstance Win32_Process -Filter \\\"Name='native_vp8_stream.exe'\\\" | "
-                L"Where-Object { $_.CommandLine -match '--mode\\\\s+(banner|chat-overlay)' } | "
+                L"Get-CimInstance Win32_Process | "
+                L"Where-Object { ($_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+(banner|chat-overlay|native-chat)' } | "
                 L"ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
                 L"\"";
             LogI("[ui-cleanup] killing orphan banner/chat-overlay helper processes");
@@ -1276,8 +1277,8 @@ namespace hi5 {
             std::wstring ps =
                 L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \""
                 L"$ErrorActionPreference='SilentlyContinue'; "
-                L"$procs = Get-CimInstance Win32_Process -Filter \\\"Name='native_vp8_stream.exe'\\\" | "
-                L"Where-Object { $_.CommandLine -match '--mode\\\\s+streamer|--mode=streamer' }; ";
+                L"$procs = Get-CimInstance Win32_Process | "
+                L"Where-Object { ($_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+streamer|--mode=streamer' }; ";
 
             if (!sessionId.empty()) {
                 const std::wstring wsid = ToWidePath(EscapePowerShellSingleQuoted(sessionId));
@@ -1295,6 +1296,47 @@ namespace hi5 {
                 LogI("[streamer-cleanup] killing streamer helper processes for session=" + sessionId);
             }
             RunHiddenProcessAndWait(ps, 10000);
+        }
+
+        static HANDLE CreateSessionJobObject(const std::string& sessionId) {
+            HANDLE job = CreateJobObjectW(nullptr, nullptr);
+            if (!job) {
+                LogW("[session-job] CreateJobObject failed session=" + sessionId + " err=" + std::to_string(GetLastError()));
+                return nullptr;
+            }
+
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+                JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+                LogW("[session-job] SetInformationJobObject failed session=" + sessionId + " err=" + std::to_string(GetLastError()));
+                CloseHandle(job);
+                return nullptr;
+            }
+
+            LogI("[session-job] created session=" + sessionId);
+            return job;
+        }
+
+        static bool AssignProcessToSessionJob(HANDLE job, HANDLE process, const std::string& sessionId, const char* role) {
+            if (!job || !process) return false;
+            if (AssignProcessToJobObject(job, process)) {
+                LogI("[session-job] assigned role=" + std::string(role ? role : "helper") + " session=" + sessionId +
+                    " pid=" + std::to_string(GetProcessId(process)));
+                return true;
+            }
+            LogW("[session-job] assign failed role=" + std::string(role ? role : "helper") + " session=" + sessionId +
+                " pid=" + std::to_string(GetProcessId(process)) + " err=" + std::to_string(GetLastError()));
+            return false;
+        }
+
+        static void TrimIdleWorkingSet() {
+            if (EmptyWorkingSet(GetCurrentProcess())) {
+                LogI("[memory] trimmed service working set after last remote session");
+            }
+            else {
+                LogW("[memory] EmptyWorkingSet failed err=" + std::to_string(GetLastError()));
+            }
         }
 
         static std::string ChatOverlayExePath() {
@@ -1372,7 +1414,7 @@ namespace hi5 {
             for (const auto& id : ids) StopPresenceBanner(id);
         }
 
-        static void StartPresenceBanner(const std::string& sessionId, const std::string& technicianName) {
+        static void StartPresenceBanner(const std::string& sessionId, const std::string& technicianName, HANDLE sessionJob) {
             if (sessionId.empty()) return;
 
             StopPresenceBanner(sessionId);
@@ -1398,6 +1440,7 @@ namespace hi5 {
                 if (stopEvent) CloseHandle(stopEvent);
                 return;
             }
+            AssignProcessToSessionJob(sessionJob, proc, sessionId, "presence-banner");
 
             PresenceBannerState state;
             state.sessionId = sessionId;
@@ -1542,7 +1585,7 @@ namespace hi5 {
             }
         }
 
-        static ChatOverlayState* EnsureChatOverlay(const std::string& sessionId, ChatOverlayReplyCallback cb) {
+        static ChatOverlayState* EnsureChatOverlay(const std::string& sessionId, HANDLE sessionJob, ChatOverlayReplyCallback cb) {
             std::lock_guard<std::mutex> lock(g_chatOverlayMu);
             auto found = g_chatOverlays.find(sessionId);
             if (found != g_chatOverlays.end() && found->second) {
@@ -1568,11 +1611,11 @@ namespace hi5 {
             raw->inServerThread = std::thread(ChatOverlayInServerLoop, raw);
             raw->outServerThread = std::thread(ChatOverlayOutServerLoop, raw, cb);
 
-            const std::string args = "--mode chat-overlay --session " + QuoteArg(sessionId) +
+            const std::string args = "--mode native-chat --session " + QuoteArg(sessionId) +
                 " --pipe-in " + QuoteArg(state->inPipeName) +
                 " --pipe-out " + QuoteArg(state->outPipeName) +
                 " --stop-event " + QuoteArg(state->stopEventName);
-            LogI("[chat-ui] launching same-exe WebView2 overlay session=" + sessionId +
+            LogI("[chat-ui] launching native chat helper session=" + sessionId +
                 " in=" + state->inPipeName + " out=" + state->outPipeName);
             raw->process = LaunchInInteractiveSession(overlayExe, args);
             if (!raw->process) {
@@ -1590,16 +1633,18 @@ namespace hi5 {
                 return nullptr;
             }
 
+            AssignProcessToSessionJob(sessionJob, raw->process, sessionId, "chat-overlay");
             g_chatOverlays[sessionId] = std::move(state);
             return raw;
         }
 
         static bool SendChatToOverlay(const std::string& sessionId,
+            HANDLE sessionJob,
             const std::string& displayName,
             const std::string& body,
             ChatOverlayReplyCallback cb) {
             if (body.empty()) return false;
-            ChatOverlayState* state = EnsureChatOverlay(sessionId, std::move(cb));
+            ChatOverlayState* state = EnsureChatOverlay(sessionId, sessionJob, std::move(cb));
             if (!state) return false;
             json payload = {
                 {"type", "chat_message"},
@@ -1693,6 +1738,7 @@ namespace hi5 {
 
             HANDLE normalStopEvent = nullptr;
             HANDLE secureStopEvent = nullptr;
+            HANDLE sessionJob = nullptr;
 
             HANDLE normalStreamerProcess = nullptr;
             HANDLE secureStreamerProcess = nullptr;
@@ -1881,24 +1927,34 @@ LogI(
 
                     if (type == "start_webrtc") {
                         const SessionMode sessionMode = ParseSessionMode(msg.value("mode", std::string("console")));
+                        const std::string technicianName = msg.value("technician_name", msg.value("technician", std::string("Technician")));
                         LogI("start_webrtc session=" + sessionId + " mode=" + SessionModeName(sessionMode));
                         sessionBridge_.SetActiveSession(sessionId);
+
+                        auto iceServers = parseIceServers(msg);
+                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode);
+                        if (!HasSession(sessionId)) {
+                            LogSupportEvent("Remote session failed to start for " + technicianName);
+                            sessionBridge_.ClearActiveSession();
+                            FlushBridgeOutgoing();
+                            return;
+                        }
+
                         if (sessionMode == SessionMode::Console) {
-                            const std::string technicianName = msg.value("technician_name", msg.value("technician", std::string("Technician")));
                             presenceController_.ShowConnected(technicianName, true);
-                            StartPresenceBanner(sessionId, technicianName);
+                            StartPresenceBanner(sessionId, technicianName, SessionJobHandle(sessionId));
                         }
                         else {
                             presenceController_.Hide();
                             StopPresenceBanner(sessionId);
                         }
-                        auto iceServers = parseIceServers(msg);
-                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode);
+
+                        LogSupportEvent("Remote session started by " + technicianName);
+                        LogSupportEvent("Connecting - WebRTC");
                         // Keep the portal responsive without running expensive WMI/PowerShell
                         // collectors during live remote control. The WebSocket/session state
                         // is already live; full inventory can still be requested manually.
                         LogI("remote session active; full scheduled inventory throttled during stream session=" + sessionId);
-                        FlushBridgeOutgoing();
                         FlushBridgeOutgoing();
                         return;
                     }
@@ -1970,7 +2026,7 @@ LogI(
 
                         AppendChatTranscript(sessionId, "tech", displayName, body);
 
-                        const bool sent = SendChatToOverlay(sessionId, displayName, body,
+                        const bool sent = SendChatToOverlay(sessionId, SessionJobHandle(sessionId), displayName, body,
                             [this](const std::string& sid, const std::string& replyBody) {
                                 AppendChatTranscript(sid, "user", "Remote user", replyBody);
                                 LogI("chat message from remote user session=" + sid + " bytes=" + std::to_string(replyBody.size()));
@@ -4161,6 +4217,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                              " path=" + path +
                              " bytes=" + std::to_string(totalBytes) +
                              " chunks=" + std::to_string(index));
+                        LogSupportEvent("File downloaded: " + filename);
                     } catch (const std::exception& ex) {
                         SendFileDownloadJson({
                             {"type", "files_error"},
@@ -4583,6 +4640,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     LogI("files upload completed session=" + sessionId + " path=" + it->second.finalPath + " bytes=" + std::to_string(it->second.received));
+                    LogSupportEvent("File uploaded: " + it->second.filename);
 
                     SendFileUploadJson({
                         {"type", "files_upload_result"},
@@ -4817,6 +4875,17 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             bool HasActiveSessions() {
                 std::lock_guard<std::mutex> lock(sessionsMu_);
                 return !sessions_.empty();
+            }
+
+            HANDLE SessionJobHandle(const std::string& sessionId) {
+                std::lock_guard<std::mutex> lock(sessionsMu_);
+                auto it = sessions_.find(sessionId);
+                return it == sessions_.end() ? nullptr : it->second->sessionJob;
+            }
+
+            bool HasSession(const std::string& sessionId) {
+                std::lock_guard<std::mutex> lock(sessionsMu_);
+                return sessions_.find(sessionId) != sessions_.end();
             }
 
             void FlushBridgeOutgoing() {
@@ -5593,11 +5662,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     return false;
                 }
 
+                AssignProcessToSessionJob(ctx.sessionJob, ctx.normalStreamerProcess, ctx.sessionId, "normal-streamer");
                 LogI("launch normal streamer ok session=" + ctx.sessionId +
                     " pid=" + std::to_string(GetProcessId(ctx.normalStreamerProcess)) +
                     " console=" + SessionIdToString(ctx.activeConsoleSessionId));
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 SyncChatStateToContext(ctx);
                 return true;
             }
@@ -5635,10 +5704,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx.secureLaunchInProgress = true;
                 ctx.lastSecureLaunchAttempt = std::chrono::steady_clock::now();
 
+                AssignProcessToSessionJob(ctx.sessionJob, ctx.secureStreamerProcess, ctx.sessionId, "secure-streamer");
                 LogI("launch secure streamer ok session=" + ctx.sessionId +
                     " pid=" + std::to_string(GetProcessId(ctx.secureStreamerProcess)));
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 SyncChatStateToContext(ctx);
                 return true;
             }
@@ -5675,6 +5744,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx.backstageMode = true;
                 ctx.activeMode = DesktopMode::Normal;
                 ctx.lastNormalFrameAt = {};
+                AssignProcessToSessionJob(ctx.sessionJob, ctx.backstageHostProcess, ctx.sessionId, "backstage-host");
                 LogI("launch backstage host ok session=" + ctx.sessionId +
                     " pid=" + std::to_string(GetProcessId(ctx.backstageHostProcess)));
                 return true;
@@ -5870,6 +5940,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     return;
                 }
 
+                ctx->sessionJob = CreateSessionJobObject(sessionId);
+                if (!ctx->sessionJob) {
+                    LogW("session will use fallback cleanup because Job Object creation failed session=" + sessionId);
+                }
+
                 ctx->chatPipeServer = std::make_unique<NamedPipeServer>();
                 ctx->chatPipeServer->Start(ctx->chatPipeName, [this](const std::string& raw) {
                     const auto msg = json::parse(raw, nullptr, false);
@@ -5927,6 +6002,23 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     DispatchInputToPipe(*raw, msg);
                     });
 
+                ctx->sender->setDirectMouseMoveHandler([raw = ctx.get()](double xNorm, double yNorm, uint64_t seq, double clientTsMs) {
+                    InputPipeWriter& targetPipe = (raw->activeMode == DesktopMode::Secure)
+                        ? raw->secureInputPipe
+                        : raw->normalInputPipe;
+                    auto monitor = targetPipe.GetMonitorInfo(raw->displayIndex);
+                    if (monitor.w <= 0 || monitor.h <= 0) {
+                        monitor = raw->normalInputPipe.GetMonitorInfo(raw->displayIndex);
+                    }
+                    if (monitor.w <= 0 || monitor.h <= 0) return false;
+
+                    const int32_t x = monitor.x + static_cast<int32_t>(xNorm * static_cast<double>(std::max(1, monitor.w - 1)));
+                    const int32_t y = monitor.y + static_cast<int32_t>(yNorm * static_cast<double>(std::max(1, monitor.h - 1)));
+                    return targetPipe.PublishFastMouseTarget(
+                        x, y, raw->displayIndex, seq,
+                        clientTsMs > 0.0 ? static_cast<uint64_t>(clientTsMs) : 0);
+                    });
+
                 ctx->sender->start();
 
                 const bool launched = (sessionMode == SessionMode::Backstage)
@@ -5946,6 +6038,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->normalInputPipe.Close();
                     ctx->secureShmem.Close();
                     ctx->normalShmem.Close();
+                    if (ctx->sessionJob) {
+                        CloseHandle(ctx->sessionJob);
+                        ctx->sessionJob = nullptr;
+                    }
                     return;
                 }
 
@@ -6270,20 +6366,26 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 // orphaned. UI cleanup must therefore not depend on sessions_ containing the id.
                 StopChatOverlay(sessionId);
                 StopPresenceBanner(sessionId);
-                CleanupOrphanUiHelperProcesses();
 
                 std::unique_ptr<SessionContext> ctx;
 
                 {
                     std::lock_guard<std::mutex> lock(sessionsMu_);
                     auto it = sessions_.find(sessionId);
-                    if (it == sessions_.end()) {
-                        LogW("StopSession: no active stream context for session=" + sessionId + "; UI cleanup already completed, cleaning possible streamer orphan");
-                        CleanupOrphanStreamerProcesses(sessionId);
-                        return;
+                    if (it != sessions_.end()) {
+                        ctx = std::move(it->second);
+                        sessions_.erase(it);
                     }
-                    ctx = std::move(it->second);
-                    sessions_.erase(it);
+                }
+
+                if (!ctx) {
+                    LogW("StopSession: no active stream context for session=" + sessionId + "; cleaning possible legacy orphan");
+                    CleanupOrphanStreamerProcesses(sessionId);
+                    if (!HasActiveSessions()) {
+                        CleanupOrphanUiHelperProcesses();
+                        TrimIdleWorkingSet();
+                    }
+                    return;
                 }
 
                 ctx->framePumpStop.store(true);
@@ -6328,6 +6430,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->secureStreamerProcess = nullptr;
                 }
 
+                // KILL_ON_JOB_CLOSE is the final OS-enforced boundary. Anything that ignored
+                // its stop event (streamer, banner, chat or a child helper) cannot outlive the session.
+                if (ctx->sessionJob) {
+                    CloseHandle(ctx->sessionJob);
+                    ctx->sessionJob = nullptr;
+                    LogI("[session-job] closed kill boundary session=" + sessionId);
+                }
+
                 CleanupOrphanStreamerProcesses(sessionId);
 
                 if (ctx->normalStopEvent) {
@@ -6355,7 +6465,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx->secureShmem.Close();
                 ctx->normalShmem.Close();
 
+                LogSupportEvent("Remote session ended");
                 LogI("session stopped=" + sessionId);
+                if (!HasActiveSessions()) {
+                    CleanupOrphanUiHelperProcesses();
+                    TrimIdleWorkingSet();
+                }
             }
 
         private:
