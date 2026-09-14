@@ -309,21 +309,27 @@ namespace hi5 {
 
         RECT current{};
         GetWindowRect(hwnd_, &current);
-        const int workW = std::max(320L, info.rcWork.right - info.rcWork.left);
-        const int workH = std::max(260L, info.rcWork.bottom - info.rcWork.top);
-        int width = std::min(current.right - current.left, std::max(320, workW - 32));
-        int height = std::min(current.bottom - current.top, std::max(260, workH - 32));
+        const int workLeft = static_cast<int>(info.rcWork.left);
+        const int workTop = static_cast<int>(info.rcWork.top);
+        const int workRight = static_cast<int>(info.rcWork.right);
+        const int workBottom = static_cast<int>(info.rcWork.bottom);
+        const int workW = std::max(320, workRight - workLeft);
+        const int workH = std::max(260, workBottom - workTop);
+        const int currentW = static_cast<int>(current.right - current.left);
+        const int currentH = static_cast<int>(current.bottom - current.top);
+        int width = std::min(currentW, std::max(320, workW - 32));
+        int height = std::min(currentH, std::max(260, workH - 32));
         width = std::max(320, width);
         height = std::max(260, height);
 
-        int x = current.left;
-        int y = current.top;
+        int x = static_cast<int>(current.left);
+        int y = static_cast<int>(current.top);
         if (preferBottomRight) {
-            x = info.rcWork.right - width - 18;
-            y = info.rcWork.bottom - height - 18;
+            x = workRight - width - 18;
+            y = workBottom - height - 18;
         }
-        x = std::max(info.rcWork.left, std::min(x, info.rcWork.right - width));
-        y = std::max(info.rcWork.top, std::min(y, info.rcWork.bottom - height));
+        x = std::max(workLeft, std::min(x, workRight - width));
+        y = std::max(workTop, std::min(y, workBottom - height));
         SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         LayoutChildren();
     }
