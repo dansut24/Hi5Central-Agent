@@ -471,7 +471,13 @@ void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, do
         return;
     }
 
-    const double frameBudgetMs = 1000.0 / static_cast<double>(std::max(1, m_externalConfiguredFps));
+    // Judge encoder health against the capture rate the streamer is actually
+    // asking for now, not the FPS the current encoder happened to be created
+    // with. VP9 stays interaction-ready while idle, so its configured FPS can
+    // intentionally be higher than the 2 FPS idle capture cadence.
+    const int hintedFps = m_externalHintFps.load();
+    const int healthFps = std::max(1, hintedFps > 0 ? hintedFps : m_externalConfiguredFps);
+    const double frameBudgetMs = 1000.0 / static_cast<double>(healthFps);
     const double viewerRttMs = m_viewerRttMs.load();
     const double viewerJitterMs = m_viewerJitterMs.load();
     const double viewerJitterBufferMs = m_viewerJitterBufferMs.load();
@@ -1833,18 +1839,36 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         const I420Frame vp9Frame = scaleI420ForVp9WebRtc(frame, &vp9Scaled);
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
 
+        // Media Foundation VP9 does not currently have the lightweight runtime
+        // reconfigure path that our libvpx VP8 encoder has. Creating VP9 while
+        // the desktop is idle used to lock it to 2 FPS / 1.2 Mbps; when motion
+        // immediately jumped to 20-30 FPS that caused a brief blocky/fuzzy
+        // burst. Keep VP9 configured at the session interaction ceiling while
+        // the capture helper is still free to idle at 2 FPS. A static desktop
+        // does not consume the ceiling bitrate simply because it is available.
+        const int vp9EncoderFps = readEnvInt(
+            "HI5_VP9_ENCODER_FPS",
+            std::min(30, std::max(1, m_fps)),
+            1,
+            60);
+        const int vp9EncoderBitrateKbps = readEnvInt(
+            "HI5_VP9_ENCODER_KBPS",
+            std::max(250, m_bitrateKbps),
+            500,
+            30000);
+
         if (!m_vp9Encoder || sizeChangedVp9) {
             m_externalEncoderWidth = vp9Frame.width;
             m_externalEncoderHeight = vp9Frame.height;
-            m_externalConfiguredFps = profile.fps;
-            m_externalConfiguredBitrateKbps = profile.bitrateKbps;
-            m_externalProfileName = std::string("mediafoundation-vp9-") + profile.name;
+            m_externalConfiguredFps = vp9EncoderFps;
+            m_externalConfiguredBitrateKbps = vp9EncoderBitrateKbps;
+            m_externalProfileName = "mediafoundation-vp9-interaction-ready";
 
             auto enc = std::make_unique<Vp9MfEncoder>();
             std::string vp9Err;
             const bool preferHardware = (m_codecMode == "vp9_hw" || m_codecMode == "vp9" || m_codecMode == "auto");
 
-            if (!enc->init(vp9Frame.width, vp9Frame.height, profile.fps, profile.bitrateKbps, preferHardware, &vp9Err)) {
+            if (!enc->init(vp9Frame.width, vp9Frame.height, vp9EncoderFps, vp9EncoderBitrateKbps, preferHardware, &vp9Err)) {
                 LogInfo("[vp9] init failed session=" + m_sessionId +
                     " error=" + vp9Err);
                 m_vp9Failed = true;
@@ -1862,8 +1886,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     " source=" + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
                     " encoded_size=" + std::to_string(vp9Frame.width) + "x" + std::to_string(vp9Frame.height) +
                     " scaled=" + std::string(vp9Scaled ? "1" : "0") +
-                    " fps=" + std::to_string(profile.fps) +
-                    " bitrate=" + std::to_string(profile.bitrateKbps) +
+                    " fps=" + std::to_string(vp9EncoderFps) +
+                    " bitrate=" + std::to_string(vp9EncoderBitrateKbps) +
                     " hw_preferred=" + std::string(preferHardware ? "1" : "0")
                 );
             }
@@ -1894,14 +1918,14 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                         auto swEnc = std::make_unique<Vp9MfEncoder>();
                         std::string swErr;
 
-                        if (swEnc->init(vp9Frame.width, vp9Frame.height, profile.fps, profile.bitrateKbps, false, &swErr)) {
+                        if (swEnc->init(vp9Frame.width, vp9Frame.height, vp9EncoderFps, vp9EncoderBitrateKbps, false, &swErr)) {
                             m_vp9Encoder = std::move(swEnc);
                             m_codecMode = "vp9_sw";
                             m_externalEncoderWidth = vp9Frame.width;
                             m_externalEncoderHeight = vp9Frame.height;
-                            m_externalConfiguredFps = profile.fps;
-                            m_externalConfiguredBitrateKbps = profile.bitrateKbps;
-                            m_externalProfileName = std::string("software-vp9-fallback-") + profile.name;
+                            m_externalConfiguredFps = vp9EncoderFps;
+                            m_externalConfiguredBitrateKbps = vp9EncoderBitrateKbps;
+                            m_externalProfileName = "software-vp9-fallback-interaction-ready";
                             m_vp9Failed = false;
                             m_forceKeyframe = true;
 
@@ -1961,11 +1985,17 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     const double sentCount = std::max<uint64_t>(1, m_externalSentFrames);
                     const double encodeAvgMs = m_externalEncodeMsTotal / encodedCount;
                     const double sendAvgMs = m_externalSendMsTotal / sentCount;
+                    const int liveHintFps = m_externalHintFps.load();
+                    const int liveCaptureFps = std::max(1, liveHintFps > 0
+                        ? liveHintFps
+                        : m_externalConfiguredFps);
                     LogInfo("[vp9] encode health session=" + m_sessionId +
                         " encode_avg_ms=" + std::to_string(encodeAvgMs) +
                         " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
                         " send_avg_ms=" + std::to_string(sendAvgMs) +
-                        " target_fps=" + std::to_string(m_externalConfiguredFps));
+                        " capture_fps=" + std::to_string(liveCaptureFps) +
+                        " encoder_fps=" + std::to_string(m_externalConfiguredFps) +
+                        " encoder_bitrate_kbps=" + std::to_string(m_externalConfiguredBitrateKbps));
                     observeCodecHealth(encodeAvgMs, m_externalEncodeMsMax, sendAvgMs);
                     m_externalEncodedFrames = 0;
                     m_externalSentFrames = 0;

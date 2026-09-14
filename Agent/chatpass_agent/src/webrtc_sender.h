@@ -71,8 +71,8 @@ public:
     bool sendControlMessageText(const std::string& text);
 
     // Called by the service when the capture helper publishes low-CPU stream stats.
-    // This lets the VP8 encoder follow the real stream mode instead of staying
-    // at the original session max FPS/bitrate forever.
+    // VP8 uses these hints for runtime tuning; adaptive codec health also uses
+    // them so VP9/H.264 are judged against the real live capture cadence.
     void setExternalStreamHint(int streamMode, int targetFps, bool backstageMode, bool secureDesktop);
 
     void sendExternalEncodedVp8(const uint8_t* data,
