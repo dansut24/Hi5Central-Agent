@@ -649,6 +649,21 @@ namespace hi5 {
             return WTSGetActiveConsoleSessionId();
         }
 
+        // A numeric console session does not necessarily have an interactive
+        // user desktop. After sign-out Windows keeps Winlogon on the console,
+        // but WTSQueryUserToken correctly reports ERROR_NO_TOKEN until a user
+        // has logged in. Use this as the boundary between Winlogon capture and
+        // the normal/default desktop.
+        static bool InteractiveUserSessionReady(DWORD sessionId) {
+            if (sessionId == 0xFFFFFFFF) return false;
+            HANDLE token = nullptr;
+            if (!WTSQueryUserToken(sessionId, &token) || !token) {
+                return false;
+            }
+            CloseHandle(token);
+            return true;
+        }
+
         static std::string SessionIdToString(DWORD sessionId) {
             if (sessionId == 0xFFFFFFFF) return std::string("none");
             return std::to_string(sessionId);
@@ -1422,6 +1437,13 @@ namespace hi5 {
 
             StopPresenceBanner(sessionId);
 
+            const DWORD consoleSession = ActiveConsoleSessionId();
+            if (!InteractiveUserSessionReady(consoleSession)) {
+                LogI("[presence] deferred until interactive user desktop session=" + sessionId +
+                    " console=" + SessionIdToString(consoleSession));
+                return;
+            }
+
             const std::string exe = CurrentExePath();
             if (exe.empty()) {
                 LogE("[presence] cannot resolve current executable path");
@@ -1788,6 +1810,11 @@ namespace hi5 {
             DWORD bannerConsoleSessionId = 0xFFFFFFFF;
             bool consoleSwitchInProgress = false;
             bool consoleHandoffActive = false;
+            // Stable Winlogon/login-screen state. While true the secure worker
+            // exclusively owns video + input and no normal desktop helper is
+            // launched until WTS exposes an interactive user token.
+            bool loginDesktopMode = false;
+            bool interactiveUserReady = false;
             bool bannerRebindPending = false;
             bool secureRetiring = false;
             uint64_t consoleGeneration = 0;
@@ -5665,6 +5692,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     LogW("launch normal streamer skipped, no active console session=" + ctx.sessionId);
                     return false;
                 }
+                if (ctx.sessionMode == SessionMode::Console && !InteractiveUserSessionReady(consoleSession)) {
+                    LogI("launch normal streamer deferred at Winlogon session=" + ctx.sessionId +
+                        " console=" + SessionIdToString(consoleSession));
+                    return false;
+                }
 
                 ctx.activeConsoleSessionId = consoleSession;
                 ctx.lastSeenConsoleSessionId = consoleSession;
@@ -5933,6 +5965,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx->lastSeenConsoleSessionId = ctx->activeConsoleSessionId;
                 ctx->pendingConsoleSessionId = ctx->activeConsoleSessionId;
                 ctx->bannerConsoleSessionId = ctx->activeConsoleSessionId;
+                ctx->interactiveUserReady = sessionMode == SessionMode::Console &&
+                    InteractiveUserSessionReady(ctx->activeConsoleSessionId);
+                ctx->loginDesktopMode = sessionMode == SessionMode::Console &&
+                    ctx->activeConsoleSessionId != 0xFFFFFFFF && !ctx->interactiveUserReady;
+                ctx->bannerRebindPending = ctx->loginDesktopMode;
+                if (ctx->loginDesktopMode) {
+                    ctx->activeMode = DesktopMode::Secure;
+                    ctx->secureFallbackOwnsInput.store(true, std::memory_order_release);
+                }
                 ctx->lastConsoleSessionPoll = std::chrono::steady_clock::now();
 
                 const std::string prefix = sessionId.substr(0, std::min<size_t>(16, sessionId.size()));
@@ -5946,7 +5987,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx->chatPipeName = "\\\\.\\pipe\\Hi5Chat_" + prefix;
 
                 LogI("initial console session session=" + sessionId +
-                    " console=" + SessionIdToString(ctx->activeConsoleSessionId));
+                    " console=" + SessionIdToString(ctx->activeConsoleSessionId) +
+                    " interactive_user=" + std::string(ctx->interactiveUserReady ? "true" : "false") +
+                    " login_desktop=" + std::string(ctx->loginDesktopMode ? "true" : "false"));
                 LogI("chat pipe name session=" + sessionId + " pipe=" + ctx->chatPipeName);
 
                 if (!ctx->normalShmem.CreateProducer(ctx->normalShmemName)) {
@@ -6086,7 +6129,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 const bool launched = (sessionMode == SessionMode::Backstage)
                     ? LaunchBackstageHost(*ctx)
-                    : LaunchNormalStreamer(*ctx);
+                    : (ctx->loginDesktopMode ? LaunchSecureStreamer(*ctx) : LaunchNormalStreamer(*ctx));
 
                 if (!launched) {
                     StopPresenceBanner(sessionId);
@@ -6130,8 +6173,6 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                 const uint64_t maxFrameAgeNs = static_cast<uint64_t>(ReadConfigInt("HI5_MAX_FRAME_AGE_MS", 250, 50, 2000)) * 1000000ull;
-                const auto consoleHandoffSettleDelay = std::chrono::milliseconds(
-                    ReadConfigInt("HI5_CONSOLE_HANDOFF_SETTLE_MS", 1500, 300, 5000));
                 uint64_t staleFramesDropped = 0;
                 auto nextStaleFrameLog = std::chrono::steady_clock::now();
                 ctx.lastNormalLaunchAttempt = std::chrono::steady_clock::now();
@@ -6231,6 +6272,68 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     " to=" + SessionIdToString(currentConsole));
                             }
                         }
+
+                        // A console id alone is not proof that winsta0\default exists.
+                        // At Winlogon, WTSGetActiveConsoleSessionId returns a real id while
+                        // WTSQueryUserToken returns ERROR_NO_TOKEN. Treat that as a stable
+                        // login-screen stream owned exclusively by the secure helper.
+                        if (ctx.sessionMode == SessionMode::Console &&
+                            currentConsole != 0xFFFFFFFF &&
+                            currentConsole == ctx.activeConsoleSessionId) {
+                            const bool interactiveReady = InteractiveUserSessionReady(currentConsole);
+                            if (interactiveReady != ctx.interactiveUserReady) {
+                                LogI("[session-handoff] interactive user state session=" + ctx.sessionId +
+                                    " console=" + SessionIdToString(currentConsole) +
+                                    " ready=" + std::string(interactiveReady ? "true" : "false"));
+                                ctx.interactiveUserReady = interactiveReady;
+
+                                if (!interactiveReady) {
+                                    const bool newHandoff = !ctx.consoleHandoffActive;
+                                    ctx.loginDesktopMode = true;
+                                    ctx.consoleHandoffActive = true;
+                                    ctx.bannerRebindPending = true;
+                                    ctx.uacRequested = false;
+                                    ctx.unifiedSecureReady = false;
+                                    // Re-prime Winlogon even when the secure helper already exists.
+                                    // This forces a clean keyframe instead of carrying prediction
+                                    // history from the sign-out animation into the login screen.
+                                    ctx.secureReady = false;
+                                    ctx.consoleNormalReadyAfterTickNs = 0;
+                                    if (newHandoff) ++ctx.consoleGeneration;
+
+                                    if (!ctx.handoffStateAnnounced) {
+                                        SendSessionState(ctx.sessionId, "desktop_handoff_entering");
+                                        ctx.handoffStateAnnounced = true;
+                                    }
+
+                                    if (ctx.normalStreamerProcess && ctx.normalStopEvent) {
+                                        SetEvent(ctx.normalStopEvent);
+                                        ctx.normalRetireRequestedAt = now;
+                                    }
+                                    ctx.lastSecureLaunchAttempt = now - std::chrono::seconds(1);
+                                    LogI("[session-handoff] Winlogon is authoritative session=" + ctx.sessionId +
+                                        " console=" + SessionIdToString(currentConsole));
+                                }
+                                else if (ctx.loginDesktopMode) {
+                                    // A user token has appeared. Keep the secure/login feed visible
+                                    // while the normal worker warms, then switch video + input together.
+                                    ctx.loginDesktopMode = false;
+                                    ctx.consoleHandoffActive = true;
+                                    ctx.bannerRebindPending = true;
+                                    ctx.consoleNormalReadyAfterTickNs =
+                                        static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                                    ctx.normalInputPipe.ResetConsumerState();
+                                    ctx.lastNormalLaunchAttempt = now - std::chrono::seconds(3);
+                                    ++ctx.consoleGeneration;
+                                    if (!ctx.handoffStateAnnounced) {
+                                        SendSessionState(ctx.sessionId, "desktop_handoff_entering");
+                                        ctx.handoffStateAnnounced = true;
+                                    }
+                                    LogI("[session-handoff] interactive desktop available session=" + ctx.sessionId +
+                                        " console=" + SessionIdToString(currentConsole));
+                                }
+                            }
+                        }
                     }
 
                     if (ctx.consoleHandoffActive && ctx.normalStreamerProcess &&
@@ -6275,7 +6378,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     // During console migration warm the Winlogon helper and the new normal
                     // helper under the same WebRTC session. The first valid frame decides the
                     // visible source; there is no peer/data-channel restart.
-                    if (!ctx.backstageMode && ctx.consoleHandoffActive &&
+                    if (!ctx.backstageMode && (ctx.consoleHandoffActive || ctx.loginDesktopMode) &&
                         ctx.activeConsoleSessionId != 0xFFFFFFFF &&
                         !ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
                         now - ctx.lastSecureLaunchAttempt >= std::chrono::milliseconds(300)) {
@@ -6285,6 +6388,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     if (!ctx.backstageMode &&
                         !ctx.normalStreamerProcess &&
                         !ctx.consoleSwitchInProgress &&
+                        !ctx.loginDesktopMode &&
+                        ctx.interactiveUserReady &&
                         ctx.activeConsoleSessionId != 0xFFFFFFFF &&
                         ActiveConsoleSessionId() == ctx.activeConsoleSessionId &&
                         now - ctx.lastNormalLaunchAttempt >= std::chrono::milliseconds(250)) {
@@ -6338,7 +6443,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     if (now >= nextSecurePoll) {
-                        if (ctx.backstageMode) {
+                        if (ctx.backstageMode || ctx.loginDesktopMode) {
+                            // Winlogon/login-screen mode is already a secure desktop. Do not
+                            // infer UAC state from a normal input pipe that intentionally has
+                            // no worker attached.
                             ctx.uacRequested = false;
                             nextSecurePoll = now + std::chrono::milliseconds(250);
                         }
@@ -6393,10 +6501,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 const bool normalFresh = ctx.lastNormalFrameAt.time_since_epoch().count() != 0 &&
                                     (now - ctx.lastNormalFrameAt) <= std::chrono::milliseconds(800);
                                 if (!ctx.uacRequested && normalFresh) {
-                                    const bool handoffCanFinish = !ctx.consoleHandoffActive ||
-                                        (ctx.lastConsoleSwitchDetected.time_since_epoch().count() != 0 &&
-                                         now - ctx.lastConsoleSwitchDetected >= consoleHandoffSettleDelay);
-                                    if (ctx.handoffStateAnnounced && handoffCanFinish) {
+                                    if (ctx.handoffStateAnnounced) {
                                         SendSessionState(ctx.sessionId, "desktop_handoff_ready");
                                         ctx.handoffStateAnnounced = false;
                                     }
@@ -6475,23 +6580,37 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 SendSessionState(ctx.sessionId, "secure_desktop_ready");
                                 LogI("active mode -> SECURE session=" + ctx.sessionId);
                             }
+
+                            // The secure helper may already have been ready while sign-out was
+                            // still reporting an interactive token. As soon as Winlogon becomes
+                            // authoritative, any fresh secure frame can complete the handoff.
+                            if (ctx.loginDesktopMode && ctx.consoleHandoffActive &&
+                                !ctx.secureRetiring && secureWorkerCurrent && !secureTransitionBlank) {
+                                ctx.consoleHandoffActive = false;
+                                ctx.consoleNormalReadyAfterTickNs = 0;
+                                ctx.secureFallbackOwnsInput.store(true, std::memory_order_release);
+                                if (ctx.handoffStateAnnounced) {
+                                    SendSessionState(ctx.sessionId, "desktop_handoff_ready");
+                                    ctx.handoffStateAnnounced = false;
+                                }
+                                LogI("[session-handoff] login desktop ready session=" + ctx.sessionId +
+                                    " console=" + SessionIdToString(ctx.activeConsoleSessionId) +
+                                    " input=secure");
+                            }
                         }
                     }
 
                     bool sent = false;
                     const bool normalHandoffReady = ctx.consoleHandoffActive && gotNormal &&
+                        !ctx.loginDesktopMode && ctx.interactiveUserReady &&
                         ctx.activeConsoleSessionId != 0xFFFFFFFF &&
                         ActiveConsoleSessionId() == ctx.activeConsoleSessionId &&
                         ctx.normalStreamerSessionId == ctx.activeConsoleSessionId &&
                         (ctx.consoleNormalReadyAfterTickNs == 0 || normalTs >= ctx.consoleNormalReadyAfterTickNs) &&
                         !isNearBlackTransitionFrame(normalFrame);
-                    const bool consoleHandoffSettled = ctx.consoleHandoffActive &&
-                        ctx.lastConsoleSwitchDetected.time_since_epoch().count() != 0 &&
-                        now - ctx.lastConsoleSwitchDetected >= consoleHandoffSettleDelay;
-                    const bool normalHandoffCommitted = normalHandoffReady && consoleHandoffSettled;
-                    const bool useSecureFallback = !normalHandoffCommitted && !ctx.secureRetiring &&
+                    const bool useSecureFallback = !normalHandoffReady && !ctx.secureRetiring &&
                         ctx.secureStreamerProcess != nullptr &&
-                        (ctx.uacRequested || ctx.consoleHandoffActive || !gotNormal);
+                        (ctx.loginDesktopMode || ctx.uacRequested || ctx.consoleHandoffActive || !gotNormal);
 
                     if (useSecureFallback) {
                         if (gotSecure && !secureTransitionBlank) {
@@ -6508,7 +6627,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             sent = true;
                         }
                     }
-                    else if (gotNormal && (!ctx.consoleHandoffActive || normalHandoffReady)) {
+                    else if (!ctx.loginDesktopMode && gotNormal && (!ctx.consoleHandoffActive || normalHandoffReady)) {
                         const bool staleSecureCandidate = ctx.unifiedDesktopStreamer && ctx.uacRequested &&
                             ctx.uacDetectedTickNs != 0 && normalTs < ctx.uacDetectedTickNs;
                         const bool staleNormalReturn = ctx.unifiedDesktopStreamer && !ctx.uacRequested &&
@@ -6536,12 +6655,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             if (enteringSecure) {
                                 ctx.unifiedSecureReady = true;
                                 ctx.activeMode = DesktopMode::Secure;
-                                // A console logoff/login handoff stays announced until the
-                                // replacement desktop has settled. UAC-only transitions can
-                                // still clear the handoff state immediately.
-                                if (!ctx.consoleHandoffActive) {
-                                    ctx.handoffStateAnnounced = false;
-                                }
+                                ctx.handoffStateAnnounced = false;
                                 SendSessionState(ctx.sessionId, "secure_desktop_ready");
                                 LogI("active mode -> SECURE session=" + ctx.sessionId + " source=dynamic-desktop");
                             }
@@ -6550,8 +6664,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             !blankConsoleHandoff && !ctx.uacRequested) {
                             const bool wasSecure = ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess != nullptr;
                             if (wasSecure) {
-                                if (ctx.handoffStateAnnounced &&
-                                    (!ctx.consoleHandoffActive || consoleHandoffSettled)) {
+                                if (ctx.handoffStateAnnounced) {
                                     SendSessionState(ctx.sessionId, "desktop_handoff_ready");
                                     ctx.handoffStateAnnounced = false;
                                 }
@@ -6575,7 +6688,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 LogI("active mode -> NORMAL session=" + ctx.sessionId + " raw-source=1");
                             }
 
-                            const bool completedConsoleHandoff = ctx.consoleHandoffActive && consoleHandoffSettled;
+                            const bool completedConsoleHandoff = ctx.consoleHandoffActive;
                             ctx.secureFallbackOwnsInput.store(false, std::memory_order_release);
                             ++framesForwarded;
                             const bool forceKf = wasSecure || completedConsoleHandoff || framesForwarded == 1;
