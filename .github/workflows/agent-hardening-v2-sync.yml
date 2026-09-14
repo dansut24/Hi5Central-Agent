@@ -1,4 +1,4 @@
-name: Sync console handoff stability checkpoint
+name: Sync stable Winlogon checkpoint
 
 on:
   push:
@@ -20,23 +20,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download and verify console handoff stability snapshot
+      - name: Download and verify stable Winlogon snapshot
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/handoff-stability-178101f.tar.gz \
-            -o /tmp/handoff-stability-178101f.tar.gz
-          echo "8fdc1feed9ddc96b965c176a94ffe54c3a49f863e0f5be747d3c3364342bf678  /tmp/handoff-stability-178101f.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/winlogon-stable-5ff24ef.tar.gz \
+            -o /tmp/winlogon-stable-5ff24ef.tar.gz
+          echo "93e186bf0cb504e303deb6b1165431da31600443d61043eba532d26384264106  /tmp/winlogon-stable-5ff24ef.tar.gz" | sha256sum -c -
 
       - name: Apply exact changed file
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/handoff-stability
-          tar -xzf /tmp/handoff-stability-178101f.tar.gz -C /tmp/handoff-stability
-          cp -a /tmp/handoff-stability/. .
-          git add Agent/chatpass_agent/src/platform/windows/windows_service.cpp
+          mkdir -p /tmp/winlogon-stable
+          tar -xzf /tmp/winlogon-stable-5ff24ef.tar.gz -C /tmp/winlogon-stable
+          cp -a /tmp/winlogon-stable/. .
+          rm -f Agent/.ci-console-handoff-stability-178101f
+          git add -A
           git status --short
 
       - name: Commit synced checkpoint
@@ -49,5 +50,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Sync console handoff stability checkpoint"
+          git commit -m "Sync stable Winlogon remote desktop checkpoint"
           git push origin HEAD:agent-hardening-v2
