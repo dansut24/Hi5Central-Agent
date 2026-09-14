@@ -1954,6 +1954,29 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                 m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
                 ++m_externalEncodedFrames;
 
+                // A rare long Media Foundation encode can complete after the desktop has
+                // already moved on. Sending that result creates a single visibly stale/fuzzy
+                // frame even though the transport is healthy. Drop it and force the next
+                // fresh frame to be a keyframe instead of letting old pixels reach the Viewer.
+                const uint64_t postEncodeNowNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                const uint64_t postEncodeAgeNs = captureTimestampNs != 0 && postEncodeNowNs > captureTimestampNs
+                    ? postEncodeNowNs - captureTimestampNs
+                    : 0;
+                const uint64_t maxPostEncodeAgeNs = static_cast<uint64_t>(readEnvInt(
+                    "HI5_MAX_POST_ENCODE_FRAME_AGE_MS", 250, 80, 2000)) * 1000000ull;
+                if (postEncodeAgeNs > maxPostEncodeAgeNs) {
+                    static std::atomic<uint64_t> staleVp9EncodeDrops{ 0 };
+                    const uint64_t dropCount = ++staleVp9EncodeDrops;
+                    m_forceKeyframe = true;
+                    if (dropCount <= 10 || (dropCount % 60) == 0) {
+                        LogInfo("[vp9] stale post-encode frame dropped session=" + m_sessionId +
+                            " age_ms=" + std::to_string(postEncodeAgeNs / 1000000ull) +
+                            " encode_ms=" + std::to_string(encodeMs) +
+                            " count=" + std::to_string(dropCount));
+                    }
+                    return;
+                }
+
                 if (!encoded.data.empty()) {
                     encoded.timestamp90k = captureRtpTimestamp;
                     const auto sendStart = std::chrono::steady_clock::now();

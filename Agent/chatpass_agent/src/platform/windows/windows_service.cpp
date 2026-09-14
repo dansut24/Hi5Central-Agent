@@ -1394,11 +1394,14 @@ namespace hi5 {
             LogI("[presence] stopping banner session=" + sessionId);
             if (state.stopEvent) SetEvent(state.stopEvent);
             if (state.process) {
-                const DWORD waitRc = WaitForSingleObject(state.process, 3000);
+                // Presence UI must never pause video handoff for seconds. It normally
+                // exits immediately on its stop event; give it a short grace period,
+                // then terminate the UI-only helper and continue the live stream.
+                const DWORD waitRc = WaitForSingleObject(state.process, 150);
                 if (waitRc == WAIT_TIMEOUT) {
-                    LogW("[presence] banner did not exit on stop event, terminating session=" + sessionId);
+                    LogW("[presence] banner did not exit promptly, terminating session=" + sessionId);
                     TerminateProcess(state.process, 0);
-                    WaitForSingleObject(state.process, 1000);
+                    WaitForSingleObject(state.process, 100);
                 }
                 CloseHandle(state.process);
             }
@@ -1719,6 +1722,7 @@ namespace hi5 {
         struct SessionContext {
             std::string sessionId;
             std::vector<std::string> iceServers;
+            std::string technicianName = "Technician";
 
             std::unique_ptr<WebRtcSender> sender;
 
@@ -1743,6 +1747,8 @@ namespace hi5 {
             HANDLE normalStreamerProcess = nullptr;
             HANDLE secureStreamerProcess = nullptr;
             HANDLE backstageHostProcess = nullptr;
+            DWORD normalStreamerSessionId = 0xFFFFFFFF;
+            DWORD secureStreamerSessionId = 0xFFFFFFFF;
             bool backstageMode = false;
             SessionMode sessionMode = SessionMode::Console;
             std::unique_ptr<NamedPipeServer> chatPipeServer;
@@ -1772,10 +1778,20 @@ namespace hi5 {
             std::chrono::steady_clock::time_point lastSecureLaunchAttempt{};
             std::chrono::steady_clock::time_point lastConsoleSessionPoll{};
             std::chrono::steady_clock::time_point lastConsoleSwitchDetected{};
+            std::chrono::steady_clock::time_point normalRetireRequestedAt{};
+            std::chrono::steady_clock::time_point secureRetireRequestedAt{};
+            uint64_t consoleNormalReadyAfterTickNs = 0;
 
             DWORD activeConsoleSessionId = 0xFFFFFFFF;
             DWORD lastSeenConsoleSessionId = 0xFFFFFFFF;
+            DWORD pendingConsoleSessionId = 0xFFFFFFFF;
+            DWORD bannerConsoleSessionId = 0xFFFFFFFF;
             bool consoleSwitchInProgress = false;
+            bool consoleHandoffActive = false;
+            bool bannerRebindPending = false;
+            bool secureRetiring = false;
+            uint64_t consoleGeneration = 0;
+            std::atomic<bool> secureFallbackOwnsInput{ false };
         };
 
 
@@ -1938,7 +1954,7 @@ LogI(
                         sessionBridge_.SetActiveSession(sessionId);
 
                         auto iceServers = parseIceServers(msg);
-                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode);
+                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode, technicianName);
                         if (!HasSession(sessionId)) {
                             LogSupportEvent("Remote session failed to start for " + technicianName);
                             sessionBridge_.ClearActiveSession();
@@ -4917,6 +4933,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             }
 
             InputPipeWriter& ActiveInputPipe(SessionContext& ctx) {
+                // Dynamic-desktop normally keeps input on the normal pipe. If the
+                // visible frame is coming from a fallback Winlogon/login helper,
+                // move keyboard/mouse to that helper too.
+                if (ctx.secureFallbackOwnsInput.load(std::memory_order_acquire)) {
+                    return ctx.secureInputPipe;
+                }
                 if (ctx.unifiedDesktopStreamer) return ctx.normalInputPipe;
                 return (ctx.activeMode == DesktopMode::Secure)
                     ? ctx.secureInputPipe
@@ -5636,7 +5658,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             }
 
             bool LaunchNormalStreamer(SessionContext& ctx) {
-                const DWORD consoleSession = ActiveConsoleSessionId();
+                const DWORD consoleSession = ctx.activeConsoleSessionId != 0xFFFFFFFF
+                    ? ctx.activeConsoleSessionId
+                    : ActiveConsoleSessionId();
                 if (consoleSession == 0xFFFFFFFF) {
                     LogW("launch normal streamer skipped, no active console session=" + ctx.sessionId);
                     return false;
@@ -5663,12 +5687,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 LogI("launch normal streamer [NORMAL_SHMEM_EXPECTED_NO_UAC] session=" + ctx.sessionId + " cmd=" + cmdLine);
 
-                ctx.normalStreamerProcess = LaunchInElevatedDefaultSession(std::string(exePath), cmdLine);
+                ctx.normalStreamerProcess = LaunchInElevatedDefaultSessionForSession(
+                    std::string(exePath), cmdLine, consoleSession);
                 if (!ctx.normalStreamerProcess) {
                     LogE("launch normal streamer FAILED session=" + ctx.sessionId);
                     return false;
                 }
 
+                ctx.normalStreamerSessionId = consoleSession;
+                ctx.normalRetireRequestedAt = {};
                 AssignProcessToSessionJob(ctx.sessionJob, ctx.normalStreamerProcess, ctx.sessionId, "normal-streamer");
                 LogI("launch normal streamer ok session=" + ctx.sessionId +
                     " pid=" + std::to_string(GetProcessId(ctx.normalStreamerProcess)) +
@@ -5700,7 +5727,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 LogI("launch secure streamer session=" + ctx.sessionId + " cmd=" + cmdLine);
 
-                ctx.secureStreamerProcess = LaunchOnSecureDesktop(std::string(exePath), cmdLine);
+                DWORD secureSession = ctx.activeConsoleSessionId;
+                if (secureSession == 0xFFFFFFFF) secureSession = ActiveConsoleSessionId();
+                ctx.secureStreamerProcess = LaunchOnSecureDesktopForSession(
+                    std::string(exePath), cmdLine, secureSession);
                 if (!ctx.secureStreamerProcess) {
                     LogE("launch secure streamer FAILED session=" + ctx.sessionId);
                     ctx.secureLaunchInProgress = false;
@@ -5709,6 +5739,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 ctx.secureReady = false;
                 ctx.secureLaunchInProgress = true;
+                ctx.secureRetiring = false;
+                ctx.secureStreamerSessionId = secureSession;
+                ctx.secureRetireRequestedAt = {};
                 ctx.lastSecureLaunchAttempt = std::chrono::steady_clock::now();
 
                 AssignProcessToSessionJob(ctx.sessionJob, ctx.secureStreamerProcess, ctx.sessionId, "secure-streamer");
@@ -5838,6 +5871,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx.secureStreamerProcess = nullptr;
                 }
 
+                ctx.secureStreamerSessionId = 0xFFFFFFFF;
+                ctx.secureRetireRequestedAt = {};
+                ctx.secureRetiring = false;
                 ctx.secureReady = false;
                 ctx.secureLaunchInProgress = false;
             }
@@ -5858,6 +5894,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx.normalStreamerProcess = nullptr;
                 }
 
+                ctx.normalStreamerSessionId = 0xFFFFFFFF;
+                ctx.normalRetireRequestedAt = {};
                 ctx.lastNormalFrameAt = {};
             }
 
@@ -5868,12 +5906,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 int height,
                 int fps,
                 int bitrateKbps,
-                SessionMode sessionMode) {
+                SessionMode sessionMode,
+                const std::string& technicianName) {
                 StopSession(sessionId);
 
                 auto ctx = std::make_unique<SessionContext>();
                 ctx->sessionId = sessionId;
                 ctx->iceServers = iceServers;
+                ctx->technicianName = technicianName.empty() ? "Technician" : technicianName;
                 ctx->displayIndex = 0;
                 ctx->fps = fps;
                 ctx->activeMode = DesktopMode::Normal;
@@ -5891,6 +5931,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx->secureLaunchInProgress = false;
                 ctx->activeConsoleSessionId = ActiveConsoleSessionId();
                 ctx->lastSeenConsoleSessionId = ctx->activeConsoleSessionId;
+                ctx->pendingConsoleSessionId = ctx->activeConsoleSessionId;
+                ctx->bannerConsoleSessionId = ctx->activeConsoleSessionId;
                 ctx->lastConsoleSessionPoll = std::chrono::steady_clock::now();
 
                 const std::string prefix = sessionId.substr(0, std::min<size_t>(16, sessionId.size()));
@@ -6022,9 +6064,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     });
 
                 ctx->sender->setDirectMouseMoveHandler([raw = ctx.get()](double xNorm, double yNorm, uint64_t seq, double clientTsMs) {
-                    InputPipeWriter& targetPipe = raw->unifiedDesktopStreamer
-                        ? raw->normalInputPipe
-                        : ((raw->activeMode == DesktopMode::Secure) ? raw->secureInputPipe : raw->normalInputPipe);
+                    InputPipeWriter& targetPipe = raw->secureFallbackOwnsInput.load(std::memory_order_acquire)
+                        ? raw->secureInputPipe
+                        : (raw->unifiedDesktopStreamer
+                            ? raw->normalInputPipe
+                            : ((raw->activeMode == DesktopMode::Secure) ? raw->secureInputPipe : raw->normalInputPipe));
                     auto monitor = targetPipe.GetMonitorInfo(raw->displayIndex);
                     if (monitor.w <= 0 || monitor.h <= 0) {
                         monitor = raw->normalInputPipe.GetMonitorInfo(raw->displayIndex);
@@ -6112,39 +6156,90 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 while (!ctx.framePumpStop.load()) {
                     const auto now = std::chrono::steady_clock::now();
 
-                    // Detect console-session churn, but do not block secure/winlogon bridging.
-                    // Secure must be allowed to start immediately during sign-out, otherwise the
-                    // viewer sits black at Winlogon.
-                    if (now - ctx.lastConsoleSessionPoll >= std::chrono::milliseconds(500)) {
+                    // Console logoff/login is a transport-worker migration, not a WebRTC
+                    // session restart. Keep the peer connection and last good video frame alive
+                    // while Winlogon and the next interactive session come and go.
+                    if (now - ctx.lastConsoleSessionPoll >= std::chrono::milliseconds(250)) {
                         ctx.lastConsoleSessionPoll = now;
                         const DWORD currentConsole = ActiveConsoleSessionId();
 
                         if (currentConsole != ctx.lastSeenConsoleSessionId) {
-                            LogW("console switch detected session=" + ctx.sessionId +
+                            LogW("[session-handoff] console change session=" + ctx.sessionId +
                                 " old_seen=" + SessionIdToString(ctx.lastSeenConsoleSessionId) +
                                 " new_seen=" + SessionIdToString(currentConsole));
                             ctx.lastSeenConsoleSessionId = currentConsole;
+                            ctx.pendingConsoleSessionId = currentConsole;
                             ctx.lastConsoleSwitchDetected = now;
                             ctx.consoleSwitchInProgress = true;
+                            ctx.consoleHandoffActive = true;
+                            ctx.bannerRebindPending = true;
+                            ++ctx.consoleGeneration;
+
+                            if (!ctx.handoffStateAnnounced) {
+                                SendSessionState(ctx.sessionId, "desktop_handoff_entering");
+                                ctx.handoffStateAnnounced = true;
+                            }
+                            LogI("[session-handoff] entering generation=" + std::to_string(ctx.consoleGeneration) +
+                                " session=" + ctx.sessionId);
                         }
 
+                        // A short debounce is enough to avoid the transient no-console value.
+                        // The old 1.5 second hold made Winlogon visibly black.
                         if (ctx.consoleSwitchInProgress &&
-                            now - ctx.lastConsoleSwitchDetected >= std::chrono::milliseconds(1500)) {
+                            now - ctx.lastConsoleSwitchDetected >= std::chrono::milliseconds(150) &&
+                            currentConsole == ctx.pendingConsoleSessionId) {
                             ctx.consoleSwitchInProgress = false;
 
                             if (currentConsole != 0xFFFFFFFF && currentConsole != ctx.activeConsoleSessionId) {
-                                LogW("console session stable, relaunch normal session=" + ctx.sessionId +
+                                LogW("[session-handoff] target console ready session=" + ctx.sessionId +
                                     " old=" + SessionIdToString(ctx.activeConsoleSessionId) +
                                     " new=" + SessionIdToString(currentConsole));
-
-                                SendSessionState(ctx.sessionId, "desktop_handoff_entering");
-                                ctx.handoffStateAnnounced = true;
+                                const DWORD previousConsole = ctx.activeConsoleSessionId;
                                 ctx.activeConsoleSessionId = currentConsole;
+                                ctx.consoleNormalReadyAfterTickNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                                ctx.uacRequested = false;
+                                ctx.unifiedSecureReady = false;
+                                ctx.secureReady = false;
+                                ctx.normalInputPipe.ResetConsumerState();
+                                ctx.secureInputPipe.ResetConsumerState();
 
-                                StopNormalStreamer(ctx);
+                                // Retire helpers bound to the old Windows session without blocking
+                                // the WebRTC/frame-pump thread. The secure bridge or last good
+                                // frame remains visible while their replacements warm up.
+                                if (ctx.normalStreamerProcess && ctx.normalStreamerSessionId != currentConsole) {
+                                    if (ctx.normalStopEvent) SetEvent(ctx.normalStopEvent);
+                                    ctx.normalRetireRequestedAt = now;
+                                    LogI("[session-handoff] retire old normal helper session=" + ctx.sessionId +
+                                        " worker_console=" + SessionIdToString(ctx.normalStreamerSessionId) +
+                                        " target_console=" + SessionIdToString(currentConsole));
+                                }
+                                if (ctx.secureStreamerProcess && ctx.secureStreamerSessionId != currentConsole) {
+                                    if (ctx.secureStopEvent) SetEvent(ctx.secureStopEvent);
+                                    ctx.secureRetiring = true;
+                                    ctx.secureRetireRequestedAt = now;
+                                    LogI("[session-handoff] retire old secure helper session=" + ctx.sessionId +
+                                        " worker_console=" + SessionIdToString(ctx.secureStreamerSessionId) +
+                                        " target_console=" + SessionIdToString(currentConsole));
+                                }
+
                                 ctx.lastNormalLaunchAttempt = now - std::chrono::seconds(3);
+                                ctx.lastSecureLaunchAttempt = now - std::chrono::seconds(1);
+                                LogI("[session-handoff] migration armed session=" + ctx.sessionId +
+                                    " from=" + SessionIdToString(previousConsole) +
+                                    " to=" + SessionIdToString(currentConsole));
                             }
                         }
+                    }
+
+                    if (ctx.consoleHandoffActive && ctx.normalStreamerProcess &&
+                        ctx.normalStreamerSessionId != 0xFFFFFFFF &&
+                        ctx.normalStreamerSessionId != ctx.activeConsoleSessionId &&
+                        ctx.normalRetireRequestedAt.time_since_epoch().count() != 0 &&
+                        now - ctx.normalRetireRequestedAt >= std::chrono::milliseconds(750)) {
+                        LogW("[session-handoff] forcing old normal helper exit session=" + ctx.sessionId +
+                            " worker_console=" + SessionIdToString(ctx.normalStreamerSessionId));
+                        TerminateProcess(ctx.normalStreamerProcess, 0);
+                        WaitForSingleObject(ctx.normalStreamerProcess, 100);
                     }
 
                     if (ctx.normalStreamerProcess) {
@@ -6156,6 +6251,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 " exitCode=" + std::to_string(exitCode));
                             CloseHandle(ctx.normalStreamerProcess);
                             ctx.normalStreamerProcess = nullptr;
+                            ctx.normalStreamerSessionId = 0xFFFFFFFF;
+                            ctx.normalRetireRequestedAt = {};
                             ctx.lastNormalFrameAt = {};
 
                             if (!ctx.handoffStateAnnounced) {
@@ -6165,20 +6262,30 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                             // Start Menu sign-out can kill the normal desktop before it sets UACActive.
                             // Do NOT throttle this path; otherwise the viewer stays black at Winlogon.
-                            if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress) {
+                            if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
+                                ctx.activeConsoleSessionId != 0xFFFFFFFF &&
+                                now - ctx.lastSecureLaunchAttempt >= std::chrono::milliseconds(300)) {
                                 LaunchSecureStreamer(ctx);
                             }
                         }
                     }
 
-                    // Throttle normal desktop relaunches during session churn. This prevents
-                    // process spam when switching between multiple users, but still allows the
-                    // secure/winlogon helper to start immediately on sign-out.
+                    // During console migration warm the Winlogon helper and the new normal
+                    // helper under the same WebRTC session. The first valid frame decides the
+                    // visible source; there is no peer/data-channel restart.
+                    if (!ctx.backstageMode && ctx.consoleHandoffActive &&
+                        ctx.activeConsoleSessionId != 0xFFFFFFFF &&
+                        !ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
+                        now - ctx.lastSecureLaunchAttempt >= std::chrono::milliseconds(300)) {
+                        LaunchSecureStreamer(ctx);
+                    }
+
                     if (!ctx.backstageMode &&
                         !ctx.normalStreamerProcess &&
                         !ctx.consoleSwitchInProgress &&
-                        ActiveConsoleSessionId() != 0xFFFFFFFF &&
-                        now - ctx.lastNormalLaunchAttempt >= std::chrono::seconds(3)) {
+                        ctx.activeConsoleSessionId != 0xFFFFFFFF &&
+                        ActiveConsoleSessionId() == ctx.activeConsoleSessionId &&
+                        now - ctx.lastNormalLaunchAttempt >= std::chrono::milliseconds(250)) {
                         ctx.lastNormalLaunchAttempt = now;
                         LaunchNormalStreamer(ctx);
                     }
@@ -6200,6 +6307,17 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         }
                     }
 
+                    if (ctx.consoleHandoffActive && ctx.secureStreamerProcess &&
+                        ctx.secureStreamerSessionId != 0xFFFFFFFF &&
+                        ctx.secureStreamerSessionId != ctx.activeConsoleSessionId &&
+                        ctx.secureRetireRequestedAt.time_since_epoch().count() != 0 &&
+                        now - ctx.secureRetireRequestedAt >= std::chrono::milliseconds(750)) {
+                        LogW("[session-handoff] forcing old secure helper exit session=" + ctx.sessionId +
+                            " worker_console=" + SessionIdToString(ctx.secureStreamerSessionId));
+                        TerminateProcess(ctx.secureStreamerProcess, 0);
+                        WaitForSingleObject(ctx.secureStreamerProcess, 100);
+                    }
+
                     if (ctx.secureStreamerProcess) {
                         const DWORD waitRc = WaitForSingleObject(ctx.secureStreamerProcess, 0);
                         if (waitRc == WAIT_OBJECT_0) {
@@ -6209,6 +6327,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 " exitCode=" + std::to_string(exitCode));
                             CloseHandle(ctx.secureStreamerProcess);
                             ctx.secureStreamerProcess = nullptr;
+                            ctx.secureStreamerSessionId = 0xFFFFFFFF;
+                            ctx.secureRetireRequestedAt = {};
+                            ctx.secureRetiring = false;
                             ctx.secureReady = false;
                             ctx.secureLaunchInProgress = false;
                         }
@@ -6255,7 +6376,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 }
                                 else if (!ctx.unifiedSecureReady && !ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
                                     ctx.uacDetectedAt.time_since_epoch().count() != 0 &&
-                                    now - ctx.uacDetectedAt >= std::chrono::milliseconds(350)) {
+                                    now - ctx.uacDetectedAt >= std::chrono::milliseconds(350) &&
+                                    now - ctx.lastSecureLaunchAttempt >= std::chrono::milliseconds(300)) {
                                     LogW("dynamic desktop did not produce a secure frame quickly; launching fallback secure helper session=" + ctx.sessionId);
                                     LaunchSecureStreamer(ctx);
                                 }
@@ -6337,7 +6459,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 ctx.uacDetectedAt.time_since_epoch().count() != 0 &&
                                 now - ctx.uacDetectedAt < std::chrono::milliseconds(250) &&
                                 isNearBlackTransitionFrame(secureFrame);
-                            if (!secureTransitionBlank && !ctx.secureReady) {
+                            const bool secureWorkerCurrent = ctx.secureStreamerSessionId == 0xFFFFFFFF ||
+                                ctx.activeConsoleSessionId == 0xFFFFFFFF ||
+                                ctx.secureStreamerSessionId == ctx.activeConsoleSessionId;
+                            if (!ctx.secureRetiring && secureWorkerCurrent && !secureTransitionBlank && !ctx.secureReady) {
                                 secureBecameReady = true;
                                 ctx.secureReady = true;
                                 ctx.secureLaunchInProgress = false;
@@ -6349,8 +6474,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     bool sent = false;
-                    const bool useSecureFallback = ctx.secureStreamerProcess != nullptr &&
-                        (ctx.uacRequested || !gotNormal);
+                    const bool normalHandoffReady = ctx.consoleHandoffActive && gotNormal &&
+                        ctx.activeConsoleSessionId != 0xFFFFFFFF &&
+                        ActiveConsoleSessionId() == ctx.activeConsoleSessionId &&
+                        ctx.normalStreamerSessionId == ctx.activeConsoleSessionId &&
+                        (ctx.consoleNormalReadyAfterTickNs == 0 || normalTs >= ctx.consoleNormalReadyAfterTickNs) &&
+                        !isNearBlackTransitionFrame(normalFrame);
+                    const bool useSecureFallback = !normalHandoffReady && !ctx.secureRetiring &&
+                        ctx.secureStreamerProcess != nullptr &&
+                        (ctx.uacRequested || ctx.consoleHandoffActive || !gotNormal);
 
                     if (useSecureFallback) {
                         if (gotSecure && !secureTransitionBlank) {
@@ -6362,11 +6494,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     " size=" + std::to_string(secureFrame.y.size() + secureFrame.u.size() + secureFrame.v.size()) +
                                     " mode=secure-fallback force_kf=" + std::to_string(forceKf ? 1 : 0));
                             }
+                            ctx.secureFallbackOwnsInput.store(true, std::memory_order_release);
                             if (ctx.sender) ctx.sender->sendExternalRawI420(secureFrame, secureTs, forceKf);
                             sent = true;
                         }
                     }
-                    else if (gotNormal) {
+                    else if (gotNormal && (!ctx.consoleHandoffActive || normalHandoffReady)) {
                         const bool staleSecureCandidate = ctx.unifiedDesktopStreamer && ctx.uacRequested &&
                             ctx.uacDetectedTickNs != 0 && normalTs < ctx.uacDetectedTickNs;
                         const bool staleNormalReturn = ctx.unifiedDesktopStreamer && !ctx.uacRequested &&
@@ -6380,12 +6513,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ctx.desktopReturnAt.time_since_epoch().count() != 0 &&
                             now - ctx.desktopReturnAt < std::chrono::milliseconds(250) &&
                             isNearBlackTransitionFrame(normalFrame);
+                        const bool blankConsoleHandoff = ctx.consoleHandoffActive &&
+                            isNearBlackTransitionFrame(normalFrame);
 
                         if (!staleSecureCandidate && !staleNormalReturn && !blankSecureTransition &&
                             ctx.unifiedDesktopStreamer && ctx.uacRequested) {
                             const bool enteringSecure = !ctx.unifiedSecureReady || ctx.activeMode != DesktopMode::Secure;
                             ++framesForwarded;
                             const bool forceKf = enteringSecure || framesForwarded == 1;
+                            ctx.secureFallbackOwnsInput.store(false, std::memory_order_release);
                             if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, normalTs, forceKf);
                             sent = true;
                             if (enteringSecure) {
@@ -6396,7 +6532,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 LogI("active mode -> SECURE session=" + ctx.sessionId + " source=dynamic-desktop");
                             }
                         }
-                        else if (!staleSecureCandidate && !staleNormalReturn && !blankNormalReturn && !ctx.uacRequested) {
+                        else if (!staleSecureCandidate && !staleNormalReturn && !blankNormalReturn &&
+                            !blankConsoleHandoff && !ctx.uacRequested) {
                             const bool wasSecure = ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess != nullptr;
                             if (wasSecure) {
                                 if (ctx.handoffStateAnnounced) {
@@ -6407,7 +6544,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     SendSessionState(ctx.sessionId, "secure_desktop_exited");
                                     ctx.secureStateAnnounced = false;
                                 }
-                                if (ctx.secureStreamerProcess) StopSecureStreamer(ctx);
+                                if (ctx.secureStreamerProcess && ctx.secureStopEvent) {
+                                    // Do not synchronously wait here; the normal frame is ready now.
+                                    // Request the Winlogon helper to exit after the source/input
+                                    // switch so the Viewer never waits on process teardown or falls
+                                    // back to an old secure frame after the new desktop is visible.
+                                    ctx.secureRetiring = true;
+                                    ctx.secureRetireRequestedAt = now;
+                                    SetEvent(ctx.secureStopEvent);
+                                }
                                 ctx.activeMode = DesktopMode::Normal;
                                 ctx.unifiedSecureReady = false;
                                 ctx.desktopReturnTickNs = 0;
@@ -6415,10 +6560,34 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 LogI("active mode -> NORMAL session=" + ctx.sessionId + " raw-source=1");
                             }
 
+                            const bool completedConsoleHandoff = ctx.consoleHandoffActive;
+                            ctx.secureFallbackOwnsInput.store(false, std::memory_order_release);
                             ++framesForwarded;
-                            const bool forceKf = wasSecure || framesForwarded == 1;
+                            const bool forceKf = wasSecure || completedConsoleHandoff || framesForwarded == 1;
                             if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, normalTs, forceKf);
                             sent = true;
+
+                            if (completedConsoleHandoff) {
+                                ctx.consoleHandoffActive = false;
+                                ctx.consoleNormalReadyAfterTickNs = 0;
+                                if (ctx.handoffStateAnnounced) {
+                                    SendSessionState(ctx.sessionId, "desktop_handoff_ready");
+                                    ctx.handoffStateAnnounced = false;
+                                }
+                                LogI("[session-handoff] ready generation=" + std::to_string(ctx.consoleGeneration) +
+                                    " session=" + ctx.sessionId +
+                                    " console=" + SessionIdToString(ctx.activeConsoleSessionId) +
+                                    " input=normal");
+
+                                if (ctx.bannerRebindPending && ctx.sessionMode == SessionMode::Console) {
+                                    StartPresenceBanner(ctx.sessionId, ctx.technicianName, ctx.sessionJob);
+                                    ctx.bannerConsoleSessionId = ctx.activeConsoleSessionId;
+                                    ctx.bannerRebindPending = false;
+                                    LogI("[session-handoff] presence rebound session=" + ctx.sessionId +
+                                        " console=" + SessionIdToString(ctx.bannerConsoleSessionId));
+                                }
+                                SyncChatStateToContext(ctx);
+                            }
                         }
                     }
 

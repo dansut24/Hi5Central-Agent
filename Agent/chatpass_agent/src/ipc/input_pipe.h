@@ -285,6 +285,24 @@ public:
         return true;
     }
 
+    // Drop commands/state that belonged to a previous session-bound helper.
+    // The mapping itself intentionally survives console-session changes so the
+    // WebRTC input channels do not need to be recreated.
+    void ResetConsumerState() {
+        if (!base_) return;
+        auto* hdr = header();
+        const uint64_t w = hdr->writeIdx.load(std::memory_order_acquire);
+        hdr->readIdx.store(w, std::memory_order_release);
+        hdr->monitorCount.store(0, std::memory_order_release);
+        hdr->uacActive.store(0, std::memory_order_release);
+        hdr->desktopTransitionTickNs.store(0, std::memory_order_release);
+        hdr->fastMouseSeq.store(0, std::memory_order_release);
+        hdr->streamStatsTargetFps.store(0, std::memory_order_release);
+        hdr->streamStatsMode.store(0, std::memory_order_release);
+        hdr->streamStatsSecureDesktopActive.store(0, std::memory_order_release);
+        hdr->streamStatsSeq.fetch_add(1, std::memory_order_acq_rel);
+    }
+
     // Read monitor info published by the streamer
     int GetMonitorCount() const {
         if (!base_) return 0;

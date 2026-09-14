@@ -27,7 +27,15 @@ inline HANDLE Hi5NamedLogMutex() {
 class Hi5InterprocessLogLock {
 public:
     Hi5InterprocessLogLock() : handle_(Hi5NamedLogMutex()) {
-        if (handle_) acquired_ = WaitForSingleObject(handle_, 5000) == WAIT_OBJECT_0;
+        if (handle_) {
+            // Diagnostics must never stall capture/input. A helper can be killed
+            // during logout/UAC while owning this mutex; WAIT_ABANDONED still
+            // transfers ownership to us and therefore must be released. The old
+            // code ignored WAIT_ABANDONED and could leave the mutex owned forever,
+            // making every other process pause for five seconds per log line.
+            const DWORD rc = WaitForSingleObject(handle_, 100);
+            acquired_ = (rc == WAIT_OBJECT_0 || rc == WAIT_ABANDONED);
+        }
     }
     ~Hi5InterprocessLogLock() {
         if (handle_ && acquired_) ReleaseMutex(handle_);

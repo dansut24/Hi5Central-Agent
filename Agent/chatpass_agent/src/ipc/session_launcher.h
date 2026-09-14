@@ -19,10 +19,14 @@ namespace hi5 {
     // are present on the normal desktop.
     HANDLE LaunchInElevatedDefaultSession(const std::string& exePath,
         const std::string& cmdLine);
+    HANDLE LaunchInElevatedDefaultSessionForSession(const std::string& exePath,
+        const std::string& cmdLine, DWORD sessionId);
 
     // Launches exePath with cmdLine on the secure desktop: winsta0\Winlogon.
     // Intended for UAC prompts, lock screen, and logon screen capture.
     HANDLE LaunchOnSecureDesktop(const std::string& exePath,
         const std::string& cmdLine);
+    HANDLE LaunchOnSecureDesktopForSession(const std::string& exePath,
+        const std::string& cmdLine, DWORD sessionId);
 
 } // namespace hi5  

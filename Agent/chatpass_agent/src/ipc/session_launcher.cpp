@@ -351,83 +351,62 @@ namespace hi5 {
         return hProc;
     }
 
-    HANDLE LaunchInElevatedDefaultSession(const std::string& exePath,
-        const std::string& cmdLine) {
+    HANDLE LaunchInElevatedDefaultSessionForSession(const std::string& exePath,
+        const std::string& cmdLine, DWORD sessionId) {
         if (!IsRunningAsLocalSystem()) {
             LogWarn("[launcher] process is not LocalSystem/SCM; using current-user CreateProcessW fallback for default desktop");
             return LaunchWithCurrentProcessToken(
-                exePath,
-                cmdLine,
-                L"winsta0\\default",
-                "[launcher][default-console]");
+                exePath, cmdLine, L"winsta0\\default", "[launcher][default-console]");
         }
-
-        EnableLaunchPrivileges();
-
-        const DWORD sessionId = WTSGetActiveConsoleSessionId();
         if (sessionId == 0xFFFFFFFF) {
-            LogError("[launcher] no active console session for elevated default desktop");
+            LogError("[launcher] no target console session for elevated default desktop");
             return nullptr;
         }
-
+        EnableLaunchPrivileges();
         LogInfo("[launcher] launching elevated on Default Desktop, session=" + std::to_string(sessionId));
-
         HANDLE hPrimary = nullptr;
         if (!DuplicateCurrentProcessPrimaryTokenForSession(sessionId, hPrimary)) {
             LogError("[launcher] failed to build LocalSystem primary token for default desktop");
             return nullptr;
         }
-
         const std::wstring wExePath = ToWide(exePath);
         const std::wstring wCmd = L"\"" + wExePath + L"\" " + ToWide(cmdLine);
         const std::wstring wDir = DirOf(wExePath);
+        HANDLE hProc = LaunchWithToken(hPrimary, wExePath, wCmd, wDir,
+            L"winsta0\\default", "LocalSystem(session-bound)", "[launcher][default-elevated]");
+        CloseHandle(hPrimary);
+        return hProc;
+    }
 
-        HANDLE hProc = LaunchWithToken(
-            hPrimary,
-            wExePath,
-            wCmd,
-            wDir,
-            L"winsta0\\default",
-            "LocalSystem(session-bound)",
-            "[launcher][default-elevated]");
+    HANDLE LaunchInElevatedDefaultSession(const std::string& exePath,
+        const std::string& cmdLine) {
+        return LaunchInElevatedDefaultSessionForSession(exePath, cmdLine, WTSGetActiveConsoleSessionId());
+    }
 
+    HANDLE LaunchOnSecureDesktopForSession(const std::string& exePath,
+        const std::string& cmdLine, DWORD sessionId) {
+        if (sessionId == 0xFFFFFFFF) {
+            LogError("[launcher] no target console session for Secure Desktop");
+            return nullptr;
+        }
+        EnableLaunchPrivileges();
+        LogInfo("[launcher] launching on Secure Desktop, session=" + std::to_string(sessionId));
+        HANDLE hPrimary = nullptr;
+        if (!DuplicateCurrentProcessPrimaryTokenForSession(sessionId, hPrimary)) {
+            LogError("[launcher] failed to build LocalSystem primary token for secure desktop");
+            return nullptr;
+        }
+        const std::wstring wExePath = ToWide(exePath);
+        const std::wstring wCmd = L"\"" + wExePath + L"\" " + ToWide(cmdLine);
+        const std::wstring wDir = DirOf(wExePath);
+        HANDLE hProc = LaunchWithToken(hPrimary, wExePath, wCmd, wDir,
+            L"winsta0\\Winlogon", "LocalSystem(session-bound)", "[launcher][secure]");
         CloseHandle(hPrimary);
         return hProc;
     }
 
     HANDLE LaunchOnSecureDesktop(const std::string& exePath,
         const std::string& cmdLine) {
-        EnableLaunchPrivileges();
-
-        const DWORD sessionId = WTSGetActiveConsoleSessionId();
-        if (sessionId == 0xFFFFFFFF) {
-            LogError("[launcher] no active console session for Secure Desktop");
-            return nullptr;
-        }
-
-        LogInfo("[launcher] launching on Secure Desktop, session=" + std::to_string(sessionId));
-
-        HANDLE hPrimary = nullptr;
-        if (!DuplicateCurrentProcessPrimaryTokenForSession(sessionId, hPrimary)) {
-            LogError("[launcher] failed to build LocalSystem primary token for secure desktop");
-            return nullptr;
-        }
-
-        const std::wstring wExePath = ToWide(exePath);
-        const std::wstring wCmd = L"\"" + wExePath + L"\" " + ToWide(cmdLine);
-        const std::wstring wDir = DirOf(wExePath);
-
-        HANDLE hProc = LaunchWithToken(
-            hPrimary,
-            wExePath,
-            wCmd,
-            wDir,
-            L"winsta0\\Winlogon",
-            "LocalSystem(session-bound)",
-            "[launcher][secure]");
-
-        CloseHandle(hPrimary);
-        return hProc;
+        return LaunchOnSecureDesktopForSession(exePath, cmdLine, WTSGetActiveConsoleSessionId());
     }
-
 } // namespace hi5
