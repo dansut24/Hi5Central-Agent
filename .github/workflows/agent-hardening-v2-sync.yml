@@ -1,4 +1,4 @@
-name: Sync stable Winlogon checkpoint
+name: Sync Winlogon lifecycle latch checkpoint
 
 on:
   push:
@@ -20,23 +20,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download and verify stable Winlogon snapshot
+      - name: Download and verify Winlogon lifecycle latch snapshot
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/winlogon-stable-5ff24ef.tar.gz \
-            -o /tmp/winlogon-stable-5ff24ef.tar.gz
-          echo "93e186bf0cb504e303deb6b1165431da31600443d61043eba532d26384264106  /tmp/winlogon-stable-5ff24ef.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/winlogon-latch-f269b6e.tar.gz \
+            -o /tmp/winlogon-latch-f269b6e.tar.gz
+          echo "3f0968bac9856ed1ae35c8984b6b493e4ca929a1ed8896544bcd6c324e52af75  /tmp/winlogon-latch-f269b6e.tar.gz" | sha256sum -c -
 
       - name: Apply exact changed file
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/winlogon-stable
-          tar -xzf /tmp/winlogon-stable-5ff24ef.tar.gz -C /tmp/winlogon-stable
-          cp -a /tmp/winlogon-stable/. .
-          rm -f Agent/.ci-console-handoff-stability-178101f
+          mkdir -p /tmp/winlogon-latch
+          tar -xzf /tmp/winlogon-latch-f269b6e.tar.gz -C /tmp/winlogon-latch
+          cp -a /tmp/winlogon-latch/. .
+          rm -f Agent/.ci-winlogon-stable-5ff24ef
           git add -A
           git status --short
 
@@ -50,5 +50,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Sync stable Winlogon remote desktop checkpoint"
+          git commit -m "Sync Winlogon lifecycle latch checkpoint"
           git push origin HEAD:agent-hardening-v2
