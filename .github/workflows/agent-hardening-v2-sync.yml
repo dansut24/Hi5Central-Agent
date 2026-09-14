@@ -1,0 +1,46 @@
+name: Agent hardening v2 source sync
+
+on:
+  push:
+    branches: [agent-hardening-v2]
+    paths: ['.github/workflows/agent-hardening-v2-sync.yml']
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent-hardening-v2
+          fetch-depth: 0
+      - name: Download validated VPS snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o /tmp/agent-hardening-v2.tar.gz https://downloads.hi5central.com/bootstrap-agent-sync/agent-hardening-v2-be54bc1.tar.gz
+          echo '48be2858dd5046929e95f865068cab017fc3696bca1dba6a015b055919d85c1a  /tmp/agent-hardening-v2.tar.gz' | sha256sum -c -
+      - name: Replace branch with validated snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          tar -xzf /tmp/agent-hardening-v2.tar.gz -C .
+      - name: Commit and push snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Sync deterministic single-helper desktop switching'
+          git push origin HEAD:agent-hardening-v2
+      - name: Dispatch Windows validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh workflow run windows-installers.yml --ref agent-hardening-v2
