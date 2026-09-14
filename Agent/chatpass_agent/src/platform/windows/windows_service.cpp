@@ -1755,6 +1755,8 @@ namespace hi5 {
             DesktopMode activeMode = DesktopMode::Normal;
 
             bool uacRequested = false;
+            bool unifiedDesktopStreamer = true;
+            bool unifiedSecureReady = false;
             bool secureLaunchInProgress = false;
             bool secureReady = false;
             bool secureStateAnnounced = false;
@@ -1762,6 +1764,9 @@ namespace hi5 {
             bool chatOpen = false;
             std::chrono::steady_clock::time_point lastNormalFrameAt{};
             std::chrono::steady_clock::time_point lastSecureFrameAt{};
+            std::chrono::steady_clock::time_point uacDetectedAt{};
+            uint64_t uacDetectedTickNs = 0;
+            uint64_t desktopReturnTickNs = 0;
             std::chrono::steady_clock::time_point lastNormalLaunchAttempt{};
             std::chrono::steady_clock::time_point lastSecureLaunchAttempt{};
             std::chrono::steady_clock::time_point lastConsoleSessionPoll{};
@@ -4911,7 +4916,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             }
 
             InputPipeWriter& ActiveInputPipe(SessionContext& ctx) {
-
+                if (ctx.unifiedDesktopStreamer) return ctx.normalInputPipe;
                 return (ctx.activeMode == DesktopMode::Secure)
                     ? ctx.secureInputPipe
                     : ctx.normalInputPipe;
@@ -5652,7 +5657,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " --stop-event " + ctx.normalStopEventName +
                     " --chat-pipe " + ctx.chatPipeName +
                     " --fps " + std::to_string(ctx.fps) +
-                    " --display " + std::to_string(ctx.displayIndex);
+                    " --display " + std::to_string(ctx.displayIndex) +
+                    (ctx.unifiedDesktopStreamer ? " --dynamic-desktop" : "");
 
                 LogI("launch normal streamer [NORMAL_SHMEM_EXPECTED_NO_UAC] session=" + ctx.sessionId + " cmd=" + cmdLine);
 
@@ -5873,6 +5879,13 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx->sessionMode = sessionMode;
                 ctx->backstageMode = sessionMode == SessionMode::Backstage;
                 ctx->uacRequested = false;
+                {
+                    std::string dynamicDesktop = ReadConfigString("HI5_DYNAMIC_DESKTOP", "1");
+                    std::transform(dynamicDesktop.begin(), dynamicDesktop.end(), dynamicDesktop.begin(),
+                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                    ctx->unifiedDesktopStreamer = dynamicDesktop != "0" && dynamicDesktop != "false" && dynamicDesktop != "off";
+                }
+                ctx->unifiedSecureReady = false;
                 ctx->secureReady = false;
                 ctx->secureLaunchInProgress = false;
                 ctx->activeConsoleSessionId = ActiveConsoleSessionId();
@@ -6003,9 +6016,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     });
 
                 ctx->sender->setDirectMouseMoveHandler([raw = ctx.get()](double xNorm, double yNorm, uint64_t seq, double clientTsMs) {
-                    InputPipeWriter& targetPipe = (raw->activeMode == DesktopMode::Secure)
-                        ? raw->secureInputPipe
-                        : raw->normalInputPipe;
+                    InputPipeWriter& targetPipe = raw->unifiedDesktopStreamer
+                        ? raw->normalInputPipe
+                        : ((raw->activeMode == DesktopMode::Secure) ? raw->secureInputPipe : raw->normalInputPipe);
                     auto monitor = targetPipe.GetMonitorInfo(raw->displayIndex);
                     if (monitor.w <= 0 || monitor.h <= 0) {
                         monitor = raw->normalInputPipe.GetMonitorInfo(raw->displayIndex);
@@ -6181,41 +6194,63 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             nextSecurePoll = now + std::chrono::milliseconds(250);
                         }
                         else {
+                            const bool previousUacRequested = ctx.uacRequested;
                             ctx.uacRequested = ctx.normalInputPipe.GetUACActive();
+
+                            if (ctx.uacRequested != previousUacRequested) {
+                                const uint64_t transitionTickNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                                ctx.unifiedSecureReady = false;
+                                if (ctx.uacRequested) {
+                                    ctx.uacDetectedAt = now;
+                                    ctx.uacDetectedTickNs = transitionTickNs;
+                                    ctx.desktopReturnTickNs = 0;
+                                }
+                                else {
+                                    ctx.uacDetectedAt = {};
+                                    ctx.desktopReturnTickNs = transitionTickNs;
+                                }
+                            }
 
                             if (ctx.uacRequested) {
                                 if (!ctx.secureStateAnnounced) {
                                     SendSessionState(ctx.sessionId, "secure_desktop_entering");
                                     ctx.secureStateAnnounced = true;
                                 }
-                                if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress) {
+
+                                if (!ctx.unifiedDesktopStreamer) {
+                                    if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress) {
+                                        LaunchSecureStreamer(ctx);
+                                    }
+                                }
+                                else if (!ctx.unifiedSecureReady && !ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
+                                    ctx.uacDetectedAt.time_since_epoch().count() != 0 &&
+                                    now - ctx.uacDetectedAt >= std::chrono::milliseconds(350)) {
+                                    LogW("dynamic desktop did not produce a secure frame quickly; launching fallback secure helper session=" + ctx.sessionId);
                                     LaunchSecureStreamer(ctx);
                                 }
                             }
-
-                            const bool normalFresh = ctx.lastNormalFrameAt.time_since_epoch().count() != 0 &&
-                                (now - ctx.lastNormalFrameAt) <= std::chrono::milliseconds(800);
-
-                            if (!ctx.uacRequested && ctx.secureStateAnnounced && !normalFresh) {
-                                if (!ctx.handoffStateAnnounced) {
-                                    SendSessionState(ctx.sessionId, "desktop_handoff_entering");
-                                    ctx.handoffStateAnnounced = true;
-                                }
+                            else if (ctx.secureStateAnnounced && !ctx.handoffStateAnnounced) {
+                                SendSessionState(ctx.sessionId, "desktop_handoff_entering");
+                                ctx.handoffStateAnnounced = true;
                             }
 
-                            if (!ctx.uacRequested && normalFresh) {
-                                if (ctx.handoffStateAnnounced) {
-                                    SendSessionState(ctx.sessionId, "desktop_handoff_ready");
-                                    ctx.handoffStateAnnounced = false;
-                                }
-                                if (ctx.secureStateAnnounced) {
-                                    SendSessionState(ctx.sessionId, "secure_desktop_exited");
-                                    ctx.secureStateAnnounced = false;
-                                }
-                                if (ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess) {
-                                    ctx.activeMode = DesktopMode::Normal;
-                                    StopSecureStreamer(ctx);
-                                    LogI("active mode -> NORMAL session=" + ctx.sessionId);
+                            if (!ctx.unifiedDesktopStreamer) {
+                                const bool normalFresh = ctx.lastNormalFrameAt.time_since_epoch().count() != 0 &&
+                                    (now - ctx.lastNormalFrameAt) <= std::chrono::milliseconds(800);
+                                if (!ctx.uacRequested && normalFresh) {
+                                    if (ctx.handoffStateAnnounced) {
+                                        SendSessionState(ctx.sessionId, "desktop_handoff_ready");
+                                        ctx.handoffStateAnnounced = false;
+                                    }
+                                    if (ctx.secureStateAnnounced) {
+                                        SendSessionState(ctx.sessionId, "secure_desktop_exited");
+                                        ctx.secureStateAnnounced = false;
+                                    }
+                                    if (ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess) {
+                                        ctx.activeMode = DesktopMode::Normal;
+                                        StopSecureStreamer(ctx);
+                                        LogI("active mode -> NORMAL session=" + ctx.sessionId);
+                                    }
                                 }
                             }
 
@@ -6231,6 +6266,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     uint64_t tmpTs = 0;
                     bool gotNormal = false;
                     bool gotSecure = false;
+                    bool secureBecameReady = false;
 
                     while (ctx.normalShmem.ReadRawI420Frame(tmpFrame, tmpTs)) {
                         normalFrame = std::move(tmpFrame);
@@ -6251,6 +6287,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         if (gotSecure) {
                             ctx.lastSecureFrameAt = now;
                             if (!ctx.secureReady) {
+                                secureBecameReady = true;
                                 ctx.secureReady = true;
                                 ctx.secureLaunchInProgress = false;
                                 ctx.activeMode = DesktopMode::Secure;
@@ -6261,52 +6298,67 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     bool sent = false;
-                    const bool useSecure = ctx.uacRequested || (!gotNormal && ctx.secureStreamerProcess);
+                    const bool useSecureFallback = ctx.secureStreamerProcess != nullptr &&
+                        (ctx.uacRequested || !gotNormal);
 
-                    if (useSecure && gotSecure) {
-                        ++framesForwarded;
-                        const bool forceKf = ctx.activeMode != DesktopMode::Secure || !ctx.secureReady;
-                        if (framesForwarded == 1 || (framesForwarded % 120) == 0) {
-                            LogI("raw frame forwarded session=" + ctx.sessionId +
-                                " frames=" + std::to_string(framesForwarded) +
-                                " size=" + std::to_string(secureFrame.y.size() + secureFrame.u.size() + secureFrame.v.size()) +
-                                " mode=secure force_kf=" + std::to_string(forceKf ? 1 : 0));
+                    if (useSecureFallback) {
+                        if (gotSecure) {
+                            ++framesForwarded;
+                            const bool forceKf = secureBecameReady || ctx.activeMode != DesktopMode::Secure || !ctx.secureReady;
+                            if (framesForwarded == 1 || (framesForwarded % 120) == 0) {
+                                LogI("raw frame forwarded session=" + ctx.sessionId +
+                                    " frames=" + std::to_string(framesForwarded) +
+                                    " size=" + std::to_string(secureFrame.y.size() + secureFrame.u.size() + secureFrame.v.size()) +
+                                    " mode=secure-fallback force_kf=" + std::to_string(forceKf ? 1 : 0));
+                            }
+                            if (ctx.sender) ctx.sender->sendExternalRawI420(secureFrame, forceKf);
+                            sent = true;
                         }
-                        if (ctx.sender) {
-                            ctx.sender->sendExternalRawI420(secureFrame, forceKf);
-                        }
-                        sent = true;
                     }
                     else if (gotNormal) {
-                        const bool wasSecure = ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess != nullptr;
-                        if (wasSecure) {
-                            if (ctx.handoffStateAnnounced) {
-                                SendSessionState(ctx.sessionId, "desktop_handoff_ready");
-                                ctx.handoffStateAnnounced = false;
-                            }
-                            if (ctx.secureStateAnnounced) {
-                                SendSessionState(ctx.sessionId, "secure_desktop_exited");
-                                ctx.secureStateAnnounced = false;
-                            }
-                            if (ctx.secureStreamerProcess) {
-                                StopSecureStreamer(ctx);
-                            }
-                            ctx.activeMode = DesktopMode::Normal;
-                            LogI("active mode -> NORMAL session=" + ctx.sessionId + " raw-source=1");
-                        }
+                        const bool staleSecureCandidate = ctx.unifiedDesktopStreamer && ctx.uacRequested &&
+                            ctx.uacDetectedTickNs != 0 && normalTs < ctx.uacDetectedTickNs;
+                        const bool staleNormalReturn = ctx.unifiedDesktopStreamer && !ctx.uacRequested &&
+                            ctx.activeMode == DesktopMode::Secure && ctx.desktopReturnTickNs != 0 &&
+                            normalTs < ctx.desktopReturnTickNs;
 
-                        ++framesForwarded;
-                        const bool forceKf = wasSecure || framesForwarded == 1;
-                        if (framesForwarded == 1 || (framesForwarded % 120) == 0) {
-                            LogI("raw frame forwarded session=" + ctx.sessionId +
-                                " frames=" + std::to_string(framesForwarded) +
-                                " size=" + std::to_string(normalFrame.y.size() + normalFrame.u.size() + normalFrame.v.size()) +
-                                " mode=normal force_kf=" + std::to_string(forceKf ? 1 : 0));
+                        if (!staleSecureCandidate && !staleNormalReturn && ctx.unifiedDesktopStreamer && ctx.uacRequested) {
+                            const bool enteringSecure = !ctx.unifiedSecureReady || ctx.activeMode != DesktopMode::Secure;
+                            ++framesForwarded;
+                            const bool forceKf = enteringSecure || framesForwarded == 1;
+                            if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, forceKf);
+                            sent = true;
+                            if (enteringSecure) {
+                                ctx.unifiedSecureReady = true;
+                                ctx.activeMode = DesktopMode::Secure;
+                                ctx.handoffStateAnnounced = false;
+                                SendSessionState(ctx.sessionId, "secure_desktop_ready");
+                                LogI("active mode -> SECURE session=" + ctx.sessionId + " source=dynamic-desktop");
+                            }
                         }
-                        if (ctx.sender) {
-                            ctx.sender->sendExternalRawI420(normalFrame, forceKf);
+                        else if (!staleSecureCandidate && !staleNormalReturn && !ctx.uacRequested) {
+                            const bool wasSecure = ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess != nullptr;
+                            if (wasSecure) {
+                                if (ctx.handoffStateAnnounced) {
+                                    SendSessionState(ctx.sessionId, "desktop_handoff_ready");
+                                    ctx.handoffStateAnnounced = false;
+                                }
+                                if (ctx.secureStateAnnounced) {
+                                    SendSessionState(ctx.sessionId, "secure_desktop_exited");
+                                    ctx.secureStateAnnounced = false;
+                                }
+                                if (ctx.secureStreamerProcess) StopSecureStreamer(ctx);
+                                ctx.activeMode = DesktopMode::Normal;
+                                ctx.unifiedSecureReady = false;
+                                ctx.desktopReturnTickNs = 0;
+                                LogI("active mode -> NORMAL session=" + ctx.sessionId + " raw-source=1");
+                            }
+
+                            ++framesForwarded;
+                            const bool forceKf = wasSecure || framesForwarded == 1;
+                            if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, forceKf);
+                            sent = true;
                         }
-                        sent = true;
                     }
 
                     if (now >= nextDiagnosticsPoll) {

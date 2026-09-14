@@ -769,6 +769,17 @@ struct DesktopFrameSource::Impl {
 
 DesktopFrameSource::DesktopFrameSource() : m_impl(new Impl()) {}
 DesktopFrameSource::~DesktopFrameSource() { delete m_impl; }
+DesktopFrameSource::DesktopFrameSource(DesktopFrameSource&& other) noexcept : m_impl(other.m_impl) {
+    other.m_impl = nullptr;
+}
+DesktopFrameSource& DesktopFrameSource::operator=(DesktopFrameSource&& other) noexcept {
+    if (this != &other) {
+        delete m_impl;
+        m_impl = other.m_impl;
+        other.m_impl = nullptr;
+    }
+    return *this;
+}
 
 I420Frame DesktopFrameSource::nextFrame() {
     FrameCaptureResult r = nextFrameEx();

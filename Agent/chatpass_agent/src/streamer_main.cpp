@@ -35,6 +35,7 @@ namespace {
         std::string stopEventName;
         int fps = 45;
         int display = 0;
+        bool dynamicDesktop = false;
     };
 
     std::optional<std::string> GetArgValue(int argc, char** argv, const std::string& key) {
@@ -46,6 +47,13 @@ namespace {
         return std::nullopt;
     }
 
+    bool HasArg(int argc, char** argv, const std::string& key) {
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == key) return true;
+        }
+        return false;
+    }
+
     Args ParseArgs(int argc, char** argv) {
         Args a;
         if (auto v = GetArgValue(argc, argv, "--session")) a.sessionId = *v;
@@ -54,6 +62,7 @@ namespace {
         if (auto v = GetArgValue(argc, argv, "--stop-event")) a.stopEventName = *v;
         if (auto v = GetArgValue(argc, argv, "--fps")) a.fps = std::max(1, std::stoi(*v));
         if (auto v = GetArgValue(argc, argv, "--display")) a.display = std::stoi(*v);
+        a.dynamicDesktop = HasArg(argc, argv, "--dynamic-desktop");
         return a;
     }
 
@@ -72,6 +81,46 @@ namespace {
         }
         CloseDesktop(hdesk);
         return secure;
+    }
+
+    std::string DesktopName(HDESK desktop) {
+        if (!desktop) return {};
+        char name[256]{};
+        DWORD needed = 0;
+        if (!GetUserObjectInformationA(desktop, UOI_NAME, name, sizeof(name), &needed)) return {};
+        return std::string(name);
+    }
+
+    bool IsSecureDesktopName(const std::string& name) {
+        return !(name == "Default" || name == "default");
+    }
+
+    bool SyncThreadToActiveInputDesktop(HDESK& ownedDesktop,
+        std::string& attachedDesktopName,
+        bool& secureOut,
+        bool& changedOut) {
+        changedOut = false;
+        HDESK inputDesktop = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+        if (!inputDesktop) return false;
+
+        const std::string inputName = DesktopName(inputDesktop);
+        secureOut = inputName.empty() ? true : IsSecureDesktopName(inputName);
+        if (!inputName.empty() && inputName == attachedDesktopName) {
+            CloseDesktop(inputDesktop);
+            return true;
+        }
+
+        if (!SetThreadDesktop(inputDesktop)) {
+            CloseDesktop(inputDesktop);
+            return false;
+        }
+
+        HDESK previousOwnedDesktop = ownedDesktop;
+        ownedDesktop = inputDesktop;
+        attachedDesktopName = inputName;
+        changedOut = true;
+        if (previousOwnedDesktop) CloseDesktop(previousOwnedDesktop);
+        return true;
     }
 
     bool IsSecureHelperArgs(const Args& args) {
@@ -791,8 +840,12 @@ namespace hi5 {
         int currentDisplay = args.display;
         bool lastSecureState = false;
         const bool isSecureHelper = IsSecureHelperArgs(args);
+        const bool dynamicDesktop = args.dynamicDesktop && !isSecureHelper;
+        HDESK ownedDynamicDesktop = nullptr;
+        std::string attachedDesktopName = DesktopName(GetThreadDesktop(GetCurrentThreadId()));
         bool secureDesktopEnding = false;
         std::chrono::steady_clock::time_point secureDesktopEndedAt{};
+        std::chrono::steady_clock::time_point nextDesktopSwitchErrorLog{};
         int consecutiveResetFailures = 0;
 
         auto nextMonitorPublish = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -868,7 +921,38 @@ namespace hi5 {
             }
 
             if (inputPipeOk && now >= nextSecurePoll) {
-                const bool secureNow = IsSecureDesktopActive();
+                bool secureNow = IsSecureDesktopActive();
+                if (dynamicDesktop) {
+                    bool switchedDesktop = false;
+                    bool attachedSecure = secureNow;
+                    if (SyncThreadToActiveInputDesktop(ownedDynamicDesktop, attachedDesktopName, attachedSecure, switchedDesktop)) {
+                        secureNow = attachedSecure;
+                        if (switchedDesktop) {
+                            try {
+                                DesktopFrameSource resetSource;
+                                resetSource.setDisplayIndex(currentDisplay);
+                                source = std::move(resetSource);
+                                PublishMonitorInfo(inputPipe, source);
+                                nextCaptureAt = now;
+                                consecutiveResetFailures = 0;
+                                PrimeInputQueue();
+                                LogInfo("[streamer] capture thread switched input desktop session=" + args.sessionId +
+                                    " desktop=" + attachedDesktopName +
+                                    " secure=" + std::to_string(secureNow ? 1 : 0));
+                            }
+                            catch (const std::exception& ex) {
+                                LogWarn("[streamer] capture reset after desktop switch failed session=" + args.sessionId +
+                                    ": " + ex.what());
+                            }
+                        }
+                    }
+                    else if (nextDesktopSwitchErrorLog.time_since_epoch().count() == 0 || now >= nextDesktopSwitchErrorLog) {
+                        LogWarn("[streamer] unable to attach capture thread to active input desktop session=" + args.sessionId +
+                            " err=" + std::to_string(GetLastError()));
+                        nextDesktopSwitchErrorLog = now + std::chrono::seconds(1);
+                    }
+                }
+
                 inputPipe.SetUACActive(secureNow);
                 if (secureNow != lastSecureState) {
                     lastSecureState = secureNow;
@@ -885,6 +969,7 @@ namespace hi5 {
 
                     LogInfo("[streamer] desktop transition session=" + args.sessionId +
                         " secure=" + std::to_string(secureNow ? 1 : 0) +
+                        " dynamic=" + std::to_string(dynamicDesktop ? 1 : 0) +
                         " input-primed=1");
                 }
                 nextSecurePoll = now + std::chrono::milliseconds(25);

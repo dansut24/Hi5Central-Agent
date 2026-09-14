@@ -34,6 +34,10 @@ class DesktopFrameSource {
 public:
     DesktopFrameSource();
     ~DesktopFrameSource();
+    DesktopFrameSource(const DesktopFrameSource&) = delete;
+    DesktopFrameSource& operator=(const DesktopFrameSource&) = delete;
+    DesktopFrameSource(DesktopFrameSource&& other) noexcept;
+    DesktopFrameSource& operator=(DesktopFrameSource&& other) noexcept;
 
     I420Frame nextFrame();
     FrameCaptureResult nextFrameEx();
