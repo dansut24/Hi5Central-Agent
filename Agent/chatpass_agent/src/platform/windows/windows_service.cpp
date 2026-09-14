@@ -6198,7 +6198,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ctx.uacRequested = ctx.normalInputPipe.GetUACActive();
 
                             if (ctx.uacRequested != previousUacRequested) {
-                                const uint64_t transitionTickNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                                uint64_t transitionTickNs = ctx.normalInputPipe.GetDesktopTransitionTickNs();
+                                if (transitionTickNs == 0) {
+                                    transitionTickNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                                }
                                 ctx.unifiedSecureReady = false;
                                 if (ctx.uacRequested) {
                                     ctx.uacDetectedAt = now;

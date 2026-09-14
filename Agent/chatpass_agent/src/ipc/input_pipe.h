@@ -164,8 +164,12 @@ struct InputRingHeader {
         uint8_t primary;
         uint8_t _pad[3];
     } monitors[8];                  // up to 8 monitors
-    // UAC / Secure Desktop flag (set by streamer, read by service)
+    // UAC / Secure Desktop flag (set by streamer, read by service).
+    // desktopTransitionTickNs is captured by the streamer immediately before
+    // publishing a changed UAC state, so the service can reject frames queued
+    // before a desktop transition without inventing its own later timestamp.
     std::atomic<int32_t>  uacActive;  // 1 = UAC/Secure Desktop active, 0 = normal
+    std::atomic<uint64_t> desktopTransitionTickNs;
 
     // Stream diagnostics, written by streamer and read by service.
     std::atomic<uint64_t> streamStatsSeq;
@@ -233,6 +237,7 @@ public:
         hdr->slotBytes = kInputSlotBytes;
         hdr->monitorCount.store(0);
         hdr->uacActive.store(0);
+        hdr->desktopTransitionTickNs.store(0);
         hdr->streamStatsSeq.store(0);
         hdr->streamStatsUnixMs.store(0);
         hdr->streamStatsCaptureAttempts.store(0);
@@ -295,6 +300,11 @@ public:
     bool GetUACActive() const {
         if (!base_) return false;
         return header()->uacActive.load(std::memory_order_acquire) != 0;
+    }
+
+    uint64_t GetDesktopTransitionTickNs() const {
+        if (!base_) return 0;
+        return header()->desktopTransitionTickNs.load(std::memory_order_acquire);
     }
 
     bool PublishFastMouseTarget(int32_t x, int32_t y, int32_t monitorIndex, uint64_t seq, uint64_t clientTsMs) {
@@ -423,10 +433,18 @@ public:
         hdr->monitorCount.store(n, std::memory_order_release);
     }
 
-    // Publish UAC active status so the service can react
+    // Publish UAC active status so the service can react. Capture the transition
+    // tick before publishing the changed state so an acquiring service reader sees
+    // the exact streamer-side boundary for post-transition video frames.
     void SetUACActive(bool active) {
         if (!base_) return;
-        header()->uacActive.store(active ? 1 : 0, std::memory_order_release);
+        auto* hdr = header();
+        const int32_t desired = active ? 1 : 0;
+        const int32_t previous = hdr->uacActive.load(std::memory_order_relaxed);
+        if (previous == desired) return;
+        hdr->desktopTransitionTickNs.store(static_cast<uint64_t>(GetTickCount64()) * 1000000ull,
+            std::memory_order_relaxed);
+        hdr->uacActive.store(desired, std::memory_order_release);
     }
 
     bool ReadFastMouseTarget(uint64_t& lastSeq, FastMouseTarget& out) {
