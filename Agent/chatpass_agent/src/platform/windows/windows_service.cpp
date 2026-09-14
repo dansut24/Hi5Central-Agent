@@ -6130,6 +6130,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                 const uint64_t maxFrameAgeNs = static_cast<uint64_t>(ReadConfigInt("HI5_MAX_FRAME_AGE_MS", 250, 50, 2000)) * 1000000ull;
+                const auto consoleHandoffSettleDelay = std::chrono::milliseconds(
+                    ReadConfigInt("HI5_CONSOLE_HANDOFF_SETTLE_MS", 1500, 300, 5000));
                 uint64_t staleFramesDropped = 0;
                 auto nextStaleFrameLog = std::chrono::steady_clock::now();
                 ctx.lastNormalLaunchAttempt = std::chrono::steady_clock::now();
@@ -6391,7 +6393,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 const bool normalFresh = ctx.lastNormalFrameAt.time_since_epoch().count() != 0 &&
                                     (now - ctx.lastNormalFrameAt) <= std::chrono::milliseconds(800);
                                 if (!ctx.uacRequested && normalFresh) {
-                                    if (ctx.handoffStateAnnounced) {
+                                    const bool handoffCanFinish = !ctx.consoleHandoffActive ||
+                                        (ctx.lastConsoleSwitchDetected.time_since_epoch().count() != 0 &&
+                                         now - ctx.lastConsoleSwitchDetected >= consoleHandoffSettleDelay);
+                                    if (ctx.handoffStateAnnounced && handoffCanFinish) {
                                         SendSessionState(ctx.sessionId, "desktop_handoff_ready");
                                         ctx.handoffStateAnnounced = false;
                                     }
@@ -6480,7 +6485,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         ctx.normalStreamerSessionId == ctx.activeConsoleSessionId &&
                         (ctx.consoleNormalReadyAfterTickNs == 0 || normalTs >= ctx.consoleNormalReadyAfterTickNs) &&
                         !isNearBlackTransitionFrame(normalFrame);
-                    const bool useSecureFallback = !normalHandoffReady && !ctx.secureRetiring &&
+                    const bool consoleHandoffSettled = ctx.consoleHandoffActive &&
+                        ctx.lastConsoleSwitchDetected.time_since_epoch().count() != 0 &&
+                        now - ctx.lastConsoleSwitchDetected >= consoleHandoffSettleDelay;
+                    const bool normalHandoffCommitted = normalHandoffReady && consoleHandoffSettled;
+                    const bool useSecureFallback = !normalHandoffCommitted && !ctx.secureRetiring &&
                         ctx.secureStreamerProcess != nullptr &&
                         (ctx.uacRequested || ctx.consoleHandoffActive || !gotNormal);
 
@@ -6527,7 +6536,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             if (enteringSecure) {
                                 ctx.unifiedSecureReady = true;
                                 ctx.activeMode = DesktopMode::Secure;
-                                ctx.handoffStateAnnounced = false;
+                                // A console logoff/login handoff stays announced until the
+                                // replacement desktop has settled. UAC-only transitions can
+                                // still clear the handoff state immediately.
+                                if (!ctx.consoleHandoffActive) {
+                                    ctx.handoffStateAnnounced = false;
+                                }
                                 SendSessionState(ctx.sessionId, "secure_desktop_ready");
                                 LogI("active mode -> SECURE session=" + ctx.sessionId + " source=dynamic-desktop");
                             }
@@ -6536,7 +6550,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             !blankConsoleHandoff && !ctx.uacRequested) {
                             const bool wasSecure = ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess != nullptr;
                             if (wasSecure) {
-                                if (ctx.handoffStateAnnounced) {
+                                if (ctx.handoffStateAnnounced &&
+                                    (!ctx.consoleHandoffActive || consoleHandoffSettled)) {
                                     SendSessionState(ctx.sessionId, "desktop_handoff_ready");
                                     ctx.handoffStateAnnounced = false;
                                 }
@@ -6560,7 +6575,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 LogI("active mode -> NORMAL session=" + ctx.sessionId + " raw-source=1");
                             }
 
-                            const bool completedConsoleHandoff = ctx.consoleHandoffActive;
+                            const bool completedConsoleHandoff = ctx.consoleHandoffActive && consoleHandoffSettled;
                             ctx.secureFallbackOwnsInput.store(false, std::memory_order_release);
                             ++framesForwarded;
                             const bool forceKf = wasSecure || completedConsoleHandoff || framesForwarded == 1;
