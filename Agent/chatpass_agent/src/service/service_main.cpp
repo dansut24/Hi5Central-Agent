@@ -6130,7 +6130,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 " mode=secure force_kf=" + std::to_string(forceKf ? 1 : 0));
                         }
                         if (ctx.sender) {
-                            ctx.sender->sendExternalRawI420(secureFrame, forceKf);
+                            ctx.sender->sendExternalRawI420(secureFrame, secureTs, forceKf);
                         }
                         sent = true;
                     }
@@ -6161,7 +6161,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 " mode=normal force_kf=" + std::to_string(forceKf ? 1 : 0));
                         }
                         if (ctx.sender) {
-                            ctx.sender->sendExternalRawI420(normalFrame, forceKf);
+                            ctx.sender->sendExternalRawI420(normalFrame, normalTs, forceKf);
                         }
                         sent = true;
                     }

@@ -1765,6 +1765,7 @@ namespace hi5 {
             std::chrono::steady_clock::time_point lastNormalFrameAt{};
             std::chrono::steady_clock::time_point lastSecureFrameAt{};
             std::chrono::steady_clock::time_point uacDetectedAt{};
+            std::chrono::steady_clock::time_point desktopReturnAt{};
             uint64_t uacDetectedTickNs = 0;
             uint64_t desktopReturnTickNs = 0;
             std::chrono::steady_clock::time_point lastNormalLaunchAttempt{};
@@ -5995,10 +5996,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     bitrateKbps,
                     WebRtcSender::Mode::ExternalFeed,
                     ([&]() {
-                        const std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
-                        if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw") return requestedCodec;
-                        if (requestedCodec == "vp8") return std::string("vp8");
-                        return std::string("h264_hw");
+                        std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
+                        std::transform(requestedCodec.begin(), requestedCodec.end(), requestedCodec.begin(),
+                            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                        if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw" ||
+                            requestedCodec == "vp8" || requestedCodec == "h264_hw" || requestedCodec == "h264" ||
+                            requestedCodec == "h264_sw") {
+                            return requestedCodec;
+                        }
+                        return std::string("auto");
                         })()
                 );
 
@@ -6079,9 +6085,29 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                const uint64_t maxFrameAgeNs = static_cast<uint64_t>(ReadConfigInt("HI5_MAX_FRAME_AGE_MS", 250, 50, 2000)) * 1000000ull;
+                uint64_t staleFramesDropped = 0;
+                auto nextStaleFrameLog = std::chrono::steady_clock::now();
                 ctx.lastNormalLaunchAttempt = std::chrono::steady_clock::now();
                 ctx.lastSecureLaunchAttempt = {};
                 ctx.lastConsoleSessionPoll = std::chrono::steady_clock::now();
+
+                const auto isNearBlackTransitionFrame = [](const I420Frame& frame) -> bool {
+                    if (frame.y.empty()) return false;
+                    const size_t step = std::max<size_t>(1, frame.y.size() / 4096);
+                    uint64_t sum = 0;
+                    uint8_t maxY = 0;
+                    size_t count = 0;
+                    for (size_t i = 0; i < frame.y.size(); i += step) {
+                        const uint8_t y = frame.y[i];
+                        sum += y;
+                        maxY = std::max(maxY, y);
+                        ++count;
+                    }
+                    if (count == 0) return false;
+                    const double avgY = static_cast<double>(sum) / static_cast<double>(count);
+                    return maxY <= 30 && avgY <= 21.0;
+                };
 
                 while (!ctx.framePumpStop.load()) {
                     const auto now = std::chrono::steady_clock::now();
@@ -6205,11 +6231,13 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 ctx.unifiedSecureReady = false;
                                 if (ctx.uacRequested) {
                                     ctx.uacDetectedAt = now;
+                                    ctx.desktopReturnAt = {};
                                     ctx.uacDetectedTickNs = transitionTickNs;
                                     ctx.desktopReturnTickNs = 0;
                                 }
                                 else {
                                     ctx.uacDetectedAt = {};
+                                    ctx.desktopReturnAt = now;
                                     ctx.desktopReturnTickNs = transitionTickNs;
                                 }
                             }
@@ -6270,6 +6298,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     bool gotNormal = false;
                     bool gotSecure = false;
                     bool secureBecameReady = false;
+                    bool secureTransitionBlank = false;
 
                     while (ctx.normalShmem.ReadRawI420Frame(tmpFrame, tmpTs)) {
                         normalFrame = std::move(tmpFrame);
@@ -6277,7 +6306,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         gotNormal = true;
                     }
                     if (gotNormal) {
-                        ctx.lastNormalFrameAt = now;
+                        const uint64_t nowTickNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                        if (normalTs != 0 && nowTickNs > normalTs && nowTickNs - normalTs > maxFrameAgeNs) {
+                            gotNormal = false;
+                            ++staleFramesDropped;
+                        }
+                        else {
+                            ctx.lastNormalFrameAt = now;
+                        }
                     }
 
                     if (ctx.secureStreamerProcess) {
@@ -6288,8 +6324,20 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         }
 
                         if (gotSecure) {
+                            const uint64_t nowTickNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                            if (secureTs != 0 && nowTickNs > secureTs && nowTickNs - secureTs > maxFrameAgeNs) {
+                                gotSecure = false;
+                                ++staleFramesDropped;
+                            }
+                        }
+
+                        if (gotSecure) {
                             ctx.lastSecureFrameAt = now;
-                            if (!ctx.secureReady) {
+                            secureTransitionBlank = ctx.uacRequested &&
+                                ctx.uacDetectedAt.time_since_epoch().count() != 0 &&
+                                now - ctx.uacDetectedAt < std::chrono::milliseconds(250) &&
+                                isNearBlackTransitionFrame(secureFrame);
+                            if (!secureTransitionBlank && !ctx.secureReady) {
                                 secureBecameReady = true;
                                 ctx.secureReady = true;
                                 ctx.secureLaunchInProgress = false;
@@ -6305,7 +6353,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         (ctx.uacRequested || !gotNormal);
 
                     if (useSecureFallback) {
-                        if (gotSecure) {
+                        if (gotSecure && !secureTransitionBlank) {
                             ++framesForwarded;
                             const bool forceKf = secureBecameReady || ctx.activeMode != DesktopMode::Secure || !ctx.secureReady;
                             if (framesForwarded == 1 || (framesForwarded % 120) == 0) {
@@ -6314,7 +6362,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     " size=" + std::to_string(secureFrame.y.size() + secureFrame.u.size() + secureFrame.v.size()) +
                                     " mode=secure-fallback force_kf=" + std::to_string(forceKf ? 1 : 0));
                             }
-                            if (ctx.sender) ctx.sender->sendExternalRawI420(secureFrame, forceKf);
+                            if (ctx.sender) ctx.sender->sendExternalRawI420(secureFrame, secureTs, forceKf);
                             sent = true;
                         }
                     }
@@ -6324,12 +6372,21 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         const bool staleNormalReturn = ctx.unifiedDesktopStreamer && !ctx.uacRequested &&
                             ctx.activeMode == DesktopMode::Secure && ctx.desktopReturnTickNs != 0 &&
                             normalTs < ctx.desktopReturnTickNs;
+                        const bool blankSecureTransition = ctx.unifiedDesktopStreamer && ctx.uacRequested &&
+                            ctx.uacDetectedAt.time_since_epoch().count() != 0 &&
+                            now - ctx.uacDetectedAt < std::chrono::milliseconds(250) &&
+                            isNearBlackTransitionFrame(normalFrame);
+                        const bool blankNormalReturn = ctx.unifiedDesktopStreamer && !ctx.uacRequested &&
+                            ctx.desktopReturnAt.time_since_epoch().count() != 0 &&
+                            now - ctx.desktopReturnAt < std::chrono::milliseconds(250) &&
+                            isNearBlackTransitionFrame(normalFrame);
 
-                        if (!staleSecureCandidate && !staleNormalReturn && ctx.unifiedDesktopStreamer && ctx.uacRequested) {
+                        if (!staleSecureCandidate && !staleNormalReturn && !blankSecureTransition &&
+                            ctx.unifiedDesktopStreamer && ctx.uacRequested) {
                             const bool enteringSecure = !ctx.unifiedSecureReady || ctx.activeMode != DesktopMode::Secure;
                             ++framesForwarded;
                             const bool forceKf = enteringSecure || framesForwarded == 1;
-                            if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, forceKf);
+                            if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, normalTs, forceKf);
                             sent = true;
                             if (enteringSecure) {
                                 ctx.unifiedSecureReady = true;
@@ -6339,7 +6396,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 LogI("active mode -> SECURE session=" + ctx.sessionId + " source=dynamic-desktop");
                             }
                         }
-                        else if (!staleSecureCandidate && !staleNormalReturn && !ctx.uacRequested) {
+                        else if (!staleSecureCandidate && !staleNormalReturn && !blankNormalReturn && !ctx.uacRequested) {
                             const bool wasSecure = ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess != nullptr;
                             if (wasSecure) {
                                 if (ctx.handoffStateAnnounced) {
@@ -6354,17 +6411,25 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 ctx.activeMode = DesktopMode::Normal;
                                 ctx.unifiedSecureReady = false;
                                 ctx.desktopReturnTickNs = 0;
+                                ctx.desktopReturnAt = {};
                                 LogI("active mode -> NORMAL session=" + ctx.sessionId + " raw-source=1");
                             }
 
                             ++framesForwarded;
                             const bool forceKf = wasSecure || framesForwarded == 1;
-                            if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, forceKf);
+                            if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, normalTs, forceKf);
                             sent = true;
                         }
                     }
 
                     if (now >= nextDiagnosticsPoll) {
+                        if (staleFramesDropped > 0 && now >= nextStaleFrameLog) {
+                            LogW("stale remote frames dropped session=" + ctx.sessionId +
+                                " count=" + std::to_string(staleFramesDropped) +
+                                " max_age_ms=" + std::to_string(maxFrameAgeNs / 1000000ull));
+                            staleFramesDropped = 0;
+                            nextStaleFrameLog = now + std::chrono::seconds(2);
+                        }
                         hi5::StreamStats stats{};
                         if (ctx.normalInputPipe.ReadStreamStats(lastNormalStatsSeq, stats)) {
                             lastNormalStatsSeq = stats.seq;

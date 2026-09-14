@@ -127,6 +127,42 @@ namespace {
         return dst;
     }
 
+    static I420Frame scaleI420ForVp9WebRtc(const I420Frame& src, bool* scaledOut = nullptr) {
+        if (scaledOut) *scaledOut = false;
+        if (src.width <= 0 || src.height <= 0) return src;
+
+        // VP9 does not inherit H.264 Baseline level 3.1's 720p constraint.
+        // Preserve a crisp 1080p desktop by default while keeping an explicit
+        // ceiling for very large/4K desktops and bandwidth-limited sessions.
+        const int maxW = readEnvInt("HI5_VP9_MAX_WIDTH", 1920, 0, 7680);
+        const int maxH = readEnvInt("HI5_VP9_MAX_HEIGHT", 1080, 0, 4320);
+        if (maxW <= 0 || maxH <= 0) return src;
+        if (src.width <= maxW && src.height <= maxH) return src;
+
+        const double sx = static_cast<double>(maxW) / static_cast<double>(src.width);
+        const double sy = static_cast<double>(maxH) / static_cast<double>(src.height);
+        const double scale = std::min(sx, sy);
+        int dstW = makeEvenAtLeast2(static_cast<int>(src.width * scale));
+        int dstH = makeEvenAtLeast2(static_cast<int>(src.height * scale));
+        dstW = std::min(dstW, makeEvenAtLeast2(maxW));
+        dstH = std::min(dstH, makeEvenAtLeast2(maxH));
+
+        I420Frame dst;
+        dst.width = dstW;
+        dst.height = dstH;
+        scalePlaneNearest(src.y, src.width, src.height, dst.y, dstW, dstH);
+
+        const int srcUw = (src.width + 1) / 2;
+        const int srcUh = (src.height + 1) / 2;
+        const int dstUw = (dstW + 1) / 2;
+        const int dstUh = (dstH + 1) / 2;
+        scalePlaneNearest(src.u, srcUw, srcUh, dst.u, dstUw, dstUh);
+        scalePlaneNearest(src.v, srcUw, srcUh, dst.v, dstUw, dstUh);
+
+        if (scaledOut) *scaledOut = true;
+        return dst;
+    }
+
     struct Vp8RuntimeProfile {
         const char* name = "software-vp8-lowcpu-idle";
         int fps = 2;
@@ -270,7 +306,15 @@ WebRtcSender::WebRtcSender(std::string sessionId,
 
     LogInfo("[codec] WebRtcSender codec mode=" + m_codecMode);
 
-    if (m_codecMode == "h264_hw" || m_codecMode == "h264" || m_codecMode == "h264_sw") {
+    m_autoCodec = (m_codecMode == "auto");
+    if (m_autoCodec) {
+        // Auto advertises all mature codecs and starts with VP9. The SDP answer
+        // tells us what the Viewer can actually decode before media starts.
+        m_videoCodec = VideoCodec::VP9;
+        m_payloadType = 98;
+        LogInfo("[codec] adaptive auto mode enabled, VP9 preferred session=" + m_sessionId);
+    }
+    else if (m_codecMode == "h264_hw" || m_codecMode == "h264" || m_codecMode == "h264_sw") {
         m_videoCodec = VideoCodec::H264;
         m_payloadType = 102;
         LogInfo("[codec] WebRtcSender experimental H.264 requested mode=" + m_codecMode +
@@ -313,6 +357,161 @@ uint32_t WebRtcSender::randomU32() {
     std::mt19937 gen(rd());
     std::uniform_int_distribution<uint32_t> dist;
     return dist(gen);
+}
+
+uint32_t WebRtcSender::externalRtpTimestamp(uint64_t captureTimestampNs) {
+    // External capture publishes a monotonic timestamp in nanoseconds. Drive RTP
+    // from that real capture clock rather than from an encoder frame counter: the
+    // remote desktop intentionally changes cadence between idle/active/motion, and
+    // a synthetic fixed-FPS clock causes WebRTC playout latency to accumulate.
+    if (captureTimestampNs == 0) {
+        if (m_externalLastRtpTimestamp == 0) {
+            m_externalLastRtpTimestamp = randomU32();
+        }
+        const uint32_t step = static_cast<uint32_t>(90000u / static_cast<uint32_t>(std::max(1, m_fps)));
+        m_externalLastRtpTimestamp += std::max<uint32_t>(1u, step);
+        return m_externalLastRtpTimestamp;
+    }
+
+    if (m_externalRtpBaseCaptureNs == 0) {
+        m_externalRtpBaseCaptureNs = captureTimestampNs;
+        m_externalRtpBaseTimestamp = randomU32();
+        m_externalLastRtpTimestamp = m_externalRtpBaseTimestamp;
+        return m_externalLastRtpTimestamp;
+    }
+
+    const uint64_t deltaNs = captureTimestampNs >= m_externalRtpBaseCaptureNs
+        ? (captureTimestampNs - m_externalRtpBaseCaptureNs)
+        : 0;
+    const uint64_t delta90k = (deltaNs * 90000ull) / 1000000000ull;
+    uint32_t timestamp = m_externalRtpBaseTimestamp + static_cast<uint32_t>(delta90k);
+
+    // Multiple publications can theoretically land within the same 90 kHz tick.
+    // Keep timestamps strictly advancing for decoders while preserving wall-clock
+    // spacing for normal frames.
+    if (timestamp == m_externalLastRtpTimestamp && deltaNs != 0) {
+        ++timestamp;
+    }
+    m_externalLastRtpTimestamp = timestamp;
+    return timestamp;
+}
+
+void WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
+    if (!m_autoCodec) return;
+
+    std::string upper = sdp;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+        });
+
+    m_peerAcceptsVp9 = upper.find("A=RTPMAP:98 VP9/90000") != std::string::npos;
+    m_peerAcceptsVp8 = upper.find("A=RTPMAP:96 VP8/90000") != std::string::npos;
+    m_peerAcceptsH264 = upper.find("A=RTPMAP:102 H264/90000") != std::string::npos;
+
+    LogInfo("[codec] viewer answer capabilities session=" + m_sessionId +
+        " vp9=" + std::string(m_peerAcceptsVp9 ? "1" : "0") +
+        " vp8=" + std::string(m_peerAcceptsVp8 ? "1" : "0") +
+        " h264=" + std::string(m_peerAcceptsH264 ? "1" : "0"));
+
+    if (m_peerAcceptsVp9) {
+        switchVideoCodec(VideoCodec::VP9, "auto initial selection: Viewer accepts VP9");
+    }
+    else if (m_peerAcceptsVp8) {
+        switchVideoCodec(VideoCodec::VP8, "auto initial selection: VP9 unavailable, Viewer accepts VP8");
+    }
+    else if (m_peerAcceptsH264) {
+        switchVideoCodec(VideoCodec::H264, "auto initial selection: H.264 is the remaining accepted codec");
+    }
+    else {
+        LogInfo("[codec] adaptive offer answer exposed no recognised video payload; keeping current codec session=" + m_sessionId);
+    }
+}
+
+bool WebRtcSender::switchVideoCodec(VideoCodec codec, const std::string& reason) {
+    int payload = 96;
+    const char* name = "VP8";
+    if (codec == VideoCodec::VP9) { payload = 98; name = "VP9"; }
+    else if (codec == VideoCodec::H264) { payload = 102; name = "H.264"; }
+
+    if (codec == VideoCodec::VP9 && m_autoCodec && !m_peerAcceptsVp9) return false;
+    if (codec == VideoCodec::VP8 && m_autoCodec && !m_peerAcceptsVp8) return false;
+    if (codec == VideoCodec::H264 && m_autoCodec && !m_peerAcceptsH264) return false;
+
+    const bool changed = codec != m_videoCodec || payload != m_payloadType;
+    m_videoCodec = codec;
+    m_payloadType = payload;
+    if (!changed) return true;
+
+    // Keep SSRC/sequence/RTP clock continuous. Only the codec payload and encoder
+    // change, which lets a negotiated receiver switch decoders on a keyframe.
+    m_encoder.reset();
+    m_vp9Encoder.reset();
+    m_h264Encoder.reset();
+    m_externalEncoderWidth = 0;
+    m_externalEncoderHeight = 0;
+    m_externalConfiguredFps = 0;
+    m_externalConfiguredBitrateKbps = 0;
+    m_externalFrameCounter = 0;
+    m_codecUnhealthyWindows = 0;
+    m_forceKeyframe = true;
+    m_lastCodecSwitchAt = std::chrono::steady_clock::now();
+
+    LogInfo("[codec] live switch session=" + m_sessionId + " codec=" + name +
+        " payload=" + std::to_string(payload) + " reason=" + reason);
+    LogSupportEvent(std::string("Codec switched to ") + name + " - " + reason);
+    return true;
+}
+
+void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, double sendAvgMs) {
+    if (!m_autoCodec) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_lastCodecSwitchAt.time_since_epoch().count() != 0 &&
+        now - m_lastCodecSwitchAt < std::chrono::seconds(10)) {
+        return;
+    }
+
+    const double frameBudgetMs = 1000.0 / static_cast<double>(std::max(1, m_externalConfiguredFps));
+    const double viewerRttMs = m_viewerRttMs.load();
+    const double viewerJitterMs = m_viewerJitterMs.load();
+    const double viewerJitterBufferMs = m_viewerJitterBufferMs.load();
+    const bool encoderUnhealthy = encodeAvgMs > std::max(35.0, frameBudgetMs * 0.80) ||
+        encodeMaxMs > std::max(120.0, frameBudgetMs * 2.5);
+    const bool networkPressured = viewerRttMs > 250.0 || viewerJitterBufferMs > 250.0 || viewerJitterMs > 80.0;
+
+    if (!encoderUnhealthy) {
+        if (networkPressured) {
+            LogInfo("[codec] network pressure without encoder pressure session=" + m_sessionId +
+                " rtt_ms=" + std::to_string(viewerRttMs) +
+                " jitter_ms=" + std::to_string(viewerJitterMs) +
+                " jitter_buffer_ms=" + std::to_string(viewerJitterBufferMs) +
+                " action=hold_codec");
+        }
+        m_codecUnhealthyWindows = 0;
+        return;
+    }
+
+    ++m_codecUnhealthyWindows;
+    LogInfo("[codec] unhealthy window session=" + m_sessionId +
+        " count=" + std::to_string(m_codecUnhealthyWindows) +
+        " encode_avg_ms=" + std::to_string(encodeAvgMs) +
+        " encode_max_ms=" + std::to_string(encodeMaxMs) +
+        " send_avg_ms=" + std::to_string(sendAvgMs) +
+        " viewer_rtt_ms=" + std::to_string(viewerRttMs) +
+        " viewer_jitter_buffer_ms=" + std::to_string(viewerJitterBufferMs));
+
+    // Require two consecutive 5-second health windows before a codec change.
+    if (m_codecUnhealthyWindows < 2) return;
+
+    if (m_videoCodec == VideoCodec::H264 && m_peerAcceptsVp9 && !m_vp9Failed) {
+        switchVideoCodec(VideoCodec::VP9, "H.264 encode/send latency remained high");
+    }
+    else if (m_videoCodec == VideoCodec::VP9 && m_peerAcceptsVp8) {
+        switchVideoCodec(VideoCodec::VP8, "VP9 encode/send latency remained high");
+    }
+    else if (m_videoCodec == VideoCodec::H264 && m_peerAcceptsVp8) {
+        switchVideoCodec(VideoCodec::VP8, "H.264 latency remained high and VP9 was unavailable");
+    }
 }
 
 void WebRtcSender::ensureDirectCaptureInitialized() {
@@ -420,6 +619,14 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                 const auto msg = json::parse(*s, nullptr, false);
                 if (!msg.is_discarded()) {
                     const std::string kind = msg.value("kind", msg.value("type", ""));
+
+                    if (kind == "viewer_diagnostics") {
+                        m_viewerRttMs = msg.value("rtt_ms", 0.0);
+                        m_viewerJitterMs = msg.value("jitter_ms", 0.0);
+                        m_viewerJitterBufferMs = msg.value("jitter_buffer_ms", 0.0);
+                        m_viewerBitrateKbps = msg.value("bitrate_kbps", 0.0);
+                        return;
+                    }
 
                     // Mouse movement is high frequency and best-effort. Keep the
                     // native cursor path responsive, but do not force the expensive
@@ -693,7 +900,7 @@ void WebRtcSender::signalLocalOfferIfReady() {
 
     std::string sdp = std::string(desc.value());
 
-    if (m_videoCodec == VideoCodec::H264) {
+    if (m_videoCodec == VideoCodec::H264 || m_autoCodec) {
         sdp = normalizeOutgoingH264SdpForDesktop(sdp, m_bitrateKbps);
         std::cout << "[codec] outgoing H.264 SDP normalized session=" << m_sessionId
             << " profile_level_id=42e01f"
@@ -751,7 +958,16 @@ void WebRtcSender::createPeerConnection() {
         });
 
     rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
-    if (m_videoCodec == VideoCodec::H264) {
+    if (m_autoCodec) {
+        // Keep all adaptive candidates negotiated on the same media section/SSRC.
+        // RTP payload type can then change with a fresh keyframe without tearing
+        // down input channels or the remote session.
+        media.addVP9Codec(98);
+        media.addVP8Codec(96);
+        media.addH264Codec(102);
+        LogInfo("[codec] SDP adaptive offer VP9=98 VP8=96 H264=102 session=" + m_sessionId);
+    }
+    else if (m_videoCodec == VideoCodec::H264) {
         try {
             media.addH264Codec(m_payloadType);
             std::cout << "[codec] SDP offering experimental H.264 payload=" << m_payloadType
@@ -922,6 +1138,7 @@ void WebRtcSender::handleSignalingMessage(const std::string& jsonText) {
                 << " sdp_len=" << sdp.size()
                 << " type=" << sdpType << "\n";
 
+            selectAutoCodecFromAnswer(sdp);
             m_pc->setRemoteDescription(rtc::Description(sdp, sdpType));
 
             std::cout << "[signal] set remote description ok session=" << m_sessionId << "\n";
@@ -1447,7 +1664,7 @@ void WebRtcSender::sendH264NalPayloads(const std::vector<std::vector<uint8_t>>& 
     }
 }
 
-void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyframe) {
+void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureTimestampNs, bool forceKeyframe) {
     static std::atomic<uint64_t> rawEntryLogCounter{ 0 };
     const uint64_t rawEntryCount = ++rawEntryLogCounter;
 
@@ -1477,6 +1694,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
     std::lock_guard<std::mutex> encodeLock(m_externalEncodeMu);
 
+    const uint32_t captureRtpTimestamp = externalRtpTimestamp(captureTimestampNs);
     const auto nowForProfile = std::chrono::steady_clock::now();
     if (m_externalLastFrameAt.time_since_epoch().count() != 0) {
         const auto gapMs = std::chrono::duration_cast<std::chrono::milliseconds>(nowForProfile - m_externalLastFrameAt).count();
@@ -1612,7 +1830,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
     if (m_videoCodec == VideoCodec::VP9 && !m_vp9Failed) {
         bool vp9Scaled = false;
-        const I420Frame vp9Frame = scaleI420ForH264WebRtc(frame, &vp9Scaled);
+        const I420Frame vp9Frame = scaleI420ForVp9WebRtc(frame, &vp9Scaled);
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
 
         if (!m_vp9Encoder || sizeChangedVp9) {
@@ -1631,6 +1849,10 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     " error=" + vp9Err);
                 m_vp9Failed = true;
                 m_vp9Encoder.reset();
+                if (m_autoCodec && m_peerAcceptsVp8) {
+                    switchVideoCodec(VideoCodec::VP8, "VP9 encoder unavailable on endpoint");
+                    return;
+                }
             }
             else {
                 m_vp9Encoder = std::move(enc);
@@ -1695,6 +1917,9 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
                     m_vp9Failed = true;
                     m_vp9Encoder.reset();
+                    if (m_autoCodec && m_peerAcceptsVp8) {
+                        switchVideoCodec(VideoCodec::VP8, "VP9 encoder failed during session");
+                    }
                     return;
                 }
 
@@ -1706,6 +1931,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 ++m_externalEncodedFrames;
 
                 if (!encoded.data.empty()) {
+                    encoded.timestamp90k = captureRtpTimestamp;
                     const auto sendStart = std::chrono::steady_clock::now();
                     sendRtpVp9Frame(encoded);
                     const auto sendEnd = std::chrono::steady_clock::now();
@@ -1724,6 +1950,30 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                             " frame=" + std::to_string(vp9Frame.width) + "x" + std::to_string(vp9Frame.height) +
                             " keyframe=" + std::string(vp9Keyframe ? "true" : "false"));
                     }
+                }
+
+                const auto healthNow = std::chrono::steady_clock::now();
+                if (m_externalNextStatsLog.time_since_epoch().count() == 0) {
+                    m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
+                }
+                if (healthNow >= m_externalNextStatsLog) {
+                    const double encodedCount = std::max<uint64_t>(1, m_externalEncodedFrames);
+                    const double sentCount = std::max<uint64_t>(1, m_externalSentFrames);
+                    const double encodeAvgMs = m_externalEncodeMsTotal / encodedCount;
+                    const double sendAvgMs = m_externalSendMsTotal / sentCount;
+                    LogInfo("[vp9] encode health session=" + m_sessionId +
+                        " encode_avg_ms=" + std::to_string(encodeAvgMs) +
+                        " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+                        " send_avg_ms=" + std::to_string(sendAvgMs) +
+                        " target_fps=" + std::to_string(m_externalConfiguredFps));
+                    observeCodecHealth(encodeAvgMs, m_externalEncodeMsMax, sendAvgMs);
+                    m_externalEncodedFrames = 0;
+                    m_externalSentFrames = 0;
+                    m_externalEncodeMsTotal = 0.0;
+                    m_externalEncodeMsMax = 0.0;
+                    m_externalSendMsTotal = 0.0;
+                    m_externalSendMsMax = 0.0;
+                    m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
                 }
 
                 return;
@@ -1859,6 +2109,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 ++m_externalEncodedFrames;
 
                 if (!encoded.data.empty()) {
+                    encoded.timestamp90k = captureRtpTimestamp;
                     const auto sendStart = std::chrono::steady_clock::now();
                     sendRtpH264Frame(encoded);
                     const auto sendEnd = std::chrono::steady_clock::now();
@@ -1876,17 +2127,20 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 if (now >= m_externalNextStatsLog) {
                     const double encodedCount = std::max<uint64_t>(1, m_externalEncodedFrames);
                     const double sentCount = std::max<uint64_t>(1, m_externalSentFrames);
+                    const double encodeAvgMs = m_externalEncodeMsTotal / encodedCount;
+                    const double sendAvgMs = m_externalSendMsTotal / sentCount;
                     std::cout << "[h264] encode health session=" << m_sessionId
                         << " encoded=" << m_externalEncodedFrames
                         << " sent=" << m_externalSentFrames
-                        << " encode_avg_ms=" << (m_externalEncodeMsTotal / encodedCount)
+                        << " encode_avg_ms=" << encodeAvgMs
                         << " encode_max_ms=" << m_externalEncodeMsMax
-                        << " send_avg_ms=" << (m_externalSendMsTotal / sentCount)
+                        << " send_avg_ms=" << sendAvgMs
                         << " send_max_ms=" << m_externalSendMsMax
                         << " bitrate=" << m_externalConfiguredBitrateKbps
                         << " target_fps=" << m_externalConfiguredFps
                         << "\n";
 
+                    observeCodecHealth(encodeAvgMs, m_externalEncodeMsMax, sendAvgMs);
                     m_externalEncodedFrames = 0;
                     m_externalSentFrames = 0;
                     m_externalEncodeMsTotal = 0.0;
@@ -1926,6 +2180,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         ++m_externalEncodedFrames;
 
         if (!encoded.data.empty()) {
+            encoded.rtpTimestamp = captureRtpTimestamp;
             const auto sendStart = std::chrono::steady_clock::now();
             sendRtpVp8Frame(encoded);
             const auto sendEnd = std::chrono::steady_clock::now();
@@ -1990,6 +2245,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             catch (...) {
             }
 
+            observeCodecHealth(encodeAvgMs, m_externalEncodeMsMax, sendAvgMs);
             m_externalEncodedFrames = 0;
             m_externalSentFrames = 0;
             m_externalEncodeMsTotal = 0.0;

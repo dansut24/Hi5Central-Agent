@@ -81,6 +81,7 @@ public:
         bool keyframe);
 
     void sendExternalRawI420(const I420Frame& frame,
+        uint64_t captureTimestampNs,
         bool forceKeyframe = false);
 
 private:
@@ -92,6 +93,10 @@ private:
     void attachInputDataChannelHandlers(const std::shared_ptr<rtc::DataChannel>& dc, const std::string& label);
     bool handleBinaryMousePacket(const rtc::binary& data, const std::string& label);
     void signalLocalOfferIfReady();
+    uint32_t externalRtpTimestamp(uint64_t captureTimestampNs);
+    void selectAutoCodecFromAnswer(const std::string& sdp);
+    bool switchVideoCodec(VideoCodec codec, const std::string& reason);
+    void observeCodecHealth(double encodeAvgMs, double encodeMaxMs, double sendAvgMs);
 
     void ensureDirectCaptureInitialized();
     void startStreamingThread();
@@ -143,6 +148,12 @@ private:
     std::unique_ptr<H264MfEncoder> m_h264Encoder;
     std::unique_ptr<Vp9MfEncoder> m_vp9Encoder;
     bool m_vp9Failed = false;
+    bool m_autoCodec = false;
+    bool m_peerAcceptsVp8 = false;
+    bool m_peerAcceptsVp9 = false;
+    bool m_peerAcceptsH264 = false;
+    int m_codecUnhealthyWindows = 0;
+    std::chrono::steady_clock::time_point m_lastCodecSwitchAt{};
     VideoCodec m_videoCodec = VideoCodec::VP8;
     bool m_h264Attempted = false;
     bool m_h264Failed = false;
@@ -158,6 +169,9 @@ private:
     std::atomic<bool> m_forceKeyframe{ false };
 
     int m_externalFrameCounter = 0;
+    uint64_t m_externalRtpBaseCaptureNs = 0;
+    uint32_t m_externalRtpBaseTimestamp = 0;
+    uint32_t m_externalLastRtpTimestamp = 0;
     int m_externalEncoderWidth = 0;
     int m_externalEncoderHeight = 0;
 
@@ -182,6 +196,10 @@ private:
     std::atomic<int> m_externalLastNonIdleMode{ 2 };
     std::atomic<bool> m_externalHintBackstage{ false };
     std::atomic<bool> m_externalHintSecure{ false };
+    std::atomic<double> m_viewerRttMs{ 0.0 };
+    std::atomic<double> m_viewerJitterMs{ 0.0 };
+    std::atomic<double> m_viewerJitterBufferMs{ 0.0 };
+    std::atomic<double> m_viewerBitrateKbps{ 0.0 };
 
     int m_externalConfiguredFps = 0;
     int m_externalConfiguredBitrateKbps = 0;

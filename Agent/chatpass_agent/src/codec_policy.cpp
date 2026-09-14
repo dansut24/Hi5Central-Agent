@@ -93,13 +93,13 @@ namespace hi5 {
             return decision;
         }
 
-        decision.selectedCodec = "h264";
-        decision.encoder = "mediafoundation-h264-hw-fallback-sw";
+        decision.selectedCodec = "auto";
+        decision.encoder = "adaptive-webrtc";
         decision.fps = 20;
         decision.bitrateKbps = 6000;
-        decision.hardware = true;
+        decision.hardware = false;
         decision.stable = true;
-        decision.reason = "Auto selected H.264 with hardware attempt and software fallback";
+        decision.reason = "Auto negotiates VP9, VP8 and H.264 per session and selects from the Viewer SDP answer";
 
         return decision;
     }

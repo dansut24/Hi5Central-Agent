@@ -192,8 +192,8 @@ CodecSelectionResult ProbeCodecCapabilitiesAndSelect(const std::string& requeste
         }
     }
     else if (result.requestedMode == "auto") {
-        result.selectedCodec = "vp8";
-        result.selectedReason = "auto mode keeps VP8 stable until H.264 hardware sender passes validation; force HI5_CODEC=h264_hw for experiment";
+        result.selectedCodec = "auto";
+        result.selectedReason = "adaptive session mode: negotiate VP9/VP8/H.264 with the Viewer, prefer VP9, and fall back using live encoder health";
     }
     else {
         result.selectedCodec = "vp8";

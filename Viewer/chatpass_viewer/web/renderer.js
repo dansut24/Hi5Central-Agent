@@ -69,7 +69,7 @@ let pendingRemoteIce = [];
 
 let statsTimer = null;
 let transitionWatchdogTimer = null;
-let lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0 };
+let lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, jitterDelay: 0, jitterEmitted: 0 };
 
 let inputBound = false;
 let controlActive = false;
@@ -759,7 +759,7 @@ function stopStatsPoll() {
     clearInterval(transitionWatchdogTimer);
     transitionWatchdogTimer = null;
   }
-  lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0 };
+  lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, jitterDelay: 0, jitterEmitted: 0 };
   lastFramesDecoded = 0;
 }
 
@@ -1159,11 +1159,23 @@ async function pollStatsOnce() {
   let fps = NaN;
   let framesDecoded = null;
   let packetsLost = null;
+  let jitterMs = null;
+  let jitterBufferMs = null;
 
   if (inbound) {
     const bytesReceived = Number(inbound.bytesReceived || 0);
     framesDecoded = Number(inbound.framesDecoded || 0);
     packetsLost = Number(inbound.packetsLost || 0);
+    jitterMs = Number.isFinite(Number(inbound.jitter)) ? Number(inbound.jitter) * 1000 : null;
+    const jitterDelay = Number(inbound.jitterBufferDelay || 0);
+    const jitterEmitted = Number(inbound.jitterBufferEmittedCount || 0);
+    if (jitterEmitted > lastStats.jitterEmitted) {
+      const emittedDelta = jitterEmitted - lastStats.jitterEmitted;
+      const delayDelta = jitterDelay - lastStats.jitterDelay;
+      if (emittedDelta > 0 && delayDelta >= 0) {
+        jitterBufferMs = (delayDelta / emittedDelta) * 1000;
+      }
+    }
 
     if (framesDecoded > lastFramesDecoded) {
       lastFramesDecoded = framesDecoded;
@@ -1188,11 +1200,22 @@ async function pollStatsOnce() {
     lastStats.bytes = bytesReceived;
     lastStats.frames = framesDecoded;
     lastStats.packetsLost = packetsLost;
+    lastStats.jitterDelay = jitterDelay;
+    lastStats.jitterEmitted = jitterEmitted;
   }
 
   const rttMs = selectedPair && isFinite(selectedPair.currentRoundTripTime)
     ? Math.round(selectedPair.currentRoundTripTime * 1000)
     : null;
+
+  sendInput("viewer_diagnostics", {
+    rtt_ms: rttMs ?? 0,
+    jitter_ms: Number.isFinite(jitterMs) ? jitterMs : 0,
+    jitter_buffer_ms: Number.isFinite(jitterBufferMs) ? jitterBufferMs : 0,
+    bitrate_kbps: Number.isFinite(bitrateKbps) ? bitrateKbps : 0,
+    fps: Number.isFinite(fps) ? fps : 0,
+    packets_lost: packetsLost ?? 0,
+  }, true);
 
   const state = pc.connectionState || pc.iceConnectionState || "—";
   const brStr  = fmtKbps(bitrateKbps);

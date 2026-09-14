@@ -226,6 +226,11 @@ namespace {
 
     static void compositeCursorBgra(int originX, int originY, int width, int height,
         std::vector<uint8_t>& bgra, int stride) {
+        // The Viewer renders a predicted low-latency cursor overlay. Baking the
+        // endpoint cursor into video creates a second, delayed pointer and makes
+        // normal control feel less responsive. Keep composition as an explicit
+        // compatibility/debug override only.
+        if (!Hi5CompositeCursorEnabled()) return;
         if (width <= 0 || height <= 0 || bgra.empty() || stride <= 0) return;
 
         CURSORINFO ci{};

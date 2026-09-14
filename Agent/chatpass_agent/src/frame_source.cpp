@@ -226,6 +226,7 @@ namespace {
 
     static void compositeCursorBgra(int originX, int originY, int width, int height,
         std::vector<uint8_t>& bgra, int stride) {
+        if (!Hi5CompositeCursorEnabled()) return;
         if (width <= 0 || height <= 0 || bgra.empty() || stride <= 0) return;
 
         CURSORINFO ci{};
