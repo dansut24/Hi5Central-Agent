@@ -117,7 +117,7 @@ void PositionBanner(HWND hwnd, BannerState& state) {
     const int height = Px(heightDip, state.scale);
     const int workHeight = work.bottom - work.top;
     const int preferredY = work.top + static_cast<int>((workHeight - height) * 0.32);
-    const int y = std::max(work.top + Px(24.0f, state.scale), preferredY);
+    const int y = std::max(static_cast<int>(work.top) + Px(24.0f, state.scale), preferredY);
     const int x = work.right - width;
 
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height,
@@ -182,7 +182,7 @@ void DrawTextLine(BannerState& state,
     format->SetTextAlignment(alignment);
     format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     SetBrush(state, rgb);
-    state.renderTarget->DrawTextW(
+    state.renderTarget->DrawText(
         text.c_str(),
         static_cast<UINT32>(text.size()),
         format,
@@ -378,7 +378,7 @@ void ShowConnectionNotification(HWND hwnd, BannerState& state) {
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = kNotifyCallback;
-    nid.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
+    nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32516)); // IDI_INFORMATION
     wcscpy_s(nid.szTip, L"Hi5Central Remote Support");
 
     if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
