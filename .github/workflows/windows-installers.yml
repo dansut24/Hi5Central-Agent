@@ -3,7 +3,7 @@ name: Windows Agent and Viewer installers
 on:
   workflow_dispatch:
   push:
-    branches: [main, hardening-mobile-viewer, agent-hardening-v2]
+    branches: [main, hardening-mobile-viewer, agent-hardening-v2, ui-chat-files-sas-20260915]
     paths:
       - "Agent/**"
       - "Viewer/**"
@@ -29,6 +29,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Apply feature-branch test transforms
+        if: github.ref == 'refs/heads/ui-chat-files-sas-20260915' || github.head_ref == 'ui-chat-files-sas-20260915'
+        shell: pwsh
+        run: |
+          python ci/apply_ui_files_chat_only.py
+          if ($LASTEXITCODE -ne 0) { throw 'Chat/File UI transform failed.' }
+          python ci/apply_sas_policy_guard.py
+          if ($LASTEXITCODE -ne 0) { throw 'SAS policy transform failed.' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Transformed source failed whitespace validation.' }
+          git diff --stat
 
       - name: Verify local Windows build path is preserved
         shell: pwsh
