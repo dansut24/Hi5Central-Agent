@@ -253,6 +253,8 @@ target_link_libraries(native_vp8_stream PRIVATE
   shell32
   shlwapi
   dwmapi
+  d2d1
+  dwrite
 )
 
 if(MSVC AND HI5_REQUIRE_STATIC_CRT)

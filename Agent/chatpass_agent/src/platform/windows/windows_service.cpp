@@ -1194,6 +1194,14 @@ namespace hi5 {
             return "Global\\Hi5BannerStop_" + SafeFilePart(ShortSessionPrefixForOverlay(sessionId));
         }
 
+        static std::string SessionBannerChatEventName(const std::string& sessionId) {
+            return "Global\\Hi5BannerChat_" + SafeFilePart(ShortSessionPrefixForOverlay(sessionId));
+        }
+
+        static std::string SessionBannerEndEventName(const std::string& sessionId) {
+            return "Global\\Hi5BannerEnd_" + SafeFilePart(ShortSessionPrefixForOverlay(sessionId));
+        }
+
         static std::string SessionChatStopEventName(const std::string& sessionId) {
             return "Global\\Hi5ChatOverlayStop_" + SafeFilePart(ShortSessionPrefixForOverlay(sessionId));
         }
@@ -1391,7 +1399,11 @@ namespace hi5 {
             std::string sessionId;
             HANDLE process = nullptr;
             HANDLE stopEvent = nullptr;
+            HANDLE chatEvent = nullptr;
+            HANDLE endEvent = nullptr;
             std::string stopEventName;
+            std::string chatEventName;
+            std::string endEventName;
         };
 
         static std::mutex g_presenceBannerMu;
@@ -1427,6 +1439,8 @@ namespace hi5 {
                 CloseHandle(state.process);
             }
             if (state.stopEvent) CloseHandle(state.stopEvent);
+            if (state.chatEvent) CloseHandle(state.chatEvent);
+            if (state.endEvent) CloseHandle(state.endEvent);
         }
 
         static void StopPresenceBanners() {
@@ -1438,7 +1452,7 @@ namespace hi5 {
             for (const auto& id : ids) StopPresenceBanner(id);
         }
 
-        static void StartPresenceBanner(const std::string& sessionId, const std::string& technicianName, HANDLE sessionJob) {
+        static void StartPresenceBanner(const std::string& sessionId, const std::string& technicianName, HANDLE sessionJob, bool notifyOnStart = true) {
             if (sessionId.empty()) return;
 
             StopPresenceBanner(sessionId);
@@ -1458,17 +1472,30 @@ namespace hi5 {
 
             const std::string safeTech = technicianName.empty() ? "Technician" : technicianName;
             const std::string stopEventName = SessionBannerStopEventName(sessionId);
+            const std::string chatEventName = SessionBannerChatEventName(sessionId);
+            const std::string endEventName = SessionBannerEndEventName(sessionId);
             HANDLE stopEvent = CreateOrOpenManualResetEventA(stopEventName, false);
+            HANDLE chatEvent = CreateOrOpenManualResetEventA(chatEventName, false);
+            HANDLE endEvent = CreateOrOpenManualResetEventA(endEventName, false);
             if (stopEvent) ResetEvent(stopEvent);
+            if (chatEvent) ResetEvent(chatEvent);
+            if (endEvent) ResetEvent(endEvent);
             const std::string args = "--mode banner --session " + QuoteArg(sessionId) +
                 " --technician " + QuoteArg(safeTech) +
-                " --stop-event " + QuoteArg(stopEventName);
+                " --stop-event " + QuoteArg(stopEventName) +
+                " --chat-event " + QuoteArg(chatEventName) +
+                " --end-event " + QuoteArg(endEventName) +
+                " --notify " + std::string(notifyOnStart ? "1" : "0");
 
-            LogI("[presence] launching connected banner session=" + sessionId + " technician=" + safeTech + " stop_event=" + stopEventName);
+            LogI("[presence] launching edge support panel session=" + sessionId +
+                " technician=" + safeTech +
+                " notify=" + std::string(notifyOnStart ? "true" : "false"));
             HANDLE proc = LaunchInInteractiveSession(exe, args);
             if (!proc) {
                 LogE("[presence] banner launch failed session=" + sessionId);
                 if (stopEvent) CloseHandle(stopEvent);
+                if (chatEvent) CloseHandle(chatEvent);
+                if (endEvent) CloseHandle(endEvent);
                 return;
             }
             AssignProcessToSessionJob(sessionJob, proc, sessionId, "presence-banner");
@@ -1477,11 +1504,26 @@ namespace hi5 {
             state.sessionId = sessionId;
             state.process = proc;
             state.stopEvent = stopEvent;
+            state.chatEvent = chatEvent;
+            state.endEvent = endEvent;
             state.stopEventName = stopEventName;
+            state.chatEventName = chatEventName;
+            state.endEventName = endEventName;
             {
                 std::lock_guard<std::mutex> lock(g_presenceBannerMu);
                 g_presenceBanners[sessionId] = state;
             }
+        }
+
+        static bool ConsumePresenceBannerAction(const std::string& sessionId, bool chatAction) {
+            std::lock_guard<std::mutex> lock(g_presenceBannerMu);
+            auto it = g_presenceBanners.find(sessionId);
+            if (it == g_presenceBanners.end()) return false;
+            HANDLE eventHandle = chatAction ? it->second.chatEvent : it->second.endEvent;
+            if (!eventHandle) return false;
+            if (WaitForSingleObject(eventHandle, 0) != WAIT_OBJECT_0) return false;
+            ResetEvent(eventHandle);
+            return true;
         }
 
 
@@ -6215,6 +6257,32 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 while (!ctx.framePumpStop.load()) {
                     const auto now = std::chrono::steady_clock::now();
 
+                    if (ConsumePresenceBannerAction(ctx.sessionId, true)) {
+                        LogI("[presence] local user opened chat session=" + ctx.sessionId);
+                        EnsureChatOverlay(ctx.sessionId, ctx.sessionJob,
+                            [this](const std::string& sid, const std::string& replyBody) {
+                                AppendChatTranscript(sid, "user", "Remote user", replyBody);
+                                if (signaling_) {
+                                    json out = {
+                                        {"type", "chat_message"},
+                                        {"session_id", sid},
+                                        {"sender", "user"},
+                                        {"display_name", "Remote user"},
+                                        {"body", replyBody},
+                                        {"unix_ms", NowUnixMs()}
+                                    };
+                                    signaling_->send(out.dump());
+                                }
+                            });
+                    }
+
+                    if (ConsumePresenceBannerAction(ctx.sessionId, false)) {
+                        LogI("[presence] local user ending remote session=" + ctx.sessionId);
+                        const std::string sid = ctx.sessionId;
+                        std::thread([this, sid]() { StopSession(sid); }).detach();
+                        return;
+                    }
+
                     // Prefer authoritative SCM/WTS session lifecycle events over polling.
                     // A LOGOFF event latches the stream onto Winlogon immediately, even if
                     // WTSQueryUserToken still temporarily succeeds for the dying desktop.
@@ -6807,7 +6875,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     " input=normal");
 
                                 if (ctx.bannerRebindPending && ctx.sessionMode == SessionMode::Console) {
-                                    StartPresenceBanner(ctx.sessionId, ctx.technicianName, ctx.sessionJob);
+                                    StartPresenceBanner(ctx.sessionId, ctx.technicianName, ctx.sessionJob, false);
                                     ctx.bannerConsoleSessionId = ctx.activeConsoleSessionId;
                                     ctx.bannerRebindPending = false;
                                     LogI("[session-handoff] presence rebound session=" + ctx.sessionId +
