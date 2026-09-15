@@ -1,4 +1,4 @@
-name: Sync chat files CAD checkpoint
+name: Sync chat files mobile CAD checkpoint
 
 on:
   push:
@@ -20,28 +20,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download and verify chat files CAD snapshot
+      - name: Download and verify chat files mobile CAD snapshot
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/chat-files-cad-a9e4b47.tar.gz \
-            -o /tmp/chat-files-cad-a9e4b47.tar.gz
-          echo "81ff593a03a0f7b340bb1339c2dcf1283f8f01d6a981353df94e7fca15347ade  /tmp/chat-files-cad-a9e4b47.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/chat-files-mobile-cad-0a03d82.tar.gz \
+            -o /tmp/chat-files-mobile-cad-0a03d82.tar.gz
+          echo "63b652a5e0cd23e2de663a60b2ad2d6f96efc5e66a0fd545aec59c5b6eb5f1ee  /tmp/chat-files-mobile-cad-0a03d82.tar.gz" | sha256sum -c -
 
       - name: Apply exact changed files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/chat-files-cad
-          tar -xzf /tmp/chat-files-cad-a9e4b47.tar.gz -C /tmp/chat-files-cad
-          cp -a /tmp/chat-files-cad/. .
+          mkdir -p /tmp/chat-files-mobile-cad
+          tar -xzf /tmp/chat-files-mobile-cad-0a03d82.tar.gz -C /tmp/chat-files-mobile-cad
+          cp -a /tmp/chat-files-mobile-cad/. .
           git add \
             Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
             Agent/chatpass_agent/src/ui/native_chat_window.cpp \
-            Agent/chatpass_agent/src/ui/native_chat_window.h \
             Viewer/chatpass_viewer/src/app/viewer_app.cpp \
             Viewer/chatpass_viewer/web/file_browser.html \
+            Viewer/chatpass_viewer/web/index.html \
             Viewer/chatpass_viewer/web/renderer.js
           git status --short
 
@@ -55,5 +55,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Sync chat files CAD checkpoint"
+          git commit -m "Sync chat files mobile CAD checkpoint"
           git push origin HEAD:agent-hardening-v2
