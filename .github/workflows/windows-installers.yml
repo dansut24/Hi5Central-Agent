@@ -124,3 +124,5 @@ jobs:
           git add latest
           git commit -m "Publish Windows test build 0.1.${{ github.run_number }}"
           git push --force origin HEAD:build-output
+
+# Validation trigger: 0a03d82
