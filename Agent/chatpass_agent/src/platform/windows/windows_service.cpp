@@ -1577,15 +1577,21 @@ namespace hi5 {
 
         static HANDLE CreateMessagePipeServer(const std::string& pipeName, DWORD openMode) {
             const std::wstring wName = ToWidePath(pipeName);
-            return CreateNamedPipeW(
-                wName.c_str(),
-                openMode,
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            SECURITY_ATTRIBUTES sa{};
+            sa.nLength = sizeof(sa);
+            sa.bInheritHandle = FALSE;
+            if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+                "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)(A;;GA;;;WD)",
+                SDDL_REVISION_1, &sd, nullptr)) {
+                sa.lpSecurityDescriptor = sd;
+            }
+            HANDLE pipe = CreateNamedPipeW(
+                wName.c_str(), openMode,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                1,
-                65536,
-                65536,
-                0,
-                nullptr);
+                1, 65536, 65536, 0, sa.lpSecurityDescriptor ? &sa : nullptr);
+            if (sd) LocalFree(sd);
+            return pipe;
         }
 
         static void FlushQueuedChatToOverlay(ChatOverlayState* state) {
@@ -2205,6 +2211,21 @@ LogI(
 
                     if (type == "remote_file_upload_request") {
                         HandleRemoteFileUploadRequest(sessionId, msg);
+                        return;
+                    }
+
+                    if (type == "remote_file_upload_start") {
+                        HandleRemoteFileUploadStart(sessionId, msg);
+                        return;
+                    }
+
+                    if (type == "remote_file_upload_chunk") {
+                        HandleRemoteFileUploadChunk(sessionId, msg);
+                        return;
+                    }
+
+                    if (type == "remote_file_upload_complete_request") {
+                        HandleRemoteFileUploadComplete(sessionId, msg);
                         return;
                     }
 
@@ -5665,6 +5686,86 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 }
             }
 
+            struct IncomingFileUpload {
+                std::filesystem::path target;
+                std::unique_ptr<std::ofstream> stream;
+                std::uint64_t expected = 0;
+                std::uint64_t received = 0;
+            };
+
+            static std::string FileUploadKey(const std::string& sessionId, const std::string& transferId) {
+                return sessionId + "|" + transferId;
+            }
+
+            void HandleRemoteFileUploadStart(const std::string& sessionId, const json& msg) {
+                namespace fs = std::filesystem;
+                const std::string transferId = msg.value("transfer_id", std::string());
+                const std::string path = msg.value("path", std::string());
+                if (transferId.empty() || path.empty()) {
+                    SendFileError(sessionId, "remote_file_upload", path, "Missing upload transfer id or target path");
+                    return;
+                }
+                try {
+                    fs::path target = ResolveRemotePath(path);
+                    if (target.empty()) { SendFileError(sessionId, "remote_file_upload", path, "Invalid target path"); return; }
+                    if (!target.parent_path().empty()) fs::create_directories(target.parent_path());
+                    auto stream = std::make_unique<std::ofstream>(target, std::ios::binary | std::ios::trunc);
+                    if (!*stream) { SendFileError(sessionId, "remote_file_upload", path, "Could not open file for chunked upload"); return; }
+                    auto state = std::make_unique<IncomingFileUpload>();
+                    state->target = target;
+                    state->stream = std::move(stream);
+                    state->expected = msg.value("size", static_cast<std::uint64_t>(0));
+                    { std::lock_guard<std::mutex> lock(fileUploadsMu_); fileUploads_[FileUploadKey(sessionId, transferId)] = std::move(state); }
+                    SendFilePayloadToViewer(sessionId, json{{"type","remote_file_upload_started"},{"transfer_id",transferId},{"path",path}});
+                } catch (const std::exception& ex) { SendFileError(sessionId, "remote_file_upload", path, ex.what()); }
+            }
+
+            void HandleRemoteFileUploadChunk(const std::string& sessionId, const json& msg) {
+                const std::string transferId = msg.value("transfer_id", std::string());
+                const std::string path = msg.value("path", std::string());
+                const std::vector<unsigned char> bytes = Base64Decode(msg.value("data", std::string()));
+                std::lock_guard<std::mutex> lock(fileUploadsMu_);
+                auto it = fileUploads_.find(FileUploadKey(sessionId, transferId));
+                if (it == fileUploads_.end() || !it->second || !it->second->stream) return;
+                if (!bytes.empty()) it->second->stream->write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                if (!*it->second->stream) {
+                    fileUploads_.erase(it);
+                    SendFileError(sessionId, "remote_file_upload", path, "Failed while writing upload chunk");
+                    return;
+                }
+                it->second->received += static_cast<std::uint64_t>(bytes.size());
+            }
+
+            void HandleRemoteFileUploadComplete(const std::string& sessionId, const json& msg) {
+                const std::string transferId = msg.value("transfer_id", std::string());
+                const std::string path = msg.value("path", std::string());
+                std::filesystem::path target;
+                std::uint64_t received = 0;
+                std::uint64_t expected = 0;
+                {
+                    std::lock_guard<std::mutex> lock(fileUploadsMu_);
+                    auto it = fileUploads_.find(FileUploadKey(sessionId, transferId));
+                    if (it == fileUploads_.end() || !it->second) { SendFileError(sessionId, "remote_file_upload", path, "Upload transfer was not found"); return; }
+                    target = it->second->target; received = it->second->received; expected = it->second->expected;
+                    if (it->second->stream) { it->second->stream->flush(); it->second->stream->close(); }
+                    fileUploads_.erase(it);
+                }
+                if (expected && received != expected) {
+                    SendFileError(sessionId, "remote_file_upload", path, "Upload size mismatch");
+                    return;
+                }
+                SendFilePayloadToViewer(sessionId, json{{"type","remote_file_upload_complete"},{"transfer_id",transferId},{"path",path},{"size",received}});
+                HandleRemoteFileListRequest(sessionId, target.parent_path().string());
+            }
+
+            void CancelFileUploadsForSession(const std::string& sessionId) {
+                std::lock_guard<std::mutex> lock(fileUploadsMu_);
+                const std::string prefix = sessionId + "|";
+                for (auto it = fileUploads_.begin(); it != fileUploads_.end(); ) {
+                    if (it->first.rfind(prefix, 0) == 0) it = fileUploads_.erase(it); else ++it;
+                }
+            }
+
             void HandleRemoteFileUploadRequest(const std::string& sessionId, const json& msg) {
                 namespace fs = std::filesystem;
                 const std::string path = msg.value("path", std::string());
@@ -7144,6 +7245,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     LogW("[display-state] endpoint geometry differs from remote-session start session=" + sessionId);
                 }
 
+                CancelFileUploadsForSession(sessionId);
                 LogSupportEvent("Remote session ended");
                 LogI("session stopped=" + sessionId);
                 if (!HasActiveSessions()) {
@@ -7171,6 +7273,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
             std::mutex sessionsMu_;
             std::unordered_map<std::string, std::unique_ptr<SessionContext>> sessions_;
+            std::mutex fileUploadsMu_;
+            std::unordered_map<std::string, std::unique_ptr<IncomingFileUpload>> fileUploads_;
         };
 
         static std::unique_ptr<Worker> g_worker;

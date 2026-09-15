@@ -806,7 +806,7 @@ textarea:focus{border-color:#93b9ff;box-shadow:0 0 0 3px rgba(37,99,235,.09)}
                     LogInfo("[viewer-files] creating native file browser WebView window");
                     webview::webview file(true, nullptr);
                     file.set_title("Hi5Central File Browser");
-                    file.set_size(1120, 740, WEBVIEW_HINT_NONE);
+                    file.set_size(1440, 820, WEBVIEW_HINT_NONE);
 
                     file.bind("hi5FileReady", [bridge](std::string) -> std::string { { std::lock_guard<std::mutex> lock(bridge->mutex); bridge->fileReady = true; } FlushFileQueue(bridge); return "true"; });
                     file.bind("hi5FileClose", [&file](std::string) -> std::string { file.terminate(); return "true"; });
@@ -904,8 +904,8 @@ textarea:focus{border-color:#93b9ff;box-shadow:0 0 0 3px rgba(37,99,235,.09)}
                         const int workHeight = static_cast<int>(work.bottom - work.top);
                         const int availWidth = std::max<int>(280, workWidth - 32);
                         const int availHeight = std::max<int>(260, workHeight - 32);
-                        const int width = std::min<int>(1120, availWidth);
-                        const int height = std::min<int>(740, availHeight);
+                        const int width = std::min<int>(1440, availWidth);
+                        const int height = std::min<int>(820, availHeight);
                         const int minWidth = std::min<int>(520, availWidth);
                         const int minHeight = std::min<int>(420, availHeight);
                         file.set_size(minWidth, minHeight, WEBVIEW_HINT_MIN);

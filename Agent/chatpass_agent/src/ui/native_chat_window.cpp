@@ -614,7 +614,8 @@ namespace hi5 {
             std::lock_guard<std::mutex> lock(outMu);
             WriteChatHelperLine(outPipe, {{"type", "overlay_ready"}, {"session_id", sessionId}});
         }
-        LogInfo("[native-chat] ready session=" + sessionId);
+        window.Show();
+        LogInfo("[native-chat] ready and shown session=" + sessionId);
 
         std::string pending;
         char buffer[8192];

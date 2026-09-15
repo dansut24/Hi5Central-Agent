@@ -22,6 +22,9 @@ const elFilesClose   = document.getElementById("files-close");
 const elChatClose    = document.getElementById("chat-close");
 const elFilePath     = document.getElementById("file-path");
 const elFileRefresh  = document.getElementById("file-refresh");
+const elFileUpload   = document.getElementById("file-upload");
+const elFileUploadInput = document.getElementById("file-upload-input");
+const elFileMobileStatus = document.getElementById("file-mobile-status");
 const elFileList     = document.getElementById("file-list");
 const elChatLog      = document.getElementById("chat-log");
 const elChatInput    = document.getElementById("chat-input");
@@ -147,6 +150,7 @@ function setOverlayMode(mode) {
   elOverlay.classList.toggle("secure-black", mode === "secure-black");
   elOverlay.classList.toggle("silent", mode === "silent");
   elOverlay.classList.toggle("secure-black-silent", mode === "secure-black-silent");
+  elOverlay.classList.toggle("transition-hold", mode === "transition-hold");
 }
 
 function showOverlay(title, sub, {
@@ -200,12 +204,17 @@ function showPassiveOverlay() {
 function showSecureBlackOverlay({ spinner = false } = {}) {
   passiveOverlayActive = false;
   secureDesktopActive = true;
-  showOverlay("", "", {
-    spinner,
-    keepVideo: false,
-    secureBlack: true,
-    silent: true
-  });
+  if (hasEverRenderedFrame) {
+    if (elOverlay) {
+      elOverlay.classList.remove("hidden", "passive", "secure-black", "secure-black-silent");
+      elOverlay.classList.add("silent", "transition-hold");
+    }
+    if (elVideo) elVideo.classList.add("visible");
+    if (elStatsBar) elStatsBar.classList.add("visible");
+    hideRemoteCursor();
+    return;
+  }
+  showOverlay("", "", { spinner, keepVideo: false, secureBlack: true, silent: true });
 }
 
 function clearSecureDesktopState() {
@@ -571,21 +580,124 @@ function renderChat() {
   elChatLog.scrollTop = elChatLog.scrollHeight;
 }
 
+function setMobileFileStatus(text) {
+  if (elFileMobileStatus) elFileMobileStatus.textContent = text || "";
+}
+
+function joinRemoteFilePath(base, name) {
+  base = String(base || "/");
+  name = String(name || "").replace(/^[\\/]+/, "");
+  if (!base || base === "/") return "/" + name;
+  if (/[\\/]$/.test(base)) return base + name;
+  return base + (base.includes("\\") ? "\\" : "/") + name;
+}
+
+function base64ToBytes(data) {
+  const bin = atob(String(data || ""));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    bin += String.fromCharCode(...bytes.subarray(i, Math.min(bytes.length, i + step)));
+  }
+  return btoa(bin);
+}
+
+function saveBrowserFile(name, parts) {
+  const blob = new Blob(parts, { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name || "download";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+const browserDownloadPaths = new Set();
+const browserChunkDownloads = new Map();
+
+function requestBrowserDownload(entry) {
+  const path = String(entry?.path || "");
+  if (!path) return;
+  browserDownloadPaths.add(path);
+  setMobileFileStatus(`Downloading ${entry.name || "file"}…`);
+  if (!sendRemoteFileRequest("remote_file_download_request", { path })) {
+    browserDownloadPaths.delete(path);
+    setMobileFileStatus("Could not start download.");
+  }
+}
+
+async function uploadBrowserFiles(files) {
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  const inlineBytes = 384 * 1024;
+  const chunkBytes = 48 * 1024;
+  for (const file of list) {
+    const dest = joinRemoteFilePath(remoteFilePath, file.name);
+    setMobileFileStatus(`Uploading ${file.name}…`);
+    if (file.size <= inlineBytes) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (!sendRemoteFileRequest("remote_file_upload_request", { path: dest, data: bytesToBase64(bytes) })) {
+        setMobileFileStatus(`Could not upload ${file.name}.`);
+        break;
+      }
+      continue;
+    }
+    const transferId = `ul-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    if (!sendRemoteFileRequest("remote_file_upload_start", { transfer_id: transferId, path: dest, name: file.name, size: file.size })) {
+      setMobileFileStatus(`Could not start upload for ${file.name}.`);
+      break;
+    }
+    let offset = 0;
+    let chunkIndex = 0;
+    while (offset < file.size) {
+      const end = Math.min(file.size, offset + chunkBytes);
+      const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+      if (!sendRemoteFileRequest("remote_file_upload_chunk", { transfer_id: transferId, path: dest, chunk_index: chunkIndex++, offset, size: bytes.length, data: bytesToBase64(bytes) })) {
+        setMobileFileStatus(`Upload interrupted for ${file.name}.`);
+        return;
+      }
+      offset = end;
+      setMobileFileStatus(`Uploading ${file.name}… ${Math.round(offset / file.size * 100)}%`);
+      if ((chunkIndex % 8) === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    sendRemoteFileRequest("remote_file_upload_complete_request", { transfer_id: transferId, path: dest, size: file.size });
+  }
+}
+
 function renderRemoteFiles() {
   if (!elFileList) return;
   elFileList.innerHTML = "";
   for (const entry of remoteFileEntries) {
     const row = document.createElement("div");
     row.className = "file-entry";
+    const main = document.createElement("div");
+    main.className = "file-main";
     const title = document.createElement("div");
     title.textContent = `${entry.is_dir ? "📁" : "📄"} ${entry.name}`;
     const meta = document.createElement("div");
     meta.className = "file-meta";
     meta.textContent = entry.is_dir ? "Folder" : `${entry.size || 0} bytes`;
-    row.appendChild(title);
-    row.appendChild(meta);
+    main.appendChild(title);
+    main.appendChild(meta);
+    row.appendChild(main);
     if (entry.is_dir) {
       row.addEventListener("click", () => requestRemoteFileList(entry.path || entry.name));
+    } else {
+      const dl = document.createElement("button");
+      dl.className = "file-download";
+      dl.type = "button";
+      dl.textContent = "Download";
+      dl.addEventListener("click", (ev) => { ev.stopPropagation(); requestBrowserDownload(entry); });
+      row.appendChild(dl);
     }
     elFileList.appendChild(row);
   }
@@ -2012,20 +2124,73 @@ async function onSignalMessage(raw) {
     }
 
     case "remote_file_download": {
-      const localDir = pendingRemoteDownloads.get(String(msg.path || ""));
+      const path = String(msg.path || "");
+      if (browserDownloadPaths.has(path)) {
+        browserDownloadPaths.delete(path);
+        saveBrowserFile(msg.name || "download", [base64ToBytes(msg.data || "")]);
+        setMobileFileStatus(`Downloaded ${msg.name || "file"}.`);
+        break;
+      }
+      const localDir = pendingRemoteDownloads.get(path);
       if (localDir) {
         msg.local_dir = localDir;
-        pendingRemoteDownloads.delete(String(msg.path || ""));
+        pendingRemoteDownloads.delete(path);
       }
       postFileToNativeWindow(msg);
       break;
     }
 
-    case "file_transfer_start":
-    case "file_transfer_chunk":
-    case "file_transfer_complete":
-    case "file_transfer_error":
-    case "remote_file_upload_complete":
+    case "file_transfer_start": {
+      const path = String(msg.path || "");
+      if (msg.direction === "download" && browserDownloadPaths.has(path)) {
+        browserDownloadPaths.delete(path);
+        browserChunkDownloads.set(String(msg.transfer_id || ""), { name: msg.name || "download", parts: [], received: 0, total: Number(msg.size || 0) });
+        setMobileFileStatus(`Downloading ${msg.name || "file"}…`);
+        break;
+      }
+      postFileToNativeWindow(msg);
+      break;
+    }
+    case "file_transfer_chunk": {
+      const st = browserChunkDownloads.get(String(msg.transfer_id || ""));
+      if (st) {
+        st.parts.push(base64ToBytes(msg.data || ""));
+        st.received += Number(msg.size || 0);
+        const pct = st.total ? Math.min(100, Math.round(st.received / st.total * 100)) : 0;
+        setMobileFileStatus(`Downloading ${st.name}… ${pct}%`);
+        break;
+      }
+      postFileToNativeWindow(msg);
+      break;
+    }
+    case "file_transfer_complete": {
+      const id = String(msg.transfer_id || "");
+      const st = browserChunkDownloads.get(id);
+      if (st) {
+        browserChunkDownloads.delete(id);
+        saveBrowserFile(st.name, st.parts);
+        setMobileFileStatus(`Downloaded ${st.name}.`);
+        break;
+      }
+      postFileToNativeWindow(msg);
+      break;
+    }
+    case "file_transfer_error": {
+      const id = String(msg.transfer_id || "");
+      if (browserChunkDownloads.has(id)) {
+        browserChunkDownloads.delete(id);
+        setMobileFileStatus(msg.error || "File transfer failed.");
+        break;
+      }
+      postFileToNativeWindow(msg);
+      break;
+    }
+    case "remote_file_upload_complete": {
+      setMobileFileStatus("Upload complete.");
+      requestRemoteFileList(remoteFilePath || "/");
+      postFileToNativeWindow(msg);
+      break;
+    }
     case "remote_file_delete_complete":
     case "remote_file_mkdir_complete":
     case "remote_file_rename_complete":
@@ -2211,5 +2376,11 @@ if (elBtnChat) elBtnChat.addEventListener("click", () => toggleChatPanel(true));
 if (elFilesClose) elFilesClose.addEventListener("click", () => toggleFilesPanel(false));
 if (elChatClose) elChatClose.addEventListener("click", () => toggleChatPanel(false));
 if (elFileRefresh) elFileRefresh.addEventListener("click", () => requestRemoteFileList(elFilePath?.value || "/"));
+if (elFileUpload) elFileUpload.addEventListener("click", () => elFileUploadInput?.click());
+if (elFileUploadInput) elFileUploadInput.addEventListener("change", async () => {
+  await uploadBrowserFiles(elFileUploadInput.files);
+  elFileUploadInput.value = "";
+  requestRemoteFileList(remoteFilePath || "/");
+});
 if (elChatSend) elChatSend.addEventListener("click", sendChatMessage);
 if (elChatInput) elChatInput.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChatMessage(); } });
