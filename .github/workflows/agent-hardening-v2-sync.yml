@@ -25,16 +25,16 @@ jobs:
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/native-support-panel-2f3bd75.tar.gz \
-            -o /tmp/native-support-panel-2f3bd75.tar.gz
-          echo "a0146e574b1d1c33d34148a1d312880d838bb18020a630031b9ac5715de8743c  /tmp/native-support-panel-2f3bd75.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/native-support-panel-deed331.tar.gz \
+            -o /tmp/native-support-panel-deed331.tar.gz
+          echo "afaa7dfcb6b0f06d163a014bf3d5c67030011884fe7d891f30f30752675d4420  /tmp/native-support-panel-deed331.tar.gz" | sha256sum -c -
 
       - name: Apply exact changed files
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p /tmp/native-support-panel
-          tar -xzf /tmp/native-support-panel-2f3bd75.tar.gz -C /tmp/native-support-panel
+          tar -xzf /tmp/native-support-panel-deed331.tar.gz -C /tmp/native-support-panel
           cp -a /tmp/native-support-panel/. .
           git add Agent/chatpass_agent/CMakeLists.txt \
             Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
@@ -52,5 +52,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Sync native remote support edge panel"
+          git commit -m "Sync native support panel compile fix"
           git push origin HEAD:agent-hardening-v2
