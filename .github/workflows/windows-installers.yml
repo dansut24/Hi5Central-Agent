@@ -38,6 +38,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Chat/File UI transform failed.' }
           python ci/apply_native_chat_theme.py
           if ($LASTEXITCODE -ne 0) { throw 'Native Chat theme transform failed.' }
+          python ci/apply_viewer_chat_theme.py
+          if ($LASTEXITCODE -ne 0) { throw 'Viewer Chat theme transform failed.' }
           python ci/apply_sas_policy_guard.py
           if ($LASTEXITCODE -ne 0) { throw 'SAS policy transform failed.' }
           git diff --check
