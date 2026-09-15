@@ -74,6 +74,9 @@ namespace hi5 {
         HWND editBox_{ nullptr };
         HWND sendButton_{ nullptr };
         HFONT font_{ nullptr };
+        HFONT titleFont_{ nullptr };
+        HBRUSH backgroundBrush_{ nullptr };
+        HBRUSH controlBrush_{ nullptr };
 
         HANDLE readyEvent_{ nullptr };
 

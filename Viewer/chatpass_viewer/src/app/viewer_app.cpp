@@ -491,21 +491,22 @@ namespace hi5 {
 <title>Hi5Central Support Chat</title>
 <style>
 *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#0b1020;color:#eef2ff}
-.shell{height:100vh;display:flex;flex-direction:column;background:linear-gradient(180deg,#111827 0%,#0b1020 100%)}
-.head{height:72px;display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.08);background:rgba(15,23,42,.94)}
-.badge{width:38px;height:38px;border-radius:14px;background:linear-gradient(135deg,#6366f1,#06b6d4);display:flex;align-items:center;justify-content:center;font-weight:900;box-shadow:0 10px 26px rgba(99,102,241,.34)}
-.titles{min-width:0;flex:1}.title{font-weight:800;font-size:14px;letter-spacing:-.2px}.sub{font-size:12px;color:rgba(238,242,255,.58);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.x{border:0;background:rgba(255,255,255,.08);color:#e5e7eb;border-radius:12px;width:34px;height:34px;font-size:16px;cursor:pointer}.x:hover{background:rgba(248,113,113,.25);color:#fff}
-.messages{flex:1;overflow:auto;padding:18px 16px 12px;scroll-behavior:smooth}.empty{height:100%;display:flex;align-items:center;justify-content:center;text-align:center;color:rgba(238,242,255,.48);font-size:13px;line-height:1.5;padding:22px}
-.row{display:flex;flex-direction:column;margin:0 0 12px;max-width:86%}.row.tech{margin-left:auto;align-items:flex-end}.row.user{margin-right:auto;align-items:flex-start}
-.meta{font-size:11px;color:rgba(238,242,255,.48);margin:0 8px 5px}.bubble{border-radius:18px;padding:10px 12px;font-size:13px;line-height:1.42;white-space:pre-wrap;word-break:break-word;box-shadow:0 8px 24px rgba(0,0,0,.18)}
-.tech .bubble{background:linear-gradient(135deg,#4f46e5,#2563eb);color:white;border-bottom-right-radius:6px}.user .bubble{background:rgba(255,255,255,.09);color:#eef2ff;border:1px solid rgba(255,255,255,.08);border-bottom-left-radius:6px}
-.compose{border-top:1px solid rgba(255,255,255,.08);background:rgba(15,23,42,.92);padding:12px;display:flex;gap:10px;align-items:flex-end}
-textarea{flex:1;min-height:42px;max-height:108px;resize:none;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.07);color:#f8fafc;border-radius:16px;padding:11px 12px;font:13px/1.35 inherit;outline:none}
-textarea:focus{border-color:rgba(99,102,241,.7);box-shadow:0 0 0 3px rgba(99,102,241,.18)}
-.send{border:0;border-radius:15px;background:#6366f1;color:#fff;min-width:70px;height:42px;font-weight:800;cursor:pointer}.send:hover{background:#5457e8}.send:disabled{opacity:.45;cursor:default}
-@media(prefers-color-scheme:light){body{background:#f8fafc;color:#0f172a}.shell{background:#fff}.head{background:rgba(255,255,255,.95);border-color:rgba(15,23,42,.08)}.title{color:#0f172a}.sub{color:rgba(15,23,42,.56)}.x{background:rgba(15,23,42,.06);color:#334155}.messages{background:#f8fafc}.empty{color:rgba(15,23,42,.5)}.meta{color:rgba(15,23,42,.5)}.user .bubble{background:#fff;color:#0f172a;border-color:rgba(15,23,42,.08)}.compose{background:#fff;border-color:rgba(15,23,42,.08)}textarea{background:#f8fafc;color:#0f172a;border-color:rgba(15,23,42,.12)}}
+:root{--bg:#f7f9fc;--surface:#ffffff;--surface2:#f8fafc;--border:#dbe3ec;--text:#111827;--muted:#64748b;--accent:#2563eb;--accent-soft:#eff6ff;--success:#22c55e}
+body{font-family:"Segoe UI Variable","Segoe UI",Arial,sans-serif;background:var(--bg);color:var(--text)}
+.shell{height:100dvh;display:flex;flex-direction:column;background:var(--bg)}
+.head{min-height:68px;display:flex;align-items:center;gap:11px;padding:12px 14px;border-bottom:1px solid var(--border);background:rgba(248,250,252,.97)}
+.badge{width:36px;height:36px;flex:0 0 auto;border-radius:10px;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;box-shadow:0 8px 20px rgba(37,99,235,.22)}
+.titles{min-width:0;flex:1}.title{font-weight:750;font-size:15px;letter-spacing:-.15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.sub{font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.x{border:1px solid var(--border);background:var(--surface);color:#475569;border-radius:9px;width:34px;height:34px;font-size:15px;cursor:pointer}.x:hover{background:#fff5f5;border-color:#fecaca;color:#dc2626}
+.messages{flex:1;min-height:0;overflow:auto;padding:14px 13px 10px;scroll-behavior:smooth}.empty{height:100%;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--muted);font-size:12px;line-height:1.5;padding:20px}
+.row{display:flex;flex-direction:column;margin:0 0 11px;max-width:88%}.row.tech{margin-left:auto;align-items:flex-end}.row.user{margin-right:auto;align-items:flex-start}
+.meta{font-size:10px;color:var(--muted);margin:0 7px 4px}.bubble{border-radius:14px;padding:9px 11px;font-size:13px;line-height:1.42;white-space:pre-wrap;word-break:break-word;box-shadow:0 6px 18px rgba(15,23,42,.08)}
+.tech .bubble{background:var(--accent);color:#fff;border-bottom-right-radius:5px}.user .bubble{background:var(--surface);color:var(--text);border:1px solid var(--border);border-bottom-left-radius:5px}
+.compose{border-top:1px solid var(--border);background:var(--surface2);padding:10px;display:flex;gap:8px;align-items:flex-end}
+textarea{flex:1;min-width:0;min-height:40px;max-height:104px;resize:none;border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:11px;padding:10px 11px;font:13px/1.35 inherit;outline:none}
+textarea:focus{border-color:#93b9ff;box-shadow:0 0 0 3px rgba(37,99,235,.09)}
+.send{border:1px solid var(--accent);border-radius:10px;background:var(--accent);color:#fff;min-width:68px;height:40px;font-weight:750;cursor:pointer}.send:hover{background:#1d4ed8}.send:disabled{opacity:.45;cursor:default}
+@media(max-width:360px){.head{padding:9px 10px;min-height:58px}.badge{width:32px;height:32px}.title{font-size:14px}.sub{display:none}.messages{padding:10px 8px}.compose{padding:8px;gap:6px}.send{min-width:58px}.row{max-width:94%}}
 </style>
 </head>
 <body>
@@ -521,7 +522,7 @@ textarea:focus{border-color:rgba(99,102,241,.7);box-shadow:0 0 0 3px rgba(99,102
   function bodyOf(m){return String((m&&(m.body??m.message??m.text??m.content))||'').trim()}
   function add(m){const body=bodyOf(m);if(!body)return;if(empty)empty.style.display='none';const sender=normSender(m.sender);const row=document.createElement('div');row.className='row '+sender;const meta=document.createElement('div');meta.className='meta';meta.textContent=m.display_name||m.displayName||(sender==='tech'?'Technician':'Remote user');const bubble=document.createElement('div');bubble.className='bubble';bubble.textContent=body;row.appendChild(meta);row.appendChild(bubble);messages.appendChild(row);messages.scrollTop=messages.scrollHeight}
   window.__hi5ChatReceive=function(m){try{if(typeof m==='string')m=JSON.parse(m);add(m)}catch(e){console.error(e)}};
-  async function doSend(){const body=input.value.trim();if(!body)return;input.value='';try{if(window.hi5ChatSend)await window.hi5ChatSend(body);add({sender:'tech',display_name:'Technician',body});}catch(e){console.error(e)}}
+  async function doSend(){const body=input.value.trim();if(!body)return;input.value='';try{if(window.hi5ChatSend)await window.hi5ChatSend(body);}catch(e){console.error(e)}}
   send.addEventListener('click',doSend);
   input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doSend()}});
   closeBtn.addEventListener('click',()=>{try{if(window.hi5ChatClose)window.hi5ChatClose('');else window.close()}catch(e){}});
@@ -901,12 +902,14 @@ textarea:focus{border-color:rgba(99,102,241,.7);box-shadow:0 0 0 3px rgba(99,102
                         RECT work{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
                         const int workWidth = static_cast<int>(work.right - work.left);
                         const int workHeight = static_cast<int>(work.bottom - work.top);
-                        const int maxWidth = std::max<int>(860, workWidth);
-                        const int maxHeight = std::max<int>(560, workHeight);
-                        const int width = std::min<int>(1120, maxWidth);
-                        const int height = std::min<int>(740, maxHeight);
-                        file.set_size(900, 600, WEBVIEW_HINT_MIN);
-                        file.set_size(32000, 32000, WEBVIEW_HINT_MAX);
+                        const int availWidth = std::max<int>(280, workWidth - 32);
+                        const int availHeight = std::max<int>(260, workHeight - 32);
+                        const int width = std::min<int>(1120, availWidth);
+                        const int height = std::min<int>(740, availHeight);
+                        const int minWidth = std::min<int>(520, availWidth);
+                        const int minHeight = std::min<int>(420, availHeight);
+                        file.set_size(minWidth, minHeight, WEBVIEW_HINT_MIN);
+                        file.set_size(workWidth, workHeight, WEBVIEW_HINT_MAX);
                         LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
                         // Use the normal Windows title bar/minimise/maximise/close controls.
                         // This preserves Windows Snap Assist and avoids crashes caused by custom maximise/minimise handling.
@@ -1014,7 +1017,7 @@ textarea:focus{border-color:rgba(99,102,241,.7);box-shadow:0 0 0 3px rgba(99,102
                     LogInfo("[viewer-chat] creating native chat WebView window");
                     webview::webview chat(true, nullptr);
                     chat.set_title("Hi5Central Support Chat");
-                    chat.set_size(380, 560, WEBVIEW_HINT_NONE);
+                    chat.set_size(420, 620, WEBVIEW_HINT_NONE);
 
                     chat.bind("hi5ChatSend", [bridge](std::string req) -> std::string {
                         const auto body = ParseFirstJsonStringArg(req);
@@ -1048,13 +1051,21 @@ textarea:focus{border-color:rgba(99,102,241,.7);box-shadow:0 0 0 3px rgba(99,102
 #ifdef _WIN32
                     HWND hwnd = GetWebviewHwnd(chat);
                     if (hwnd) {
-                        const int width = 380;
-                        const int height = 560;
                         RECT work{};
                         SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-                        const int x = work.right - width - 24;
-                        const int y = work.bottom - height - 24;
-                        MoveWindow(hwnd, x > 0 ? x : 40, y > 0 ? y : 40, width, height, TRUE);
+                        const int workWidth = std::max<int>(1, work.right - work.left);
+                        const int workHeight = std::max<int>(1, work.bottom - work.top);
+                        const int availWidth = std::max<int>(240, workWidth - 32);
+                        const int availHeight = std::max<int>(280, workHeight - 32);
+                        const int width = std::min<int>(420, availWidth);
+                        const int height = std::min<int>(620, availHeight);
+                        const int minWidth = std::min<int>(300, availWidth);
+                        const int minHeight = std::min<int>(320, availHeight);
+                        chat.set_size(minWidth, minHeight, WEBVIEW_HINT_MIN);
+                        chat.set_size(workWidth, workHeight, WEBVIEW_HINT_MAX);
+                        const int x = std::max<int>(work.left, work.right - width - 24);
+                        const int y = std::max<int>(work.top, work.bottom - height - 24);
+                        SetWindowPos(hwnd, nullptr, x, y, width, height, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
                         ShowWindow(hwnd, SW_SHOWNORMAL);
                         SetForegroundWindow(hwnd);
                     }

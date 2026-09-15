@@ -658,10 +658,13 @@ function sendChatMessageBody(body) {
   body = String(body || "").trim();
   if (!body || !ws || ws.readyState !== WebSocket.OPEN || !currentSession) return false;
 
+  const messageId = `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const payload = {
     type: "chat_message",
     session_id: currentSession.sessionId,
     sessionId: currentSession.sessionId,
+    message_id: messageId,
+    messageId: messageId,
     sender: "tech",
     display_name: "Technician",
     displayName: "Technician",
@@ -856,19 +859,20 @@ function sendShortcut(action) {
     };
 
     try {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(servicePayload));
+      if (inputDc && inputDc.readyState === "open") {
+        inputDc.send(JSON.stringify(servicePayload));
+        return true;
       }
     } catch {}
 
     try {
-      if (inputDc && inputDc.readyState === "open") {
-        inputDc.send(JSON.stringify(servicePayload));
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(servicePayload));
+        return true;
       }
     } catch {}
 
-    sendInput("shortcut", { action: "ctrl_alt_del" }, true);
-    return true;
+    return false;
   }
 
   sendInput("shortcut", { action }, true);
@@ -1956,6 +1960,21 @@ async function onSignalMessage(raw) {
       break;
     }
 
+    case "shortcut_result": {
+      const action = String(msg.action || "").toLowerCase();
+      if (action === "ctrl_alt_del" || action === "cad" || action === "sas") {
+        if (!msg.ok) {
+          const text = msg.message || "Ctrl+Alt+Del could not be sent by Windows.";
+          console.warn("[viewer] CAD unavailable", msg.code || "sas_failed", text);
+          setStatus("error", text);
+          setTimeout(() => {
+            if (pc && pc.connectionState === "connected") setStatus("online", "Streaming");
+          }, 4500);
+        }
+      }
+      break;
+    }
+
     case "agent_presence": {
       if (msg.technician_name) {
         setStatus("online", `Streaming · ${msg.technician_name}`);
@@ -1965,6 +1984,8 @@ async function onSignalMessage(raw) {
 
     case "chat_message": {
       const body = getChatBody(msg);
+      const incomingId = String(msg.message_id || msg.messageId || "");
+      if (incomingId && chatMessages.some((item) => String(item.message_id || item.messageId || "") === incomingId)) break;
       if (body) {
         const normalized = {
           ...msg,

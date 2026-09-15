@@ -958,6 +958,40 @@ namespace hi5 {
 #endif
         }
 
+        struct DisplayGeometrySnapshot {
+            int primaryWidth = 0;
+            int primaryHeight = 0;
+            int virtualX = 0;
+            int virtualY = 0;
+            int virtualWidth = 0;
+            int virtualHeight = 0;
+
+            bool operator==(const DisplayGeometrySnapshot& other) const {
+                return primaryWidth == other.primaryWidth && primaryHeight == other.primaryHeight &&
+                    virtualX == other.virtualX && virtualY == other.virtualY &&
+                    virtualWidth == other.virtualWidth && virtualHeight == other.virtualHeight;
+            }
+            bool operator!=(const DisplayGeometrySnapshot& other) const { return !(*this == other); }
+        };
+
+        static DisplayGeometrySnapshot ReadDisplayGeometrySnapshot() {
+            DisplayGeometrySnapshot out{};
+            out.primaryWidth = GetSystemMetrics(SM_CXSCREEN);
+            out.primaryHeight = GetSystemMetrics(SM_CYSCREEN);
+            out.virtualX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            out.virtualY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            out.virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            out.virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            return out;
+        }
+
+        static void LogDisplayGeometry(const std::string& sessionId, const std::string& phase, const DisplayGeometrySnapshot& value) {
+            LogI("[display-state] phase=" + phase + " session=" + sessionId +
+                " primary=" + std::to_string(value.primaryWidth) + "x" + std::to_string(value.primaryHeight) +
+                " virtual=" + std::to_string(value.virtualWidth) + "x" + std::to_string(value.virtualHeight) +
+                " origin=" + std::to_string(value.virtualX) + "," + std::to_string(value.virtualY));
+        }
+
         static std::string WtsStateName(WTS_CONNECTSTATE_CLASS state) {
             switch (state) {
             case WTSActive: return "Active";
@@ -1057,13 +1091,18 @@ namespace hi5 {
                 CadLog("temporary SoftwareSASGeneration previous exists=false query_rc=" + std::to_string(rc));
             }
 
-            if (backup.hadValue && ((backup.oldValue & 0x1u) != 0)) {
-                CadLog("temporary SoftwareSASGeneration already allows Services; leaving existing value unchanged");
+            if (backup.hadValue) {
+                if ((backup.oldValue & 0x1u) != 0) {
+                    CadLog("SoftwareSASGeneration already allows Services; leaving administrator policy unchanged");
+                    RegCloseKey(key);
+                    return true;
+                }
+                CadLog("SoftwareSASGeneration exists and does not allow Services; respecting explicit administrator policy");
                 RegCloseKey(key);
-                return true;
+                return false;
             }
 
-            DWORD newValue = backup.hadValue ? (backup.oldValue | 0x1u) : 1u;
+            const DWORD newValue = 1u;
             rc = RegSetValueExW(key, kName, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&newValue), sizeof(newValue));
             RegCloseKey(key);
 
@@ -1148,7 +1187,7 @@ namespace hi5 {
         static bool TrySendSecureAttentionSequenceFromService(const std::string& sessionId) {
 #ifdef _WIN32
             CadLog("==== CAD request begin session=" + sessionId + " ====");
-            CadLog("CAD_BUILD=Temporary-SoftwareSASGeneration-SendSAS active=true");
+            CadLog("CAD_BUILD=PolicySafe-SoftwareSASGeneration-SendSAS active=true");
             CadLogSessionDiagnostics(sessionId);
 
             SoftwareSasGenerationBackup backup;
@@ -1160,7 +1199,7 @@ namespace hi5 {
                 ok = InvokeSendSas(sessionId, "service", FALSE);
             }
             else {
-                CadLog("service SendSAS skipped because temporary SoftwareSASGeneration could not be enabled");
+                CadLog("service SendSAS skipped because Services SAS permission is unavailable or explicitly blocked");
             }
 
             RestoreTemporarySoftwareSasGeneration(backup);
@@ -1828,6 +1867,10 @@ namespace hi5 {
 
             int displayIndex = 0;
             int fps = 30;
+            DisplayGeometrySnapshot displayGeometryAtStart{};
+            DisplayGeometrySnapshot lastDisplayGeometry{};
+            int lastCaptureMonitorWidth = 0;
+            int lastCaptureMonitorHeight = 0;
             DesktopMode activeMode = DesktopMode::Normal;
 
             bool uacRequested = false;
@@ -5154,10 +5197,27 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         // before the input pipe fallback so the LocalSystem service gets the first
                         // chance to trigger SAS. The streamer fallback remains useful for nested
                         // VM sessions and non-SAS Ctrl+Alt+Del handling.
+                        bool sasPolicyExists = false;
+                        const DWORD sasPolicyValue = ReadSoftwareSasGenerationValue(&sasPolicyExists);
                         const bool sasSent = TrySendSecureAttentionSequenceFromService(ctx.sessionId);
                         LogI("ctrl_alt_del service command requested session=" + ctx.sessionId +
                             " service_sas_attempted=" + std::string(sasSent ? "1" : "0") +
                             " kind=" + kind + " type=" + type);
+                        if (signaling_) {
+                            const bool policyBlocked = sasPolicyExists && ((sasPolicyValue & 0x1u) == 0);
+                            json result = {
+                                {"type", "shortcut_result"},
+                                {"session_id", ctx.sessionId},
+                                {"action", "ctrl_alt_del"},
+                                {"ok", sasSent},
+                                {"code", sasSent ? "sent" : (policyBlocked ? "policy_blocked" : "sas_failed")},
+                                {"message", sasSent ? "Ctrl+Alt+Del sent" :
+                                    (policyBlocked ? "Secure attention sequence is disabled by device policy." :
+                                        "Windows could not send Ctrl+Alt+Del using the secure attention API.")}
+                            };
+                            signaling_->send(result.dump());
+                        }
+                        // Preserve the normal shortcut command as a nested/VM fallback.
                         writeShortcutCommand(ShortcutAction::CtrlAltDel);
                         return;
                     }
@@ -6033,6 +6093,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->secureFallbackOwnsInput.store(true, std::memory_order_release);
                 }
                 ctx->lastConsoleSessionPoll = std::chrono::steady_clock::now();
+                ctx->displayGeometryAtStart = ReadDisplayGeometrySnapshot();
+                ctx->lastDisplayGeometry = ctx->displayGeometryAtStart;
+                LogDisplayGeometry(sessionId, "session_start", ctx->displayGeometryAtStart);
 
                 const std::string prefix = sessionId.substr(0, std::min<size_t>(16, sessionId.size()));
 
@@ -6259,7 +6322,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                     if (ConsumePresenceBannerAction(ctx.sessionId, true)) {
                         LogI("[presence] local user opened chat session=" + ctx.sessionId);
-                        EnsureChatOverlay(ctx.sessionId, ctx.sessionJob,
+                        ChatOverlayState* overlay = EnsureChatOverlay(ctx.sessionId, ctx.sessionJob,
                             [this](const std::string& sid, const std::string& replyBody) {
                                 AppendChatTranscript(sid, "user", "Remote user", replyBody);
                                 if (signaling_) {
@@ -6274,6 +6337,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     signaling_->send(out.dump());
                                 }
                             });
+                        if (overlay) {
+                            {
+                                std::lock_guard<std::mutex> lock(overlay->mu);
+                                overlay->pendingToOverlay.push_back(json{
+                                    {"type", "show"}, {"session_id", ctx.sessionId}
+                                }.dump());
+                            }
+                            FlushQueuedChatToOverlay(overlay);
+                        }
                     }
 
                     if (ConsumePresenceBannerAction(ctx.sessionId, false)) {
@@ -6917,7 +6989,24 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     if (now >= nextMonitorPoll) {
+                        const auto displayGeometry = ReadDisplayGeometrySnapshot();
+                        if (displayGeometry != ctx.lastDisplayGeometry) {
+                            LogDisplayGeometry(ctx.sessionId, "changed_during_session", displayGeometry);
+                            ctx.lastDisplayGeometry = displayGeometry;
+                        }
                         const int count = ctx.normalInputPipe.GetMonitorCount();
+                        if (count > 0) {
+                            const int monitorIndex = std::clamp(ctx.displayIndex, 0, count - 1);
+                            const auto captureMonitor = ctx.normalInputPipe.GetMonitorInfo(monitorIndex);
+                            if (captureMonitor.w > 0 && captureMonitor.h > 0 &&
+                                (captureMonitor.w != ctx.lastCaptureMonitorWidth || captureMonitor.h != ctx.lastCaptureMonitorHeight)) {
+                                LogI("[display-state] phase=capture_monitor session=" + ctx.sessionId +
+                                    " monitor=" + std::to_string(monitorIndex) +
+                                    " geometry=" + std::to_string(captureMonitor.w) + "x" + std::to_string(captureMonitor.h));
+                                ctx.lastCaptureMonitorWidth = captureMonitor.w;
+                                ctx.lastCaptureMonitorHeight = captureMonitor.h;
+                            }
+                        }
                         if (count > 0 && signaling_) {
                             json msg;
                             msg["type"] = "monitor_info";
@@ -7048,6 +7137,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx->normalInputPipe.Close();
                 ctx->secureShmem.Close();
                 ctx->normalShmem.Close();
+
+                const auto displayGeometryAtEnd = ReadDisplayGeometrySnapshot();
+                LogDisplayGeometry(sessionId, "session_end", displayGeometryAtEnd);
+                if (displayGeometryAtEnd != ctx->displayGeometryAtStart) {
+                    LogW("[display-state] endpoint geometry differs from remote-session start session=" + sessionId);
+                }
 
                 LogSupportEvent("Remote session ended");
                 LogI("session stopped=" + sessionId);
