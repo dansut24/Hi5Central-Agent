@@ -1,4 +1,4 @@
-name: Sync automation tray compile fix
+name: Sync RMM polish and audio checkpoint
 
 on:
   push:
@@ -20,28 +20,41 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download and verify tray compile fix snapshot
+      - name: Download and verify RMM polish snapshot
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/automation-tray-compile-fix-116d131.tar.gz \
-            -o /tmp/automation-tray-compile-fix-116d131.tar.gz
-          echo "da6b4f15124a41b8d6ec2b291220e65cf4b217f56a6f34349a77972891e49dfe  /tmp/automation-tray-compile-fix-116d131.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/rmm-polish-audio-e7727e1.tar.gz \
+            -o /tmp/rmm-polish-audio-e7727e1.tar.gz
+          echo "1bd2f4dbcee49d70c38819af481506413b83d3fd0efe703ae5fe8207e32302ee  /tmp/rmm-polish-audio-e7727e1.tar.gz" | sha256sum -c -
 
       - name: Apply exact changed files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/automation-tray-compile-fix
-          tar -xzf /tmp/automation-tray-compile-fix-116d131.tar.gz -C /tmp/automation-tray-compile-fix
-          cp -a /tmp/automation-tray-compile-fix/. .
+          mkdir -p /tmp/rmm-polish-audio
+          tar -xzf /tmp/rmm-polish-audio-e7727e1.tar.gz -C /tmp/rmm-polish-audio
+          cp -a /tmp/rmm-polish-audio/. .
           git add \
+            Agent/chatpass_agent/CMakeLists.txt \
+            Agent/chatpass_agent/vcpkg.json \
+            Agent/chatpass_agent/src/ipc/input_pipe.h \
             Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
-            Agent/chatpass_agent/src/ui/native_tray.cpp
+            Agent/chatpass_agent/src/platform/windows/wasapi_loopback.cpp \
+            Agent/chatpass_agent/src/platform/windows/wasapi_loopback.h \
+            Agent/chatpass_agent/src/streamer_main.cpp \
+            Agent/chatpass_agent/src/ui/native_banner.cpp \
+            Agent/chatpass_agent/src/ui/native_chat_window.cpp \
+            Agent/chatpass_agent/src/ui/native_chat_window.h \
+            Agent/chatpass_agent/src/ui/native_tray.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.h \
+            Viewer/chatpass_viewer/web/index.html \
+            Viewer/chatpass_viewer/web/renderer.js
           git status --short
 
-      - name: Commit synced compile fix
+      - name: Commit synced RMM polish
         shell: bash
         run: |
           set -euo pipefail
@@ -51,5 +64,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Fix Windows tray compilation"
+          git commit -m "Polish tray remote controls and add audio"
           git push origin HEAD:agent-hardening-v2
