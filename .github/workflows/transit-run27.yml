@@ -1,4 +1,4 @@
-name: Transit run 27 installers
+name: Cleanup run 27 transit
 
 on:
   push:
@@ -9,46 +9,16 @@ on:
 
 permissions:
   contents: write
-  actions: read
 
 jobs:
-  transit:
+  cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Download run 27 artifacts
-        uses: actions/download-artifact@v4
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          run-id: 35134822172
-          path: /tmp/hi5-run27
-
-      - name: Prepare exact installers
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/hi5-transit
-          agent="$(find /tmp/hi5-run27 -type f -name 'Hi5CentralAgentSetup.exe' -print -quit)"
-          viewer="$(find /tmp/hi5-run27 -type f -name 'Hi5CentralViewerSetup.exe' -print -quit)"
-          test -n "$agent" && test -f "$agent"
-          test -n "$viewer" && test -f "$viewer"
-          cp "$agent" /tmp/hi5-transit/Hi5CentralAgentSetup.exe
-          cp "$viewer" /tmp/hi5-transit/Hi5CentralViewerSetup.exe
-          sha256sum /tmp/hi5-transit/*.exe
-
-      - name: Publish temporary prerelease assets
+      - name: Remove temporary prerelease and tag
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release delete transit-0.1.27 --repo "$GITHUB_REPOSITORY" --yes || true
-          gh release create transit-0.1.27 \
-            /tmp/hi5-transit/Hi5CentralAgentSetup.exe \
-            /tmp/hi5-transit/Hi5CentralViewerSetup.exe \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --prerelease \
-            --title "Temporary 0.1.27 transit" \
-            --notes "Temporary transfer assets for verified run 27 staging."
+          gh release delete transit-0.1.27 --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
