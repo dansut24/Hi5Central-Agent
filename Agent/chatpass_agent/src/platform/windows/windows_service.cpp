@@ -1318,7 +1318,7 @@ namespace hi5 {
                 L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \""
                 L"$ErrorActionPreference='SilentlyContinue'; "
                 L"Get-CimInstance Win32_Process | "
-                L"Where-Object { ($_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+(banner|chat-overlay|native-chat)' } | "
+                L"Where-Object { ($_.Name -eq 'Hi5CentralUser.exe' -or $_.Name -eq 'Hi5CentralAgentService.exe' -or $_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+(banner|chat-overlay|native-chat)' } | "
                 L"ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
                 L"\"";
             LogI("[ui-cleanup] killing orphan banner/chat-overlay helper processes");
@@ -1346,7 +1346,7 @@ namespace hi5 {
                 L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \""
                 L"$ErrorActionPreference='SilentlyContinue'; "
                 L"$procs = Get-CimInstance Win32_Process | "
-                L"Where-Object { ($_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+streamer|--mode=streamer' }; ";
+                L"Where-Object { ($_.Name -eq 'Hi5CentralRemoteHost.exe' -or $_.Name -eq 'Hi5CentralAgentService.exe' -or $_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+streamer|--mode=streamer' }; ";
 
             if (!sessionId.empty()) {
                 const std::wstring wsid = ToWidePath(EscapePowerShellSingleQuoted(sessionId));
@@ -1407,8 +1407,25 @@ namespace hi5 {
             }
         }
 
+        static std::string SiblingExecutablePath(const char* fileName) {
+            const std::string current = CurrentExePath();
+            if (current.empty() || !fileName || !*fileName) return current;
+            std::filesystem::path candidate = std::filesystem::path(current).parent_path() / fileName;
+            std::error_code ec;
+            if (std::filesystem::exists(candidate, ec)) return candidate.string();
+            return current; // rollback compatibility for older/single-binary installs
+        }
+
+        static std::string UserHostExePath() {
+            return SiblingExecutablePath("Hi5CentralUser.exe");
+        }
+
+        static std::string RemoteHostExePath() {
+            return SiblingExecutablePath("Hi5CentralRemoteHost.exe");
+        }
+
         static std::string ChatOverlayExePath() {
-            return CurrentExePath();
+            return UserHostExePath();
         }
 
         struct ChatOverlayState {
@@ -1503,9 +1520,9 @@ namespace hi5 {
                 return;
             }
 
-            const std::string exe = CurrentExePath();
+            const std::string exe = UserHostExePath();
             if (exe.empty()) {
-                LogE("[presence] cannot resolve current executable path");
+                LogE("[presence] cannot resolve user host executable path");
                 return;
             }
 
@@ -3786,7 +3803,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                             reinterpret_cast<const unsigned char*>(policyText.data()),
                                             policyText.size()
                                         );
-                                        const std::string exe = CurrentExePath();
+                                        const std::string exe = UserHostExePath();
                                         const std::string args = "--mode tray --session " + QuoteArg(std::to_string(activeSession)) +
                                             " --stop-event " + QuoteArg(stopEventName) +
                                             " --policy-b64 " + QuoteArg(policyB64);
@@ -6143,8 +6160,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx.activeConsoleSessionId = consoleSession;
                 ctx.lastSeenConsoleSessionId = consoleSession;
 
-                char exePath[MAX_PATH]{};
-                GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+                const std::string exePath = RemoteHostExePath();
 
                 ResetEvent(ctx.normalStopEvent);
 
@@ -6184,8 +6200,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     return true;
                 }
 
-                char exePath[MAX_PATH]{};
-                GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+                const std::string exePath = RemoteHostExePath();
 
                 ResetEvent(ctx.secureStopEvent);
 
@@ -6232,8 +6247,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     return true;
                 }
 
-                char exePath[MAX_PATH]{};
-                GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+                const std::string exePath = RemoteHostExePath();
 
                 ResetEvent(ctx.normalStopEvent);
 

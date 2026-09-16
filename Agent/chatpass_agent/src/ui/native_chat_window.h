@@ -67,6 +67,7 @@ namespace hi5 {
 
         std::thread uiThread_;
         std::atomic<bool> running_{ false };
+        bool dismissedByUser_ = false;
 
         DWORD uiThreadId_{ 0 };
         HWND hwnd_{ nullptr };

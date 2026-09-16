@@ -283,7 +283,7 @@ if (-not $SkipBuild) {
     $buildArgs = @(
         "--build", $buildPath,
         "--config", $Configuration,
-        "--target", "native_vp8_stream",
+        "--target", "native_vp8_stream", "hi5central_user", "hi5central_remote_host",
         "-j"
     )
 
@@ -294,21 +294,26 @@ if (-not $SkipBuild) {
 }
 
 $agentCandidates = @(
-    (Join-Path $buildPath "Hi5CentralAgent.exe"),
-    (Join-Path (Join-Path $buildPath $Configuration) "Hi5CentralAgent.exe"),
-    (Join-Path $buildPath "native_vp8_stream.exe"),
-    (Join-Path (Join-Path $buildPath $Configuration) "native_vp8_stream.exe")
+    (Join-Path $buildPath "Hi5CentralAgentService.exe"),
+    (Join-Path (Join-Path $buildPath $Configuration) "Hi5CentralAgentService.exe")
 )
 $agentExe = $agentCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $agentExe) {
-    $found = Get-ChildItem -Path $buildPath -Filter "Hi5CentralAgent.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    $found = Get-ChildItem -Path $buildPath -Filter "Hi5CentralAgentService.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($found) { $agentExe = $found.FullName }
 }
 if (-not $agentExe -or -not (Test-Path $agentExe)) {
-    throw "Agent executable not found under build directory: $buildPath"
+    throw "Agent service executable not found under build directory: $buildPath"
 }
 
+$userExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralUser.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+$remoteHostExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralRemoteHost.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $userExe) { throw "Hi5CentralUser.exe not found under build directory: $buildPath" }
+if (-not $remoteHostExe) { throw "Hi5CentralRemoteHost.exe not found under build directory: $buildPath" }
+
 Assert-NoDynamicVcRuntimeDependency -ExePath $agentExe
+Assert-NoDynamicVcRuntimeDependency -ExePath $userExe.FullName
+Assert-NoDynamicVcRuntimeDependency -ExePath $remoteHostExe.FullName
 
 New-Item -ItemType Directory -Force -Path $distPath | Out-Null
 
@@ -342,6 +347,8 @@ $isccArgs = @(
     "/DSourceDir=$buildPath",
     "/DOutputDir=$distPath",
     "/DAgentExePath=$agentExe",
+    "/DUserExePath=$($userExe.FullName)",
+    "/DRemoteHostExePath=$($remoteHostExe.FullName)",
     $issPath
 )
 

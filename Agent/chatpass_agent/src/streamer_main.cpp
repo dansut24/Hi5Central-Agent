@@ -23,6 +23,62 @@
 namespace {
 
     std::atomic<bool> g_running{ true };
+    std::atomic<bool> g_suppressPhysicalInput{ false };
+    std::atomic<bool> g_inputHooksReady{ false };
+    std::thread g_inputHookThread;
+    DWORD g_inputHookThreadId = 0;
+
+    LRESULT CALLBACK LocalKeyboardHook(int code, WPARAM wParam, LPARAM lParam) {
+        if (code >= 0 && g_suppressPhysicalInput.load(std::memory_order_relaxed)) {
+            const auto* info = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+            if (info && (info->flags & LLKHF_INJECTED) == 0) return 1;
+        }
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
+    LRESULT CALLBACK LocalMouseHook(int code, WPARAM wParam, LPARAM lParam) {
+        if (code >= 0 && g_suppressPhysicalInput.load(std::memory_order_relaxed)) {
+            const auto* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+            if (info && (info->flags & LLMHF_INJECTED) == 0) return 1;
+        }
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
+    bool StartPhysicalInputGuard() {
+        g_suppressPhysicalInput.store(true, std::memory_order_release);
+        if (g_inputHookThread.joinable()) return g_inputHooksReady.load(std::memory_order_acquire);
+
+        HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ready) return false;
+        g_inputHookThread = std::thread([ready]() {
+            g_inputHookThreadId = GetCurrentThreadId();
+            MSG msg{};
+            PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+            HHOOK keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, LocalKeyboardHook, GetModuleHandleW(nullptr), 0);
+            HHOOK mouse = SetWindowsHookExW(WH_MOUSE_LL, LocalMouseHook, GetModuleHandleW(nullptr), 0);
+            g_inputHooksReady.store(keyboard != nullptr && mouse != nullptr, std::memory_order_release);
+            SetEvent(ready);
+            while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (mouse) UnhookWindowsHookEx(mouse);
+            if (keyboard) UnhookWindowsHookEx(keyboard);
+            g_inputHooksReady.store(false, std::memory_order_release);
+            g_inputHookThreadId = 0;
+        });
+        WaitForSingleObject(ready, 2000);
+        CloseHandle(ready);
+        return g_inputHooksReady.load(std::memory_order_acquire);
+    }
+
+    void StopPhysicalInputGuard() {
+        g_suppressPhysicalInput.store(false, std::memory_order_release);
+        const DWORD tid = g_inputHookThreadId;
+        if (tid) PostThreadMessageW(tid, WM_QUIT, 0, 0);
+        if (g_inputHookThread.joinable()) g_inputHookThread.join();
+        g_inputHooksReady.store(false, std::memory_order_release);
+    }
 
     void SignalHandler(int) {
         g_running = false;
@@ -741,12 +797,28 @@ namespace {
                 break;
             case hi5::InputCmdType::LocalInputBlock: {
                 const bool requested = cmd.localInput.blocked != 0;
-                const BOOL ok = BlockInput(requested ? TRUE : FALSE);
-                if (ok) localInputBlocked = requested;
+                BOOL blockOk = TRUE;
+                bool hookOk = true;
+                DWORD blockErr = 0;
+
+                if (requested) {
+                    blockOk = BlockInput(TRUE);
+                    if (!blockOk) blockErr = GetLastError();
+                    hookOk = StartPhysicalInputGuard();
+                    localInputBlocked = blockOk || hookOk;
+                } else {
+                    blockOk = BlockInput(FALSE);
+                    if (!blockOk) blockErr = GetLastError();
+                    StopPhysicalInputGuard();
+                    localInputBlocked = false;
+                }
+
                 LogInfo("[streamer] local input block session=" + sessionId +
                     " requested=" + std::string(requested ? "true" : "false") +
-                    " ok=" + std::string(ok ? "true" : "false") +
-                    " err=" + std::to_string(ok ? 0 : GetLastError()));
+                    " blockinput_ok=" + std::string(blockOk ? "true" : "false") +
+                    " hook_ok=" + std::string(hookOk ? "true" : "false") +
+                    " active=" + std::string(localInputBlocked ? "true" : "false") +
+                    " err=" + std::to_string(blockErr));
                 break;
             }
             case hi5::InputCmdType::SwitchMonitor: {
@@ -1097,8 +1169,9 @@ namespace hi5 {
             }
         }
 
-        if (localInputBlocked) {
+        if (localInputBlocked || g_inputHookThread.joinable()) {
             const BOOL released = BlockInput(FALSE);
+            StopPhysicalInputGuard();
             LogInfo("[streamer] local input automatically released session=" + args.sessionId +
                 " ok=" + std::string(released ? "true" : "false"));
             localInputBlocked = false;

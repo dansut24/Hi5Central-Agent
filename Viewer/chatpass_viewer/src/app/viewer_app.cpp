@@ -564,10 +564,59 @@ textarea:focus{border-color:#93b9ff;box-shadow:0 0 0 3px rgba(37,99,235,.09)}
         HHOOK gKeyboardHook = nullptr;
         HWND gMainViewerHwnd = nullptr;
         webview::webview* gMainViewerWebview = nullptr;
+        WNDPROC gOriginalViewerWndProc = nullptr;
+        bool gViewerCloseApproved = false;
+        bool gViewerClosePromptActive = false;
         DWORD gMainViewerPid = 0;
         bool gWinKeyDown = false;
         bool gWinComboUsed = false;
         bool gRemoteAltTabActive = false;
+
+        LRESULT CALLBACK ViewerMainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+            if (msg == WM_CLOSE) {
+                if (gViewerCloseApproved) {
+                    return CallWindowProcW(gOriginalViewerWndProc, hwnd, msg, wParam, lParam);
+                }
+                if (gViewerClosePromptActive) return 0;
+
+                gViewerClosePromptActive = true;
+                const int answer = MessageBoxW(
+                    hwnd,
+                    L"End this remote session and close Hi5Central Viewer?",
+                    L"Hi5Central Viewer",
+                    MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2 | MB_APPLMODAL);
+                gViewerClosePromptActive = false;
+                if (answer != IDYES) return 0;
+
+                auto* main = gMainViewerWebview;
+                if (main) {
+                    main->dispatch([main]() {
+                        main->eval("window.__hi5NativeCloseRequested && window.__hi5NativeCloseRequested();");
+                    });
+                    return 0;
+                }
+
+                gViewerCloseApproved = true;
+                return CallWindowProcW(gOriginalViewerWndProc, hwnd, msg, wParam, lParam);
+            }
+            return CallWindowProcW(gOriginalViewerWndProc, hwnd, msg, wParam, lParam);
+        }
+
+        void InstallViewerCloseGuard(webview::webview& w) {
+            HWND hwnd = GetWebviewHwnd(w);
+            if (!hwnd || gOriginalViewerWndProc) return;
+            gViewerCloseApproved = false;
+            gViewerClosePromptActive = false;
+            gOriginalViewerWndProc = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ViewerMainWndProc)));
+        }
+
+        void ApproveAndCloseViewer() {
+            gViewerCloseApproved = true;
+            if (gMainViewerHwnd && IsWindow(gMainViewerHwnd)) {
+                PostMessageW(gMainViewerHwnd, WM_CLOSE, 0, 0);
+            }
+        }
 
         bool IsViewerForegroundAndMaximized() {
             if (!gMainViewerHwnd || !IsWindow(gMainViewerHwnd)) return false;
@@ -1161,6 +1210,11 @@ textarea:focus{border-color:#93b9ff;box-shadow:0 0 0 3px rgba(37,99,235,.09)}
                 << "    console.log('[native-host] notifyDisconnected');\n"
                 << "  };\n"
                 << "\n"
+                << "  window.hi5.closeViewer = function() {\n"
+                << "    if (typeof window.hi5CloseViewer === 'function') return window.hi5CloseViewer('');\n"
+                << "    return false;\n"
+                << "  };\n"
+                << "\n"
                 << "  window.hi5.openChatWindow = function() {\n"
                 << "    if (typeof window.hi5OpenChatWindow === 'function') return window.hi5OpenChatWindow('');\n"
                 << "    return false;\n"
@@ -1302,6 +1356,13 @@ textarea:focus{border-color:#93b9ff;box-shadow:0 0 0 3px rgba(37,99,235,.09)}
             return "true";
             });
 
+#ifdef _WIN32
+        w.bind("hi5CloseViewer", [](std::string) -> std::string {
+            ApproveAndCloseViewer();
+            return "true";
+            });
+#endif
+
         w.bind("hi5OpenFileBrowserWindow", [fileBridge](std::string) -> std::string {
             LogInfo("[viewer-files] open requested from renderer");
             OpenFileWindow(fileBridge);
@@ -1328,6 +1389,7 @@ textarea:focus{border-color:#93b9ff;box-shadow:0 0 0 3px rgba(37,99,235,.09)}
         w.set_size(1280, 800, WEBVIEW_HINT_NONE);
 #ifdef _WIN32
         InstallViewerKeyboardHook(w);
+        InstallViewerCloseGuard(w);
 #endif
 
         if (!std::filesystem::exists(indexPath)) {

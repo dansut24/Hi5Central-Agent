@@ -54,6 +54,7 @@ namespace hi5 {
     bool NativeChatWindow::Start(const std::string& sessionId, SendCallback onSend) {
         Stop();
 
+        dismissedByUser_ = false;
         sessionId_ = sessionId;
         onSend_ = std::move(onSend);
         readyEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -289,6 +290,7 @@ namespace hi5 {
 
     void NativeChatWindow::ShowOnUiThread() {
         if (!hwnd_) return;
+        dismissedByUser_ = false;
         ClampToCurrentWorkArea(false);
         ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
@@ -481,6 +483,7 @@ namespace hi5 {
                 return 0;
             }
             if (LOWORD(wParam) == kCloseId && HIWORD(wParam) == BN_CLICKED) {
+                dismissedByUser_ = true;
                 HideOnUiThread();
                 return 0;
             }
@@ -502,7 +505,7 @@ namespace hi5 {
                 switch (item.type) {
                 case PendingUiMessage::Type::Append:
                     AppendMessageOnUiThread(item.chat);
-                    ShowOnUiThread();
+                    if (!dismissedByUser_) ShowOnUiThread();
                     break;
                 case PendingUiMessage::Type::Show:
                     ShowOnUiThread();
@@ -549,8 +552,12 @@ namespace hi5 {
         }
 
         case WM_CLOSE:
-            if (!running_.load()) DestroyWindow(hwnd);
-            else ShowWindow(hwnd, SW_HIDE);
+            if (!running_.load()) {
+                DestroyWindow(hwnd);
+            } else {
+                dismissedByUser_ = true;
+                HideOnUiThread();
+            }
             return 0;
 
         case WM_DESTROY:

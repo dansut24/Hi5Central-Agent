@@ -818,14 +818,21 @@ function showRemoteCursor() {
 
 function getVideoContentRect(el) {
   const rect = el.getBoundingClientRect();
+  const objectFit = String(getComputedStyle(el).objectFit || "fill").toLowerCase();
+
+  // Stretch mode renders the decoded frame across the full element. Input
+  // coordinates must use that same rectangle or clicks drift horizontally /
+  // vertically even though the synthetic cursor looks correct.
+  if (objectFit === "fill") {
+    return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+  }
+
   const vw = el.videoWidth || 1;
   const vh = el.videoHeight || 1;
-
   const elementAspect = rect.width / rect.height;
   const videoAspect = vw / vh;
 
   let drawWidth, drawHeight, offsetX, offsetY;
-
   if (elementAspect > videoAspect) {
     drawHeight = rect.height;
     drawWidth = drawHeight * videoAspect;
@@ -1149,7 +1156,8 @@ function resetTransitionState() {
 
 function disconnect(reason, options = {}) {
   const silent = !!options.silent;
-  console.log("[viewer] disconnect called:", reason || "(none)", silent ? "silent" : "");
+  const closeNative = !!options.closeNative;
+  console.log("[viewer] disconnect called:", reason || "(none)", silent ? "silent" : "", closeNative ? "close-native" : "");
   stopStatsPoll();
 
   remoteDescSet = false;
@@ -1239,10 +1247,17 @@ function disconnect(reason, options = {}) {
   if (!silent) {
     try { window.hi5?.notifyDisconnected?.(); } catch {}
   }
+  if (closeNative) {
+    try { window.hi5?.closeViewer?.(); } catch {}
+  }
 }
 
+window.__hi5NativeCloseRequested = function() {
+  disconnect("Disconnected by technician", { closeNative: true });
+};
+
 if (elBtnDisc) {
-  elBtnDisc.addEventListener("click", () => disconnect("Disconnected by user"));
+  elBtnDisc.addEventListener("click", () => disconnect("Disconnected by technician", { closeNative: true }));
 }
 if (elBtnAudio) {
   elBtnAudio.addEventListener("click", () => setRemoteAudioEnabled(!audioEnabled));
@@ -2316,7 +2331,7 @@ async function onSignalMessage(raw) {
     }
 
     case "viewer_disconnected":
-      disconnect("Disconnected by remote device");
+      disconnect("Disconnected by user");
       break;
 
     default:
@@ -2436,7 +2451,7 @@ try {
 // WebView host. The server supplies a short-lived session token and per-session ICE credentials.
 window.hi5RemoteViewer = Object.freeze({
   start: (params) => startSession(params),
-  disconnect: () => disconnect("Disconnected by user"),
+  disconnect: () => disconnect("Disconnected by technician", { closeNative: true }),
   isConnected: () => !!(pc && pc.connectionState === "connected")
 });
 

@@ -1,6 +1,8 @@
 #define MyAppName "Hi5Central Agent"
 #define MyAppPublisher "Hi5Central"
-#define MyAppExeName "Hi5CentralAgent.exe"
+#define MyAppExeName "Hi5CentralAgentService.exe"
+#define MyUserExeName "Hi5CentralUser.exe"
+#define MyRemoteHostExeName "Hi5CentralRemoteHost.exe"
 #define MyServiceName "Hi5CentralAgent"
 #define MyAppVersion GetEnv("HI5_AGENT_VERSION")
 #if MyAppVersion == ""
@@ -17,6 +19,12 @@
 
 #ifndef AgentExePath
   #define AgentExePath SourceDir + "\" + MyAppExeName
+#endif
+#ifndef UserExePath
+  #define UserExePath SourceDir + "\" + MyUserExeName
+#endif
+#ifndef RemoteHostExePath
+  #define RemoteHostExePath SourceDir + "\" + MyRemoteHostExeName
 #endif
 
 
@@ -49,8 +57,11 @@ Name: "{commonappdata}\Hi5Central\Agent\ChatLogs"; Permissions: users-readexec a
 
 [Files]
 Source: "{#AgentExePath}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
+Source: "{#UserExePath}"; DestDir: "{app}"; DestName: "{#MyUserExeName}"; Flags: ignoreversion
+Source: "{#RemoteHostExePath}"; DestDir: "{app}"; DestName: "{#MyRemoteHostExeName}"; Flags: ignoreversion
 
 [InstallDelete]
+Type: files; Name: "{app}\Hi5CentralAgent.exe"
 Type: files; Name: "{app}\hi5tech_cad_winlogon_helper.exe"
 Type: files; Name: "{app}\hi5central_sas_helper.exe"
 Type: files; Name: "{app}\hi5tech_sas_launcher.exe"

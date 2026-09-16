@@ -275,5 +275,40 @@ if(MSVC AND HI5_REQUIRE_STATIC_CRT)
 endif()
 
 set_target_properties(native_vp8_stream PROPERTIES
-    OUTPUT_NAME "Hi5CentralAgent"
+    OUTPUT_NAME "Hi5CentralAgentService"
 )
+
+if(WIN32)
+  add_executable(hi5central_user
+    src/user_main.cpp
+    src/ui/native_banner.cpp
+    src/ui/native_chat_window.cpp
+    src/ui/native_tray.cpp
+  )
+  hi5_use_static_msvc_runtime(hi5central_user)
+  target_include_directories(hi5central_user PRIVATE src)
+  target_compile_definitions(hi5central_user PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
+  target_link_libraries(hi5central_user PRIVATE
+    nlohmann_json::nlohmann_json Threads::Threads
+    crypt32 advapi32 user32 gdi32 shell32 dwmapi d2d1 dwrite ole32
+  )
+  set_target_properties(hi5central_user PROPERTIES OUTPUT_NAME "Hi5CentralUser")
+
+  add_executable(hi5central_remote_host
+    src/remote_host_main.cpp
+    src/streamer_main.cpp
+    src/backstage/backstage_host.cpp
+    src/backstage/backstage_browser_host.cpp
+    src/backstage/backstage_cef_browser.cpp
+    src/platform/windows/windows_screen.cpp
+  )
+  hi5_use_static_msvc_runtime(hi5central_remote_host)
+  target_include_directories(hi5central_remote_host PRIVATE ${WEBVIEW2_INCLUDE_DIR} src)
+  target_compile_definitions(hi5central_remote_host PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
+  target_link_libraries(hi5central_remote_host PRIVATE
+    ${WEBVIEW2_LOADER_STATIC} Threads::Threads
+    d3d11 dxgi windowscodecs advapi32 user32 gdi32 shell32 shlwapi
+    ole32 oleaut32 uuid wtsapi32 userenv psapi dwmapi
+  )
+  set_target_properties(hi5central_remote_host PROPERTIES OUTPUT_NAME "Hi5CentralRemoteHost")
+endif()
