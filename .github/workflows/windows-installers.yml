@@ -84,7 +84,9 @@ jobs:
           retention-days: 14
           path: |
             Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe
-            Agent/chatpass_agent/build/Release/Hi5CentralAgent.exe
+            Agent/chatpass_agent/build/Release/Hi5CentralAgentService.exe
+            Agent/chatpass_agent/build/Release/Hi5CentralRemoteHost.exe
+            Agent/chatpass_agent/build/Release/Hi5CentralUser.exe
 
       - name: Upload Viewer installer
         uses: actions/upload-artifact@v4
