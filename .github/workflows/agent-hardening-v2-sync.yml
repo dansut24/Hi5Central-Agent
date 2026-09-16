@@ -1,4 +1,4 @@
-name: Sync low-CPU memory checkpoint
+name: Sync Viewer codec badge
 
 on:
   push:
@@ -20,37 +20,36 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download and verify exact checkpoint
+      - name: Download and verify exact Viewer checkpoint
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/perf-lowcpu-0.1.29-HEAD.tar.gz \
-            -o /tmp/perf-lowcpu-0.1.29.tar.gz
-          echo "46bcc63b9aebfb64923689d4fd351c8ca34976ba61e193f8014867735b4bd77c  /tmp/perf-lowcpu-0.1.29.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/viewer-codec-badge-HEAD.tar.gz \
+            -o /tmp/viewer-codec-badge.tar.gz
+          echo "568a8e9b7d28fd09f25b6b082201ba2892189aea81115cc6d29f63418c83e674  /tmp/viewer-codec-badge.tar.gz" | sha256sum -c -
 
-      - name: Apply exact changed files
+      - name: Apply exact Viewer files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/perf-lowcpu-0.1.29
-          tar -xzf /tmp/perf-lowcpu-0.1.29.tar.gz -C /tmp/perf-lowcpu-0.1.29
-          cp -a /tmp/perf-lowcpu-0.1.29/. .
+          mkdir -p /tmp/viewer-codec-badge
+          tar -xzf /tmp/viewer-codec-badge.tar.gz -C /tmp/viewer-codec-badge
+          cp -a /tmp/viewer-codec-badge/. .
           git add \
-            Agent/chatpass_agent/src/ipc/shmem_ring.h \
-            Agent/chatpass_agent/src/streamer_main.cpp \
-            Agent/chatpass_agent/src/webrtc_sender.cpp
+            Viewer/chatpass_viewer/web/index.html \
+            Viewer/chatpass_viewer/web/renderer.js
           git status --short
 
-      - name: Commit synced checkpoint
+      - name: Commit synced Viewer checkpoint
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git diff --cached --quiet; then
-            echo "No source changes to sync."
+            echo "No Viewer source changes to sync."
             exit 0
           fi
-          git commit -m "Reduce remote session memory and CPU bursts"
+          git commit -m "Show negotiated codec in Viewer"
           git push origin HEAD:agent-hardening-v2
