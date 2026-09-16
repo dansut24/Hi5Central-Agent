@@ -1,4 +1,4 @@
-name: Transit run 28 installers
+name: Cleanup run 28 transit
 
 on:
   push:
@@ -9,51 +9,15 @@ on:
 
 permissions:
   contents: write
-  actions: read
 
 jobs:
-  transit:
+  cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - name: Download Agent artifact from run 28
-        uses: actions/download-artifact@v4
-        with:
-          name: Hi5Central-Agent-Windows
-          path: /tmp/agent
-          github-token: ${{ github.token }}
-          repository: dansut24/Hi5Central-Agent
-          run-id: 35145076381
-
-      - name: Download Viewer artifact from run 28
-        uses: actions/download-artifact@v4
-        with:
-          name: Hi5Central-Viewer-Windows
-          path: /tmp/viewer
-          github-token: ${{ github.token }}
-          repository: dansut24/Hi5Central-Agent
-          run-id: 35145076381
-
-      - name: Verify and publish temporary prerelease
+      - name: Remove temporary prerelease and tag
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          agent="$(find /tmp/agent -type f -name Hi5CentralAgentSetup.exe -print -quit)"
-          viewer="$(find /tmp/viewer -type f -name Hi5CentralViewerSetup.exe -print -quit)"
-          test -n "$agent" && test -f "$agent"
-          test -n "$viewer" && test -f "$viewer"
-          echo "AGENT=$agent"
-          echo "VIEWER=$viewer"
-          sha256sum "$agent" "$viewer"
-          stat -c '%n %s' "$agent" "$viewer"
-          gh release delete transit-run28 --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
-          gh release create transit-run28 \
-            "$agent#Hi5CentralAgentSetup.exe" \
-            "$viewer#Hi5CentralViewerSetup.exe" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Temporary run 28 installer transit" \
-            --notes "Temporary staging transport for validated Windows run 35145076381. Remove after VPS verification." \
-            --prerelease
+          gh release delete transit-run28 --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
