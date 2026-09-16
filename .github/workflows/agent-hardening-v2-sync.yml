@@ -1,0 +1,59 @@
+name: Sync lifecycle user-host low-CPU checkpoint
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - ".github/workflows/agent-hardening-v2-sync.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout hardening branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download and verify exact checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            https://downloads.hi5central.com/bootstrap-agent-sync/session-lifecycle-userhost-lowcpu-HEAD.tar.gz \
+            -o /tmp/session-lifecycle-userhost-lowcpu.tar.gz
+          echo "b99579aaec36a6e6d42e281c5f6a1847cec41a88626ae3454b62e9a317c1e8a4  /tmp/session-lifecycle-userhost-lowcpu.tar.gz" | sha256sum -c -
+
+      - name: Apply exact changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/session-lifecycle-userhost-lowcpu
+          tar -xzf /tmp/session-lifecycle-userhost-lowcpu.tar.gz -C /tmp/session-lifecycle-userhost-lowcpu
+          cp -a /tmp/session-lifecycle-userhost-lowcpu/. .
+          git add \
+            Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
+            Agent/chatpass_agent/src/ui/native_chat_window.cpp \
+            Agent/chatpass_agent/src/ui/native_chat_window.h \
+            Agent/chatpass_agent/src/user_main.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.h
+          git status --short
+
+      - name: Commit synced checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "No source changes to sync."
+            exit 0
+          fi
+          git commit -m "Consolidate user host and harden session lifecycle"
+          git push origin HEAD:agent-hardening-v2
