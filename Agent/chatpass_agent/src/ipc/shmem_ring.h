@@ -21,8 +21,8 @@
 
 namespace hi5 {
 
-    static constexpr int      kShmRingSlots = 3;
-    static constexpr uint32_t kShmMaxFrameBytes = 32u * 1024u * 1024u; // enough for large I420 desktops
+    static constexpr int      kShmRingSlots = 2;
+    static constexpr uint32_t kShmMaxFrameBytes = 16u * 1024u * 1024u; // one 4K/5K-ultrawide I420 frame; latest-frame-wins only needs two slots
 
     struct ShmFrameHeader {
         std::atomic<uint32_t> size;   // payload bytes; 0 means slot not committed yet

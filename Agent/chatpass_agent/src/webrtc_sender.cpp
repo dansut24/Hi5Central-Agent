@@ -317,11 +317,13 @@ WebRtcSender::WebRtcSender(std::string sessionId,
 
     m_autoCodec = (m_codecMode == "auto");
     if (m_autoCodec) {
-        // Auto advertises all mature codecs and starts with VP9. The SDP answer
-        // tells us what the Viewer can actually decode before media starts.
-        m_videoCodec = VideoCodec::VP9;
-        m_payloadType = 98;
-        LogInfo("[codec] adaptive auto mode enabled, VP9 preferred session=" + m_sessionId);
+        // Remote-support Auto favours predictable endpoint CPU/RAM over maximum
+        // compression efficiency. Advertise all mature codecs, but begin with
+        // the proven low-latency VP8 baseline unless an operator explicitly
+        // selects VP9/H.264 (or a future hardware policy promotes them).
+        m_videoCodec = VideoCodec::VP8;
+        m_payloadType = 96;
+        LogInfo("[codec] adaptive auto mode enabled, VP8 low-CPU baseline preferred session=" + m_sessionId);
     }
     else if (m_codecMode == "h264_hw" || m_codecMode == "h264" || m_codecMode == "h264_sw") {
         m_videoCodec = VideoCodec::H264;
@@ -422,14 +424,14 @@ void WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
         " vp8=" + std::string(m_peerAcceptsVp8 ? "1" : "0") +
         " h264=" + std::string(m_peerAcceptsH264 ? "1" : "0"));
 
-    if (m_peerAcceptsVp9) {
-        switchVideoCodec(VideoCodec::VP9, "auto initial selection: Viewer accepts VP9");
+    if (m_peerAcceptsVp8) {
+        switchVideoCodec(VideoCodec::VP8, "auto initial selection: low-CPU VP8 baseline accepted");
     }
-    else if (m_peerAcceptsVp8) {
-        switchVideoCodec(VideoCodec::VP8, "auto initial selection: VP9 unavailable, Viewer accepts VP8");
+    else if (m_peerAcceptsVp9) {
+        switchVideoCodec(VideoCodec::VP9, "auto initial selection: VP8 unavailable, Viewer accepts VP9");
     }
     else if (m_peerAcceptsH264) {
-        switchVideoCodec(VideoCodec::H264, "auto initial selection: H.264 is the remaining accepted codec");
+        switchVideoCodec(VideoCodec::H264, "auto initial selection: VP8/VP9 unavailable, Viewer accepts H.264");
     }
     else {
         LogInfo("[codec] adaptive offer answer exposed no recognised video payload; keeping current codec session=" + m_sessionId);

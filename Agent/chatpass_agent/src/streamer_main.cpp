@@ -937,7 +937,7 @@ namespace hi5 {
         const int requestedMaxFps = std::max(1, args.fps);
         const int activeFps = std::min(requestedMaxFps, ReadEnvInt("HI5_STREAM_ACTIVE_FPS", 20, 1, 60));
         const int idleFps = std::min(activeFps, ReadEnvInt("HI5_STREAM_IDLE_FPS", 2, 1, 15));
-        const int motionFps = std::min(requestedMaxFps, ReadEnvInt("HI5_STREAM_MOTION_FPS", 30, 1, 60));
+        const int motionFps = std::min(requestedMaxFps, ReadEnvInt("HI5_STREAM_MOTION_FPS", activeFps, 1, 60));
         const auto activeHold = std::chrono::milliseconds(ReadEnvInt("HI5_STREAM_ACTIVE_HOLD_MS", 900, 100, 5000));
         const auto statsEvery = std::chrono::seconds(ReadEnvInt("HI5_STREAM_STATS_SECONDS", 5, 1, 60));
         auto nextCaptureAt = std::chrono::steady_clock::now();
