@@ -743,7 +743,11 @@ namespace {
         bool hadInput = false;
         while (drained < kMaxDrainPerTick && pipe.Read(cmd)) {
             ++drained;
-            hadInput = true;
+            // Pointer motion is carried independently of video and should not
+            // wake the desktop capture cadence. Other input can legitimately
+            // change pixels (clicks, keys, wheel, shortcuts), so keep those as
+            // capture activity.
+            if (cmd.type != hi5::InputCmdType::MouseMove) hadInput = true;
             if (cmd.type == hi5::InputCmdType::MouseMove) {
                 pendingMove = cmd;
                 havePendingMove = true;
@@ -951,7 +955,7 @@ namespace hi5 {
         uint64_t inputEvents = 0;
         uint64_t fastMouseApplied = 0;
         uint64_t fastMouseLastSeq = 0;
-        uint64_t cursorOnlyFrames = 0; // intentionally disabled; keep log field at 0
+        uint64_t cursorOnlyFrames = 0;
         bool localInputBlocked = false;
         std::chrono::steady_clock::time_point fastMouseNextLog{};
         const int cursorRefreshFps = 0; // disabled: mouse movement must not force video frames
@@ -1068,7 +1072,7 @@ namespace hi5 {
             try {
                 if (now >= nextCaptureAt) {
                     ++captureAttempts;
-                    FrameCaptureResult captured = source.nextFrameEx();
+                    FrameCaptureResult captured = source.nextFrameEx(false);
                     const bool recentInput = (now - lastInputAt) <= activeHold;
                     const bool recentMotion = (now - lastChangedFrameAt) <= std::chrono::milliseconds(ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
                     const int targetFps = recentInput ? motionFps : (recentMotion ? activeFps : idleFps);
@@ -1077,7 +1081,11 @@ namespace hi5 {
                     const auto frameInterval = std::chrono::milliseconds(1000 / std::max(1, targetFps));
                     nextCaptureAt = now + frameInterval;
 
-                    if (captured.hasFrame && captured.changed) {
+                    if (captured.cursorOnly) {
+                        ++cursorOnlyFrames;
+                        ++skippedFrames;
+                    }
+                    else if (captured.hasFrame && captured.changed) {
                         ++changedFrames;
                         lastChangedFrameAt = now;
                         const uint64_t tsNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;

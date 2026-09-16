@@ -679,7 +679,7 @@ struct DesktopFrameSource::Impl {
         return result;
     }
 
-    FrameCaptureResult captureOneLocked() {
+    FrameCaptureResult captureOneLocked(bool includeUnchangedFrame) {
         refreshDisplaysLocked();
 
         if (currentIndex == -1) {
@@ -706,8 +706,8 @@ struct DesktopFrameSource::Impl {
             }
 
             FrameCaptureResult result;
-            result.frame = lastFrame;
-            result.hasFrame = true;
+            if (includeUnchangedFrame) result.frame = lastFrame;
+            result.hasFrame = includeUnchangedFrame;
             result.changed = false;
             result.frameId = frameId;
             return result;
@@ -719,8 +719,8 @@ struct DesktopFrameSource::Impl {
             }
 
             FrameCaptureResult result;
-            result.frame = lastFrame;
-            result.hasFrame = true;
+            if (includeUnchangedFrame) result.frame = lastFrame;
+            result.hasFrame = includeUnchangedFrame;
             result.changed = false;
             result.frameId = frameId;
             return result;
@@ -730,6 +730,23 @@ struct DesktopFrameSource::Impl {
         }
 
         const bool cursorOnly = frameInfo.TotalMetadataBufferSize == 0 && frameInfo.LastMouseUpdateTime.QuadPart != 0;
+
+        // DXGI reports pointer-only updates separately from desktop pixel damage.
+        // The Viewer already renders the remote pointer on its low-latency cursor
+        // overlay, so do not copy/map/convert a full desktop frame just because
+        // Windows moved the hardware cursor. This keeps mouse movement off the
+        // expensive GPU->CPU BGRA->I420->encoder path.
+        if (cursorOnly && !Hi5CompositeCursorEnabled()) {
+            duplication->ReleaseFrame();
+            FrameCaptureResult result;
+            const bool cached = !lastFrame.y.empty() && lastFrame.width > 0 && lastFrame.height > 0;
+            if (includeUnchangedFrame && cached) result.frame = lastFrame;
+            result.hasFrame = includeUnchangedFrame && cached;
+            result.changed = false;
+            result.cursorOnly = true;
+            result.frameId = frameId;
+            return result;
+        }
 
         ComPtr<ID3D11Texture2D> tex;
         if (FAILED(resource.As(&tex))) {
@@ -772,13 +789,13 @@ DesktopFrameSource::DesktopFrameSource() : m_impl(new Impl()) {}
 DesktopFrameSource::~DesktopFrameSource() { delete m_impl; }
 
 I420Frame DesktopFrameSource::nextFrame() {
-    FrameCaptureResult r = nextFrameEx();
+    FrameCaptureResult r = nextFrameEx(true);
     return r.frame;
 }
 
-FrameCaptureResult DesktopFrameSource::nextFrameEx() {
+FrameCaptureResult DesktopFrameSource::nextFrameEx(bool includeUnchangedFrame) {
     std::lock_guard<std::mutex> lock(m_impl->mu);
-    return m_impl->captureOneLocked();
+    return m_impl->captureOneLocked(includeUnchangedFrame);
 }
 
 std::vector<DisplayInfo> DesktopFrameSource::listDisplays() const {

@@ -724,10 +724,7 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                     // native cursor path responsive, but do not force the expensive
                     // full-motion VP8 profile for every single mouse packet. Clicks,
                     // wheel and keyboard still boost to motion immediately.
-                    if (kind == "mouse_move") {
-                        m_externalHintMode = std::max(m_externalHintMode.load(), 1);
-                    }
-                    else {
+                    if (kind != "mouse_move") {
                         m_externalHintMode = std::max(m_externalHintMode.load(), 2);
                     }
                     if (m_mode == Mode::ExternalFeed && m_inputEventFn) {
@@ -816,7 +813,8 @@ bool WebRtcSender::handleBinaryMousePacket(const rtc::binary& data, const std::s
         }
     }
 
-    m_externalHintMode = std::max(m_externalHintMode.load(), 1);
+    // Pointer movement is transported independently from video. Do not wake
+    // the encoder profile for cursor-only motion.
 
     const auto receivedAt = std::chrono::steady_clock::now();
     bool injected = false;

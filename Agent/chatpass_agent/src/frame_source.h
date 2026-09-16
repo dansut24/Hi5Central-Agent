@@ -40,7 +40,7 @@ public:
     DesktopFrameSource& operator=(DesktopFrameSource&& other) noexcept;
 
     I420Frame nextFrame();
-    FrameCaptureResult nextFrameEx();
+    FrameCaptureResult nextFrameEx(bool includeUnchangedFrame = true);
 
     std::vector<DisplayInfo> listDisplays() const;
     DisplayInfo currentDisplayInfo() const;
