@@ -1,0 +1,55 @@
+name: Transit run 28 installers
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - ".github/workflows/transit-run28.yml"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  transit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download Agent artifact from run 28
+        uses: actions/download-artifact@v4
+        with:
+          name: Hi5Central-Agent-Windows
+          path: /tmp/agent
+          github-token: ${{ github.token }}
+          repository: dansut24/Hi5Central-Agent
+          run-id: 35145076381
+
+      - name: Download Viewer artifact from run 28
+        uses: actions/download-artifact@v4
+        with:
+          name: Hi5Central-Viewer-Windows
+          path: /tmp/viewer
+          github-token: ${{ github.token }}
+          repository: dansut24/Hi5Central-Agent
+          run-id: 35145076381
+
+      - name: Verify and publish temporary prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f /tmp/agent/Hi5CentralAgentSetup.exe
+          test -f /tmp/viewer/Hi5CentralViewerSetup.exe
+          sha256sum /tmp/agent/Hi5CentralAgentSetup.exe /tmp/viewer/Hi5CentralViewerSetup.exe
+          stat -c '%n %s' /tmp/agent/Hi5CentralAgentSetup.exe /tmp/viewer/Hi5CentralViewerSetup.exe
+          gh release delete transit-run28 --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create transit-run28 \
+            /tmp/agent/Hi5CentralAgentSetup.exe#Hi5CentralAgentSetup.exe \
+            /tmp/viewer/Hi5CentralViewerSetup.exe#Hi5CentralViewerSetup.exe \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Temporary run 28 installer transit" \
+            --notes "Temporary staging transport for validated Windows run 35145076381. Remove after VPS verification." \
+            --prerelease
