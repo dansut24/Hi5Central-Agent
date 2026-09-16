@@ -75,7 +75,7 @@ struct TrayApp {
         nid.uID = 1;
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = kTrayMessage;
-        nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
         wcsncpy_s(nid.szTip, title.c_str(), _TRUNCATE);
         if (Shell_NotifyIconW(NIM_ADD, &nid)) {
             nid.uVersion = NOTIFYICON_VERSION_4;
@@ -213,7 +213,7 @@ int RunNativeTrayMain(int argc, char** argv) {
     wc.lpfnWndProc = TrayWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = className;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     RegisterClassW(&wc);
 
     HWND hwnd = CreateWindowExW(0, className, L"Hi5Central Tray", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, &app);

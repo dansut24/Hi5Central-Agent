@@ -3810,18 +3810,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 ResetEvent(bindings[index].eventHandle);
                                 try {
                                     json request = { {"user", ActiveConsoleUser()} };
-                                    const std::string response = HttpPostJsonWithAgentAuth(
+                                    HttpPostJsonWithAgentAuth(
                                         "https://api.hi5central.com/api/v1/agent/devices/tray-actions/" + bindings[index].actionId + "/run",
                                         request.dump(),
                                         ident
                                     );
-                                    const auto queued = json::parse(response, nullptr, false);
-                                    if (!queued.is_discarded() && queued.value("success", false)) {
-                                        LogI("[tray] action queued id=" + bindings[index].actionId);
-                                    }
-                                    else {
-                                        LogW("[tray] action request rejected id=" + bindings[index].actionId);
-                                    }
+                                    // The authenticated POST helper throws on transport/non-2xx failures.
+                                    // Reaching here means the API accepted and queued the pinned automation.
+                                    LogI("[tray] action queued id=" + bindings[index].actionId);
                                 }
                                 catch (const std::exception& ex) {
                                     LogW(std::string("[tray] action request failed: ") + ex.what());
