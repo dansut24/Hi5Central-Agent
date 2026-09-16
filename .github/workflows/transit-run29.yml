@@ -1,4 +1,4 @@
-name: Transit run 29 installers
+name: Cleanup run 29 transit
 
 on:
   push:
@@ -7,55 +7,17 @@ on:
       - ".github/workflows/transit-run29.yml"
 
 permissions:
-  actions: read
   contents: write
 
 jobs:
-  transit:
+  cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download Agent artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: Hi5Central-Agent-Windows
-          path: /tmp/agent
-          repository: dansut24/Hi5Central-Agent
-          run-id: 35149352322
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download Viewer artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: Hi5Central-Viewer-Windows
-          path: /tmp/viewer
-          repository: dansut24/Hi5Central-Agent
-          run-id: 35149352322
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish temporary prerelease assets
+      - name: Remove temporary prerelease and tag
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          AGENT="$(find /tmp/agent -type f -name 'Hi5CentralAgentSetup.exe' -print -quit)"
-          VIEWER="$(find /tmp/viewer -type f -name 'Hi5CentralViewerSetup.exe' -print -quit)"
-          test -n "$AGENT" && test -f "$AGENT"
-          test -n "$VIEWER" && test -f "$VIEWER"
-          mkdir -p /tmp/release
-          cp "$AGENT" /tmp/release/Hi5CentralAgentSetup.exe
-          cp "$VIEWER" /tmp/release/Hi5CentralViewerSetup.exe
-          sha256sum /tmp/release/Hi5CentralAgentSetup.exe /tmp/release/Hi5CentralViewerSetup.exe
-          stat -c '%n %s bytes' /tmp/release/Hi5CentralAgentSetup.exe /tmp/release/Hi5CentralViewerSetup.exe
-          gh release create transit-0.1.29-20260916 \
-            /tmp/release/Hi5CentralAgentSetup.exe \
-            /tmp/release/Hi5CentralViewerSetup.exe \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Temporary 0.1.29 transit" \
-            --notes "Temporary transport only for verified run 29 installers." \
-            --prerelease
+          gh release delete transit-0.1.29-20260916 --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
