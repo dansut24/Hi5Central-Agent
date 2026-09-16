@@ -1,0 +1,58 @@
+name: Sync cursor pipeline checkpoint
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - ".github/workflows/agent-hardening-v2-sync.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout hardening branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download and verify exact checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            https://downloads.hi5central.com/bootstrap-agent-sync/cursor-off-video-0.1.30-HEAD.tar.gz \
+            -o /tmp/cursor-off-video-0.1.30.tar.gz
+          echo "12812a53909f2ed148a77b7e6d91d7bdffd40eacbfb538f9dc4c32338e78c5be  /tmp/cursor-off-video-0.1.30.tar.gz" | sha256sum -c -
+
+      - name: Apply exact changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cursor-off-video-0.1.30
+          tar -xzf /tmp/cursor-off-video-0.1.30.tar.gz -C /tmp/cursor-off-video-0.1.30
+          cp -a /tmp/cursor-off-video-0.1.30/. .
+          git add \
+            Agent/chatpass_agent/src/frame_source.cpp \
+            Agent/chatpass_agent/src/frame_source.h \
+            Agent/chatpass_agent/src/platform/windows/windows_screen.cpp \
+            Agent/chatpass_agent/src/streamer_main.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.cpp
+          git status --short
+
+      - name: Commit synced checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "No source changes to sync."
+            exit 0
+          fi
+          git commit -m "Keep cursor motion off remote video pipeline"
+          git push origin HEAD:agent-hardening-v2
