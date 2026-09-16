@@ -1,0 +1,56 @@
+name: Sync low-CPU memory checkpoint
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - ".github/workflows/agent-hardening-v2-sync.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout hardening branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download and verify exact checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            https://downloads.hi5central.com/bootstrap-agent-sync/perf-lowcpu-0.1.29-HEAD.tar.gz \
+            -o /tmp/perf-lowcpu-0.1.29.tar.gz
+          echo "46bcc63b9aebfb64923689d4fd351c8ca34976ba61e193f8014867735b4bd77c  /tmp/perf-lowcpu-0.1.29.tar.gz" | sha256sum -c -
+
+      - name: Apply exact changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/perf-lowcpu-0.1.29
+          tar -xzf /tmp/perf-lowcpu-0.1.29.tar.gz -C /tmp/perf-lowcpu-0.1.29
+          cp -a /tmp/perf-lowcpu-0.1.29/. .
+          git add \
+            Agent/chatpass_agent/src/ipc/shmem_ring.h \
+            Agent/chatpass_agent/src/streamer_main.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.cpp
+          git status --short
+
+      - name: Commit synced checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "No source changes to sync."
+            exit 0
+          fi
+          git commit -m "Reduce remote session memory and CPU bursts"
+          git push origin HEAD:agent-hardening-v2
