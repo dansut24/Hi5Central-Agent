@@ -1,4 +1,4 @@
-name: Transit run 25 installers
+name: Cleanup run 25 transit
 
 on:
   push:
@@ -8,38 +8,17 @@ on:
       - ".github/workflows/transit-run25.yml"
 
 permissions:
-  actions: read
   contents: write
 
 jobs:
-  expose:
+  cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Download exact run 25 artifacts
+      - name: Remove temporary prerelease and tag
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/agent /tmp/viewer
-          gh run download 35059091023 --repo "${GITHUB_REPOSITORY}" --name Hi5Central-Agent-Windows --dir /tmp/agent
-          gh run download 35059091023 --repo "${GITHUB_REPOSITORY}" --name Hi5Central-Viewer-Windows --dir /tmp/viewer
-          test -f /tmp/agent/dist/installer/Hi5CentralAgentSetup.exe
-          test -f /tmp/viewer/installer/Hi5CentralViewerSetup.exe
-          sha256sum /tmp/agent/dist/installer/Hi5CentralAgentSetup.exe /tmp/viewer/installer/Hi5CentralViewerSetup.exe
-
-      - name: Publish temporary prerelease transit assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="transit-0.1.25"
-          gh release delete "$tag" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag >/dev/null 2>&1 || true
-          gh release create "$tag" \
-            /tmp/agent/dist/installer/Hi5CentralAgentSetup.exe#Hi5CentralAgentSetup.exe \
-            /tmp/viewer/installer/Hi5CentralViewerSetup.exe#Hi5CentralViewerSetup.exe \
-            --repo "${GITHUB_REPOSITORY}" \
-            --target 03a4b819469a7337e27c39b01d804d293f6db439 \
-            --title "Temporary transit 0.1.25" \
-            --notes "Temporary prerelease assets used only to transfer the already-green run 25 installers to the Hi5Central downloads VPS for independent verification." \
-            --prerelease
+          gh release delete transit-0.1.25 --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag
