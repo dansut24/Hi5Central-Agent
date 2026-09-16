@@ -2015,6 +2015,7 @@ LogI(
 
                 StartTelemetryLoop(ident);
                 StartJobLoop(ident);
+                StartTrayLoop(ident);
 
                 auto sendFn = [this](const std::string& payload) {
                     if (signaling_) {
@@ -2417,6 +2418,7 @@ LogI(
 
                 patchWorker_.Stop();
                 StopInventoryLoop();
+                StopTrayLoop();
                 StopChatOverlays();
                 StopPresenceBanners();
                 CleanupOrphanUiHelperProcesses();
@@ -3643,6 +3645,205 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         PostJobResult(ident, jobId, false, json::object(), "unknown error");
                     } catch (...) {}
                 }
+            }
+
+            struct TrayActionBinding {
+                std::string actionId;
+                std::string eventName;
+                HANDLE eventHandle = nullptr;
+            };
+
+            void StartTrayLoop(AgentIdentity ident) {
+                if (trayThread_.joinable()) return;
+                trayThread_ = std::thread([this, ident = std::move(ident)]() mutable {
+                    std::vector<TrayActionBinding> bindings;
+                    HANDLE helperProcess = nullptr;
+                    HANDLE helperStopEvent = nullptr;
+                    DWORD helperSessionId = 0xFFFFFFFF;
+                    std::string activeSignature;
+                    auto nextRefresh = std::chrono::steady_clock::now();
+
+                    auto closeBindings = [&]() {
+                        for (auto& binding : bindings) {
+                            if (binding.eventHandle) {
+                                CloseHandle(binding.eventHandle);
+                                binding.eventHandle = nullptr;
+                            }
+                        }
+                        bindings.clear();
+                    };
+
+                    auto stopHelper = [&]() {
+                        if (helperStopEvent) SetEvent(helperStopEvent);
+                        if (helperProcess) {
+                            DWORD wait = WaitForSingleObject(helperProcess, 1600);
+                            if (wait == WAIT_TIMEOUT) {
+                                LogW("[tray] helper did not exit cleanly; terminating");
+                                TerminateProcess(helperProcess, 0);
+                                WaitForSingleObject(helperProcess, 800);
+                            }
+                            CloseHandle(helperProcess);
+                            helperProcess = nullptr;
+                        }
+                        if (helperStopEvent) {
+                            CloseHandle(helperStopEvent);
+                            helperStopEvent = nullptr;
+                        }
+                        helperSessionId = 0xFFFFFFFF;
+                    };
+
+                    while (!stop_.load()) {
+                        if (helperProcess && WaitForSingleObject(helperProcess, 0) != WAIT_TIMEOUT) {
+                            LogI("[tray] helper exited; scheduling relaunch");
+                            CloseHandle(helperProcess);
+                            helperProcess = nullptr;
+                            helperSessionId = 0xFFFFFFFF;
+                            nextRefresh = std::chrono::steady_clock::now();
+                        }
+
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now >= nextRefresh) {
+                            nextRefresh = now + std::chrono::seconds(30);
+                            try {
+                                const std::string response = HttpGetJsonWithAgentAuth(
+                                    "https://api.hi5central.com/api/v1/agent/devices/tray-policy",
+                                    ident
+                                );
+                                const auto root = json::parse(response, nullptr, false);
+                                if (root.is_discarded() || !root.value("success", false) || !root.contains("policy") || !root["policy"].is_object()) {
+                                    LogW("[tray] policy response invalid");
+                                }
+                                else {
+                                    json policy = root["policy"];
+                                    const bool enabled = policy.value("enabled", false);
+                                    const DWORD activeSession = WTSGetActiveConsoleSessionId();
+                                    const std::string signature = policy.dump();
+                                    const bool sessionValid = activeSession != 0xFFFFFFFF;
+                                    const bool helperAlive = helperProcess && WaitForSingleObject(helperProcess, 0) == WAIT_TIMEOUT;
+                                    const bool changed = signature != activeSignature || helperSessionId != activeSession;
+
+                                    if (!enabled || !sessionValid) {
+                                        if (helperProcess || !bindings.empty()) {
+                                            LogI(enabled ? "[tray] no interactive session; removing tray helper" : "[tray] policy disabled; removing tray helper");
+                                        }
+                                        stopHelper();
+                                        closeBindings();
+                                        activeSignature = signature;
+                                    }
+                                    else if (changed || !helperAlive) {
+                                        stopHelper();
+                                        closeBindings();
+
+                                        const std::string devicePart = SafeFilePart(ident.deviceId.substr(0, std::min<size_t>(24, ident.deviceId.size())));
+                                        const std::string stopEventName = "Global\\Hi5TrayStop_" + devicePart;
+                                        helperStopEvent = CreateOrOpenManualResetEventA(stopEventName, false);
+                                        if (helperStopEvent) ResetEvent(helperStopEvent);
+
+                                        json helperPolicy = policy;
+                                        helperPolicy["title"] = "Hi5Central";
+                                        json helperActions = json::array();
+                                        if (policy.contains("actions") && policy["actions"].is_array()) {
+                                            size_t index = 0;
+                                            for (const auto& item : policy["actions"]) {
+                                                if (!item.is_object() || index >= 20) continue;
+                                                const std::string actionId = item.value("id", std::string());
+                                                if (actionId.empty()) continue;
+                                                const std::string eventName = "Global\\Hi5TrayAction_" + devicePart + "_" + SafeFilePart(actionId);
+                                                HANDLE actionEvent = CreateOrOpenManualResetEventA(eventName, false);
+                                                if (!actionEvent) continue;
+                                                ResetEvent(actionEvent);
+
+                                                TrayActionBinding binding;
+                                                binding.actionId = actionId;
+                                                binding.eventName = eventName;
+                                                binding.eventHandle = actionEvent;
+                                                bindings.push_back(binding);
+
+                                                json helperAction = item;
+                                                helperAction["eventName"] = eventName;
+                                                helperActions.push_back(helperAction);
+                                                ++index;
+                                            }
+                                        }
+                                        helperPolicy["actions"] = helperActions;
+
+                                        const std::string policyText = helperPolicy.dump();
+                                        const std::string policyB64 = Base64EncodeBytes(
+                                            reinterpret_cast<const unsigned char*>(policyText.data()),
+                                            policyText.size()
+                                        );
+                                        const std::string exe = CurrentExePath();
+                                        const std::string args = "--mode tray --session " + QuoteArg(std::to_string(activeSession)) +
+                                            " --stop-event " + QuoteArg(stopEventName) +
+                                            " --policy-b64 " + QuoteArg(policyB64);
+
+                                        helperProcess = LaunchInInteractiveSession(exe, args);
+                                        if (!helperProcess) {
+                                            LogW("[tray] helper launch failed session=" + std::to_string(activeSession));
+                                            if (helperStopEvent) { CloseHandle(helperStopEvent); helperStopEvent = nullptr; }
+                                            closeBindings();
+                                            nextRefresh = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                                        }
+                                        else {
+                                            helperSessionId = activeSession;
+                                            activeSignature = signature;
+                                            LogI("[tray] helper launched session=" + std::to_string(activeSession) + " actions=" + std::to_string(bindings.size()));
+                                        }
+                                    }
+                                }
+                            }
+                            catch (const std::exception& ex) {
+                                LogW(std::string("[tray] policy refresh failed: ") + ex.what());
+                            }
+                            catch (...) {
+                                LogW("[tray] policy refresh failed: unknown error");
+                            }
+                        }
+
+                        if (!bindings.empty()) {
+                            std::vector<HANDLE> handles;
+                            handles.reserve(bindings.size());
+                            for (const auto& binding : bindings) handles.push_back(binding.eventHandle);
+                            DWORD wait = WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(), FALSE, 500);
+                            if (wait >= WAIT_OBJECT_0 && wait < WAIT_OBJECT_0 + static_cast<DWORD>(handles.size())) {
+                                const size_t index = static_cast<size_t>(wait - WAIT_OBJECT_0);
+                                ResetEvent(bindings[index].eventHandle);
+                                try {
+                                    json request = { {"user", ActiveConsoleUser()} };
+                                    const std::string response = HttpPostJsonWithAgentAuth(
+                                        "https://api.hi5central.com/api/v1/agent/devices/tray-actions/" + bindings[index].actionId + "/run",
+                                        request.dump(),
+                                        ident
+                                    );
+                                    const auto queued = json::parse(response, nullptr, false);
+                                    if (!queued.is_discarded() && queued.value("success", false)) {
+                                        LogI("[tray] action queued id=" + bindings[index].actionId);
+                                    }
+                                    else {
+                                        LogW("[tray] action request rejected id=" + bindings[index].actionId);
+                                    }
+                                }
+                                catch (const std::exception& ex) {
+                                    LogW(std::string("[tray] action request failed: ") + ex.what());
+                                }
+                                catch (...) {
+                                    LogW("[tray] action request failed: unknown error");
+                                }
+                            }
+                        }
+                        else {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        }
+                    }
+
+                    stopHelper();
+                    closeBindings();
+                    LogI("[tray] loop stopped");
+                });
+            }
+
+            void StopTrayLoop() {
+                if (trayThread_.joinable()) trayThread_.join();
             }
 
             void StartJobLoop(AgentIdentity ident) {
@@ -7269,6 +7470,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             ChatController chatController_;
             std::unique_ptr<SignalingClient> signaling_;
             std::thread inventoryThread_;
+            std::thread trayThread_;
             PatchWorker patchWorker_;
 
             std::mutex sessionsMu_;

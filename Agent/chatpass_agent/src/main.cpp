@@ -35,6 +35,7 @@ namespace hi5 {
     int RunChatOverlayMain(int argc, char** argv);
     int RunNativeChatMain(int argc, char** argv);
     int RunNativeBannerMain(int argc, char** argv);
+    int RunNativeTrayMain(int argc, char** argv);
     int RunBackstageHostMain(int argc, char** argv);
     int RunBackstageBrowserMain(int argc, char** argv);
     int MaybeRunCefSubprocess(int argc, char** argv);
@@ -344,6 +345,12 @@ int main(int argc, char** argv) {
                 std::cout << "[main] mode=banner\n";
                 LogInfo("[main] mode=banner");
                 return hi5::RunNativeBannerMain(argc, argv);
+            }
+
+            if (next == "tray") {
+                std::cout << "[main] mode=tray\n";
+                LogInfo("[main] mode=tray");
+                return hi5::RunNativeTrayMain(argc, argv);
             }
 
             if (next == "sas-helper") {
