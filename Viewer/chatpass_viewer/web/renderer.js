@@ -42,6 +42,7 @@ const elStatsBar     = document.getElementById("statsbar");
 const elStatRes      = document.getElementById("stat-res");
 const elStatState    = document.getElementById("stat-state");
 const elStatCodec    = document.getElementById("stat-codec");
+const elCodecDevBadge = document.getElementById("codec-dev-badge");
 const elDiagIceState = document.getElementById("diag-ice-state");
 const elDiagConnState = document.getElementById("diag-connection-state");
 const elDiagCandidatePair = document.getElementById("diag-candidate-pair");
@@ -1159,6 +1160,7 @@ function disconnect(reason, options = {}) {
   const closeNative = !!options.closeNative;
   console.log("[viewer] disconnect called:", reason || "(none)", silent ? "silent" : "", closeNative ? "close-native" : "");
   stopStatsPoll();
+  setViewerCodecLabel("—");
 
   remoteDescSet = false;
   pendingRemoteIce = [];
@@ -1873,7 +1875,16 @@ function logSdpCodecSummary(label, sdp) {
 }
 
 function setViewerCodecLabel(value) {
-  if (elStatCodec) elStatCodec.textContent = value || "—";
+  const detail = String(value || "—").trim() || "—";
+  if (elStatCodec) elStatCodec.textContent = detail;
+  if (elCodecDevBadge) {
+    let codec = detail === "—" ? "—" : detail.split(/\s+/)[0].toUpperCase();
+    if (codec === "H264") codec = "H.264";
+    elCodecDevBadge.textContent = `Codec: ${codec}`;
+    elCodecDevBadge.title = detail === "—"
+      ? "Negotiated remote video codec"
+      : `Negotiated remote video codec: ${detail}`;
+  }
 }
 
 async function updateSelectedCodecFromStats() {
