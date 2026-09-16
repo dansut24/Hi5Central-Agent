@@ -21,11 +21,12 @@ namespace hi5 {
     class NativeChatWindow {
     public:
         using SendCallback = std::function<void(const std::string&)>;
+        using DismissCallback = std::function<void()>;
 
         NativeChatWindow();
         ~NativeChatWindow();
 
-        bool Start(const std::string& sessionId, SendCallback onSend);
+        bool Start(const std::string& sessionId, SendCallback onSend, DismissCallback onDismiss = {});
         void Stop();
 
         void Show();
@@ -64,6 +65,7 @@ namespace hi5 {
     private:
         std::string sessionId_;
         SendCallback onSend_;
+        DismissCallback onDismiss_;
 
         std::thread uiThread_;
         std::atomic<bool> running_{ false };

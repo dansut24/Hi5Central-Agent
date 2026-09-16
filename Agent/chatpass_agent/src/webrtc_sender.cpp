@@ -1852,7 +1852,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
     }
     m_externalEffectiveMode = effectiveMode;
 
-    if (previousEffectiveMode <= 0 && effectiveMode > 0 && readEnvInt("HI5_VP8_FORCE_KEYFRAME_ON_WAKE", 1, 0, 1) == 1) {
+    if (previousEffectiveMode <= 0 && effectiveMode > 0 && readEnvInt("HI5_VP8_FORCE_KEYFRAME_ON_WAKE", 0, 0, 1) == 1) {
         forceKeyframe = true;
     }
 
@@ -1931,6 +1931,13 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             return;
         }
     }
+
+    const auto encodeInterval = std::chrono::milliseconds(std::max(1, 1000 / std::max(1, profile.fps)));
+    if (!forceKeyframe && !m_forceKeyframe.load() && m_externalLastEncodeAt.time_since_epoch().count() != 0 &&
+        nowForProfile - m_externalLastEncodeAt < encodeInterval) {
+        return;
+    }
+    m_externalLastEncodeAt = nowForProfile;
 
     ++m_externalFrameCounter;
 

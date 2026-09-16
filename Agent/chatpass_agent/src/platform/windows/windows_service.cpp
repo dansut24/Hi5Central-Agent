@@ -1420,6 +1420,32 @@ namespace hi5 {
             return SiblingExecutablePath("Hi5CentralUser.exe");
         }
 
+        static HANDLE LaunchUserHostFeature(const std::string& featureArgs) {
+            const std::string exe = UserHostExePath();
+            if (exe.empty()) return nullptr;
+            const DWORD windowsSession = WTSGetActiveConsoleSessionId();
+            if (windowsSession == 0xFFFFFFFF) return nullptr;
+
+            const std::string hostArgs = "--mode user-host --windows-session " + QuoteArg(std::to_string(windowsSession));
+            HANDLE hostProbe = LaunchInInteractiveSession(exe, hostArgs);
+            if (hostProbe) {
+                WaitForSingleObject(hostProbe, 250);
+                CloseHandle(hostProbe);
+            }
+            Sleep(75);
+            return LaunchInInteractiveSession(exe, featureArgs);
+        }
+
+        static void StopResidentUserHosts() {
+            const std::wstring ps =
+                L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \""
+                L"$ErrorActionPreference='SilentlyContinue'; "
+                L"Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Hi5CentralUser.exe' -and $_.CommandLine -match '--mode\\s+user-host' } | "
+                L"ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+                L"\"";
+            RunHiddenProcessAndWait(ps, 5000);
+        }
+
         static std::string RemoteHostExePath() {
             return SiblingExecutablePath("Hi5CentralRemoteHost.exe");
         }
@@ -1444,6 +1470,7 @@ namespace hi5 {
             std::vector<std::string> pendingToOverlay;
             bool inConnected = false;
             bool overlayReady = false;
+            bool userDismissed = false;
         };
 
         static std::mutex g_chatOverlayMu;
@@ -1546,7 +1573,7 @@ namespace hi5 {
             LogI("[presence] launching edge support panel session=" + sessionId +
                 " technician=" + safeTech +
                 " notify=" + std::string(notifyOnStart ? "true" : "false"));
-            HANDLE proc = LaunchInInteractiveSession(exe, args);
+            HANDLE proc = LaunchUserHostFeature(args);
             if (!proc) {
                 LogE("[presence] banner launch failed session=" + sessionId);
                 if (stopEvent) CloseHandle(stopEvent);
@@ -1554,11 +1581,12 @@ namespace hi5 {
                 if (endEvent) CloseHandle(endEvent);
                 return;
             }
-            AssignProcessToSessionJob(sessionJob, proc, sessionId, "presence-banner");
+            WaitForSingleObject(proc, 1000);
+            CloseHandle(proc);
 
             PresenceBannerState state;
             state.sessionId = sessionId;
-            state.process = proc;
+            state.process = nullptr;
             state.stopEvent = stopEvent;
             state.chatEvent = chatEvent;
             state.endEvent = endEvent;
@@ -1713,8 +1741,12 @@ namespace hi5 {
                         const std::string body = j.value("body", std::string());
                         if (!body.empty() && cb) cb(state->sessionId, body);
                     }
-                    else if (type == "closed") {
-                        LogI("[chat-ui] overlay closed by user session=" + state->sessionId);
+                    else if (type == "dismissed" || type == "closed") {
+                        {
+                            std::lock_guard<std::mutex> lock(state->mu);
+                            state->userDismissed = true;
+                        }
+                        LogI("[chat-ui] overlay dismissed by user session=" + state->sessionId);
                     }
                 }
             }
@@ -1752,7 +1784,7 @@ namespace hi5 {
                 " --stop-event " + QuoteArg(state->stopEventName);
             LogI("[chat-ui] launching native chat helper session=" + sessionId +
                 " in=" + state->inPipeName + " out=" + state->outPipeName);
-            raw->process = LaunchInInteractiveSession(overlayExe, args);
+            raw->process = LaunchUserHostFeature(args);
             if (!raw->process) {
                 LogE("[chat-ui] launch failed session=" + sessionId);
                 raw->stop.store(true);
@@ -1768,7 +1800,9 @@ namespace hi5 {
                 return nullptr;
             }
 
-            AssignProcessToSessionJob(sessionJob, raw->process, sessionId, "chat-overlay");
+            WaitForSingleObject(raw->process, 1000);
+            CloseHandle(raw->process);
+            raw->process = nullptr;
             g_chatOverlays[sessionId] = std::move(state);
             return raw;
         }
@@ -1792,6 +1826,10 @@ namespace hi5 {
 
             {
                 std::lock_guard<std::mutex> lock(state->mu);
+                if (state->userDismissed) {
+                    LogI("[chat-ui] transcript updated while remote chat remains dismissed session=" + sessionId);
+                    return true;
+                }
                 state->pendingToOverlay.push_back(payload.dump());
             }
             FlushQueuedChatToOverlay(state);
@@ -2453,6 +2491,7 @@ LogI(
                 StopChatOverlays();
                 StopPresenceBanners();
                 CleanupOrphanUiHelperProcesses();
+                StopResidentUserHosts();
                 CleanupOrphanStreamerProcesses();
                 presenceController_.Hide();
                 sessionBridge_.ClearActiveSession();
@@ -3750,7 +3789,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     const DWORD activeSession = WTSGetActiveConsoleSessionId();
                                     const std::string signature = policy.dump();
                                     const bool sessionValid = activeSession != 0xFFFFFFFF;
-                                    const bool helperAlive = helperProcess && WaitForSingleObject(helperProcess, 0) == WAIT_TIMEOUT;
+                                    const bool helperAlive = helperSessionId == activeSession && !activeSignature.empty();
                                     const bool changed = signature != activeSignature || helperSessionId != activeSession;
 
                                     if (!enabled || !sessionValid) {
@@ -3808,7 +3847,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                             " --stop-event " + QuoteArg(stopEventName) +
                                             " --policy-b64 " + QuoteArg(policyB64);
 
-                                        helperProcess = LaunchInInteractiveSession(exe, args);
+                                        helperProcess = LaunchUserHostFeature(args);
                                         if (!helperProcess) {
                                             LogW("[tray] helper launch failed session=" + std::to_string(activeSession));
                                             if (helperStopEvent) { CloseHandle(helperStopEvent); helperStopEvent = nullptr; }
@@ -3816,9 +3855,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                             nextRefresh = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                                         }
                                         else {
+                                            WaitForSingleObject(helperProcess, 1000);
+                                            CloseHandle(helperProcess);
+                                            helperProcess = nullptr;
                                             helperSessionId = activeSession;
                                             activeSignature = signature;
-                                            LogI("[tray] helper launched session=" + std::to_string(activeSession) + " actions=" + std::to_string(bindings.size()));
+                                            LogI("[tray] feature registered with resident user host session=" + std::to_string(activeSession) + " actions=" + std::to_string(bindings.size()));
                                         }
                                     }
                                 }
@@ -6683,6 +6725,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         if (overlay) {
                             {
                                 std::lock_guard<std::mutex> lock(overlay->mu);
+                                overlay->userDismissed = false;
                                 overlay->pendingToOverlay.push_back(json{
                                     {"type", "show"}, {"session_id", ctx.sessionId}
                                 }.dump());
@@ -6694,6 +6737,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     if (ConsumePresenceBannerAction(ctx.sessionId, false)) {
                         LogI("[presence] local user ending remote session=" + ctx.sessionId);
                         const std::string sid = ctx.sessionId;
+                        if (signaling_) {
+                            json ended = {
+                                {"type", "viewer_disconnected"},
+                                {"session_id", sid},
+                                {"reason", "user_ended_session"},
+                                {"ended_by", "user"}
+                            };
+                            signaling_->send(ended.dump());
+                        }
                         std::thread([this, sid]() { StopSession(sid); }).detach();
                         return;
                     }

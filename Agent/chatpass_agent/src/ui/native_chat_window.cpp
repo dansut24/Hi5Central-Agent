@@ -51,12 +51,13 @@ namespace hi5 {
         Stop();
     }
 
-    bool NativeChatWindow::Start(const std::string& sessionId, SendCallback onSend) {
+    bool NativeChatWindow::Start(const std::string& sessionId, SendCallback onSend, DismissCallback onDismiss) {
         Stop();
 
         dismissedByUser_ = false;
         sessionId_ = sessionId;
         onSend_ = std::move(onSend);
+        onDismiss_ = std::move(onDismiss);
         readyEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!readyEvent_) {
             return false;
@@ -95,6 +96,7 @@ namespace hi5 {
         closeButton_ = nullptr;
         uiThreadId_ = 0;
         onSend_ = nullptr;
+        onDismiss_ = nullptr;
         sessionId_.clear();
 
         if (font_) { DeleteObject(font_); font_ = nullptr; }
@@ -483,7 +485,10 @@ namespace hi5 {
                 return 0;
             }
             if (LOWORD(wParam) == kCloseId && HIWORD(wParam) == BN_CLICKED) {
-                dismissedByUser_ = true;
+                if (!dismissedByUser_) {
+                    dismissedByUser_ = true;
+                    if (onDismiss_) onDismiss_();
+                }
                 HideOnUiThread();
                 return 0;
             }
@@ -555,7 +560,10 @@ namespace hi5 {
             if (!running_.load()) {
                 DestroyWindow(hwnd);
             } else {
-                dismissedByUser_ = true;
+                if (!dismissedByUser_) {
+                    dismissedByUser_ = true;
+                    if (onDismiss_) onDismiss_();
+                }
                 HideOnUiThread();
             }
             return 0;
@@ -625,6 +633,9 @@ namespace hi5 {
                 {"type", "chat_message"}, {"session_id", sessionId},
                 {"sender", "user"}, {"display_name", "Remote user"}, {"body", body}
             });
+        }, [&]() {
+            std::lock_guard<std::mutex> lock(outMu);
+            WriteChatHelperLine(outPipe, {{"type", "dismissed"}, {"session_id", sessionId}});
         })) {
             CloseHandle(inPipe);
             CloseHandle(outPipe);
