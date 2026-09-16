@@ -125,4 +125,4 @@ jobs:
           git commit -m "Publish Windows test build 0.1.${{ github.run_number }}"
           git push --force origin HEAD:build-output
 
-# Validation trigger: 4c856f4 automation tray
+# Validation trigger: 116d131 tray compile fix
