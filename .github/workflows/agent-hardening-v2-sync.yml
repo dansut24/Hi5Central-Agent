@@ -1,4 +1,4 @@
-name: Sync RMM polish and audio checkpoint
+name: Sync session controls and process split checkpoint
 
 on:
   push:
@@ -20,41 +20,39 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download and verify RMM polish snapshot
+      - name: Download and verify exact checkpoint
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/rmm-polish-audio-e7727e1.tar.gz \
-            -o /tmp/rmm-polish-audio-e7727e1.tar.gz
-          echo "1bd2f4dbcee49d70c38819af481506413b83d3fd0efe703ae5fe8207e32302ee  /tmp/rmm-polish-audio-e7727e1.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/rmm-session-controls-process-split-57a7aa7.tar.gz \
+            -o /tmp/rmm-session-controls-process-split-57a7aa7.tar.gz
+          echo "92970c24ca2e37360dcc3de722d396e99e7daebf28726c8eec119a2e70d196f5  /tmp/rmm-session-controls-process-split-57a7aa7.tar.gz" | sha256sum -c -
 
       - name: Apply exact changed files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/rmm-polish-audio
-          tar -xzf /tmp/rmm-polish-audio-e7727e1.tar.gz -C /tmp/rmm-polish-audio
-          cp -a /tmp/rmm-polish-audio/. .
+          mkdir -p /tmp/rmm-session-controls-process-split
+          tar -xzf /tmp/rmm-session-controls-process-split-57a7aa7.tar.gz -C /tmp/rmm-session-controls-process-split
+          cp -a /tmp/rmm-session-controls-process-split/. .
           git add \
+            .github/workflows/windows-installers.yml \
             Agent/chatpass_agent/CMakeLists.txt \
-            Agent/chatpass_agent/vcpkg.json \
-            Agent/chatpass_agent/src/ipc/input_pipe.h \
+            Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1 \
+            Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss \
+            Agent/chatpass_agent/installer/windows/Hi5TechAgentSetup.iss \
             Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
-            Agent/chatpass_agent/src/platform/windows/wasapi_loopback.cpp \
-            Agent/chatpass_agent/src/platform/windows/wasapi_loopback.h \
+            Agent/chatpass_agent/src/remote_host_main.cpp \
             Agent/chatpass_agent/src/streamer_main.cpp \
-            Agent/chatpass_agent/src/ui/native_banner.cpp \
             Agent/chatpass_agent/src/ui/native_chat_window.cpp \
             Agent/chatpass_agent/src/ui/native_chat_window.h \
-            Agent/chatpass_agent/src/ui/native_tray.cpp \
-            Agent/chatpass_agent/src/webrtc_sender.cpp \
-            Agent/chatpass_agent/src/webrtc_sender.h \
-            Viewer/chatpass_viewer/web/index.html \
+            Agent/chatpass_agent/src/user_main.cpp \
+            Viewer/chatpass_viewer/src/app/viewer_app.cpp \
             Viewer/chatpass_viewer/web/renderer.js
           git status --short
 
-      - name: Commit synced RMM polish
+      - name: Commit synced checkpoint
         shell: bash
         run: |
           set -euo pipefail
@@ -64,5 +62,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Polish tray remote controls and add audio"
+          git commit -m "Split remote helpers and fix session controls"
           git push origin HEAD:agent-hardening-v2
