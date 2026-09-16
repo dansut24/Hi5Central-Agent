@@ -37,7 +37,6 @@ jobs:
           tar -xzf /tmp/rmm-session-controls-process-split-57a7aa7.tar.gz -C /tmp/rmm-session-controls-process-split
           cp -a /tmp/rmm-session-controls-process-split/. .
           git add \
-            .github/workflows/windows-installers.yml \
             Agent/chatpass_agent/CMakeLists.txt \
             Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1 \
             Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss \
