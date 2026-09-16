@@ -40,14 +40,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f /tmp/agent/Hi5CentralAgentSetup.exe
-          test -f /tmp/viewer/Hi5CentralViewerSetup.exe
-          sha256sum /tmp/agent/Hi5CentralAgentSetup.exe /tmp/viewer/Hi5CentralViewerSetup.exe
-          stat -c '%n %s' /tmp/agent/Hi5CentralAgentSetup.exe /tmp/viewer/Hi5CentralViewerSetup.exe
+          agent="$(find /tmp/agent -type f -name Hi5CentralAgentSetup.exe -print -quit)"
+          viewer="$(find /tmp/viewer -type f -name Hi5CentralViewerSetup.exe -print -quit)"
+          test -n "$agent" && test -f "$agent"
+          test -n "$viewer" && test -f "$viewer"
+          echo "AGENT=$agent"
+          echo "VIEWER=$viewer"
+          sha256sum "$agent" "$viewer"
+          stat -c '%n %s' "$agent" "$viewer"
           gh release delete transit-run28 --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
           gh release create transit-run28 \
-            /tmp/agent/Hi5CentralAgentSetup.exe#Hi5CentralAgentSetup.exe \
-            /tmp/viewer/Hi5CentralViewerSetup.exe#Hi5CentralViewerSetup.exe \
+            "$agent#Hi5CentralAgentSetup.exe" \
+            "$viewer#Hi5CentralViewerSetup.exe" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Temporary run 28 installer transit" \
