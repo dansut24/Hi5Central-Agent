@@ -1,4 +1,4 @@
-name: Sync chat files mobile CAD checkpoint
+name: Sync automation tray checkpoint
 
 on:
   push:
@@ -20,29 +20,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download and verify chat files mobile CAD snapshot
+      - name: Download and verify automation tray snapshot
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/chat-files-mobile-cad-0a03d82.tar.gz \
-            -o /tmp/chat-files-mobile-cad-0a03d82.tar.gz
-          echo "63b652a5e0cd23e2de663a60b2ad2d6f96efc5e66a0fd545aec59c5b6eb5f1ee  /tmp/chat-files-mobile-cad-0a03d82.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/automation-tray-4c856f4.tar.gz \
+            -o /tmp/automation-tray-4c856f4.tar.gz
+          echo "730cac6e666d78aa426ea184ff99a965ff9146cd88b56020ba5d08e97b6a0770  /tmp/automation-tray-4c856f4.tar.gz" | sha256sum -c -
 
       - name: Apply exact changed files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/chat-files-mobile-cad
-          tar -xzf /tmp/chat-files-mobile-cad-0a03d82.tar.gz -C /tmp/chat-files-mobile-cad
-          cp -a /tmp/chat-files-mobile-cad/. .
+          mkdir -p /tmp/automation-tray
+          tar -xzf /tmp/automation-tray-4c856f4.tar.gz -C /tmp/automation-tray
+          cp -a /tmp/automation-tray/. .
           git add \
+            Agent/chatpass_agent/CMakeLists.txt \
+            Agent/chatpass_agent/src/main.cpp \
             Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
-            Agent/chatpass_agent/src/ui/native_chat_window.cpp \
-            Viewer/chatpass_viewer/src/app/viewer_app.cpp \
-            Viewer/chatpass_viewer/web/file_browser.html \
-            Viewer/chatpass_viewer/web/index.html \
-            Viewer/chatpass_viewer/web/renderer.js
+            Agent/chatpass_agent/src/ui/native_tray.cpp \
+            Agent/chatpass_agent/src/ui/native_tray.h
           git status --short
 
       - name: Commit synced checkpoint
@@ -55,5 +54,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Sync chat files mobile CAD checkpoint"
+          git commit -m "Sync policy controlled tray self service"
           git push origin HEAD:agent-hardening-v2
