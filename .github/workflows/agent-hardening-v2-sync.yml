@@ -1,4 +1,4 @@
-name: Sync automation tray checkpoint
+name: Sync automation tray compile fix
 
 on:
   push:
@@ -20,31 +20,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download and verify automation tray snapshot
+      - name: Download and verify tray compile fix snapshot
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/automation-tray-4c856f4.tar.gz \
-            -o /tmp/automation-tray-4c856f4.tar.gz
-          echo "730cac6e666d78aa426ea184ff99a965ff9146cd88b56020ba5d08e97b6a0770  /tmp/automation-tray-4c856f4.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/automation-tray-compile-fix-116d131.tar.gz \
+            -o /tmp/automation-tray-compile-fix-116d131.tar.gz
+          echo "da6b4f15124a41b8d6ec2b291220e65cf4b217f56a6f34349a77972891e49dfe  /tmp/automation-tray-compile-fix-116d131.tar.gz" | sha256sum -c -
 
       - name: Apply exact changed files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/automation-tray
-          tar -xzf /tmp/automation-tray-4c856f4.tar.gz -C /tmp/automation-tray
-          cp -a /tmp/automation-tray/. .
+          mkdir -p /tmp/automation-tray-compile-fix
+          tar -xzf /tmp/automation-tray-compile-fix-116d131.tar.gz -C /tmp/automation-tray-compile-fix
+          cp -a /tmp/automation-tray-compile-fix/. .
           git add \
-            Agent/chatpass_agent/CMakeLists.txt \
-            Agent/chatpass_agent/src/main.cpp \
             Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
-            Agent/chatpass_agent/src/ui/native_tray.cpp \
-            Agent/chatpass_agent/src/ui/native_tray.h
+            Agent/chatpass_agent/src/ui/native_tray.cpp
           git status --short
 
-      - name: Commit synced checkpoint
+      - name: Commit synced compile fix
         shell: bash
         run: |
           set -euo pipefail
@@ -54,5 +51,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Sync policy controlled tray self service"
+          git commit -m "Fix Windows tray compilation"
           git push origin HEAD:agent-hardening-v2
