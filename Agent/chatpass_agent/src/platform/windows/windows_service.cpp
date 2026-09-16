@@ -1887,6 +1887,7 @@ namespace hi5 {
             bool secureStateAnnounced = false;
             bool handoffStateAnnounced = false;
             bool chatOpen = false;
+            bool localInputBlocked = false;
             std::chrono::steady_clock::time_point lastNormalFrameAt{};
             std::chrono::steady_clock::time_point lastSecureFrameAt{};
             std::chrono::steady_clock::time_point uacDetectedAt{};
@@ -2116,6 +2117,19 @@ LogI(
                         if (it != sessions_.end() && it->second->sender) {
                             it->second->sender->handleSignalingMessage(text);
                         }
+                        FlushBridgeOutgoing();
+                        return;
+                    }
+
+                    if (type == "input_event") {
+                        SessionContext* ctx = nullptr;
+                        {
+                            std::lock_guard<std::mutex> lock(sessionsMu_);
+                            auto it = sessions_.find(sessionId);
+                            if (it != sessions_.end()) ctx = it->second.get();
+                        }
+                        if (ctx) DispatchInputToPipe(*ctx, msg);
+                        else LogW("input_event received but no active session session=" + sessionId);
                         FlushBridgeOutgoing();
                         return;
                     }
@@ -5347,6 +5361,22 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     return;
                 }
 
+                if (kind == "local_input_block" || kind == "block_local_input" ||
+                    type == "local_input_block" || type == "block_local_input") {
+                    const bool blocked = msg.value("blocked", true);
+                    InputCmd cmd{};
+                    cmd.type = InputCmdType::LocalInputBlock;
+                    cmd.localInput.blocked = blocked ? 1 : 0;
+                    const bool normalQueued = ctx.normalInputPipe.Write(cmd);
+                    const bool secureQueued = ctx.secureInputPipe.Write(cmd);
+                    ctx.localInputBlocked = blocked;
+                    LogI("local user input state requested session=" + ctx.sessionId +
+                        " blocked=" + std::string(blocked ? "true" : "false") +
+                        " normal_queued=" + std::string(normalQueued ? "true" : "false") +
+                        " secure_queued=" + std::string(secureQueued ? "true" : "false"));
+                    return;
+                }
+
                 auto& pipe = ActiveInputPipe(ctx);
 
                 auto writeTextCommand = [&](const std::string& text) -> bool {
@@ -6509,7 +6539,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             return requestedCodec;
                         }
                         return std::string("auto");
-                        })()
+                        })(),
+                    sessionMode == SessionMode::Console
                 );
 
                 ctx->sender->setConnectionClosedHandler([this, sid = sessionId](const std::string& reason) {

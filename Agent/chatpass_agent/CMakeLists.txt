@@ -39,9 +39,16 @@ find_package(nlohmann_json CONFIG REQUIRED)
 
 find_path(VPX_INCLUDE_DIRS "vpx/vpx_encoder.h")
 find_library(VPX_LIBRARIES NAMES vpx libvpx)
+if(WIN32)
+  find_path(OPUS_INCLUDE_DIR NAMES opus/opus.h)
+  find_library(OPUS_LIBRARY NAMES opus)
+endif()
 
 if(NOT VPX_INCLUDE_DIRS OR NOT VPX_LIBRARIES)
   message(FATAL_ERROR "libvpx not found")
+endif()
+if(WIN32 AND (NOT OPUS_INCLUDE_DIR OR NOT OPUS_LIBRARY))
+  message(FATAL_ERROR "libopus not found")
 endif()
 
 set(HI5_LIBDATACHANNEL_LINK_LIBS)
@@ -129,6 +136,7 @@ if(WIN32)
     src/platform/windows/windows_inventory.cpp
     src/platform/windows/windows_identity.cpp
     src/platform/windows/windows_codec.cpp	
+    src/platform/windows/wasapi_loopback.cpp
   )
 elseif(APPLE)
   list(APPEND HI5_PLATFORM_SOURCES
@@ -176,6 +184,7 @@ target_include_directories(native_vp8_stream BEFORE PRIVATE
   ${WEBVIEW2_INCLUDE_DIR}
   src
   ${VPX_INCLUDE_DIRS}
+  ${OPUS_INCLUDE_DIR}
 )
 
 option(HI5_ENABLE_CEF_BROWSER "Enable CEF off-screen browser for Backstage" OFF)
@@ -230,6 +239,7 @@ target_link_libraries(native_vp8_stream PRIVATE
   OpenSSL::SSL
   OpenSSL::Crypto
   ${VPX_LIBRARIES}
+  ${OPUS_LIBRARY}
   d3d11
   dxgi
   windowscodecs
@@ -251,6 +261,7 @@ target_link_libraries(native_vp8_stream PRIVATE
   psapi
   ole32
   oleaut32
+  uuid
   shell32
   shlwapi
   dwmapi

@@ -18,6 +18,11 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+struct OpusEncoder;
+namespace hi5 { class WasapiLoopbackCapture; }
+#endif
+
 struct DisplayInfo;
 class DesktopFrameSource;
 
@@ -48,7 +53,8 @@ public:
         int fps,
         int bitrateKbps,
         Mode mode = Mode::DirectCapture,
-        std::string codecMode = "auto"
+        std::string codecMode = "auto",
+        bool enableAudio = false
     );
 
     ~WebRtcSender();
@@ -97,6 +103,11 @@ private:
     void selectAutoCodecFromAnswer(const std::string& sdp);
     bool switchVideoCodec(VideoCodec codec, const std::string& reason);
     void observeCodecHealth(double encodeAvgMs, double encodeMaxMs, double sendAvgMs);
+#ifdef _WIN32
+    void startAudioLoopback();
+    void stopAudioLoopback();
+    void onAudioPcm(const int16_t* samples, size_t frames);
+#endif
 
     void ensureDirectCaptureInitialized();
     void startStreamingThread();
@@ -139,6 +150,16 @@ private:
 
     std::shared_ptr<rtc::PeerConnection> m_pc;
     std::shared_ptr<rtc::Track> m_track;
+#ifdef _WIN32
+    bool m_enableAudio = false;
+    uint32_t m_audioSsrc = 0;
+    std::shared_ptr<rtc::Track> m_audioTrack;
+    std::shared_ptr<rtc::RtpPacketizationConfig> m_audioRtpConfig;
+    std::unique_ptr<hi5::WasapiLoopbackCapture> m_audioCapture;
+    OpusEncoder* m_opusEncoder = nullptr;
+    std::vector<int16_t> m_audioPcm;
+    std::mutex m_audioMu;
+#endif
     std::shared_ptr<rtc::DataChannel> m_inputDc;
     std::shared_ptr<rtc::DataChannel> m_inputMoveDc;
     std::shared_ptr<rtc::DataChannel> m_inputControlDc;

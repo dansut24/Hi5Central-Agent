@@ -666,7 +666,8 @@ namespace {
     bool HandleInputPipe(hi5::InputPipeReader& pipe,
         DesktopFrameSource& source,
         int& currentDisplay,
-        const std::string& sessionId) {
+        const std::string& sessionId,
+        bool& localInputBlocked) {
         // Low-latency input: mouse movement is latest-state only. Collapse
         // runs of MouseMove commands so clicks/keys are not delayed behind a
         // backlog of stale pointer locations.
@@ -738,6 +739,16 @@ namespace {
             case hi5::InputCmdType::Shortcut:
                 HandleShortcut(cmd, sessionId);
                 break;
+            case hi5::InputCmdType::LocalInputBlock: {
+                const bool requested = cmd.localInput.blocked != 0;
+                const BOOL ok = BlockInput(requested ? TRUE : FALSE);
+                if (ok) localInputBlocked = requested;
+                LogInfo("[streamer] local input block session=" + sessionId +
+                    " requested=" + std::string(requested ? "true" : "false") +
+                    " ok=" + std::string(ok ? "true" : "false") +
+                    " err=" + std::to_string(ok ? 0 : GetLastError()));
+                break;
+            }
             case hi5::InputCmdType::SwitchMonitor: {
                 const int requested = cmd.switchMonitor.monitorIndex;
                 if (source.setDisplayIndex(requested)) {
@@ -869,6 +880,7 @@ namespace hi5 {
         uint64_t fastMouseApplied = 0;
         uint64_t fastMouseLastSeq = 0;
         uint64_t cursorOnlyFrames = 0; // intentionally disabled; keep log field at 0
+        bool localInputBlocked = false;
         std::chrono::steady_clock::time_point fastMouseNextLog{};
         const int cursorRefreshFps = 0; // disabled: mouse movement must not force video frames
         uint64_t resetCount = 0;
@@ -899,7 +911,7 @@ namespace hi5 {
                     ApplyFastMouseTarget(fastTarget, args.sessionId, fastMouseNextLog, fastMouseApplied);
                 }
 
-                hadInput = HandleInputPipe(inputPipe, source, currentDisplay, args.sessionId);
+                hadInput = HandleInputPipe(inputPipe, source, currentDisplay, args.sessionId, localInputBlocked);
                 if (hadFastMouse) {
                     // Fast mouse movement is applied directly in the interactive streamer.
                     // Do not treat mouse-only movement as video activity: forcing captures
@@ -1085,6 +1097,12 @@ namespace hi5 {
             }
         }
 
+        if (localInputBlocked) {
+            const BOOL released = BlockInput(FALSE);
+            LogInfo("[streamer] local input automatically released session=" + args.sessionId +
+                " ok=" + std::string(released ? "true" : "false"));
+            localInputBlocked = false;
+        }
         if (inputPipeOk) {
             inputPipe.Close();
         }

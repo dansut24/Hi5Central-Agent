@@ -158,6 +158,7 @@
       border-color: var(--border-strong);
     }
 
+    .icon-btn.session-toggle-active { background: #dbeafe; color: #1d4ed8; border-color: #93c5fd; }
     .icon-btn:active,
     #btn-monitor:active,
     #btn-disconnect:active { transform: translateY(1px); }
@@ -500,9 +501,11 @@
         right: 8px;
         bottom: max(8px, env(safe-area-inset-bottom));
         z-index: 120;
-        justify-content: center;
+        justify-content: flex-start;
         gap: 6px;
         padding: 6px;
+        overflow-x: auto;
+        scrollbar-width: none;
         border: 1px solid var(--border);
         border-radius: 14px;
         background: rgba(11,15,23,.94);
@@ -510,7 +513,8 @@
       }
       .right-actions { grid-column: 2; }
       #device-label { display: none; }
-      .icon-btn, #btn-monitor { min-width: 38px; height: 38px; }
+      .topbar-actions::-webkit-scrollbar { display: none; }
+      .icon-btn, #btn-monitor { min-width: 38px; height: 38px; flex: 0 0 38px; }
       #btn-disconnect { height: 34px; padding: 0 10px; }
       .side-panel { width: min(92vw, 420px); }
       .file-toolbar { flex-wrap: wrap; }
@@ -537,6 +541,8 @@
   <div class="topbar-actions" aria-label="Session actions">
     <button id="btn-files" class="icon-btn" disabled title="Files" aria-label="Files">📁<span class="label">Files</span></button>
     <button id="btn-chat" class="icon-btn" disabled title="Chat" aria-label="Chat">💬<span class="label">Chat</span></button>
+    <button id="btn-audio" class="icon-btn" disabled title="Play remote audio" aria-label="Remote audio">🔇<span class="label">Audio</span></button>
+    <button id="btn-block-input" class="icon-btn" disabled title="Block the local user's keyboard and mouse" aria-label="Block local keyboard and mouse">🔓<span class="label">User input</span></button>
     <button id="btn-backstage" class="icon-btn" disabled title="Backstage Desktop" aria-label="Backstage Desktop">🧰<span class="label">Backstage</span></button>
     <button id="btn-console" class="icon-btn" disabled title="Console Desktop" aria-label="Console Desktop">🖥️<span class="label">Console</span></button>
     <button id="btn-start-menu" class="icon-btn" disabled title="Start Menu" aria-label="Start Menu">⊞<span class="label">Start</span></button>
@@ -554,6 +560,7 @@
 
 <div id="main">
   <video id="remote-video" autoplay playsinline></video>
+  <audio id="remote-audio" autoplay></audio>
   <img id="remote-image" alt="Remote desktop stream" />
 
   <div id="files-panel" class="side-panel">

@@ -131,10 +131,39 @@ struct TrayApp {
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, kSupportCommand, L"Open support portal");
         }
-        POINT cursor{};
-        GetCursorPos(&cursor);
+        POINT anchor{};
+        UINT alignment = TPM_RIGHTALIGN | TPM_BOTTOMALIGN;
+        bool anchoredToIcon = false;
+        NOTIFYICONIDENTIFIER identifier{};
+        identifier.cbSize = sizeof(identifier);
+        identifier.hWnd = hwnd;
+        identifier.uID = nid.uID;
+        RECT iconRect{};
+        if (SUCCEEDED(Shell_NotifyIconGetRect(&identifier, &iconRect))) {
+            anchor.x = iconRect.right;
+            anchor.y = iconRect.top;
+            anchoredToIcon = true;
+            HMONITOR monitor = MonitorFromRect(&iconRect, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO info{};
+            info.cbSize = sizeof(info);
+            if (monitor && GetMonitorInfoW(monitor, &info)) {
+                if (info.rcWork.top > info.rcMonitor.top) {
+                    anchor.y = iconRect.bottom;
+                    alignment = TPM_RIGHTALIGN | TPM_TOPALIGN;
+                } else if (info.rcWork.left > info.rcMonitor.left) {
+                    anchor.x = iconRect.right;
+                    anchor.y = iconRect.bottom;
+                    alignment = TPM_LEFTALIGN | TPM_BOTTOMALIGN;
+                } else if (info.rcWork.right < info.rcMonitor.right) {
+                    anchor.x = iconRect.left;
+                    anchor.y = iconRect.bottom;
+                    alignment = TPM_RIGHTALIGN | TPM_BOTTOMALIGN;
+                }
+            }
+        }
+        if (!anchoredToIcon) GetCursorPos(&anchor);
         SetForegroundWindow(hwnd);
-        const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, cursor.x, cursor.y, 0, hwnd, nullptr);
+        const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | alignment, anchor.x, anchor.y, 0, hwnd, nullptr);
         DestroyMenu(menu);
         PostMessageW(hwnd, WM_NULL, 0, 0);
         if (command >= kActionBase && command < kActionBase + actions.size()) Invoke(command - kActionBase);

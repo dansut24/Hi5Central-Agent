@@ -16,6 +16,7 @@ namespace hi5 {
         constexpr int kListId = 1001;
         constexpr int kEditId = 1002;
         constexpr int kSendId = 1003;
+        constexpr int kCloseId = 1004;
 
         std::wstring Utf8ToWide(const std::string& s) {
             if (s.empty()) return std::wstring();
@@ -90,6 +91,7 @@ namespace hi5 {
         listBox_ = nullptr;
         editBox_ = nullptr;
         sendButton_ = nullptr;
+        closeButton_ = nullptr;
         uiThreadId_ = 0;
         onSend_ = nullptr;
         sessionId_.clear();
@@ -240,10 +242,16 @@ namespace hi5 {
             nullptr
         );
 
+        closeButton_ = CreateWindowExW(
+            0, L"BUTTON", L"×", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            0, 0, 32, 28, hwnd_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCloseId)), hinst, nullptr);
+
         if (font_) {
             SendMessageW(listBox_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             SendMessageW(editBox_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
             SendMessageW(sendButton_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+            if (closeButton_) SendMessageW(closeButton_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
         }
 
         LayoutChildren();
@@ -254,11 +262,13 @@ namespace hi5 {
     }
 
     void NativeChatWindow::DestroyUi() {
+        if (closeButton_) DestroyWindow(closeButton_);
         if (sendButton_) DestroyWindow(sendButton_);
         if (editBox_) DestroyWindow(editBox_);
         if (listBox_) DestroyWindow(listBox_);
         if (hwnd_) DestroyWindow(hwnd_);
 
+        closeButton_ = nullptr;
         sendButton_ = nullptr;
         editBox_ = nullptr;
         listBox_ = nullptr;
@@ -307,6 +317,7 @@ namespace hi5 {
         const int headerHeight = px(72);
         const int composerHeight = px(40);
         const int buttonWidth = px(82);
+        if (closeButton_) MoveWindow(closeButton_, std::max(margin, width - margin - px(34)), px(12), px(34), px(30), TRUE);
         const int listTop = headerHeight;
         const int listHeight = std::max(px(92), height - headerHeight - composerHeight - margin * 3);
         if (listBox_) MoveWindow(listBox_, margin, listTop, std::max(px(120), width - margin * 2), listHeight, TRUE);
@@ -422,7 +433,7 @@ namespace hi5 {
             SetTextColor(dc, RGB(255,255,255));
             HFONT old = reinterpret_cast<HFONT>(SelectObject(dc, titleFont_ ? titleFont_ : font_));
             DrawTextW(dc, L"H5", -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            RECT title{ px(60), px(12), rc.right - px(12), px(39) };
+            RECT title{ px(60), px(12), rc.right - px(58), px(39) };
             SetTextColor(dc, RGB(17,24,39));
             DrawTextW(dc, L"Hi5Central Remote Support", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             if (font_) SelectObject(dc, font_);
@@ -467,6 +478,10 @@ namespace hi5 {
         case WM_COMMAND:
             if (LOWORD(wParam) == kSendId && HIWORD(wParam) == BN_CLICKED) {
                 HandleSendClicked();
+                return 0;
+            }
+            if (LOWORD(wParam) == kCloseId && HIWORD(wParam) == BN_CLICKED) {
+                HideOnUiThread();
                 return 0;
             }
             if (LOWORD(wParam) == kEditId && HIWORD(wParam) == EN_MAXTEXT) {

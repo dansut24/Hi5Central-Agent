@@ -73,6 +73,7 @@ namespace hi5 {
         HWND listBox_{ nullptr };
         HWND editBox_{ nullptr };
         HWND sendButton_{ nullptr };
+        HWND closeButton_{ nullptr };
         HFONT font_{ nullptr };
         HFONT titleFont_{ nullptr };
         HBRUSH backgroundBrush_{ nullptr };

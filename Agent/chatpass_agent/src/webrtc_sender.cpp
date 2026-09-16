@@ -1,6 +1,10 @@
 ﻿#include "webrtc_sender.h"
 #include "frame_source.h"
 #include "util/log.h"
+#ifdef _WIN32
+#include "platform/windows/wasapi_loopback.h"
+#include <opus/opus.h>
+#endif
 
 #include <rtc/rtc.hpp>
 #include <nlohmann/json.hpp>
@@ -286,7 +290,8 @@ WebRtcSender::WebRtcSender(std::string sessionId,
     int fps,
     int bitrateKbps,
     Mode mode,
-    std::string codecMode)
+    std::string codecMode,
+    bool enableAudio)
     : m_sessionId(std::move(sessionId)),
     m_iceServers(std::move(iceServers)),
     m_signalSend(std::move(sendFn)),
@@ -295,6 +300,10 @@ WebRtcSender::WebRtcSender(std::string sessionId,
     m_fps(fps),
     m_bitrateKbps(bitrateKbps),
     m_ssrc(randomU32()),
+#ifdef _WIN32
+    m_enableAudio(enableAudio),
+    m_audioSsrc(randomU32()),
+#endif
     m_mode(mode),
     m_source(nullptr),
     m_encoder(nullptr) {
@@ -544,6 +553,9 @@ void WebRtcSender::start() {
 void WebRtcSender::stop() {
     m_running = false;
     m_canSend = false;
+#ifdef _WIN32
+    stopAudioLoopback();
+#endif
 
     if (m_streamThread.joinable()) {
         m_streamThread.join();
@@ -552,9 +564,81 @@ void WebRtcSender::stop() {
     m_inputDc.reset();
     m_inputMoveDc.reset();
     m_inputControlDc.reset();
+#ifdef _WIN32
+    m_audioTrack.reset();
+    m_audioRtpConfig.reset();
+#endif
     m_track.reset();
     m_pc.reset();
 }
+
+#ifdef _WIN32
+void WebRtcSender::startAudioLoopback() {
+    std::lock_guard<std::mutex> lock(m_audioMu);
+    if (!m_enableAudio || m_audioCapture || !m_audioTrack || !m_audioTrack->isOpen()) return;
+
+    int opusError = OPUS_OK;
+    m_opusEncoder = opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, &opusError);
+    if (!m_opusEncoder || opusError != OPUS_OK) {
+        LogWarn("[audio] Opus encoder creation failed error=" + std::to_string(opusError));
+        if (m_opusEncoder) { opus_encoder_destroy(m_opusEncoder); m_opusEncoder = nullptr; }
+        return;
+    }
+    opus_encoder_ctl(m_opusEncoder, OPUS_SET_BITRATE(96000));
+    opus_encoder_ctl(m_opusEncoder, OPUS_SET_COMPLEXITY(5));
+    opus_encoder_ctl(m_opusEncoder, OPUS_SET_VBR(1));
+    m_audioPcm.clear();
+    m_audioCapture = std::make_unique<hi5::WasapiLoopbackCapture>();
+    auto* capture = m_audioCapture.get();
+    const bool started = capture->Start([this](const int16_t* samples, size_t frames) { onAudioPcm(samples, frames); });
+    if (!started) {
+        m_audioCapture.reset();
+        opus_encoder_destroy(m_opusEncoder);
+        m_opusEncoder = nullptr;
+        LogWarn("[audio] loopback capture could not start session=" + m_sessionId);
+        return;
+    }
+    LogInfo("[audio] remote audio enabled session=" + m_sessionId);
+}
+
+void WebRtcSender::stopAudioLoopback() {
+    std::unique_ptr<hi5::WasapiLoopbackCapture> capture;
+    {
+        std::lock_guard<std::mutex> lock(m_audioMu);
+        capture = std::move(m_audioCapture);
+    }
+    if (capture) capture->Stop();
+    std::lock_guard<std::mutex> lock(m_audioMu);
+    m_audioPcm.clear();
+    if (m_opusEncoder) { opus_encoder_destroy(m_opusEncoder); m_opusEncoder = nullptr; }
+}
+
+void WebRtcSender::onAudioPcm(const int16_t* samples, size_t frames) {
+    if (!samples || frames == 0) return;
+    std::lock_guard<std::mutex> lock(m_audioMu);
+    if (!m_opusEncoder) return;
+    constexpr size_t kChannels = 2;
+    constexpr int kFrameSamples = 960; // 20 ms at 48 kHz
+    constexpr size_t kFrameValues = static_cast<size_t>(kFrameSamples) * kChannels;
+    m_audioPcm.insert(m_audioPcm.end(), samples, samples + (frames * kChannels));
+
+    while (m_audioPcm.size() >= kFrameValues) {
+        unsigned char encoded[4000]{};
+        const int bytes = opus_encode(m_opusEncoder, m_audioPcm.data(), kFrameSamples, encoded, static_cast<opus_int32>(sizeof(encoded)));
+        m_audioPcm.erase(m_audioPcm.begin(), m_audioPcm.begin() + static_cast<std::ptrdiff_t>(kFrameValues));
+        if (bytes <= 0 || !m_audioTrack || !m_audioTrack->isOpen() || !m_audioRtpConfig) continue;
+        rtc::binary payload;
+        payload.reserve(static_cast<size_t>(bytes));
+        for (int i = 0; i < bytes; ++i) payload.push_back(static_cast<std::byte>(encoded[i]));
+        try {
+            m_audioTrack->send(payload);
+            m_audioRtpConfig->timestamp += kFrameSamples;
+        } catch (const std::exception& ex) {
+            LogWarn(std::string("[audio] send failed session=") + m_sessionId + " error=" + ex.what());
+        }
+    }
+}
+#endif
 
 bool WebRtcSender::switchMonitor(int index) {
     if (m_mode != Mode::DirectCapture) {
@@ -1014,6 +1098,29 @@ void WebRtcSender::createPeerConnection() {
     media.setBitrate(m_bitrateKbps * 1000);
 
     m_track = m_pc->addTrack(media);
+
+#ifdef _WIN32
+    if (m_enableAudio) {
+        constexpr uint8_t kAudioPayloadType = 111;
+        rtc::Description::Audio audio("audio", rtc::Description::Direction::SendOnly);
+        audio.addOpusCodec(kAudioPayloadType);
+        audio.addSSRC(m_audioSsrc, "audio-stream");
+        m_audioTrack = m_pc->addTrack(audio);
+        m_audioRtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
+            m_audioSsrc, "audio-stream", kAudioPayloadType, rtc::OpusRtpPacketizer::DefaultClockRate);
+        auto packetizer = std::make_shared<rtc::OpusRtpPacketizer>(m_audioRtpConfig);
+        packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(m_audioRtpConfig));
+        packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+        m_audioTrack->setMediaHandler(packetizer);
+        m_audioTrack->onOpen([this]() {
+            LogInfo("[audio] WebRTC audio track open session=" + m_sessionId);
+            startAudioLoopback();
+        });
+        m_audioTrack->onClosed([this]() {
+            LogInfo("[audio] WebRTC audio track closed session=" + m_sessionId);
+        });
+    }
+#endif
 
     createInputDataChannel();
 

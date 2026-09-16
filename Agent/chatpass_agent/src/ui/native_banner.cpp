@@ -28,8 +28,9 @@ constexpr UINT kBannerUpdateText = WM_APP + 101;
 constexpr UINT kNotifyCallback = WM_APP + 102;
 constexpr UINT_PTR kUiTimer = 1;
 constexpr UINT_PTR kCollapseTimer = 2;
-constexpr float kCollapsedWidth = 30.0f;
-constexpr float kCollapsedHeight = 66.0f;
+constexpr UINT_PTR kSlideTimer = 3;
+constexpr float kCollapsedWidth = 40.0f;
+constexpr float kCollapsedHeight = 82.0f;
 constexpr float kExpandedWidth = 344.0f;
 constexpr float kExpandedHeight = 372.0f;
 constexpr float kExpandedInfoHeight = 420.0f;
@@ -61,8 +62,8 @@ struct BannerState {
     HANDLE chatEvent = nullptr;
     HANDLE endEvent = nullptr;
     bool expanded = false;
-    bool pinned = false;
     bool trackingMouse = false;
+    float reveal = 0.0f;
     bool showInfo = false;
     bool notifyOnStart = true;
     float scale = 1.0f;
@@ -111,8 +112,9 @@ void ApplyRoundedRegion(HWND hwnd, int width, int height, float scale, bool expa
 void PositionBanner(HWND hwnd, BannerState& state) {
     RECT work{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    const float widthDip = state.expanded ? kExpandedWidth : kCollapsedWidth;
-    const float heightDip = state.expanded ? ExpandedHeight(state) : kCollapsedHeight;
+    const float t = std::max(0.0f, std::min(1.0f, state.reveal));
+    const float widthDip = kCollapsedWidth + ((kExpandedWidth - kCollapsedWidth) * t);
+    const float heightDip = kCollapsedHeight + ((ExpandedHeight(state) - kCollapsedHeight) * t);
     const int width = Px(widthDip, state.scale);
     const int height = Px(heightDip, state.scale);
     const int workHeight = work.bottom - work.top;
@@ -122,7 +124,7 @@ void PositionBanner(HWND hwnd, BannerState& state) {
 
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height,
         SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
-    ApplyRoundedRegion(hwnd, width, height, state.scale, state.expanded);
+    ApplyRoundedRegion(hwnd, width, height, state.scale, state.reveal >= 0.5f);
 }
 void DiscardDeviceResources(BannerState& state) {
     SafeRelease(state.brush);
@@ -256,16 +258,16 @@ void PaintCollapsed(BannerState& state) {
     FillRounded(state, D2D1::RectF(0.0f, 0.0f, kCollapsedWidth, kCollapsedHeight), 13.0f, 0x111827);
 
     SetBrush(state, 0x22c55e);
-    rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(15.0f, 16.0f), 4.5f, 4.5f), state.brush);
+    rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(20.0f, 18.0f), 5.0f, 5.0f), state.brush);
 
-    DrawTextLine(state, L"\u2039", D2D1::RectF(0.0f, 22.0f, kCollapsedWidth, 49.0f),
-        22.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 0xffffff, DWRITE_TEXT_ALIGNMENT_CENTER);
+    DrawTextLine(state, L"\u2039", D2D1::RectF(0.0f, 27.0f, kCollapsedWidth, 58.0f),
+        24.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 0xffffff, DWRITE_TEXT_ALIGNMENT_CENTER);
 
     SetBrush(state, 0x2563eb);
     rt->FillRoundedRectangle(
-        D2D1::RoundedRect(D2D1::RectF(8.0f, 50.0f, 22.0f, 62.0f), 4.0f, 4.0f),
+        D2D1::RoundedRect(D2D1::RectF(10.0f, 61.0f, 30.0f, 77.0f), 5.0f, 5.0f),
         state.brush);
-    DrawTextLine(state, L"H", D2D1::RectF(8.0f, 49.0f, 22.0f, 63.0f),
+    DrawTextLine(state, L"H5", D2D1::RectF(9.0f, 60.0f, 31.0f, 78.0f),
         8.0f, DWRITE_FONT_WEIGHT_BOLD, 0xffffff, DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
@@ -334,7 +336,7 @@ void PaintBanner(HWND hwnd, BannerState& state) {
 
     state.renderTarget->BeginDraw();
     state.renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
-    if (state.expanded) PaintExpanded(state);
+    if (state.reveal >= 0.22f) PaintExpanded(state);
     else PaintCollapsed(state);
 
     const HRESULT hr = state.renderTarget->EndDraw();
@@ -343,17 +345,11 @@ void PaintBanner(HWND hwnd, BannerState& state) {
     }
 }
 
-void SetExpanded(HWND hwnd, BannerState& state, bool expanded, bool pin) {
+void SetExpanded(HWND hwnd, BannerState& state, bool expanded, bool /*pin*/) {
     KillTimer(hwnd, kCollapseTimer);
     state.expanded = expanded;
-    if (pin) state.pinned = expanded;
-    if (!expanded) {
-        state.pinned = false;
-        state.showInfo = false;
-    }
-    DiscardDeviceResources(state);
-    PositionBanner(hwnd, state);
-    InvalidateRect(hwnd, nullptr, FALSE);
+    if (!expanded) state.showInfo = false;
+    SetTimer(hwnd, kSlideTimer, 15, nullptr);
 }
 
 bool PointIn(float x, float y, float left, float top, float right, float bottom) {
@@ -442,7 +438,17 @@ LRESULT CALLBACK BannerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
         else if (wParam == kCollapseTimer) {
             KillTimer(hwnd, kCollapseTimer);
-            if (!state->pinned) SetExpanded(hwnd, *state, false, false);
+            SetExpanded(hwnd, *state, false, false);
+        }
+        else if (wParam == kSlideTimer) {
+            const float target = state->expanded ? 1.0f : 0.0f;
+            const float step = 0.14f;
+            if (state->reveal < target) state->reveal = std::min(target, state->reveal + step);
+            else if (state->reveal > target) state->reveal = std::max(target, state->reveal - step);
+            DiscardDeviceResources(*state);
+            PositionBanner(hwnd, *state);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            if (std::fabs(state->reveal - target) < 0.001f) KillTimer(hwnd, kSlideTimer);
         }
         return 0;
     case WM_MOUSEMOVE:
@@ -458,20 +464,18 @@ LRESULT CALLBACK BannerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     case WM_MOUSELEAVE:
         if (state) {
             state->trackingMouse = false;
-            if (!state->pinned) SetTimer(hwnd, kCollapseTimer, 420, nullptr);
+            SetTimer(hwnd, kCollapseTimer, 140, nullptr);
         }
         return 0;
     case WM_LBUTTONDOWN:
         if (!state) return 0;
         if (!state->expanded) {
-            SetExpanded(hwnd, *state, true, true);
+            SetExpanded(hwnd, *state, true, false);
             return 0;
         }
         else {
             const float x = static_cast<float>(GET_X_LPARAM(lParam)) / state->scale;
             const float y = static_cast<float>(GET_Y_LPARAM(lParam)) / state->scale;
-            state->pinned = true;
-
             if (PointIn(x, y, 306.0f, 8.0f, 340.0f, 46.0f)) {
                 SetExpanded(hwnd, *state, false, false);
             }
@@ -499,7 +503,8 @@ LRESULT CALLBACK BannerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         return 0;
     case kNotifyCallback:
         if (state && (static_cast<UINT>(lParam) == NIN_BALLOONUSERCLICK || LOWORD(lParam) == NIN_BALLOONUSERCLICK)) {
-            SetExpanded(hwnd, *state, true, true);
+            SetExpanded(hwnd, *state, true, false);
+            SetTimer(hwnd, kCollapseTimer, 1200, nullptr);
         }
         return 0;
     case WM_SIZE:

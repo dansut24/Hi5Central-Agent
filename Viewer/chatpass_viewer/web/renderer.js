@@ -9,6 +9,8 @@ const elStatusLabel  = document.getElementById("status-label");
 const elDeviceLabel  = document.getElementById("device-label");
 const elBtnFiles     = document.getElementById("btn-files");
 const elBtnChat      = document.getElementById("btn-chat");
+const elBtnAudio     = document.getElementById("btn-audio");
+const elBtnBlockInput = document.getElementById("btn-block-input");
 const elBtnBackstage = document.getElementById("btn-backstage");
 const elBtnConsole   = document.getElementById("btn-console");
 const elBtnStartMenu = document.getElementById("btn-start-menu");
@@ -30,6 +32,7 @@ const elChatLog      = document.getElementById("chat-log");
 const elChatInput    = document.getElementById("chat-input");
 const elChatSend     = document.getElementById("chat-send");
 const elVideo        = document.getElementById("remote-video");
+const elAudio        = document.getElementById("remote-audio");
 const elOverlay      = document.getElementById("overlay");
 const elOverlayTitle = document.getElementById("overlay-title");
 const elOverlaySub   = document.getElementById("overlay-sub");
@@ -67,6 +70,8 @@ let mouseMoveDc = null;
 let mouseMoveSeq = 0;
 
 let currentSession = null;
+let audioEnabled = false;
+let localInputBlocked = false;
 let remoteDescSet = false;
 let pendingRemoteIce = [];
 
@@ -956,6 +961,39 @@ function sendInput(kind, extra = {}, force = false) {
   }
 }
 
+function updateSessionToggleButtons() {
+  if (elBtnAudio) {
+    elBtnAudio.classList.toggle("session-toggle-active", audioEnabled);
+    elBtnAudio.innerHTML = `${audioEnabled ? "🔊" : "🔇"}<span class="label">Audio</span>`;
+    elBtnAudio.title = audioEnabled ? "Mute remote audio" : "Play remote audio";
+  }
+  if (elBtnBlockInput) {
+    elBtnBlockInput.classList.toggle("session-toggle-active", localInputBlocked);
+    elBtnBlockInput.innerHTML = `${localInputBlocked ? "🔒" : "🔓"}<span class="label">User input</span>`;
+    elBtnBlockInput.title = localInputBlocked
+      ? "Allow the local user's keyboard and mouse"
+      : "Block the local user's keyboard and mouse";
+  }
+}
+
+function setRemoteAudioEnabled(enabled) {
+  audioEnabled = !!enabled;
+  if (elAudio) {
+    elAudio.muted = !audioEnabled;
+    elAudio.defaultMuted = !audioEnabled;
+    if (audioEnabled) elAudio.play().catch(() => {});
+  }
+  updateSessionToggleButtons();
+}
+
+function setLocalInputBlocked(blocked, notifyAgent = true) {
+  localInputBlocked = !!blocked;
+  if (notifyAgent && currentSession) {
+    sendInput("local_input_block", { blocked: localInputBlocked }, true);
+  }
+  updateSessionToggleButtons();
+}
+
 function sendShortcut(action) {
   if (!currentSession) return false;
   enterRemoteControlMode();
@@ -1128,6 +1166,13 @@ function disconnect(reason, options = {}) {
   hideRemoteCursor();
   resetTransitionState();
 
+  if (localInputBlocked && currentSession) {
+    try { sendInput("local_input_block", { blocked: false }, true); } catch {}
+    localInputBlocked = false;
+  }
+  setRemoteAudioEnabled(false);
+  updateSessionToggleButtons();
+
   if (!silent && ws && ws.readyState === WebSocket.OPEN && currentSession) {
     try {
       ws.send(JSON.stringify({
@@ -1176,6 +1221,8 @@ function disconnect(reason, options = {}) {
   if (elBtnDisc) elBtnDisc.disabled = true;
   if (elBtnFiles) elBtnFiles.disabled = true;
   if (elBtnChat) elBtnChat.disabled = true;
+  if (elBtnAudio) elBtnAudio.disabled = true;
+  if (elBtnBlockInput) elBtnBlockInput.disabled = true;
   if (elBtnBackstage) elBtnBackstage.disabled = true;
   if (elBtnConsole) elBtnConsole.disabled = true;
   if (elBtnStartMenu) elBtnStartMenu.disabled = true;
@@ -1196,6 +1243,12 @@ function disconnect(reason, options = {}) {
 
 if (elBtnDisc) {
   elBtnDisc.addEventListener("click", () => disconnect("Disconnected by user"));
+}
+if (elBtnAudio) {
+  elBtnAudio.addEventListener("click", () => setRemoteAudioEnabled(!audioEnabled));
+}
+if (elBtnBlockInput) {
+  elBtnBlockInput.addEventListener("click", () => setLocalInputBlocked(!localInputBlocked, true));
 }
 
 if (elBtnMonitor) {
@@ -1899,11 +1952,23 @@ async function handleOffer(msg) {
     console.log("[rtc] ontrack", { trackKind: ev.track?.kind, streams: ev.streams?.length || 0 });
     setTimeout(updateSelectedCodecFromStats, 500);
     setTimeout(updateSelectedCodecFromStats, 1500);
-    if (!elVideo) return;
-
     const stream = (ev.streams && ev.streams[0])
       ? ev.streams[0]
       : new MediaStream([ev.track]);
+
+    if (ev.track?.kind === "audio") {
+      if (!elAudio) return;
+      elAudio.autoplay = true;
+      elAudio.muted = !audioEnabled;
+      elAudio.defaultMuted = !audioEnabled;
+      elAudio.srcObject = stream;
+      if (audioEnabled) {
+        try { await elAudio.play(); } catch {}
+      }
+      return;
+    }
+
+    if (ev.track?.kind !== "video" || !elVideo) return;
 
     elVideo.autoplay = true;
     elVideo.playsInline = true;
@@ -2297,6 +2362,10 @@ function startSession(params) {
   if (elBtnDisc) elBtnDisc.disabled = false;
   if (elBtnFiles) elBtnFiles.disabled = false;
   if (elBtnChat) elBtnChat.disabled = false;
+  if (elBtnAudio) elBtnAudio.disabled = false;
+  if (elBtnBlockInput) elBtnBlockInput.disabled = false;
+  setRemoteAudioEnabled(false);
+  setLocalInputBlocked(false, false);
   if (elBtnBackstage) elBtnBackstage.disabled = false;
   if (elBtnConsole) elBtnConsole.disabled = false;
   if (elBtnStartMenu) elBtnStartMenu.disabled = false;

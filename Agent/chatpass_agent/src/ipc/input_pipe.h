@@ -36,6 +36,7 @@ enum class InputCmdType : uint8_t {
     ChatOpen,        // show remote chat window
     ChatClose,       // hide remote chat window
     ChatMessage,     // display incoming chat text
+    LocalInputBlock, // block/unblock the local user's physical keyboard and mouse
 };
 
 enum class ShortcutAction : uint16_t {
@@ -107,6 +108,10 @@ struct InputCmd {
             uint32_t length;
             uint32_t offsetInClip;
         } chatMessage;
+
+        struct {
+            uint8_t blocked;
+        } localInput;
     };
 };
 #pragma pack(pop)
