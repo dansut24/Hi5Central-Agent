@@ -1407,6 +1407,39 @@ namespace hi5 {
             }
         }
 
+        struct ProcessMemorySnapshot {
+            SIZE_T workingSetBytes = 0;
+            SIZE_T privateBytes = 0;
+            SIZE_T peakWorkingSetBytes = 0;
+        };
+
+        static bool QueryProcessMemory(HANDLE process, ProcessMemorySnapshot& out) {
+            if (!process) return false;
+            PROCESS_MEMORY_COUNTERS_EX counters{};
+            counters.cb = sizeof(counters);
+            if (!GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters))) {
+                return false;
+            }
+            out.workingSetBytes = counters.WorkingSetSize;
+            out.privateBytes = counters.PrivateUsage;
+            out.peakWorkingSetBytes = counters.PeakWorkingSetSize;
+            return true;
+        }
+
+        static void LogProcessMemorySnapshot(const std::string& sessionId, const char* role, HANDLE process) {
+            ProcessMemorySnapshot memory{};
+            if (!QueryProcessMemory(process, memory)) return;
+            constexpr SIZE_T kMiB = 1024ull * 1024ull;
+            LogI("[memory] session=" + sessionId +
+                " role=" + std::string(role ? role : "unknown") +
+                " pid=" + std::to_string(GetProcessId(process)) +
+                " working_set_mb=" + std::to_string(memory.workingSetBytes / kMiB) +
+                " private_mb=" + std::to_string(memory.privateBytes / kMiB) +
+                " peak_working_set_mb=" + std::to_string(memory.peakWorkingSetBytes / kMiB) +
+                " working_set_bytes=" + std::to_string(static_cast<unsigned long long>(memory.workingSetBytes)) +
+                " private_bytes=" + std::to_string(static_cast<unsigned long long>(memory.privateBytes)));
+        }
+
         static std::string SiblingExecutablePath(const char* fileName) {
             const std::string current = CurrentExePath();
             if (current.empty() || !fileName || !*fileName) return current;
@@ -1951,6 +1984,9 @@ namespace hi5 {
             uint64_t desktopReturnTickNs = 0;
             std::chrono::steady_clock::time_point lastNormalLaunchAttempt{};
             std::chrono::steady_clock::time_point lastSecureLaunchAttempt{};
+            int secureHostFailureCount = 0;
+            std::chrono::steady_clock::time_point secureHostFailureWindowStart{};
+            std::chrono::steady_clock::time_point secureHostRestartBlockedUntil{};
             std::chrono::steady_clock::time_point lastConsoleSessionPoll{};
             std::chrono::steady_clock::time_point lastConsoleSwitchDetected{};
             std::chrono::steady_clock::time_point normalRetireRequestedAt{};
@@ -1977,6 +2013,44 @@ namespace hi5 {
             uint64_t consoleGeneration = 0;
             std::atomic<bool> secureFallbackOwnsInput{ false };
         };
+
+        static bool SecureHostRestartBlocked(SessionContext& ctx, std::chrono::steady_clock::time_point now) {
+            if (ctx.secureHostRestartBlockedUntil.time_since_epoch().count() == 0) return false;
+            if (now < ctx.secureHostRestartBlockedUntil) return true;
+            LogI("[secure-circuit] cooldown expired session=" + ctx.sessionId);
+            ctx.secureHostFailureCount = 0;
+            ctx.secureHostFailureWindowStart = {};
+            ctx.secureHostRestartBlockedUntil = {};
+            return false;
+        }
+
+        static void RecordSecureHostFailure(SessionContext& ctx, std::chrono::steady_clock::time_point now, const std::string& reason) {
+            const int windowMs = ReadConfigInt("HI5_SECURE_HOST_FAILURE_WINDOW_MS", 10000, 1000, 60000);
+            const int failureLimit = ReadConfigInt("HI5_SECURE_HOST_FAILURE_LIMIT", 3, 2, 10);
+            const int cooldownMs = ReadConfigInt("HI5_SECURE_HOST_FAILURE_COOLDOWN_MS", 30000, 1000, 300000);
+            if (ctx.secureHostFailureWindowStart.time_since_epoch().count() == 0 ||
+                now - ctx.secureHostFailureWindowStart > std::chrono::milliseconds(windowMs)) {
+                ctx.secureHostFailureWindowStart = now;
+                ctx.secureHostFailureCount = 0;
+            }
+            ++ctx.secureHostFailureCount;
+            LogW("[secure-circuit] failure session=" + ctx.sessionId +
+                " count=" + std::to_string(ctx.secureHostFailureCount) +
+                " limit=" + std::to_string(failureLimit) + " reason=" + reason);
+            if (ctx.secureHostFailureCount >= failureLimit) {
+                ctx.secureHostRestartBlockedUntil = now + std::chrono::milliseconds(cooldownMs);
+                LogW("[secure-circuit] OPEN session=" + ctx.sessionId +
+                    " cooldown_ms=" + std::to_string(cooldownMs));
+            }
+        }
+
+        static void ResetSecureHostFailureCircuit(SessionContext& ctx) {
+            if (ctx.secureHostFailureCount == 0 && ctx.secureHostRestartBlockedUntil.time_since_epoch().count() == 0) return;
+            LogI("[secure-circuit] reset after healthy secure frame session=" + ctx.sessionId);
+            ctx.secureHostFailureCount = 0;
+            ctx.secureHostFailureWindowStart = {};
+            ctx.secureHostRestartBlockedUntil = {};
+        }
 
 
                 struct TerminalSession {
@@ -6242,12 +6316,20 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     return true;
                 }
 
+                const auto launchNow = std::chrono::steady_clock::now();
+                if (SecureHostRestartBlocked(ctx, launchNow)) {
+                    ctx.lastSecureLaunchAttempt = launchNow;
+                    return false;
+                }
+                ctx.lastSecureLaunchAttempt = launchNow;
+
                 const std::string exePath = RemoteHostExePath();
 
                 if (!ctx.secureShmem.IsOpen()) {
                     if (!ctx.secureShmem.CreateProducer(ctx.secureShmemName)) {
                         LogE("create secure shmem FAILED session=" + ctx.sessionId +
                             " err=" + std::to_string(GetLastError()));
+                        RecordSecureHostFailure(ctx, launchNow, "shared memory create failed");
                         return false;
                     }
                     LogI("secure shmem allocated on demand session=" + ctx.sessionId);
@@ -6273,6 +6355,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     std::string(exePath), cmdLine, secureSession);
                 if (!ctx.secureStreamerProcess) {
                     LogE("launch secure streamer FAILED session=" + ctx.sessionId);
+                    RecordSecureHostFailure(ctx, launchNow, "process launch failed");
                     ctx.secureLaunchInProgress = false;
                     ctx.secureShmem.Close();
                     return false;
@@ -6283,7 +6366,6 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx.secureRetiring = false;
                 ctx.secureStreamerSessionId = secureSession;
                 ctx.secureRetireRequestedAt = {};
-                ctx.lastSecureLaunchAttempt = std::chrono::steady_clock::now();
 
                 AssignProcessToSessionJob(ctx.sessionJob, ctx.secureStreamerProcess, ctx.sessionId, "secure-streamer");
                 LogI("launch secure streamer ok session=" + ctx.sessionId +
@@ -6689,6 +6771,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                auto nextMemoryDiagnostics = std::chrono::steady_clock::now() + std::chrono::seconds(2);
                 const uint64_t maxFrameAgeNs = static_cast<uint64_t>(ReadConfigInt("HI5_MAX_FRAME_AGE_MS", 250, 50, 2000)) * 1000000ull;
                 uint64_t staleFramesDropped = 0;
                 auto nextStaleFrameLog = std::chrono::steady_clock::now();
@@ -7075,9 +7158,13 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         const DWORD waitRc = WaitForSingleObject(ctx.secureStreamerProcess, 0);
                         if (waitRc == WAIT_OBJECT_0) {
                             DWORD exitCode = 0;
+                            const bool expectedSecureExit = ctx.secureRetiring;
                             GetExitCodeProcess(ctx.secureStreamerProcess, &exitCode);
                             LogW("secure streamer exited session=" + ctx.sessionId +
                                 " exitCode=" + std::to_string(exitCode));
+                            if (!expectedSecureExit) {
+                                RecordSecureHostFailure(ctx, now, "process exited code=" + std::to_string(exitCode));
+                            }
                             CloseHandle(ctx.secureStreamerProcess);
                             ctx.secureStreamerProcess = nullptr;
                             ctx.secureStreamerSessionId = 0xFFFFFFFF;
@@ -7216,6 +7303,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 secureBecameReady = true;
                                 ctx.secureReady = true;
                                 ctx.secureLaunchInProgress = false;
+                                ResetSecureHostFailureCircuit(ctx);
                                 ctx.activeMode = DesktopMode::Secure;
                                 SendSessionState(ctx.sessionId, "secure_desktop_ready");
                                 LogI("active mode -> SECURE session=" + ctx.sessionId);
@@ -7408,6 +7496,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             SendStreamDiagnostics(ctx.sessionId, "secure", stats, framesForwarded, ctx.activeMode, ctx.backstageMode);
                         }
                         nextDiagnosticsPoll = now + std::chrono::seconds(1);
+                    }
+
+                    if (now >= nextMemoryDiagnostics) {
+                        LogProcessMemorySnapshot(ctx.sessionId, "agent-service", GetCurrentProcess());
+                        if (ctx.normalStreamerProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-normal", ctx.normalStreamerProcess);
+                        if (ctx.secureStreamerProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-secure", ctx.secureStreamerProcess);
+                        if (ctx.backstageHostProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-backstage", ctx.backstageHostProcess);
+                        nextMemoryDiagnostics = now + std::chrono::seconds(5);
                     }
 
                     if (!sent) {

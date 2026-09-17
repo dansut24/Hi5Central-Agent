@@ -197,6 +197,9 @@ namespace {
 struct H265MfEncoder::Impl {
     ComPtr<IMFTransform> transform;
     MFT_OUTPUT_STREAM_INFO outputInfo{};
+    ComPtr<IMFSample> outputSample;
+    ComPtr<IMFMediaBuffer> outputBuffer;
+    DWORD outputBufferSize = 0;
     std::vector<uint8_t> sequenceHeaderAnnexB;
     bool mfStarted = false;
 };
@@ -217,6 +220,9 @@ void H265MfEncoder::shutdown() {
 
         delete m_impl;
         m_impl = nullptr;
+        // Balance the MFStartup() performed by init(); otherwise repeated
+        // codec switches retain Media Foundation runtime resources indefinitely.
+        MFShutdown();
     }
 
     m_open = false;
@@ -458,14 +464,34 @@ bool H265MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H265Encod
         MFT_OUTPUT_DATA_BUFFER output{};
         DWORD status = 0;
 
-        ComPtr<IMFSample> outSample;
-        ComPtr<IMFMediaBuffer> outBuffer;
-
         if (!(m_impl->outputInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-            MFCreateSample(&outSample);
-            MFCreateMemoryBuffer(std::max<DWORD>(m_impl->outputInfo.cbSize, 1024 * 1024), &outBuffer);
-            outSample->AddBuffer(outBuffer.Get());
-            output.pSample = outSample.Get();
+            const DWORD outputBytes = std::max<DWORD>(m_impl->outputInfo.cbSize, 1024 * 1024);
+            if (!m_impl->outputSample || !m_impl->outputBuffer || m_impl->outputBufferSize < outputBytes) {
+                m_impl->outputSample.Reset();
+                m_impl->outputBuffer.Reset();
+                hr = MFCreateSample(&m_impl->outputSample);
+                if (FAILED(hr)) {
+                    if (error) *error = "MFCreateSample output failed " + HrToString(hr);
+                    return false;
+                }
+                hr = MFCreateMemoryBuffer(outputBytes, &m_impl->outputBuffer);
+                if (FAILED(hr)) {
+                    if (error) *error = "MFCreateMemoryBuffer output failed " + HrToString(hr);
+                    return false;
+                }
+                hr = m_impl->outputSample->AddBuffer(m_impl->outputBuffer.Get());
+                if (FAILED(hr)) {
+                    if (error) *error = "output sample AddBuffer failed " + HrToString(hr);
+                    return false;
+                }
+                m_impl->outputBufferSize = outputBytes;
+            }
+            hr = m_impl->outputBuffer->SetCurrentLength(0);
+            if (FAILED(hr)) {
+                if (error) *error = "output buffer reset failed " + HrToString(hr);
+                return false;
+            }
+            output.pSample = m_impl->outputSample.Get();
         }
 
         hr = m_impl->transform->ProcessOutput(0, 1, &output, &status);
@@ -492,7 +518,6 @@ bool H265MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H265Encod
         }
 
         ComPtr<IMFSample> got = output.pSample;
-        if (!got && outSample) got = outSample;
 
         if (!got) {
             if (output.pEvents) output.pEvents->Release();

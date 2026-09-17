@@ -32,6 +32,22 @@
 using json = nlohmann::json;
 
 namespace {
+    // A failed hardware MFT can be expensive to instantiate repeatedly and some
+    // drivers retain sizeable allocations after a failed attempt. Cache failures
+    // for the lifetime of AgentService; explicit codec switches may still use the
+    // software path without probing the same hardware encoder again.
+    static std::atomic<bool> g_hwAv1Failed{ false };
+    static std::atomic<bool> g_hwVp9Failed{ false };
+    static std::atomic<bool> g_hwH265Failed{ false };
+    static std::atomic<bool> g_hwH264Failed{ false };
+
+    static void CacheHardwareCodecFailure(std::atomic<bool>& flag, const char* codec, const std::string& reason) {
+        const bool firstFailure = !flag.exchange(true, std::memory_order_acq_rel);
+        if (firstFailure) {
+            LogWarn(std::string("[codec] hardware failure cached for process codec=") + codec + " reason=" + reason);
+        }
+    }
+
     static std::string makeDisplaySignature(const std::vector<DisplayInfo>& displays) {
         std::ostringstream oss;
         for (const auto& d : displays) {
@@ -319,6 +335,10 @@ WebRtcSender::WebRtcSender(std::string sessionId,
         }
     } catch (...) {
     }
+    if (g_hwAv1Failed.load(std::memory_order_acquire)) m_hwAv1Available = false;
+    if (g_hwVp9Failed.load(std::memory_order_acquire)) m_hwVp9Available = false;
+    if (g_hwH265Failed.load(std::memory_order_acquire)) m_hwH265Available = false;
+    if (g_hwH264Failed.load(std::memory_order_acquire)) m_hwH264Available = false;
 #ifdef _WIN32
     m_swVp9Allowed = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) >= 8;
 #else
@@ -2322,13 +2342,17 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             m_externalConfiguredFps = av1Fps; m_externalConfiguredBitrateKbps = av1Kbps;
             auto enc = std::make_unique<Av1MfEncoder>();
             std::string err;
-            const bool preferHardware = m_codecMode != "av1_sw";
+            const bool preferHardware = m_codecMode != "av1_sw" && !g_hwAv1Failed.load(std::memory_order_acquire);
             if (enc->init(frame.width, frame.height, av1Fps, av1Kbps, preferHardware, &err)) {
                 m_av1Encoder = std::move(enc);
                 m_externalProfileName = preferHardware ? "mediafoundation-av1-hardware-preferred" : "mediafoundation-av1-software";
                 LogInfo("[av1] encoder active session=" + m_sessionId + " name=" + m_av1Encoder->encoderName());
             } else {
                 LogInfo("[av1] init failed session=" + m_sessionId + " error=" + err);
+                if (preferHardware) {
+                    m_hwAv1Available = false;
+                    CacheHardwareCodecFailure(g_hwAv1Failed, "av1", "init failed: " + err);
+                }
                 m_av1Failed = true;
                 recoverForcedCodec(VideoCodec::AV1, "av1", "AV1 encoder unavailable");
                 return;
@@ -2340,8 +2364,10 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         Av1EncodedFrame encoded{};
         std::string err;
         bool ok = m_av1Encoder->encode(frame, keyframe || av1SizeChanged, encoded, &err);
-        if (!ok && m_codecMode != "av1_sw") {
+        if (!ok && m_codecMode != "av1_sw" && !g_hwAv1Failed.load(std::memory_order_acquire)) {
             LogInfo("[av1] hardware-preferred encode failed; same-frame software retry session=" + m_sessionId + " error=" + err);
+            m_hwAv1Available = false;
+            CacheHardwareCodecFailure(g_hwAv1Failed, "av1", "encode failed: " + err);
             auto sw = std::make_unique<Av1MfEncoder>();
             std::string swErr;
             if (sw->init(frame.width, frame.height, av1Fps, av1Kbps, false, &swErr)) {
@@ -2391,13 +2417,17 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             m_externalConfiguredFps = h265Fps; m_externalConfiguredBitrateKbps = h265Kbps;
             auto enc = std::make_unique<H265MfEncoder>();
             std::string err;
-            const bool preferHardware = m_codecMode != "h265_sw";
+            const bool preferHardware = m_codecMode != "h265_sw" && !g_hwH265Failed.load(std::memory_order_acquire);
             if (enc->init(frame.width, frame.height, h265Fps, h265Kbps, preferHardware, &err)) {
                 m_h265Encoder = std::move(enc);
                 m_externalProfileName = preferHardware ? "mediafoundation-h265-hardware-preferred" : "mediafoundation-h265-software";
                 LogInfo("[h265] encoder active session=" + m_sessionId + " name=" + m_h265Encoder->encoderName());
             } else {
                 LogInfo("[h265] init failed session=" + m_sessionId + " error=" + err);
+                if (preferHardware) {
+                    m_hwH265Available = false;
+                    CacheHardwareCodecFailure(g_hwH265Failed, "h265", "init failed: " + err);
+                }
                 m_h265Failed = true;
                 recoverForcedCodec(VideoCodec::H265, "h265", "H.265 encoder unavailable");
                 return;
@@ -2408,8 +2438,10 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         const auto encodeStart = std::chrono::steady_clock::now();
         H265EncodedFrame encoded{}; std::string err;
         bool ok = m_h265Encoder->encode(frame, keyframe || h265SizeChanged, encoded, &err);
-        if (!ok && m_codecMode != "h265_sw") {
+        if (!ok && m_codecMode != "h265_sw" && !g_hwH265Failed.load(std::memory_order_acquire)) {
             LogInfo("[h265] hardware-preferred encode failed; same-frame software retry session=" + m_sessionId + " error=" + err);
+            m_hwH265Available = false;
+            CacheHardwareCodecFailure(g_hwH265Failed, "h265", "encode failed: " + err);
             auto sw = std::make_unique<H265MfEncoder>(); std::string swErr;
             if (sw->init(frame.width, frame.height, h265Fps, h265Kbps, false, &swErr)) {
                 H265EncodedFrame retry{};
@@ -2480,7 +2512,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             m_externalConfiguredBitrateKbps = vp9EncoderBitrateKbps;
             m_externalProfileName = "mediafoundation-vp9-interaction-ready";
 
-            const bool forceSoftware = m_codecMode == "vp9_sw" || (m_autoCodec && !m_hwVp9Available);
+            const bool forceSoftware = m_codecMode == "vp9_sw" || (m_autoCodec && !m_hwVp9Available) || g_hwVp9Failed.load(std::memory_order_acquire);
             if (!forceSoftware) {
                 auto enc = std::make_unique<Vp9MfEncoder>();
                 std::string vp9Err;
@@ -2489,6 +2521,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     LogInfo("[vp9] Media Foundation encoder active session=" + m_sessionId +
                         " name=" + m_vp9Encoder->encoderName());
                 } else {
+                    m_hwVp9Available = false;
+                    CacheHardwareCodecFailure(g_hwVp9Failed, "vp9", "init failed: " + vp9Err);
                     LogInfo("[vp9] hardware init failed; falling back to libvpx session=" + m_sessionId +
                         " error=" + vp9Err);
                     createSoftwareVp9();
@@ -2518,6 +2552,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                 std::string vp9Err;
                 ok = m_vp9Encoder->encode(vp9Frame, vp9Keyframe, encoded, &vp9Err);
                 if (!ok) {
+                    m_hwVp9Available = false;
+                    CacheHardwareCodecFailure(g_hwVp9Failed, "vp9", "encode failed: " + vp9Err);
                     LogInfo("[vp9] hardware encode failed; same-frame libvpx fallback session=" + m_sessionId +
                         " error=" + vp9Err);
                     if (createSoftwareVp9()) {
@@ -2610,11 +2646,15 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
 
             auto enc = std::make_unique<H264MfEncoder>();
             std::string h264Err;
-            const bool preferHardware = (m_codecMode != "h264_sw");
+            const bool preferHardware = (m_codecMode != "h264_sw") && !g_hwH264Failed.load(std::memory_order_acquire);
             if (!enc->init(h264Frame.width, h264Frame.height, h264Fps, h264Kbps, preferHardware, &h264Err)) {
                 std::cerr << "[h264] init failed session=" << m_sessionId
                     << " error=" << h264Err
                     << " note=staying on negotiated track; set HI5_CODEC=vp8 to return to VP8\n";
+                if (preferHardware) {
+                    m_hwH264Available = false;
+                    CacheHardwareCodecFailure(g_hwH264Failed, "h264", "init failed: " + h264Err);
+                }
                 m_h264Failed = true;
                 m_h264Encoder.reset();
                 recoverForcedCodec(VideoCodec::H264, "h264", "H.264 encoder unavailable");
@@ -2646,10 +2686,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     LogInfo("[h264] encode failed session=" + m_sessionId +
                         " mode=" + m_codecMode + " error=" + h264Err);
 
-                    const bool hardwarePreferredMode = m_codecMode != "h264_sw";
+                    const bool hardwarePreferredMode = m_codecMode != "h264_sw" && !g_hwH264Failed.load(std::memory_order_acquire);
                     bool recoveredWithSoftware = false;
                     if (hardwarePreferredMode) {
                         LogInfo("[h264] hardware-preferred encode failed; retrying same frame with software H.264 session=" + m_sessionId);
+                        m_hwH264Available = false;
+                        CacheHardwareCodecFailure(g_hwH264Failed, "h264", "encode failed: " + h264Err);
                         auto swEnc = std::make_unique<H264MfEncoder>();
                         std::string swErr;
                         if (swEnc->init(h264Frame.width, h264Frame.height, h264Fps, h264Kbps, false, &swErr)) {
