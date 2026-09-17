@@ -1,0 +1,11 @@
+Hi5Central Windows validation trigger: H.264 async output pending handling
+
+Version target: 0.1.43
+VPS source commit: da14f57e51515d14bf564cc8fbba17daea419f7f
+GitHub source sync: fe3246995ffbc51e63016eaa1b65bc97284cae74
+Source archive SHA-256: 839248f6655ec5e8e75890fe80448062268f8ac1b61c872fa316d5bee5c454d5
+
+Purpose:
+- Treat E_UNEXPECTED from async Quick Sync ProcessOutput as transient output-not-ready.
+- Preserve accepted DXGI NV12 surfaces until actual encoded output arrives.
+- Bound a stalled 3-surface GPU pool and fall back safely rather than freeze video.
