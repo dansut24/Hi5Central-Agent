@@ -12,7 +12,9 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <deque>
 #include <sstream>
 #include <fstream>
 #include <iostream>
@@ -274,7 +276,13 @@ namespace {
 } // namespace
 
 struct H264MfEncoder::Impl {
+    struct PendingInputMeta {
+        bool forceKeyframe = false;
+        uint32_t timestamp90k = 0;
+    };
+
     ComPtr<IMFTransform> transform;
+    ComPtr<IMFMediaEventGenerator> eventGenerator;
     DWORD inputStreamId = 0;
     DWORD outputStreamId = 0;
     MFT_OUTPUT_STREAM_INFO outputInfo{};
@@ -283,6 +291,12 @@ struct H264MfEncoder::Impl {
     DWORD outputBufferSize = 0;
     std::vector<uint8_t> nv12;
     std::vector<uint8_t> sequenceHeaderAnnexB;
+    std::deque<PendingInputMeta> pendingInputs;
+    std::deque<H264EncodedFrame> pendingOutputs;
+    int needInputCredits = 0;
+    uint64_t noCreditDrops = 0;
+    int consecutiveNoCreditDrops = 0;
+    bool asyncMode = false;
     bool sequenceHeaderLogged = false;
     bool mfStarted = false;
 };
@@ -452,6 +466,18 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
     m_impl->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
     m_impl->mfStarted = true;
 
+    // Hardware Media Foundation encoders are commonly asynchronous. Once
+    // MF_TRANSFORM_ASYNC_UNLOCK is enabled they must be driven by the
+    // IMFMediaEventGenerator NeedInput/HaveOutput handshake rather than by a
+    // synchronous ProcessInput -> ProcessOutput poll. QueryInterface is the
+    // authoritative test; genuinely synchronous MFTs simply keep the legacy path.
+    ComPtr<IMFMediaEventGenerator> eventGenerator;
+    if (SUCCEEDED(m_impl->transform.As(&eventGenerator)) && eventGenerator) {
+        m_impl->eventGenerator = eventGenerator;
+        m_impl->asyncMode = true;
+    }
+    std::cout << "[h264] async_event_model=" << (m_impl->asyncMode ? 1 : 0) << "\n";
+
     m_open = true;
     return true;
 }
@@ -512,9 +538,211 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
         return false;
     }
 
-    // Forced keyframe via CodecAPI is disabled in this build. We still mark
-    // IDR/keyframe output by inspecting encoded NAL units and prepend SPS/PPS
-    // when present.
+    auto finalizeOutput = [&](IMFSample* got, H264EncodedFrame& encoded) -> bool {
+        if (!got) return true;
+
+        ComPtr<IMFMediaBuffer> contiguous;
+        HRESULT hr = got->ConvertToContiguousBuffer(&contiguous);
+        if (FAILED(hr) || !contiguous) {
+            if (error) *error = "ConvertToContiguousBuffer failed " + HrToString(hr);
+            return false;
+        }
+
+        BYTE* p = nullptr;
+        DWORD max = 0;
+        DWORD len = 0;
+        hr = contiguous->Lock(&p, &max, &len);
+        if (FAILED(hr)) {
+            if (error) *error = "output buffer Lock failed " + HrToString(hr);
+            return false;
+        }
+        if (len > 0 && p) encoded.data.assign(p, p + len);
+        contiguous->Unlock();
+
+        Impl::PendingInputMeta meta{};
+        if (!m_impl->pendingInputs.empty()) {
+            meta = m_impl->pendingInputs.front();
+            m_impl->pendingInputs.pop_front();
+        }
+
+        if (encoded.data.empty()) {
+            encoded.timestamp90k = meta.timestamp90k;
+            return true;
+        }
+
+        encoded.data = ConvertAvccLengthPrefixedToAnnexB(encoded.data);
+        encoded.keyframe = ContainsH264Idr(encoded.data) || meta.forceKeyframe;
+        encoded.timestamp90k = meta.timestamp90k;
+
+        if (encoded.keyframe && !m_impl->sequenceHeaderAnnexB.empty() &&
+            (!ContainsH264NalType(encoded.data, 7) || !ContainsH264NalType(encoded.data, 8))) {
+            std::vector<uint8_t> withHeader;
+            withHeader.reserve(m_impl->sequenceHeaderAnnexB.size() + encoded.data.size());
+            withHeader.insert(withHeader.end(), m_impl->sequenceHeaderAnnexB.begin(), m_impl->sequenceHeaderAnnexB.end());
+            withHeader.insert(withHeader.end(), encoded.data.begin(), encoded.data.end());
+            encoded.data.swap(withHeader);
+        }
+
+        if (!m_impl->sequenceHeaderLogged) {
+            m_impl->sequenceHeaderLogged = true;
+            std::cout << "[h264] sequence header bytes=" << m_impl->sequenceHeaderAnnexB.size()
+                << " keyframe=" << (encoded.keyframe ? 1 : 0)
+                << " has_sps=" << (ContainsH264NalType(encoded.data, 7) ? 1 : 0)
+                << " has_pps=" << (ContainsH264NalType(encoded.data, 8) ? 1 : 0)
+                << " has_idr=" << (ContainsH264NalType(encoded.data, 5) ? 1 : 0)
+                << " bytes=" << encoded.data.size() << "\n";
+        }
+        AppendH264Dump(encoded.data);
+        return true;
+    };
+
+    auto drainOneOutput = [&](H264EncodedFrame& encoded, bool& produced) -> bool {
+        produced = false;
+        for (;;) {
+            MFT_OUTPUT_DATA_BUFFER output{};
+            DWORD status = 0;
+            HRESULT hr = S_OK;
+
+            if (!(m_impl->outputInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
+                const DWORD outputBytes = std::max<DWORD>(m_impl->outputInfo.cbSize, 1024 * 1024);
+                if (!m_impl->outputSample || !m_impl->outputBuffer || m_impl->outputBufferSize < outputBytes) {
+                    m_impl->outputSample.Reset();
+                    m_impl->outputBuffer.Reset();
+                    hr = MFCreateSample(&m_impl->outputSample);
+                    if (FAILED(hr)) {
+                        if (error) *error = "MFCreateSample output failed " + HrToString(hr);
+                        return false;
+                    }
+                    hr = MFCreateMemoryBuffer(outputBytes, &m_impl->outputBuffer);
+                    if (FAILED(hr)) {
+                        if (error) *error = "MFCreateMemoryBuffer output failed " + HrToString(hr);
+                        return false;
+                    }
+                    hr = m_impl->outputSample->AddBuffer(m_impl->outputBuffer.Get());
+                    if (FAILED(hr)) {
+                        if (error) *error = "output sample AddBuffer failed " + HrToString(hr);
+                        return false;
+                    }
+                    m_impl->outputBufferSize = outputBytes;
+                }
+                hr = m_impl->outputBuffer->SetCurrentLength(0);
+                if (FAILED(hr)) {
+                    if (error) *error = "output buffer reset failed " + HrToString(hr);
+                    return false;
+                }
+                output.pSample = m_impl->outputSample.Get();
+            }
+
+            hr = m_impl->transform->ProcessOutput(0, 1, &output, &status);
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+                if (output.pEvents) output.pEvents->Release();
+                return true;
+            }
+            if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+                if (output.pEvents) output.pEvents->Release();
+                ComPtr<IMFMediaType> newOut;
+                if (SUCCEEDED(m_impl->transform->GetOutputAvailableType(0, 0, &newOut)) && newOut) {
+                    m_impl->transform->SetOutputType(0, newOut.Get(), 0);
+                }
+                m_impl->transform->GetOutputStreamInfo(0, &m_impl->outputInfo);
+                m_impl->sequenceHeaderAnnexB = ReadCurrentH264SequenceHeader(m_impl->transform.Get());
+                std::cout << "[h264] stream change handled sequence_header_bytes="
+                    << m_impl->sequenceHeaderAnnexB.size() << "\n";
+                continue;
+            }
+            if (FAILED(hr)) {
+                if (output.pEvents) output.pEvents->Release();
+                if (error) *error = "ProcessOutput failed " + HrToString(hr);
+                return false;
+            }
+
+            ComPtr<IMFSample> got;
+            if (output.pSample) {
+                if (m_impl->outputInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) {
+                    // ProcessOutput transfers a caller-owned reference for MFT-provided
+                    // samples. Attach consumes that reference without AddRef, so it is
+                    // released exactly once when got leaves scope.
+                    got.Attach(output.pSample);
+                } else {
+                    // This is our reusable sample; keep its owning reference in Impl and
+                    // take a temporary AddRef while extracting this output.
+                    got = output.pSample;
+                }
+            }
+            if (output.pEvents) output.pEvents->Release();
+            if (!got) return true;
+            if (!finalizeOutput(got.Get(), encoded)) return false;
+            produced = !encoded.data.empty();
+            return true;
+        }
+    };
+
+    auto pumpAsyncEvents = [&](bool waitForInputCredit) -> bool {
+        if (!m_impl->asyncMode || !m_impl->eventGenerator) return true;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3);
+        for (;;) {
+            bool sawEvent = false;
+            for (;;) {
+                ComPtr<IMFMediaEvent> event;
+                HRESULT hr = m_impl->eventGenerator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+                if (hr == MF_E_NO_EVENTS_AVAILABLE) break;
+                if (FAILED(hr)) {
+                    if (error) *error = "IMFMediaEventGenerator::GetEvent failed " + HrToString(hr);
+                    return false;
+                }
+                if (!event) break;
+                sawEvent = true;
+
+                MediaEventType type = MEUnknown;
+                HRESULT eventStatus = S_OK;
+                event->GetType(&type);
+                event->GetStatus(&eventStatus);
+                if (FAILED(eventStatus)) {
+                    if (error) *error = "async MFT event failed " + HrToString(eventStatus);
+                    return false;
+                }
+                if (type == METransformNeedInput) {
+                    ++m_impl->needInputCredits;
+                } else if (type == METransformHaveOutput) {
+                    H264EncodedFrame encoded;
+                    bool produced = false;
+                    if (!drainOneOutput(encoded, produced)) return false;
+                    if (produced) m_impl->pendingOutputs.push_back(std::move(encoded));
+                } else if (type == MEError) {
+                    if (error) *error = "async MFT emitted MEError";
+                    return false;
+                }
+            }
+
+            if (!waitForInputCredit || m_impl->needInputCredits > 0 ||
+                std::chrono::steady_clock::now() >= deadline) break;
+
+            SwitchToThread();
+            if (!sawEvent) YieldProcessor();
+        }
+        return true;
+    };
+
+    if (m_impl->asyncMode) {
+        if (!pumpAsyncEvents(true)) return false;
+        if (m_impl->needInputCredits <= 0) {
+            ++m_impl->noCreditDrops;
+            ++m_impl->consecutiveNoCreditDrops;
+            if (m_impl->noCreditDrops == 1 || (m_impl->noCreditDrops % 120) == 0) {
+                std::cout << "[h264] async no-input-credit drop count=" << m_impl->noCreditDrops
+                    << " consecutive=" << m_impl->consecutiveNoCreditDrops << "\n";
+            }
+            if (m_impl->consecutiveNoCreditDrops >= 8) {
+                if (error) *error = "async MFT stalled waiting for METransformNeedInput";
+                return false;
+            }
+            if (!m_impl->pendingOutputs.empty()) {
+                out = std::move(m_impl->pendingOutputs.front());
+                m_impl->pendingOutputs.pop_front();
+            }
+            return true;
+        }
+    }
 
     const int uvWidth = (frame.width + 1) / 2;
     const int uvHeight = (frame.height + 1) / 2;
@@ -528,7 +756,6 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
         if (error) *error = "MFCreateSample failed " + HrToString(hr);
         return false;
     }
-
     ComPtr<IMFMediaBuffer> buffer;
     hr = MFCreateMemoryBuffer(static_cast<DWORD>(nv12Size), &buffer);
     if (FAILED(hr)) {
@@ -539,44 +766,34 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
     BYTE* dst = nullptr;
     DWORD maxLen = 0;
     DWORD curLen = 0;
-
     hr = buffer->Lock(&dst, &maxLen, &curLen);
     if (FAILED(hr)) {
         if (error) *error = "input buffer Lock failed " + HrToString(hr);
         return false;
     }
-
     DWORD written = 0;
     const bool copied = CopyI420ToNV12Buffer(frame, dst, maxLen, &written);
-
     buffer->Unlock();
-
     if (!copied) {
-        if (error) {
-            *error =
-                "I420->NV12 copy failed frame=" +
-                std::to_string(frame.width) + "x" + std::to_string(frame.height) +
-                " maxLen=" + std::to_string(maxLen) +
-                " y=" + std::to_string(frame.y.size()) +
-                " u=" + std::to_string(frame.u.size()) +
-                " v=" + std::to_string(frame.v.size());
-        }
+        if (error) *error = "I420->NV12 copy failed frame=" + std::to_string(frame.width) + "x" +
+            std::to_string(frame.height) + " maxLen=" + std::to_string(maxLen) +
+            " y=" + std::to_string(frame.y.size()) + " u=" + std::to_string(frame.u.size()) +
+            " v=" + std::to_string(frame.v.size());
         return false;
     }
-
     hr = buffer->SetCurrentLength(written);
     if (FAILED(hr)) {
         if (error) *error = "SetCurrentLength failed " + HrToString(hr);
         return false;
     }
-
     hr = sample->AddBuffer(buffer.Get());
     if (FAILED(hr)) {
         if (error) *error = "sample AddBuffer failed " + HrToString(hr);
         return false;
     }
 
-    const LONGLONG frameTime = static_cast<LONGLONG>((10'000'000.0 * static_cast<double>(m_frameIndex)) / static_cast<double>(m_fps));
+    const uint64_t inputIndex = m_frameIndex;
+    const LONGLONG frameTime = static_cast<LONGLONG>((10'000'000.0 * static_cast<double>(inputIndex)) / static_cast<double>(m_fps));
     const LONGLONG frameDuration = static_cast<LONGLONG>(10'000'000.0 / static_cast<double>(m_fps));
     sample->SetSampleTime(frameTime);
     sample->SetSampleDuration(frameDuration);
@@ -587,117 +804,26 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
         return false;
     }
 
+    if (m_impl->asyncMode) {
+        --m_impl->needInputCredits;
+        m_impl->consecutiveNoCreditDrops = 0;
+    }
+    Impl::PendingInputMeta meta{};
+    meta.forceKeyframe = forceKeyframe;
+    meta.timestamp90k = static_cast<uint32_t>((inputIndex * 90000ULL) / static_cast<uint64_t>(m_fps));
+    m_impl->pendingInputs.push_back(meta);
     ++m_frameIndex;
 
-    for (;;) {
-        MFT_OUTPUT_DATA_BUFFER output{};
-        DWORD status = 0;
-
-        if (!(m_impl->outputInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-            const DWORD outputBytes = std::max<DWORD>(m_impl->outputInfo.cbSize, 1024 * 1024);
-            if (!m_impl->outputSample || !m_impl->outputBuffer || m_impl->outputBufferSize < outputBytes) {
-                m_impl->outputSample.Reset();
-                m_impl->outputBuffer.Reset();
-                hr = MFCreateSample(&m_impl->outputSample);
-                if (FAILED(hr)) {
-                    if (error) *error = "MFCreateSample output failed " + HrToString(hr);
-                    return false;
-                }
-                hr = MFCreateMemoryBuffer(outputBytes, &m_impl->outputBuffer);
-                if (FAILED(hr)) {
-                    if (error) *error = "MFCreateMemoryBuffer output failed " + HrToString(hr);
-                    return false;
-                }
-                hr = m_impl->outputSample->AddBuffer(m_impl->outputBuffer.Get());
-                if (FAILED(hr)) {
-                    if (error) *error = "output sample AddBuffer failed " + HrToString(hr);
-                    return false;
-                }
-                m_impl->outputBufferSize = outputBytes;
-            }
-            hr = m_impl->outputBuffer->SetCurrentLength(0);
-            if (FAILED(hr)) {
-                if (error) *error = "output buffer reset failed " + HrToString(hr);
-                return false;
-            }
-            output.pSample = m_impl->outputSample.Get();
+    if (m_impl->asyncMode) {
+        if (!pumpAsyncEvents(false)) return false;
+        if (!m_impl->pendingOutputs.empty()) {
+            out = std::move(m_impl->pendingOutputs.front());
+            m_impl->pendingOutputs.pop_front();
         }
-
-        hr = m_impl->transform->ProcessOutput(0, 1, &output, &status);
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            // ProcessInput succeeded; the MFT buffered this frame and simply has no output yet.
-            return true;
-        }
-        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            ComPtr<IMFMediaType> newOut;
-            if (SUCCEEDED(m_impl->transform->GetOutputAvailableType(0, 0, &newOut)) && newOut) {
-                m_impl->transform->SetOutputType(0, newOut.Get(), 0);
-            }
-            m_impl->transform->GetOutputStreamInfo(0, &m_impl->outputInfo);
-            m_impl->sequenceHeaderAnnexB = ReadCurrentH264SequenceHeader(m_impl->transform.Get());
-            std::cout << "[h264] stream change handled sequence_header_bytes=" << m_impl->sequenceHeaderAnnexB.size() << "\n";
-            continue;
-        }
-        if (FAILED(hr)) {
-            if (error) *error = "ProcessOutput failed " + HrToString(hr);
-            return false;
-        }
-
-        ComPtr<IMFSample> got = output.pSample;
-        if (!got) {
-            continue;
-        }
-
-        ComPtr<IMFMediaBuffer> contiguous;
-        hr = got->ConvertToContiguousBuffer(&contiguous);
-        if (FAILED(hr) || !contiguous) {
-            if (error) *error = "ConvertToContiguousBuffer failed " + HrToString(hr);
-            return false;
-        }
-
-        BYTE* p = nullptr;
-        DWORD max = 0;
-        DWORD len = 0;
-        contiguous->Lock(&p, &max, &len);
-        if (len > 0) {
-            const size_t old = out.data.size();
-            out.data.resize(old + len);
-            std::memcpy(out.data.data() + old, p, len);
-        }
-        contiguous->Unlock();
-
-        if (output.pEvents) output.pEvents->Release();
-
-        if (!out.data.empty()) {
-            // Media Foundation encoders may output Annex-B or AVCC/length-prefixed
-            // H.264. Normalize the encoded sample before prepending SPS/PPS, otherwise
-            // mixed Annex-B + AVCC output creates malformed NAL units and Chrome/WebView
-            // commonly displays a black frame while data channels still work.
-            out.data = ConvertAvccLengthPrefixedToAnnexB(out.data);
-            out.keyframe = ContainsH264Idr(out.data) || forceKeyframe;
-
-            // Ensure browsers receive SPS/PPS. Some Media Foundation encoders
-            // place SPS/PPS only in MF_MT_MPEG_SEQUENCE_HEADER, not in the first
-            // sample. Without this the WebRTC connection can establish, data
-            // channels work, but the viewer stays black.
-            if (out.keyframe && !m_impl->sequenceHeaderAnnexB.empty() &&
-                (!ContainsH264NalType(out.data, 7) || !ContainsH264NalType(out.data, 8))) {
-                std::vector<uint8_t> withHeader;
-                withHeader.reserve(m_impl->sequenceHeaderAnnexB.size() + out.data.size());
-                withHeader.insert(withHeader.end(), m_impl->sequenceHeaderAnnexB.begin(), m_impl->sequenceHeaderAnnexB.end());
-                withHeader.insert(withHeader.end(), out.data.begin(), out.data.end());
-                out.data.swap(withHeader);
-            }
-
-            if (!m_impl->sequenceHeaderLogged) {
-                m_impl->sequenceHeaderLogged = true;
-                std::cout << "[h264] sequence header bytes=" << m_impl->sequenceHeaderAnnexB.size() << " keyframe=" << (out.keyframe ? 1 : 0) << " has_sps=" << (ContainsH264NalType(out.data, 7) ? 1 : 0) << " has_pps=" << (ContainsH264NalType(out.data, 8) ? 1 : 0) << " has_idr=" << (ContainsH264NalType(out.data, 5) ? 1 : 0) << " bytes=" << out.data.size() << "\n";
-            }
-
-            AppendH264Dump(out.data);
-
-            out.timestamp90k = static_cast<uint32_t>((m_frameIndex * 90000ULL) / static_cast<uint64_t>(m_fps));
-            return true;
-        }
+        return true;
     }
+
+    bool produced = false;
+    if (!drainOneOutput(out, produced)) return false;
+    return true;
 }
