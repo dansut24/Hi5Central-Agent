@@ -335,6 +335,7 @@ if(WIN32)
     src/av1_mf_encoder.cpp
     src/platform/windows/windows_input.cpp
     src/platform/windows/windows_screen.cpp
+    src/platform/windows/shared_gpu_frame_reader.cpp
     src/platform/windows/windows_codec.cpp
     src/platform/windows/wasapi_loopback.cpp
   )

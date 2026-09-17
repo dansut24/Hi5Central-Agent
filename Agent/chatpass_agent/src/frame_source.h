@@ -20,6 +20,25 @@ struct FrameCaptureResult {
     uint64_t frameId = 0;
 };
 
+struct SharedGpuFrame {
+    int width = 0;
+    int height = 0;
+    uint32_t dxgiFormat = 0;
+    uint32_t adapterLuidLow = 0;
+    int32_t adapterLuidHigh = 0;
+    uint64_t sharedHandle = 0;
+    uint64_t syncKey = 0;
+    uint64_t frameId = 0;
+};
+
+struct GpuFrameCaptureResult {
+    SharedGpuFrame frame;
+    bool supported = false;
+    bool hasFrame = false;
+    bool changed = false;
+    bool cursorOnly = false;
+};
+
 struct DisplayInfo {
     int index = 0;              // -1 = All monitors
     std::string name;
@@ -42,6 +61,8 @@ public:
     I420Frame nextFrame();
     FrameCaptureResult nextFrameEx(bool includeUnchangedFrame = true);
     void nextFrameExInto(FrameCaptureResult& result, bool includeUnchangedFrame = true);
+    GpuFrameCaptureResult nextSharedGpuFrameEx();
+    void nextSharedGpuFrameExInto(GpuFrameCaptureResult& result);
 
     std::vector<DisplayInfo> listDisplays() const;
     DisplayInfo currentDisplayInfo() const;

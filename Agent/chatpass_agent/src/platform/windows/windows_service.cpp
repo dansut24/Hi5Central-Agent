@@ -6935,6 +6935,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 // Windows' heap/working set to grow far beyond the live frame data.
                 I420Frame normalFrame;
                 I420Frame secureFrame;
+                SharedGpuFrame normalGpuFrame;
                 uint64_t normalTs = 0;
                 uint64_t secureTs = 0;
 
@@ -7407,16 +7408,23 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     bool gotNormal = false;
+                    bool gotNormalGpu = false;
+                    bool gotNormalRaw = false;
                     bool gotSecure = false;
                     bool secureBecameReady = false;
                     bool secureTransitionBlank = false;
 
-                    // Drain directly into the persistent destination buffer. resize()
-                    // reuses vector capacity for same-size frames instead of allocating
-                    // a fresh Y/U/V set and moving it every pump iteration.
-                    while (ctx.normalShmem.ReadRawI420Frame(normalFrame, normalTs)) {
-                        gotNormal = true;
+                    // Normal desktop prefers a shared D3D11 texture descriptor.
+                    // Secure desktop and unsupported/all-monitor capture retain raw I420.
+                    while (ctx.normalShmem.ReadSharedGpuFrame(normalGpuFrame, normalTs)) {
+                        gotNormalGpu = true;
                     }
+                    if (!gotNormalGpu) {
+                        while (ctx.normalShmem.ReadRawI420Frame(normalFrame, normalTs)) {
+                            gotNormalRaw = true;
+                        }
+                    }
+                    gotNormal = gotNormalGpu || gotNormalRaw;
                     if (gotNormal) {
                         const uint64_t nowTickNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
                         if (normalTs != 0 && nowTickNs > normalTs && nowTickNs - normalTs > maxFrameAgeNs) {
@@ -7488,7 +7496,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         ActiveConsoleSessionId() == ctx.activeConsoleSessionId &&
                         ctx.normalStreamerSessionId == ctx.activeConsoleSessionId &&
                         (ctx.consoleNormalReadyAfterTickNs == 0 || normalTs >= ctx.consoleNormalReadyAfterTickNs) &&
-                        !isNearBlackTransitionFrame(normalFrame);
+                        !(gotNormalRaw && isNearBlackTransitionFrame(normalFrame));
                     const bool useSecureFallback = !normalHandoffReady && !ctx.secureRetiring &&
                         ctx.secureStreamerProcess != nullptr &&
                         (ctx.normalDesktopUnavailable || ctx.loginDesktopMode || ctx.uacRequested ||
@@ -7512,19 +7520,19 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         (!ctx.normalDesktopUnavailable || normalHandoffReady) &&
                         (!ctx.consoleHandoffActive || normalHandoffReady)) {
                         const bool staleSecureCandidate = ctx.unifiedDesktopStreamer && ctx.uacRequested &&
-                            ctx.uacDetectedTickNs != 0 && normalTs < ctx.uacDetectedTickNs;
+                            (gotNormalGpu || (ctx.uacDetectedTickNs != 0 && normalTs < ctx.uacDetectedTickNs));
                         const bool staleNormalReturn = ctx.unifiedDesktopStreamer && !ctx.uacRequested &&
                             ctx.activeMode == DesktopMode::Secure && ctx.desktopReturnTickNs != 0 &&
                             normalTs < ctx.desktopReturnTickNs;
                         const bool blankSecureTransition = ctx.unifiedDesktopStreamer && ctx.uacRequested &&
                             ctx.uacDetectedAt.time_since_epoch().count() != 0 &&
                             now - ctx.uacDetectedAt < std::chrono::milliseconds(250) &&
-                            isNearBlackTransitionFrame(normalFrame);
+                            gotNormalRaw && isNearBlackTransitionFrame(normalFrame);
                         const bool blankNormalReturn = ctx.unifiedDesktopStreamer && !ctx.uacRequested &&
                             ctx.desktopReturnAt.time_since_epoch().count() != 0 &&
                             now - ctx.desktopReturnAt < std::chrono::milliseconds(250) &&
-                            isNearBlackTransitionFrame(normalFrame);
-                        const bool blankConsoleHandoff = ctx.consoleHandoffActive &&
+                            gotNormalRaw && isNearBlackTransitionFrame(normalFrame);
+                        const bool blankConsoleHandoff = ctx.consoleHandoffActive && gotNormalRaw &&
                             isNearBlackTransitionFrame(normalFrame);
 
                         if (!staleSecureCandidate && !staleNormalReturn && !blankSecureTransition &&
@@ -7533,8 +7541,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ++framesForwarded;
                             const bool forceKf = enteringSecure || framesForwarded == 1;
                             ctx.secureFallbackOwnsInput.store(false, std::memory_order_release);
-                            sent = ctx.mediaShmem.WriteRawI420Frame(normalFrame, normalTs, forceKf);
-                            if (enteringSecure) {
+                            if (gotNormalRaw) {
+                                sent = ctx.mediaShmem.WriteRawI420Frame(normalFrame, normalTs, forceKf);
+                            }
+                            if (enteringSecure && gotNormalRaw) {
                                 ctx.unifiedSecureReady = true;
                                 ctx.activeMode = DesktopMode::Secure;
                                 ctx.handoffStateAnnounced = false;
@@ -7574,7 +7584,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ctx.secureFallbackOwnsInput.store(false, std::memory_order_release);
                             ++framesForwarded;
                             const bool forceKf = wasSecure || completedConsoleHandoff || framesForwarded == 1;
-                            sent = ctx.mediaShmem.WriteRawI420Frame(normalFrame, normalTs, forceKf);
+                            sent = gotNormalGpu
+                                ? ctx.mediaShmem.WriteSharedGpuFrame(normalGpuFrame, normalTs, forceKf)
+                                : ctx.mediaShmem.WriteRawI420Frame(normalFrame, normalTs, forceKf);
 
                             if (completedConsoleHandoff) {
                                 ctx.consoleHandoffActive = false;

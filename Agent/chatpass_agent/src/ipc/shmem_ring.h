@@ -32,8 +32,13 @@ namespace hi5 {
         uint32_t              uSize;
         uint32_t              vSize;
         uint64_t              tsNs;
-        uint32_t              flags;   // bit 0 = force keyframe
-        uint8_t               _pad[28];
+        uint32_t              flags;   // bit 0 = force keyframe, bit 1 = shared GPU texture
+        uint32_t              gpuFormat;
+        uint32_t              adapterLuidLow;
+        int32_t               adapterLuidHigh;
+        uint64_t              gpuHandle;
+        uint64_t              gpuKey;
+        uint8_t               _pad[8];
     };
 
     struct ShmemHeader {
@@ -90,6 +95,11 @@ namespace hi5 {
                 fh->vSize = 0;
                 fh->tsNs = 0;
                 fh->flags = 0;
+                fh->gpuFormat = 0;
+                fh->adapterLuidLow = 0;
+                fh->adapterLuidHigh = 0;
+                fh->gpuHandle = 0;
+                fh->gpuKey = 0;
             }
 
             producer_ = true;
@@ -160,6 +170,11 @@ namespace hi5 {
             fh->vSize = vSize;
             fh->tsNs = tsNs;
             fh->flags = forceKeyframe ? 1u : 0u;
+            fh->gpuFormat = 0;
+            fh->adapterLuidLow = 0;
+            fh->adapterLuidHigh = 0;
+            fh->gpuHandle = 0;
+            fh->gpuKey = 0;
 
             std::memcpy(payload, frame.y.data(), ySize);
             std::memcpy(payload + ySize, frame.u.data(), uSize);
@@ -168,6 +183,69 @@ namespace hi5 {
             std::atomic_thread_fence(std::memory_order_release);
             fh->size.store(total, std::memory_order_release);
             hdr->writeIdx.store(w + 1, std::memory_order_release);
+            return true;
+        }
+
+        bool WriteSharedGpuFrame(const SharedGpuFrame& frame, uint64_t tsNs, bool forceKeyframe = false) {
+            if (!base_ || frame.width <= 0 || frame.height <= 0 || frame.sharedHandle == 0 || frame.syncKey == 0) return false;
+
+            auto* hdr = header();
+            const uint64_t w = hdr->writeIdx.load(std::memory_order_relaxed);
+            const uint64_t r = hdr->readIdx.load(std::memory_order_acquire);
+            if (w - r >= kShmRingSlots) hdr->readIdx.store(r + 1, std::memory_order_release);
+
+            const uint32_t slot = static_cast<uint32_t>(w % kShmRingSlots);
+            auto* fh = frameHeader(slot);
+            fh->size.store(0, std::memory_order_relaxed);
+            fh->width = static_cast<uint32_t>(frame.width);
+            fh->height = static_cast<uint32_t>(frame.height);
+            fh->ySize = 0;
+            fh->uSize = 0;
+            fh->vSize = 0;
+            fh->tsNs = tsNs;
+            fh->flags = (forceKeyframe ? 1u : 0u) | 2u;
+            fh->gpuFormat = frame.dxgiFormat;
+            fh->adapterLuidLow = frame.adapterLuidLow;
+            fh->adapterLuidHigh = frame.adapterLuidHigh;
+            fh->gpuHandle = frame.sharedHandle;
+            fh->gpuKey = frame.syncKey;
+            std::atomic_thread_fence(std::memory_order_release);
+            fh->size.store(1, std::memory_order_release);
+            hdr->writeIdx.store(w + 1, std::memory_order_release);
+            return true;
+        }
+
+        bool ReadSharedGpuFrame(SharedGpuFrame& frame, uint64_t& tsNs, bool* forceKeyframe = nullptr) {
+            if (!base_) return false;
+            auto* hdr = header();
+            const uint64_t r = hdr->readIdx.load(std::memory_order_relaxed);
+            const uint64_t w = hdr->writeIdx.load(std::memory_order_acquire);
+            if (r >= w) return false;
+
+            const uint32_t slot = static_cast<uint32_t>(r % kShmRingSlots);
+            auto* fh = frameHeader(slot);
+            const uint32_t size = fh->size.load(std::memory_order_acquire);
+            if (size == 0) return false;
+            if ((fh->flags & 2u) == 0) return false;
+            if (fh->gpuHandle == 0 || fh->gpuKey == 0) {
+                fh->size.store(0, std::memory_order_relaxed);
+                hdr->readIdx.store(r + 1, std::memory_order_release);
+                return false;
+            }
+
+            frame.width = static_cast<int>(fh->width);
+            frame.height = static_cast<int>(fh->height);
+            frame.dxgiFormat = fh->gpuFormat;
+            frame.adapterLuidLow = fh->adapterLuidLow;
+            frame.adapterLuidHigh = fh->adapterLuidHigh;
+            frame.sharedHandle = fh->gpuHandle;
+            frame.syncKey = fh->gpuKey;
+            frame.frameId = r + 1;
+            tsNs = fh->tsNs;
+            if (forceKeyframe) *forceKeyframe = (fh->flags & 1u) != 0;
+
+            fh->size.store(0, std::memory_order_relaxed);
+            hdr->readIdx.store(r + 1, std::memory_order_release);
             return true;
         }
 
@@ -186,6 +264,7 @@ namespace hi5 {
             auto* fh = frameHeader(slot);
             const uint32_t size = fh->size.load(std::memory_order_acquire);
 
+            if ((fh->flags & 2u) != 0) return false;
             if (size == 0 || size > kShmMaxFrameBytes || size != fh->ySize + fh->uSize + fh->vSize) {
                 hdr->readIdx.store(r + 1, std::memory_order_release);
                 return false;

@@ -952,10 +952,14 @@ namespace hi5 {
         uint64_t changedFrames = 0;
         uint64_t skippedFrames = 0;
         uint64_t writtenFrames = 0;
+        uint64_t gpuWrittenFrames = 0;
+        uint64_t rawWrittenFrames = 0;
         uint64_t inputEvents = 0;
         uint64_t fastMouseApplied = 0;
-        // Reuse one capture result so its multi-megabyte I420 vectors keep their capacity.
+        // Reuse capture results. Normal desktop prefers a GPU-shared texture;
+        // secure/all-monitor fallback retains the known-good I420 path.
         FrameCaptureResult captured;
+        GpuFrameCaptureResult gpuCaptured;
         uint64_t fastMouseLastSeq = 0;
         uint64_t cursorOnlyFrames = 0;
         bool localInputBlocked = false;
@@ -970,7 +974,8 @@ namespace hi5 {
             " active_fps=" + std::to_string(activeFps) +
             " idle_fps=" + std::to_string(idleFps) +
             " motion_fps=" + std::to_string(motionFps) +
-            " cursor_refresh=disabled");
+            " cursor_refresh=disabled gpu_transport=" +
+            std::to_string(ReadEnvInt("HI5_GPU_FRAME_TRANSPORT", 1, 0, 1)));
 
         while (g_running.load()) {
             if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) {
@@ -1074,7 +1079,6 @@ namespace hi5 {
             try {
                 if (now >= nextCaptureAt) {
                     ++captureAttempts;
-                    source.nextFrameExInto(captured, false);
                     const bool recentInput = (now - lastInputAt) <= activeHold;
                     const bool recentMotion = (now - lastChangedFrameAt) <= std::chrono::milliseconds(ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
                     const int targetFps = recentInput ? motionFps : (recentMotion ? activeFps : idleFps);
@@ -1083,24 +1087,57 @@ namespace hi5 {
                     const auto frameInterval = std::chrono::milliseconds(1000 / std::max(1, targetFps));
                     nextCaptureAt = now + frameInterval;
 
-                    if (captured.cursorOnly) {
-                        ++cursorOnlyFrames;
-                        ++skippedFrames;
+                    bool handledByGpu = false;
+                    const bool gpuTransportAllowed = !isSecureHelper && !lastSecureState && currentDisplay >= 0 &&
+                        ReadEnvInt("HI5_GPU_FRAME_TRANSPORT", 1, 0, 1) != 0;
+                    if (gpuTransportAllowed) {
+                        source.nextSharedGpuFrameExInto(gpuCaptured);
+                        if (gpuCaptured.supported) {
+                            handledByGpu = true;
+                            if (gpuCaptured.cursorOnly) {
+                                ++cursorOnlyFrames;
+                                ++skippedFrames;
+                            }
+                            else if (gpuCaptured.hasFrame && gpuCaptured.changed) {
+                                ++changedFrames;
+                                lastChangedFrameAt = now;
+                                const uint64_t tsNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                                if (!shmem.WriteSharedGpuFrame(gpuCaptured.frame, tsNs)) {
+                                    LogWarn("[streamer] WriteSharedGpuFrame failed session=" + args.sessionId);
+                                }
+                                else {
+                                    ++writtenFrames;
+                                    ++gpuWrittenFrames;
+                                }
+                            }
+                            else {
+                                ++skippedFrames;
+                            }
+                        }
                     }
-                    else if (captured.hasFrame && captured.changed) {
-                        ++changedFrames;
-                        lastChangedFrameAt = now;
-                        const uint64_t tsNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
-                        if (!shmem.WriteRawI420Frame(captured.frame, tsNs)) {
-                            LogWarn("[streamer] WriteRawI420Frame failed session=" + args.sessionId +
-                                " bytes=" + std::to_string(captured.frame.y.size() + captured.frame.u.size() + captured.frame.v.size()));
+
+                    if (!handledByGpu) {
+                        source.nextFrameExInto(captured, false);
+                        if (captured.cursorOnly) {
+                            ++cursorOnlyFrames;
+                            ++skippedFrames;
+                        }
+                        else if (captured.hasFrame && captured.changed) {
+                            ++changedFrames;
+                            lastChangedFrameAt = now;
+                            const uint64_t tsNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                            if (!shmem.WriteRawI420Frame(captured.frame, tsNs)) {
+                                LogWarn("[streamer] WriteRawI420Frame failed session=" + args.sessionId +
+                                    " bytes=" + std::to_string(captured.frame.y.size() + captured.frame.u.size() + captured.frame.v.size()));
+                            }
+                            else {
+                                ++writtenFrames;
+                                ++rawWrittenFrames;
+                            }
                         }
                         else {
-                            ++writtenFrames;
+                            ++skippedFrames;
                         }
-                    }
-                    else {
-                        ++skippedFrames;
                     }
                     consecutiveResetFailures = 0;
                 }
@@ -1143,6 +1180,8 @@ namespace hi5 {
                     " cursor_only=" + std::to_string(cursorOnlyFrames) +
                     " skipped=" + std::to_string(skippedFrames) +
                     " written=" + std::to_string(writtenFrames) +
+                    " gpu_written=" + std::to_string(gpuWrittenFrames) +
+                    " raw_written=" + std::to_string(rawWrittenFrames) +
                     " input=" + std::to_string(inputEvents) +
                     " fps=" + std::to_string(lastTargetFps) +
                     " mode=" + std::string(StreamModeName(lastStreamMode)));

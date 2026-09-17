@@ -2,6 +2,7 @@
 #include "ipc/named_pipe.h"
 #include "ipc/shmem_ring.h"
 #include "util/log.h"
+#include "platform/windows/shared_gpu_frame_reader.h"
 
 #include <nlohmann/json.hpp>
 
@@ -198,6 +199,8 @@ int RunMediaHostMain(int argc, char** argv) {
     bool firstFrameLogged = false;
     auto nextMemoryLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     I420Frame frame;
+    SharedGpuFrame gpuFrame;
+    SharedGpuFrameReader gpuReader;
     uint64_t frameTsNs = 0;
     while (!closed.load(std::memory_order_acquire) &&
         WaitForSingleObject(stopEvent, 0) != WAIT_OBJECT_0) {
@@ -213,19 +216,37 @@ int RunMediaHostMain(int argc, char** argv) {
         }
 
         bool gotFrame = false;
+        bool gotGpuFrame = false;
         bool forceKeyframe = false;
         bool thisForceKeyframe = false;
 
-        while (frameRing.ReadRawI420Frame(frame, frameTsNs, &thisForceKeyframe)) {
-            gotFrame = true;
+        while (frameRing.ReadSharedGpuFrame(gpuFrame, frameTsNs, &thisForceKeyframe)) {
+            gotGpuFrame = true;
             forceKeyframe = forceKeyframe || thisForceKeyframe;
             if (!frameRing.HasFrame()) break;
+        }
+        if (!gotGpuFrame) {
+            while (frameRing.ReadRawI420Frame(frame, frameTsNs, &thisForceKeyframe)) {
+                gotFrame = true;
+                forceKeyframe = forceKeyframe || thisForceKeyframe;
+                if (!frameRing.HasFrame()) break;
+            }
+        } else {
+            std::string gpuError;
+            if (gpuReader.ReadI420(gpuFrame, frame, &gpuError)) {
+                gotFrame = true;
+            } else {
+                LogWarn("[gpu-transport] shared frame readback failed session=" + sessionId +
+                    " error=" + gpuError + " key=" + std::to_string(gpuFrame.syncKey));
+            }
         }
 
         if (gotFrame) {
             sender.sendExternalRawI420(frame, frameTsNs, forceKeyframe);
             if (!firstFrameLogged) {
                 firstFrameLogged = true;
+                LogInfo("[gpu-transport] first-frame session=" + sessionId +
+                    " source=" + std::string(gotGpuFrame ? "shared-d3d11" : "raw-i420"));
                 LogMediaMemory(sessionId, "first-frame");
             }
         }

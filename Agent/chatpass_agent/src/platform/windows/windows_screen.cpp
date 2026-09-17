@@ -7,6 +7,7 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -439,6 +440,17 @@ struct DesktopFrameSource::Impl {
     ComPtr<IDXGIOutputDuplication> duplication;
     ComPtr<ID3D11Texture2D> staging;
 
+    struct GpuSlot {
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<IDXGIKeyedMutex> mutex;
+        HANDLE sharedHandle = nullptr;
+        uint64_t readyKey = 0;
+    };
+    std::array<GpuSlot, 3> gpuSlots{};
+    size_t gpuNextSlot = 0;
+    uint64_t gpuGeneration = 1;
+    LUID adapterLuid{};
+
     int width = 0;
     int height = 0;
 
@@ -459,6 +471,14 @@ struct DesktopFrameSource::Impl {
     void resetD3DLocked() {
         duplication.Reset();
         staging.Reset();
+        for (auto& slot : gpuSlots) {
+            slot.mutex.Reset();
+            slot.texture.Reset();
+            slot.sharedHandle = nullptr;
+            slot.readyKey = 0;
+        }
+        gpuNextSlot = 0;
+        adapterLuid = {};
         context.Reset();
         device.Reset();
         width = 0;
@@ -544,6 +564,8 @@ struct DesktopFrameSource::Impl {
         if (FAILED(factory->EnumAdapters1(target->adapterIndex, &adapter))) {
             throw std::runtime_error("EnumAdapters1 failed");
         }
+        DXGI_ADAPTER_DESC1 adapterDesc{};
+        if (SUCCEEDED(adapter->GetDesc1(&adapterDesc))) adapterLuid = adapterDesc.AdapterLuid;
 
         D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
         const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -625,6 +647,105 @@ struct DesktopFrameSource::Impl {
         const auto* t = findCurrentTargetLocked();
         if (!t) return {};
         return t->info;
+    }
+
+    bool ensureGpuSlotsLocked() {
+        if (!device || width <= 0 || height <= 0) return false;
+        if (gpuSlots[0].texture && gpuSlots[0].mutex && gpuSlots[0].sharedHandle) return true;
+
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = static_cast<UINT>(width);
+        desc.Height = static_cast<UINT>(height);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+        for (auto& slot : gpuSlots) {
+            if (FAILED(device->CreateTexture2D(&desc, nullptr, &slot.texture)) || !slot.texture) return false;
+            if (FAILED(slot.texture.As(&slot.mutex)) || !slot.mutex) return false;
+            ComPtr<IDXGIResource> sharedResource;
+            if (FAILED(slot.texture.As(&sharedResource)) || !sharedResource) return false;
+            if (FAILED(sharedResource->GetSharedHandle(&slot.sharedHandle)) || !slot.sharedHandle) return false;
+            slot.readyKey = 0;
+        }
+        return true;
+    }
+
+    void captureSharedGpuLocked(GpuFrameCaptureResult& result) {
+        result = {};
+        refreshDisplaysLocked();
+        if (currentIndex == -1) return;
+        result.supported = true;
+        if (!duplication || !findCurrentTargetLocked()) initForCurrentLocked();
+
+        DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+        ComPtr<IDXGIResource> resource;
+        constexpr UINT kAcquireTimeoutMs = 8;
+        HRESULT hr = duplication->AcquireNextFrame(kAcquireTimeoutMs, &frameInfo, &resource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) return;
+        if (hr == DXGI_ERROR_ACCESS_LOST) { initForCurrentLocked(); return; }
+        if (FAILED(hr)) throw std::runtime_error("AcquireNextFrame failed");
+
+        const bool cursorOnly = frameInfo.TotalMetadataBufferSize == 0 && frameInfo.LastMouseUpdateTime.QuadPart != 0;
+        if (cursorOnly && !Hi5CompositeCursorEnabled()) {
+            duplication->ReleaseFrame();
+            result.cursorOnly = true;
+            return;
+        }
+
+        ComPtr<ID3D11Texture2D> sourceTexture;
+        if (FAILED(resource.As(&sourceTexture)) || !sourceTexture) {
+            duplication->ReleaseFrame();
+            throw std::runtime_error("Query ID3D11Texture2D failed");
+        }
+        if (!ensureGpuSlotsLocked()) {
+            duplication->ReleaseFrame();
+            result.supported = false;
+            return;
+        }
+
+        GpuSlot* chosen = nullptr;
+        size_t chosenIndex = 0;
+        for (size_t attempt = 0; attempt < gpuSlots.size(); ++attempt) {
+            const size_t idx = (gpuNextSlot + attempt) % gpuSlots.size();
+            auto& slot = gpuSlots[idx];
+            HRESULT lockHr = slot.mutex->AcquireSync(0, 0);
+            if (lockHr != S_OK && slot.readyKey != 0) {
+                const HRESULT reclaimHr = slot.mutex->AcquireSync(slot.readyKey, 0);
+                if (reclaimHr == S_OK) {
+                    slot.mutex->ReleaseSync(0);
+                    slot.readyKey = 0;
+                    lockHr = slot.mutex->AcquireSync(0, 0);
+                }
+            }
+            if (lockHr == S_OK) { chosen = &slot; chosenIndex = idx; break; }
+        }
+        if (!chosen) { duplication->ReleaseFrame(); return; }
+
+        context->CopyResource(chosen->texture.Get(), sourceTexture.Get());
+        context->Flush();
+        duplication->ReleaseFrame();
+
+        uint64_t key = ++gpuGeneration;
+        if (key == 0) key = ++gpuGeneration;
+        chosen->readyKey = key;
+        chosen->mutex->ReleaseSync(key);
+        gpuNextSlot = (chosenIndex + 1) % gpuSlots.size();
+
+        result.frame.width = width;
+        result.frame.height = height;
+        result.frame.dxgiFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+        result.frame.adapterLuidLow = adapterLuid.LowPart;
+        result.frame.adapterLuidHigh = adapterLuid.HighPart;
+        result.frame.sharedHandle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(chosen->sharedHandle));
+        result.frame.syncKey = key;
+        result.frame.frameId = ++frameId;
+        result.hasFrame = true;
+        result.changed = true;
     }
 
     void captureAllMonitorsGdiLocked(FrameCaptureResult& result, bool includeUnchangedFrame) {
@@ -828,6 +949,17 @@ FrameCaptureResult DesktopFrameSource::nextFrameEx(bool includeUnchangedFrame) {
 void DesktopFrameSource::nextFrameExInto(FrameCaptureResult& result, bool includeUnchangedFrame) {
     std::lock_guard<std::mutex> lock(m_impl->mu);
     m_impl->captureOneLocked(result, includeUnchangedFrame);
+}
+
+GpuFrameCaptureResult DesktopFrameSource::nextSharedGpuFrameEx() {
+    GpuFrameCaptureResult result;
+    nextSharedGpuFrameExInto(result);
+    return result;
+}
+
+void DesktopFrameSource::nextSharedGpuFrameExInto(GpuFrameCaptureResult& result) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    m_impl->captureSharedGpuLocked(result);
 }
 
 std::vector<DisplayInfo> DesktopFrameSource::listDisplays() const {
