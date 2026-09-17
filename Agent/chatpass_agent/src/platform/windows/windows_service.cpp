@@ -2,8 +2,6 @@
 #include "agent_identity.h"
 
 #include "signaling_client.h"
-#include "webrtc_sender.h"
-#include "codec_capabilities.h"
 #include "codec_policy.h"
 #include "ipc/input_pipe.h"
 #include "ipc/session_launcher.h"
@@ -17,7 +15,6 @@
 #include "patching/patch_worker.h"
 
 #include <nlohmann/json.hpp>
-#include <rtc/rtc.hpp>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1337,16 +1334,15 @@ namespace hi5 {
         }
 
         static void CleanupOrphanStreamerProcesses(const std::string& sessionId = std::string()) {
-            // Last-resort cleanup for streamer child processes. A normal/secure streamer is
-            // launched as native_vp8_stream.exe --mode streamer. If the viewer closes without
-            // a clean control-server stop message, the child can remain alive and keep the
-            // chat pipe visible because its command line contains --chat-pipe. This cleanup
-            // intentionally targets only --mode streamer helpers, never the --service process.
+            // Last-resort cleanup for session-scoped RemoteHost processes. Capture workers use
+            // --mode streamer and the WebRTC/encoder worker uses --mode media-host. If the viewer
+            // closes without a clean control-server stop message, neither worker may outlive the
+            // session. This cleanup intentionally targets only those helper modes, never --service.
             std::wstring ps =
                 L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \""
                 L"$ErrorActionPreference='SilentlyContinue'; "
                 L"$procs = Get-CimInstance Win32_Process | "
-                L"Where-Object { ($_.Name -eq 'Hi5CentralRemoteHost.exe' -or $_.Name -eq 'Hi5CentralAgentService.exe' -or $_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+streamer|--mode=streamer' }; ";
+                L"Where-Object { ($_.Name -eq 'Hi5CentralRemoteHost.exe' -or $_.Name -eq 'Hi5CentralAgentService.exe' -or $_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+(streamer|media-host)|--mode=(streamer|media-host)' }; ";
 
             if (!sessionId.empty()) {
                 const std::wstring wsid = ToWidePath(EscapePowerShellSingleQuoted(sessionId));
@@ -1481,6 +1477,19 @@ namespace hi5 {
 
         static std::string RemoteHostExePath() {
             return SiblingExecutablePath("Hi5CentralRemoteHost.exe");
+        }
+
+        static HANDLE LaunchServiceChildProcess(const std::string& exePath, const std::string& args) {
+            std::wstring command = L"\"" + WideFromUtf8(exePath) + L"\" " + WideFromUtf8(args);
+            std::wstring workDir = WideFromUtf8(DirOfPath(exePath));
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            const BOOL ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                CREATE_NO_WINDOW, nullptr, workDir.empty() ? nullptr : workDir.c_str(), &si, &pi);
+            if (!ok) return nullptr;
+            CloseHandle(pi.hThread);
+            return pi.hProcess;
         }
 
         static std::string ChatOverlayExePath() {
@@ -1927,7 +1936,11 @@ namespace hi5 {
             std::vector<std::string> iceServers;
             std::string technicianName = "Technician";
 
-            std::unique_ptr<WebRtcSender> sender;
+            ShmemRing mediaShmem;
+            std::unique_ptr<NamedPipeServer> mediaEventPipeServer;
+            NamedPipeClient mediaControlPipe;
+            std::mutex mediaControlMu;
+            std::atomic<bool> mediaReady{ false };
 
             ShmemRing normalShmem;
             ShmemRing secureShmem;
@@ -1941,15 +1954,21 @@ namespace hi5 {
             std::string secureInputPipeName;
             std::string normalStopEventName;
             std::string secureStopEventName;
+            std::string mediaShmemName;
+            std::string mediaControlPipeName;
+            std::string mediaEventPipeName;
+            std::string mediaStopEventName;
             std::string chatPipeName;
 
             HANDLE normalStopEvent = nullptr;
             HANDLE secureStopEvent = nullptr;
+            HANDLE mediaStopEvent = nullptr;
             HANDLE sessionJob = nullptr;
 
             HANDLE normalStreamerProcess = nullptr;
             HANDLE secureStreamerProcess = nullptr;
             HANDLE backstageHostProcess = nullptr;
+            HANDLE mediaHostProcess = nullptr;
             DWORD normalStreamerSessionId = 0xFFFFFFFF;
             DWORD secureStreamerSessionId = 0xFFFFFFFF;
             bool backstageMode = false;
@@ -2084,8 +2103,6 @@ class Worker {
                 LogI("worker start");
                 PurgeOldChatLogs(90);
 
-                rtc::InitLogger(rtc::LogLevel::Info);
-
                 constexpr int width = 0;
                 constexpr int height = 0;
                 const auto codecDecision = hi5::SelectCodecPolicy();
@@ -2104,9 +2121,6 @@ const int bitrateKbps = ReadConfigInt(
     50000
 );
 
-hi5::CodecSelectionResult codecProbe =
-    hi5::ProbeCodecCapabilitiesAndSelect(codecDecision.requestedMode);
-
 LogI(
     "codec policy requested=" + codecDecision.requestedMode +
     " selected=" + codecDecision.selectedCodec +
@@ -2116,16 +2130,12 @@ LogI(
     " reason=" + codecDecision.reason
 );
 
-for (const auto& line : SplitLines(hi5::CodecCapabilitiesToLogString(codecProbe))) {
-    LogI(line);
-}
-
 LogI(
     "stream config codec=" + codecDecision.selectedCodec +
     " encoder=" + codecDecision.encoder +
     " fps=" + std::to_string(fps) +
     " bitrate_kbps=" + std::to_string(bitrateKbps) +
-    " note=dynamic codec policy selected stable sender path"
+    " note=codec probing deferred to session-scoped media host"
 );
 
                 const std::string defaultAgentWsBase = "wss://rmm.hi5central.com/agent/ws";
@@ -2243,8 +2253,8 @@ LogI(
                     if (type == "webrtc_answer" || type == "ice_candidate" || type == "answer") {
                         std::lock_guard<std::mutex> lock(sessionsMu_);
                         auto it = sessions_.find(sessionId);
-                        if (it != sessions_.end() && it->second->sender) {
-                            it->second->sender->handleSignalingMessage(text);
+                        if (it != sessions_.end()) {
+                            SendMediaControl(*it->second, json{ {"type", "signal"}, {"payload", text} });
                         }
                         FlushBridgeOutgoing();
                         return;
@@ -6257,6 +6267,70 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " requested=" + std::to_string(requested));
             }
 
+            bool SendMediaControl(SessionContext& ctx, const json& message) {
+                std::lock_guard<std::mutex> lock(ctx.mediaControlMu);
+                return ctx.mediaControlPipe.SendLine(message.dump());
+            }
+
+            bool DispatchMediaFastMouse(SessionContext& ctx, double xNorm, double yNorm, uint64_t seq, double clientTsMs) {
+                InputPipeWriter& targetPipe = ctx.secureFallbackOwnsInput.load(std::memory_order_acquire)
+                    ? ctx.secureInputPipe
+                    : (ctx.unifiedDesktopStreamer
+                        ? ctx.normalInputPipe
+                        : ((ctx.activeMode == DesktopMode::Secure) ? ctx.secureInputPipe : ctx.normalInputPipe));
+                auto monitor = targetPipe.GetMonitorInfo(ctx.displayIndex);
+                if (monitor.w <= 0 || monitor.h <= 0) monitor = ctx.normalInputPipe.GetMonitorInfo(ctx.displayIndex);
+                if (monitor.w <= 0 || monitor.h <= 0) return false;
+                const int32_t x = monitor.x + static_cast<int32_t>(xNorm * static_cast<double>(std::max(1, monitor.w - 1)));
+                const int32_t y = monitor.y + static_cast<int32_t>(yNorm * static_cast<double>(std::max(1, monitor.h - 1)));
+                return targetPipe.PublishFastMouseTarget(x, y, ctx.displayIndex, seq,
+                    clientTsMs > 0.0 ? static_cast<uint64_t>(clientTsMs) : 0);
+            }
+
+            bool LaunchMediaHost(SessionContext& ctx,
+                const std::vector<std::string>& iceServers,
+                int width, int height, int fps, int bitrateKbps,
+                const std::string& codecMode, bool enableAudio) {
+                const std::string exePath = RemoteHostExePath();
+                std::string cmdLine =
+                    "--mode media-host"
+                    " --session " + QuoteArg(ctx.sessionId) +
+                    " --shmem " + QuoteArg(ctx.mediaShmemName) +
+                    " --control-pipe " + QuoteArg(ctx.mediaControlPipeName) +
+                    " --event-pipe " + QuoteArg(ctx.mediaEventPipeName) +
+                    " --stop-event " + QuoteArg(ctx.mediaStopEventName) +
+                    " --width " + std::to_string(width) +
+                    " --height " + std::to_string(height) +
+                    " --fps " + std::to_string(fps) +
+                    " --bitrate " + std::to_string(bitrateKbps) +
+                    " --codec " + QuoteArg(codecMode) +
+                    " --audio " + std::string(enableAudio ? "1" : "0");
+                for (const auto& ice : iceServers) cmdLine += " --ice-server " + QuoteArg(ice);
+
+                ctx.mediaHostProcess = LaunchServiceChildProcess(exePath, cmdLine);
+                if (!ctx.mediaHostProcess) {
+                    LogE("launch media host FAILED session=" + ctx.sessionId + " err=" + std::to_string(GetLastError()));
+                    return false;
+                }
+                AssignProcessToSessionJob(ctx.sessionJob, ctx.mediaHostProcess, ctx.sessionId, "media-host");
+                if (!ctx.mediaControlPipe.Connect(ctx.mediaControlPipeName, 80, 125)) {
+                    LogE("connect media control pipe FAILED session=" + ctx.sessionId);
+                    return false;
+                }
+                for (int i = 0; i < 250 && !ctx.mediaReady.load(std::memory_order_acquire); ++i) {
+                    if (WaitForSingleObject(ctx.mediaHostProcess, 0) == WAIT_OBJECT_0) break;
+                    Sleep(20);
+                }
+                if (!ctx.mediaReady.load(std::memory_order_acquire)) {
+                    LogE("media host did not become ready session=" + ctx.sessionId);
+                    return false;
+                }
+                LogI("launch media host ok session=" + ctx.sessionId +
+                    " pid=" + std::to_string(GetProcessId(ctx.mediaHostProcess)) +
+                    " codec=" + codecMode);
+                return true;
+            }
+
             bool LaunchNormalStreamer(SessionContext& ctx) {
                 const DWORD consoleSession = ctx.activeConsoleSessionId != 0xFFFFFFFF
                     ? ctx.activeConsoleSessionId
@@ -6524,7 +6598,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
             void StartStreamerSession(const std::string& sessionId,
                 const std::vector<std::string>& iceServers,
-                const WebRtcSender::SignalSendFn& sendFn,
+                const std::function<void(const std::string&)>& sendFn,
                 int width,
                 int height,
                 int fps,
@@ -6582,6 +6656,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx->secureInputPipeName = "Global\\Hi5Input_UAC_" + prefix;
                 ctx->normalStopEventName = "Global\\Hi5Stop_" + prefix;
                 ctx->secureStopEventName = "Global\\Hi5Stop_UAC_" + prefix;
+                ctx->mediaShmemName = "Global\\Hi5Media_" + prefix;
+                ctx->mediaControlPipeName = "\\\\.\\pipe\\Hi5MediaCtrl_" + prefix;
+                ctx->mediaEventPipeName = "\\\\.\\pipe\\Hi5MediaEvt_" + prefix;
+                ctx->mediaStopEventName = "Global\\Hi5MediaStop_" + prefix;
                 ctx->chatPipeName = "\\\\.\\pipe\\Hi5Chat_" + prefix;
 
                 LogI("initial console session session=" + sessionId +
@@ -6593,6 +6671,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 if (!ctx->normalShmem.CreateProducer(ctx->normalShmemName)) {
                     LogE("create normal shmem FAILED session=" + sessionId +
                         " err=" + std::to_string(GetLastError()));
+                    return;
+                }
+                if (!ctx->mediaShmem.CreateProducer(ctx->mediaShmemName)) {
+                    LogE("create media shmem FAILED session=" + sessionId +
+                        " err=" + std::to_string(GetLastError()));
+                    ctx->normalShmem.Close();
                     return;
                 }
 
@@ -6618,6 +6702,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->secureInputPipe.Close();
                     ctx->normalInputPipe.Close();
                     ctx->secureShmem.Close();
+                    ctx->mediaShmem.Close();
                     ctx->normalShmem.Close();
                     return;
                 }
@@ -6631,6 +6716,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->secureInputPipe.Close();
                     ctx->normalInputPipe.Close();
                     ctx->secureShmem.Close();
+                    ctx->mediaShmem.Close();
                     ctx->normalShmem.Close();
                     return;
                 }
@@ -6667,64 +6753,109 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
                     });
 
-                ctx->sender = std::make_unique<WebRtcSender>(
-                    sessionId,
-                    iceServers,
-                    sendFn,
-                    width,
-                    height,
-                    fps,
-                    bitrateKbps,
-                    WebRtcSender::Mode::ExternalFeed,
-                    ([&]() {
-                        std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
-                        std::transform(requestedCodec.begin(), requestedCodec.end(), requestedCodec.begin(),
-                            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-                        if (requestedCodec == "av1_hw" || requestedCodec == "av1" || requestedCodec == "av1_sw" ||
-                            requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw" ||
-                            requestedCodec == "h265_hw" || requestedCodec == "h265" || requestedCodec == "h265_sw" ||
-                            requestedCodec == "h264_hw" || requestedCodec == "h264" || requestedCodec == "h264_sw" ||
-                            requestedCodec == "vp8") {
-                            return requestedCodec;
-                        }
-                        return std::string("auto");
-                        })(),
-                    sessionMode == SessionMode::Console
-                );
-
-                ctx->sender->setConnectionClosedHandler([this, sid = sessionId](const std::string& reason) {
-                    LogW("WebRTC connection closed/failed session=" + sid + " reason=" + reason + "; scheduling cleanup");
-                    std::thread([this, sid]() {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                        StopSession(sid);
-                        CleanupOrphanStreamerProcesses(sid);
-                        }).detach();
-                    });
-
-                ctx->sender->setInputEventHandler([this, raw = ctx.get()](const json& msg) {
-                    DispatchInputToPipe(*raw, msg);
-                    });
-
-                ctx->sender->setDirectMouseMoveHandler([raw = ctx.get()](double xNorm, double yNorm, uint64_t seq, double clientTsMs) {
-                    InputPipeWriter& targetPipe = raw->secureFallbackOwnsInput.load(std::memory_order_acquire)
-                        ? raw->secureInputPipe
-                        : (raw->unifiedDesktopStreamer
-                            ? raw->normalInputPipe
-                            : ((raw->activeMode == DesktopMode::Secure) ? raw->secureInputPipe : raw->normalInputPipe));
-                    auto monitor = targetPipe.GetMonitorInfo(raw->displayIndex);
-                    if (monitor.w <= 0 || monitor.h <= 0) {
-                        monitor = raw->normalInputPipe.GetMonitorInfo(raw->displayIndex);
+                ctx->mediaStopEvent = CreateEventA(nullptr, TRUE, FALSE, ctx->mediaStopEventName.c_str());
+                if (!ctx->mediaStopEvent) {
+                    LogE("create media stop event FAILED session=" + sessionId +
+                        " err=" + std::to_string(GetLastError()));
+                    if (ctx->chatPipeServer) {
+                        ctx->chatPipeServer->Stop();
+                        ctx->chatPipeServer.reset();
                     }
-                    if (monitor.w <= 0 || monitor.h <= 0) return false;
+                    if (ctx->sessionJob) {
+                        CloseHandle(ctx->sessionJob);
+                        ctx->sessionJob = nullptr;
+                    }
+                    if (ctx->secureStopEvent) CloseHandle(ctx->secureStopEvent);
+                    if (ctx->normalStopEvent) CloseHandle(ctx->normalStopEvent);
+                    ctx->secureStopEvent = nullptr;
+                    ctx->normalStopEvent = nullptr;
+                    ctx->secureInputPipe.Close();
+                    ctx->normalInputPipe.Close();
+                    ctx->secureShmem.Close();
+                    ctx->mediaShmem.Close();
+                    ctx->normalShmem.Close();
+                    return;
+                }
 
-                    const int32_t x = monitor.x + static_cast<int32_t>(xNorm * static_cast<double>(std::max(1, monitor.w - 1)));
-                    const int32_t y = monitor.y + static_cast<int32_t>(yNorm * static_cast<double>(std::max(1, monitor.h - 1)));
-                    return targetPipe.PublishFastMouseTarget(
-                        x, y, raw->displayIndex, seq,
-                        clientTsMs > 0.0 ? static_cast<uint64_t>(clientTsMs) : 0);
+                std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
+                std::transform(requestedCodec.begin(), requestedCodec.end(), requestedCodec.begin(),
+                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                if (requestedCodec != "av1_hw" && requestedCodec != "av1" && requestedCodec != "av1_sw" &&
+                    requestedCodec != "vp9_hw" && requestedCodec != "vp9" && requestedCodec != "vp9_sw" &&
+                    requestedCodec != "h265_hw" && requestedCodec != "h265" && requestedCodec != "h265_sw" &&
+                    requestedCodec != "h264_hw" && requestedCodec != "h264" && requestedCodec != "h264_sw" &&
+                    requestedCodec != "vp8") {
+                    requestedCodec = "auto";
+                }
+
+                SessionContext* rawCtx = ctx.get();
+                ctx->mediaEventPipeServer = std::make_unique<NamedPipeServer>();
+                ctx->mediaEventPipeServer->Start(ctx->mediaEventPipeName,
+                    [this, rawCtx, sendFn, sid = sessionId](const std::string& raw) {
+                        const auto message = json::parse(raw, nullptr, false);
+                        if (message.is_discarded()) return;
+                        const std::string type = message.value("type", std::string());
+                        if (type == "ready") {
+                            rawCtx->mediaReady.store(true, std::memory_order_release);
+                            return;
+                        }
+                        if (type == "signal") {
+                            const std::string payload = message.value("payload", std::string());
+                            if (!payload.empty()) sendFn(payload);
+                            return;
+                        }
+                        if (type == "input_event" && message.contains("payload") && message["payload"].is_object()) {
+                            DispatchInputToPipe(*rawCtx, message["payload"]);
+                            return;
+                        }
+                        if (type == "mouse_move") {
+                            DispatchMediaFastMouse(*rawCtx,
+                                message.value("x_norm", 0.0), message.value("y_norm", 0.0),
+                                message.value("seq", static_cast<uint64_t>(0)), message.value("client_ts", 0.0));
+                            return;
+                        }
+                        if (type == "closed") {
+                            const std::string reason = message.value("reason", std::string("peer_connection_closed_or_failed"));
+                            LogW("WebRTC media host closed session=" + sid + " reason=" + reason + "; scheduling cleanup");
+                            std::thread([this, sid]() {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                                StopSession(sid);
+                                CleanupOrphanStreamerProcesses(sid);
+                            }).detach();
+                        }
                     });
 
-                ctx->sender->start();
+                if (!LaunchMediaHost(*ctx, iceServers, width, height, fps, bitrateKbps,
+                    requestedCodec, sessionMode == SessionMode::Console)) {
+                    LogE("media host startup failed session=" + sessionId);
+                    if (ctx->mediaStopEvent) SetEvent(ctx->mediaStopEvent);
+                    ctx->mediaControlPipe.Close();
+                    if (ctx->mediaEventPipeServer) {
+                        ctx->mediaEventPipeServer->Stop();
+                        ctx->mediaEventPipeServer.reset();
+                    }
+                    if (ctx->mediaHostProcess) {
+                        WaitForSingleObject(ctx->mediaHostProcess, 1500);
+                        CloseHandle(ctx->mediaHostProcess);
+                        ctx->mediaHostProcess = nullptr;
+                    }
+                    if (ctx->sessionJob) {
+                        CloseHandle(ctx->sessionJob);
+                        ctx->sessionJob = nullptr;
+                    }
+                    if (ctx->mediaStopEvent) CloseHandle(ctx->mediaStopEvent);
+                    if (ctx->secureStopEvent) CloseHandle(ctx->secureStopEvent);
+                    if (ctx->normalStopEvent) CloseHandle(ctx->normalStopEvent);
+                    ctx->mediaStopEvent = nullptr;
+                    ctx->secureStopEvent = nullptr;
+                    ctx->normalStopEvent = nullptr;
+                    ctx->secureInputPipe.Close();
+                    ctx->normalInputPipe.Close();
+                    ctx->secureShmem.Close();
+                    ctx->mediaShmem.Close();
+                    ctx->normalShmem.Close();
+                    return;
+                }
 
                 const bool launched = (sessionMode == SessionMode::Backstage)
                     ? LaunchBackstageHost(*ctx)
@@ -6733,8 +6864,21 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 if (!launched) {
                     StopPresenceBanner(sessionId);
                     StopChatOverlay(sessionId);
-                    ctx->sender->stop();
-                    ctx->sender.reset();
+                    if (ctx->mediaStopEvent) SetEvent(ctx->mediaStopEvent);
+                    ctx->mediaControlPipe.Close();
+                    if (ctx->mediaEventPipeServer) {
+                        ctx->mediaEventPipeServer->Stop();
+                        ctx->mediaEventPipeServer.reset();
+                    }
+                    if (ctx->mediaHostProcess) {
+                        WaitForSingleObject(ctx->mediaHostProcess, 1500);
+                        CloseHandle(ctx->mediaHostProcess);
+                        ctx->mediaHostProcess = nullptr;
+                    }
+                    if (ctx->mediaStopEvent) {
+                        CloseHandle(ctx->mediaStopEvent);
+                        ctx->mediaStopEvent = nullptr;
+                    }
                     CloseHandle(ctx->secureStopEvent);
                     CloseHandle(ctx->normalStopEvent);
                     ctx->secureStopEvent = nullptr;
@@ -6742,6 +6886,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->secureInputPipe.Close();
                     ctx->normalInputPipe.Close();
                     ctx->secureShmem.Close();
+                    ctx->mediaShmem.Close();
                     ctx->normalShmem.Close();
                     if (ctx->sessionJob) {
                         CloseHandle(ctx->sessionJob);
@@ -6759,6 +6904,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     sessions_[sessionId] = std::move(ctx);
                 }
 
+                if (!SendMediaControl(*rawCtx, json{ {"type", "start"} })) {
+                    LogW("failed to send media start command session=" + sessionId);
+                }
                 LogI("session fully registered session=" + sessionId);
             }
 
@@ -7354,8 +7502,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     " mode=secure-fallback force_kf=" + std::to_string(forceKf ? 1 : 0));
                             }
                             ctx.secureFallbackOwnsInput.store(true, std::memory_order_release);
-                            if (ctx.sender) ctx.sender->sendExternalRawI420(secureFrame, secureTs, forceKf);
-                            sent = true;
+                            sent = ctx.mediaShmem.WriteRawI420Frame(secureFrame, secureTs, forceKf);
                         }
                     }
                     else if (!ctx.loginDesktopMode && gotNormal &&
@@ -7383,8 +7530,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ++framesForwarded;
                             const bool forceKf = enteringSecure || framesForwarded == 1;
                             ctx.secureFallbackOwnsInput.store(false, std::memory_order_release);
-                            if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, normalTs, forceKf);
-                            sent = true;
+                            sent = ctx.mediaShmem.WriteRawI420Frame(normalFrame, normalTs, forceKf);
                             if (enteringSecure) {
                                 ctx.unifiedSecureReady = true;
                                 ctx.activeMode = DesktopMode::Secure;
@@ -7425,8 +7571,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ctx.secureFallbackOwnsInput.store(false, std::memory_order_release);
                             ++framesForwarded;
                             const bool forceKf = wasSecure || completedConsoleHandoff || framesForwarded == 1;
-                            if (ctx.sender) ctx.sender->sendExternalRawI420(normalFrame, normalTs, forceKf);
-                            sent = true;
+                            sent = ctx.mediaShmem.WriteRawI420Frame(normalFrame, normalTs, forceKf);
 
                             if (completedConsoleHandoff) {
                                 ctx.consoleHandoffActive = false;
@@ -7454,24 +7599,6 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         }
                     }
 
-                    // A dev codec switch is applied at an encoder frame boundary. If
-                    // the desktop is completely static, reuse the already-retained raw frame once
-                    // so the switch completes immediately without waking RemoteHost or allocating
-                    // another I420 buffer.
-                    if (!sent && ctx.sender && ctx.sender->hasPendingDevCodecSwitch()) {
-                        const uint64_t switchTs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
-                        if ((ctx.activeMode == DesktopMode::Secure || useSecureFallback) && !secureFrame.y.empty()) {
-                            ctx.sender->sendExternalRawI420(secureFrame, switchTs, true);
-                            sent = true;
-                            LogI("dev codec switch reused cached secure frame session=" + ctx.sessionId);
-                        }
-                        else if (ctx.activeMode == DesktopMode::Normal && !normalFrame.y.empty()) {
-                            ctx.sender->sendExternalRawI420(normalFrame, switchTs, true);
-                            sent = true;
-                            LogI("dev codec switch reused cached normal frame session=" + ctx.sessionId);
-                        }
-                    }
-
                     if (now >= nextDiagnosticsPoll) {
                         if (staleFramesDropped > 0 && now >= nextStaleFrameLog) {
                             LogW("stale remote frames dropped session=" + ctx.sessionId +
@@ -7483,16 +7610,24 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         hi5::StreamStats stats{};
                         if (ctx.normalInputPipe.ReadStreamStats(lastNormalStatsSeq, stats)) {
                             lastNormalStatsSeq = stats.seq;
-                            if (ctx.sender) {
-                                ctx.sender->setExternalStreamHint(stats.streamMode, stats.targetFps, ctx.backstageMode, stats.secureDesktopActive != 0);
-                            }
+                            SendMediaControl(ctx, json{
+                                {"type", "stream_hint"},
+                                {"stream_mode", stats.streamMode},
+                                {"target_fps", stats.targetFps},
+                                {"backstage", ctx.backstageMode},
+                                {"secure", stats.secureDesktopActive != 0}
+                            });
                             SendStreamDiagnostics(ctx.sessionId, "normal", stats, framesForwarded, ctx.activeMode, ctx.backstageMode);
                         }
                         if (ctx.secureInputPipe.ReadStreamStats(lastSecureStatsSeq, stats)) {
                             lastSecureStatsSeq = stats.seq;
-                            if (ctx.sender) {
-                                ctx.sender->setExternalStreamHint(stats.streamMode, stats.targetFps, ctx.backstageMode, stats.secureDesktopActive != 0);
-                            }
+                            SendMediaControl(ctx, json{
+                                {"type", "stream_hint"},
+                                {"stream_mode", stats.streamMode},
+                                {"target_fps", stats.targetFps},
+                                {"backstage", ctx.backstageMode},
+                                {"secure", stats.secureDesktopActive != 0}
+                            });
                             SendStreamDiagnostics(ctx.sessionId, "secure", stats, framesForwarded, ctx.activeMode, ctx.backstageMode);
                         }
                         nextDiagnosticsPoll = now + std::chrono::seconds(1);
@@ -7500,6 +7635,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                     if (now >= nextMemoryDiagnostics) {
                         LogProcessMemorySnapshot(ctx.sessionId, "agent-service", GetCurrentProcess());
+                        if (ctx.mediaHostProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-media", ctx.mediaHostProcess);
                         if (ctx.normalStreamerProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-normal", ctx.normalStreamerProcess);
                         if (ctx.secureStreamerProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-secure", ctx.secureStreamerProcess);
                         if (ctx.backstageHostProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-backstage", ctx.backstageHostProcess);
@@ -7587,6 +7723,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 if (ctx->normalStopEvent) SetEvent(ctx->normalStopEvent);
                 if (ctx->secureStopEvent) SetEvent(ctx->secureStopEvent);
+                if (ctx->mediaStopEvent) SetEvent(ctx->mediaStopEvent);
 
                 if (ctx->framePumpThread.joinable()) {
                     ctx->framePumpThread.join();
@@ -7625,6 +7762,21 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->secureStreamerProcess = nullptr;
                 }
 
+                if (ctx->mediaHostProcess) {
+                    const DWORD waitRc = WaitForSingleObject(ctx->mediaHostProcess, 3000);
+                    if (waitRc == WAIT_TIMEOUT) {
+                        LogW("media host did not exit before session job close session=" + sessionId);
+                    }
+                    CloseHandle(ctx->mediaHostProcess);
+                    ctx->mediaHostProcess = nullptr;
+                }
+
+                ctx->mediaControlPipe.Close();
+                if (ctx->mediaEventPipeServer) {
+                    ctx->mediaEventPipeServer->Stop();
+                    ctx->mediaEventPipeServer.reset();
+                }
+
                 // KILL_ON_JOB_CLOSE is the final OS-enforced boundary. Anything that ignored
                 // its stop event (streamer, banner, chat or a child helper) cannot outlive the session.
                 if (ctx->sessionJob) {
@@ -7645,9 +7797,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->secureStopEvent = nullptr;
                 }
 
-                if (ctx->sender) {
-                    ctx->sender->stop();
-                    ctx->sender.reset();
+                if (ctx->mediaStopEvent) {
+                    CloseHandle(ctx->mediaStopEvent);
+                    ctx->mediaStopEvent = nullptr;
                 }
 
                 if (ctx->chatPipeServer) {
@@ -7658,6 +7810,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx->secureInputPipe.Close();
                 ctx->normalInputPipe.Close();
                 ctx->secureShmem.Close();
+                ctx->mediaShmem.Close();
                 ctx->normalShmem.Close();
 
                 const auto displayGeometryAtEnd = ReadDisplayGeometrySnapshot();

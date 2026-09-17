@@ -1,8 +1,8 @@
 // src/ipc/shmem_ring.h
 //
 // Single-producer / single-consumer RAW I420 frame ring over Windows shared memory.
-// This replaces the old encoded-VP8 handoff so the service owns one VP8 encoder
-// and one RTP/WebRTC timeline across normal, UAC, Winlogon and user-switch frames.
+// Capture helpers publish raw frames; the service selects the active desktop source and
+// forwards it to the session-scoped media host, which owns the encoder/RTP/WebRTC timeline.
 
 #pragma once
 #ifndef WIN32_LEAN_AND_MEAN
@@ -32,7 +32,8 @@ namespace hi5 {
         uint32_t              uSize;
         uint32_t              vSize;
         uint64_t              tsNs;
-        uint8_t               _pad[32];
+        uint32_t              flags;   // bit 0 = force keyframe
+        uint8_t               _pad[28];
     };
 
     struct ShmemHeader {
@@ -88,6 +89,7 @@ namespace hi5 {
                 fh->uSize = 0;
                 fh->vSize = 0;
                 fh->tsNs = 0;
+                fh->flags = 0;
             }
 
             producer_ = true;
@@ -122,7 +124,7 @@ namespace hi5 {
             return true;
         }
 
-        bool WriteRawI420Frame(const I420Frame& frame, uint64_t tsNs) {
+        bool WriteRawI420Frame(const I420Frame& frame, uint64_t tsNs, bool forceKeyframe = false) {
             if (!base_ || frame.width <= 0 || frame.height <= 0) {
                 return false;
             }
@@ -157,6 +159,7 @@ namespace hi5 {
             fh->uSize = uSize;
             fh->vSize = vSize;
             fh->tsNs = tsNs;
+            fh->flags = forceKeyframe ? 1u : 0u;
 
             std::memcpy(payload, frame.y.data(), ySize);
             std::memcpy(payload + ySize, frame.u.data(), uSize);
@@ -168,7 +171,7 @@ namespace hi5 {
             return true;
         }
 
-        bool ReadRawI420Frame(I420Frame& frame, uint64_t& tsNs) {
+        bool ReadRawI420Frame(I420Frame& frame, uint64_t& tsNs, bool* forceKeyframe = nullptr) {
             if (!base_) return false;
 
             auto* hdr = header();
@@ -195,6 +198,7 @@ namespace hi5 {
             frame.y.resize(fh->ySize);
             frame.u.resize(fh->uSize);
             frame.v.resize(fh->vSize);
+            if (forceKeyframe) *forceKeyframe = (fh->flags & 1u) != 0;
 
             std::memcpy(frame.y.data(), payload, fh->ySize);
             std::memcpy(frame.u.data(), payload + fh->ySize, fh->uSize);

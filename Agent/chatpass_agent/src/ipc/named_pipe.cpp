@@ -44,8 +44,8 @@ void NamedPipeServer::ThreadMain() {
             PIPE_ACCESS_INBOUND,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             1,
-            4096,
-            4096,
+            64 * 1024,
+            64 * 1024,
             0,
             nullptr);
         if (hPipe == INVALID_HANDLE_VALUE) {
@@ -60,13 +60,21 @@ void NamedPipeServer::ThreadMain() {
             continue;
         }
 
-        char buffer[4096];
+        std::vector<char> buffer(64 * 1024);
         while (running_.load()) {
-            DWORD read = 0;
-            BOOL ok = ReadFile(hPipe, buffer, sizeof(buffer) - 1, &read, nullptr);
-            if (!ok || read == 0) break;
-            buffer[read] = '\0';
-            if (callback_) callback_(std::string(buffer, read));
+            std::string message;
+            for (;;) {
+                DWORD read = 0;
+                BOOL ok = ReadFile(hPipe, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr);
+                if (read > 0) message.append(buffer.data(), read);
+                if (ok) break;
+                const DWORD err = GetLastError();
+                if (err == ERROR_MORE_DATA) continue;
+                message.clear();
+                break;
+            }
+            if (message.empty()) break;
+            if (callback_) callback_(message);
         }
 
         DisconnectNamedPipe(hPipe);
