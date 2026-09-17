@@ -1,0 +1,3 @@
+Background switch overlay validation
+VPS checkpoint: f4bc19123a386d17725744163fd17a7ffe6aa832
+GitHub source sync: 8d307bb03bbd12dfb24325d5c3e700a6cef3cd67
