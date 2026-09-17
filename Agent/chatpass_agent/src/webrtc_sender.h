@@ -96,6 +96,12 @@ public:
         uint64_t captureTimestampNs,
         bool forceKeyframe = false);
 
+    // Returns true when the shared D3D11 frame was consumed by the GPU H.264
+    // path. False asks MediaHost to use the existing I420 fallback for the frame.
+    bool trySendExternalGpuH264(const SharedGpuFrame& frame,
+        uint64_t captureTimestampNs,
+        bool forceKeyframe = false);
+
 private:
     uint32_t randomU32();
 
@@ -177,6 +183,7 @@ private:
     std::unique_ptr<DesktopFrameSource> m_source;
     std::unique_ptr<Vp8Encoder> m_encoder;
     std::unique_ptr<H264MfEncoder> m_h264Encoder;
+    std::unique_ptr<H264MfEncoder> m_h264GpuEncoder;
     std::unique_ptr<Vp9MfEncoder> m_vp9Encoder;
     std::unique_ptr<Vp9VpxEncoder> m_vp9VpxEncoder;
     std::unique_ptr<Av1MfEncoder> m_av1Encoder;
@@ -210,6 +217,7 @@ private:
     VideoCodec m_videoCodec = VideoCodec::VP8;
     bool m_h264Attempted = false;
     bool m_h264Failed = false;
+    bool m_h264GpuFailed = false;
     std::string m_codecMode = "vp8";
     std::mutex m_codecSwitchMu;
     std::string m_pendingDevCodecSwitch;

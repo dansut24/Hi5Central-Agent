@@ -4,6 +4,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <d3d11.h>
+#include <d3d11_1.h>
+#include <dxgi1_2.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -12,14 +15,18 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <deque>
 #include <sstream>
 #include <fstream>
 #include <iostream>
+#include <unordered_map>
 #include <comdef.h>
 
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
@@ -279,6 +286,7 @@ struct H264MfEncoder::Impl {
     struct PendingInputMeta {
         bool forceKeyframe = false;
         uint32_t timestamp90k = 0;
+        int gpuSurfaceSlot = -1;
     };
 
     ComPtr<IMFTransform> transform;
@@ -299,6 +307,83 @@ struct H264MfEncoder::Impl {
     bool asyncMode = false;
     bool sequenceHeaderLogged = false;
     bool mfStarted = false;
+    struct GpuOpenedFrame { ComPtr<ID3D11Texture2D> texture; ComPtr<IDXGIKeyedMutex> mutex; };
+    ComPtr<ID3D11Device> gpuDevice;
+    ComPtr<ID3D11Device1> gpuDevice1;
+    ComPtr<ID3D11DeviceContext> gpuContext;
+    ComPtr<ID3D11VideoDevice> videoDevice;
+    ComPtr<ID3D11VideoContext> videoContext;
+    ComPtr<ID3D11Texture2D> localBgra;
+    ComPtr<ID3D11VideoProcessorEnumerator> vpEnumerator;
+    ComPtr<ID3D11VideoProcessor> videoProcessor;
+    ComPtr<ID3D11VideoProcessorInputView> inputView;
+    std::array<ComPtr<ID3D11Texture2D>, 3> nv12Surfaces;
+    std::array<ComPtr<ID3D11VideoProcessorOutputView>, 3> outputViews;
+    std::array<bool, 3> surfaceInUse{ false, false, false };
+    size_t nextSurface = 0;
+    std::unordered_map<uint64_t, GpuOpenedFrame> openedGpuFrames;
+    ComPtr<IMFDXGIDeviceManager> dxgiManager;
+    UINT dxgiManagerToken = 0;
+    LUID gpuAdapterLuid{};
+    DXGI_FORMAT gpuInputFormat = DXGI_FORMAT_UNKNOWN;
+    bool gpuReady = false;
+
+    bool SetupGpu(const SharedGpuFrame& first, int fps, std::string* error) {
+        gpuInputFormat = static_cast<DXGI_FORMAT>(first.dxgiFormat);
+        ComPtr<IDXGIFactory1> factory; HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) { if (error) *error = "CreateDXGIFactory1 failed " + HrToString(hr); return false; }
+        ComPtr<IDXGIAdapter1> adapter;
+        for (UINT i = 0;; ++i) {
+            ComPtr<IDXGIAdapter1> candidate; if (factory->EnumAdapters1(i, &candidate) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 desc{}; if (FAILED(candidate->GetDesc1(&desc))) continue;
+            if (desc.AdapterLuid.LowPart == first.adapterLuidLow && desc.AdapterLuid.HighPart == first.adapterLuidHigh) { adapter = candidate; gpuAdapterLuid = desc.AdapterLuid; break; }
+        }
+        if (!adapter) { if (error) *error = "matching D3D11 adapter not found"; return false; }
+        const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+        hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &level, 1, D3D11_SDK_VERSION, &gpuDevice, nullptr, &gpuContext);
+        if (FAILED(hr) || !gpuDevice || !gpuContext) { if (error) *error = "D3D11CreateDevice(video) failed " + HrToString(hr); return false; }
+        if (FAILED(gpuDevice.As(&gpuDevice1)) || FAILED(gpuDevice.As(&videoDevice)) || FAILED(gpuContext.As(&videoContext))) { if (error) *error = "D3D11 video interfaces unavailable"; return false; }
+        D3D11_TEXTURE2D_DESC bgra{}; bgra.Width = first.width; bgra.Height = first.height; bgra.MipLevels = 1; bgra.ArraySize = 1; bgra.Format = gpuInputFormat; bgra.SampleDesc.Count = 1; bgra.Usage = D3D11_USAGE_DEFAULT; bgra.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        hr = gpuDevice->CreateTexture2D(&bgra, nullptr, &localBgra); if (FAILED(hr)) { if (error) *error = "CreateTexture2D(local BGRA) failed " + HrToString(hr); return false; }
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{}; content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE; content.InputFrameRate.Numerator = fps; content.InputFrameRate.Denominator = 1; content.InputWidth = first.width; content.InputHeight = first.height; content.OutputFrameRate.Numerator = fps; content.OutputFrameRate.Denominator = 1; content.OutputWidth = first.width; content.OutputHeight = first.height; content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+        hr = videoDevice->CreateVideoProcessorEnumerator(&content, &vpEnumerator); if (FAILED(hr) || !vpEnumerator) { if (error) *error = "CreateVideoProcessorEnumerator failed " + HrToString(hr); return false; }
+        UINT support = 0; hr = vpEnumerator->CheckVideoProcessorFormat(gpuInputFormat, &support); if (FAILED(hr) || !(support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) { if (error) *error = "video processor lacks desktop input support"; return false; }
+        support = 0; hr = vpEnumerator->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &support); if (FAILED(hr) || !(support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) { if (error) *error = "video processor lacks NV12 output support"; return false; }
+        hr = videoDevice->CreateVideoProcessor(vpEnumerator.Get(), 0, &videoProcessor); if (FAILED(hr) || !videoProcessor) { if (error) *error = "CreateVideoProcessor failed " + HrToString(hr); return false; }
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv{}; iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D; iv.Texture2D.MipSlice = 0; iv.Texture2D.ArraySlice = 0;
+        hr = videoDevice->CreateVideoProcessorInputView(localBgra.Get(), vpEnumerator.Get(), &iv, &inputView); if (FAILED(hr) || !inputView) { if (error) *error = "CreateVideoProcessorInputView failed " + HrToString(hr); return false; }
+        for (size_t i = 0; i < nv12Surfaces.size(); ++i) {
+            D3D11_TEXTURE2D_DESC nv{}; nv.Width = first.width; nv.Height = first.height; nv.MipLevels = 1; nv.ArraySize = 1; nv.Format = DXGI_FORMAT_NV12; nv.SampleDesc.Count = 1; nv.Usage = D3D11_USAGE_DEFAULT; nv.BindFlags = D3D11_BIND_RENDER_TARGET;
+            hr = gpuDevice->CreateTexture2D(&nv, nullptr, &nv12Surfaces[i]); if (FAILED(hr) || !nv12Surfaces[i]) { if (error) *error = "CreateTexture2D(NV12) failed " + HrToString(hr); return false; }
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov{}; ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D; ov.Texture2D.MipSlice = 0;
+            hr = videoDevice->CreateVideoProcessorOutputView(nv12Surfaces[i].Get(), vpEnumerator.Get(), &ov, &outputViews[i]); if (FAILED(hr) || !outputViews[i]) { if (error) *error = "CreateVideoProcessorOutputView failed " + HrToString(hr); return false; }
+        }
+        hr = MFCreateDXGIDeviceManager(&dxgiManagerToken, &dxgiManager); if (FAILED(hr) || !dxgiManager) { if (error) *error = "MFCreateDXGIDeviceManager failed " + HrToString(hr); return false; }
+        hr = dxgiManager->ResetDevice(gpuDevice.Get(), dxgiManagerToken); if (FAILED(hr)) { if (error) *error = "ResetDevice failed " + HrToString(hr); return false; }
+        gpuReady = true; return true;
+    }
+
+    bool MakeGpuSample(const SharedGpuFrame& frame, int width, int height, uint64_t inputIndex, int fps, ComPtr<IMFSample>& sample, int& slot, std::string* error) {
+        slot = -1; if (!gpuReady || !gpuDevice1 || !videoContext) { if (error) *error = "GPU pipeline not ready"; return false; }
+        if (frame.width != width || frame.height != height || frame.adapterLuidLow != gpuAdapterLuid.LowPart || frame.adapterLuidHigh != gpuAdapterLuid.HighPart) { if (error) *error = "shared GPU frame geometry/adapter changed"; return false; }
+        for (size_t n = 0; n < surfaceInUse.size(); ++n) { size_t candidate = (nextSurface + n) % surfaceInUse.size(); if (!surfaceInUse[candidate]) { slot = static_cast<int>(candidate); nextSurface = (candidate + 1) % surfaceInUse.size(); break; } }
+        if (slot < 0) return true;
+        auto it = openedGpuFrames.find(frame.sharedHandle);
+        if (it == openedGpuFrames.end()) {
+            GpuOpenedFrame opened; HANDLE handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(frame.sharedHandle)); HRESULT hr = gpuDevice1->OpenSharedResource1(handle, IID_PPV_ARGS(&opened.texture));
+            if (FAILED(hr) || !opened.texture) { if (error) *error = "OpenSharedResource1 failed " + HrToString(hr); return false; }
+            hr = opened.texture.As(&opened.mutex); if (FAILED(hr) || !opened.mutex) { if (error) *error = "shared texture missing keyed mutex " + HrToString(hr); return false; }
+            it = openedGpuFrames.emplace(frame.sharedHandle, std::move(opened)).first;
+        }
+        HRESULT hr = it->second.mutex->AcquireSync(frame.syncKey, 4); if (hr == WAIT_TIMEOUT) { slot = -1; return true; } if (hr != S_OK) { if (error) *error = "AcquireSync failed " + HrToString(hr); return false; }
+        gpuContext->CopyResource(localBgra.Get(), it->second.texture.Get()); HRESULT releaseHr = it->second.mutex->ReleaseSync(0); if (releaseHr != S_OK) { if (error) *error = "ReleaseSync failed " + HrToString(releaseHr); return false; }
+        RECT rect{0,0,width,height}; videoContext->VideoProcessorSetStreamFrameFormat(videoProcessor.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE); videoContext->VideoProcessorSetStreamSourceRect(videoProcessor.Get(), 0, TRUE, &rect); videoContext->VideoProcessorSetStreamDestRect(videoProcessor.Get(), 0, TRUE, &rect); videoContext->VideoProcessorSetOutputTargetRect(videoProcessor.Get(), TRUE, &rect);
+        D3D11_VIDEO_PROCESSOR_STREAM stream{}; stream.Enable = TRUE; stream.pInputSurface = inputView.Get(); hr = videoContext->VideoProcessorBlt(videoProcessor.Get(), outputViews[slot].Get(), 0, 1, &stream); if (FAILED(hr)) { if (error) *error = "VideoProcessorBlt BGRA->NV12 failed " + HrToString(hr); return false; }
+        ComPtr<IMFMediaBuffer> dxgiBuffer; hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12Surfaces[slot].Get(), 0, FALSE, &dxgiBuffer); if (FAILED(hr) || !dxgiBuffer) { if (error) *error = "MFCreateDXGISurfaceBuffer failed " + HrToString(hr); return false; }
+        hr = MFCreateSample(&sample); if (FAILED(hr) || !sample || FAILED(sample->AddBuffer(dxgiBuffer.Get()))) { if (error) *error = "MFCreateSample/AddBuffer(DXGI) failed " + HrToString(hr); return false; }
+        LONGLONG frameTime = static_cast<LONGLONG>((10000000.0 * static_cast<double>(inputIndex)) / static_cast<double>(fps)); LONGLONG frameDuration = static_cast<LONGLONG>(10000000.0 / static_cast<double>(fps)); sample->SetSampleTime(frameTime); sample->SetSampleDuration(frameDuration);
+        return true;
+    }
 };
 
 H264MfEncoder::H264MfEncoder() = default;
@@ -313,6 +398,7 @@ void H264MfEncoder::shutdown() {
             m_impl->transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
             m_impl->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
             m_impl->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            if (m_impl->dxgiManager) m_impl->transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
         }
         delete m_impl;
         m_impl = nullptr;
@@ -321,9 +407,18 @@ void H264MfEncoder::shutdown() {
         MFShutdown();
     }
     m_open = false;
+    m_gpuMode = false;
 }
 
 bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error) {
+    return initInternal(width, height, fps, bitrateKbps, preferHardware, nullptr, error);
+}
+
+bool H264MfEncoder::initGpu(const SharedGpuFrame& frame, int fps, int bitrateKbps, std::string* error) {
+    return initInternal(frame.width, frame.height, fps, bitrateKbps, true, &frame, error);
+}
+
+bool H264MfEncoder::initInternal(int width, int height, int fps, int bitrateKbps, bool preferHardware, const SharedGpuFrame* gpuFrame, std::string* error) {
     shutdown();
 
     if (width <= 0 || height <= 0) {
@@ -338,6 +433,8 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
     }
 
     m_impl = new Impl();
+    m_gpuMode = gpuFrame != nullptr;
+    if (m_gpuMode && !m_impl->SetupGpu(*gpuFrame, std::max(1, fps), error)) return false;
     m_width = width;
     m_height = height;
     m_fps = std::max(1, fps);
@@ -359,7 +456,7 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
     else flags |= MFT_ENUM_FLAG_SYNCMFT;
 
     hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, &inInfo, &outInfo, &activates, &count);
-    if (FAILED(hr) || count == 0) {
+    if (!m_gpuMode && (FAILED(hr) || count == 0)) {
         // Retry without the strict hardware flag; this is still experimental and
         // should fall back cleanly to VP8 at the caller if no MFT is usable.
         if (activates) {
@@ -407,6 +504,14 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
             mftAttrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
             mftAttrs->SetUINT32(MF_LOW_LATENCY, TRUE);
         }
+    }
+
+    if (m_gpuMode) {
+        ComPtr<IMFAttributes> gpuAttrs; UINT32 aware = FALSE;
+        if (FAILED(m_impl->transform->GetAttributes(&gpuAttrs)) || !gpuAttrs || FAILED(gpuAttrs->GetUINT32(MF_SA_D3D11_AWARE, &aware)) || !aware) { if (error) *error = "hardware H.264 MFT is not D3D11-aware"; return false; }
+        hr = m_impl->transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(m_impl->dxgiManager.Get()));
+        if (FAILED(hr)) { if (error) *error = "MFT_MESSAGE_SET_D3D_MANAGER failed " + HrToString(hr); return false; }
+        std::cout << "[h264-gpu] D3D11 device manager attached before media types\n";
     }
 
     // CodecAPI is intentionally disabled in this build because some Windows SDK/MSVC
@@ -476,7 +581,7 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
         m_impl->eventGenerator = eventGenerator;
         m_impl->asyncMode = true;
     }
-    std::cout << "[h264] async_event_model=" << (m_impl->asyncMode ? 1 : 0) << "\n";
+    std::cout << "[h264] async_event_model=" << (m_impl->asyncMode ? 1 : 0) << " gpu_input=" << (m_gpuMode ? 1 : 0) << "\n";
 
     m_open = true;
     return true;
@@ -527,14 +632,24 @@ static bool CopyI420ToNV12Buffer(const I420Frame& frame, BYTE* dst, DWORD maxLen
 }
 
 bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264EncodedFrame& out, std::string* error) {
+    return encodeInternal(&frame, nullptr, forceKeyframe, out, error);
+}
+
+bool H264MfEncoder::encodeGpu(const SharedGpuFrame& frame, bool forceKeyframe, H264EncodedFrame& out, std::string* error) {
+    return encodeInternal(nullptr, &frame, forceKeyframe, out, error);
+}
+
+bool H264MfEncoder::encodeInternal(const I420Frame* frame, const SharedGpuFrame* gpuFrame, bool forceKeyframe, H264EncodedFrame& out, std::string* error) {
     out = {};
     if (!m_open || !m_impl || !m_impl->transform) {
         if (error) *error = "encoder not open";
         return false;
     }
 
-    if (frame.width != m_width || frame.height != m_height) {
-        if (error) *error = "frame size changed";
+    const int sourceWidth = gpuFrame ? gpuFrame->width : (frame ? frame->width : 0);
+    const int sourceHeight = gpuFrame ? gpuFrame->height : (frame ? frame->height : 0);
+    if (sourceWidth != m_width || sourceHeight != m_height || (m_gpuMode != (gpuFrame != nullptr))) {
+        if (error) *error = "frame size/input mode changed";
         return false;
     }
 
@@ -564,6 +679,7 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
             meta = m_impl->pendingInputs.front();
             m_impl->pendingInputs.pop_front();
         }
+        if (meta.gpuSurfaceSlot >= 0 && meta.gpuSurfaceSlot < static_cast<int>(m_impl->surfaceInUse.size())) m_impl->surfaceInUse[meta.gpuSurfaceSlot] = false;
 
         if (encoded.data.empty()) {
             encoded.timestamp90k = meta.timestamp90k;
@@ -744,63 +860,33 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
         }
     }
 
-    const int uvWidth = (frame.width + 1) / 2;
-    const int uvHeight = (frame.height + 1) / 2;
-    const size_t ySize = static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height);
-    const size_t uvPlaneSize = static_cast<size_t>(uvWidth) * static_cast<size_t>(uvHeight);
-    const size_t nv12Size = ySize + (uvPlaneSize * 2);
-
     ComPtr<IMFSample> sample;
-    HRESULT hr = MFCreateSample(&sample);
-    if (FAILED(hr)) {
-        if (error) *error = "MFCreateSample failed " + HrToString(hr);
-        return false;
-    }
-    ComPtr<IMFMediaBuffer> buffer;
-    hr = MFCreateMemoryBuffer(static_cast<DWORD>(nv12Size), &buffer);
-    if (FAILED(hr)) {
-        if (error) *error = "MFCreateMemoryBuffer failed " + HrToString(hr);
-        return false;
-    }
-
-    BYTE* dst = nullptr;
-    DWORD maxLen = 0;
-    DWORD curLen = 0;
-    hr = buffer->Lock(&dst, &maxLen, &curLen);
-    if (FAILED(hr)) {
-        if (error) *error = "input buffer Lock failed " + HrToString(hr);
-        return false;
-    }
-    DWORD written = 0;
-    const bool copied = CopyI420ToNV12Buffer(frame, dst, maxLen, &written);
-    buffer->Unlock();
-    if (!copied) {
-        if (error) *error = "I420->NV12 copy failed frame=" + std::to_string(frame.width) + "x" +
-            std::to_string(frame.height) + " maxLen=" + std::to_string(maxLen) +
-            " y=" + std::to_string(frame.y.size()) + " u=" + std::to_string(frame.u.size()) +
-            " v=" + std::to_string(frame.v.size());
-        return false;
-    }
-    hr = buffer->SetCurrentLength(written);
-    if (FAILED(hr)) {
-        if (error) *error = "SetCurrentLength failed " + HrToString(hr);
-        return false;
-    }
-    hr = sample->AddBuffer(buffer.Get());
-    if (FAILED(hr)) {
-        if (error) *error = "sample AddBuffer failed " + HrToString(hr);
-        return false;
-    }
-
+    HRESULT hr = S_OK;
+    int gpuSurfaceSlot = -1;
     const uint64_t inputIndex = m_frameIndex;
+    if (gpuFrame) {
+        if (!m_impl->MakeGpuSample(*gpuFrame, m_width, m_height, inputIndex, m_fps, sample, gpuSurfaceSlot, error)) return false;
+        if (!sample) return true;
+    } else {
+        const int uvWidth = (frame->width + 1) / 2; const int uvHeight = (frame->height + 1) / 2;
+        const size_t ySize = static_cast<size_t>(frame->width) * static_cast<size_t>(frame->height); const size_t uvPlaneSize = static_cast<size_t>(uvWidth) * static_cast<size_t>(uvHeight); const size_t nv12Size = ySize + (uvPlaneSize * 2);
+        hr = MFCreateSample(&sample); if (FAILED(hr)) { if (error) *error = "MFCreateSample failed " + HrToString(hr); return false; }
+        ComPtr<IMFMediaBuffer> buffer; hr = MFCreateMemoryBuffer(static_cast<DWORD>(nv12Size), &buffer); if (FAILED(hr)) { if (error) *error = "MFCreateMemoryBuffer failed " + HrToString(hr); return false; }
+        BYTE* dst = nullptr; DWORD maxLen = 0, curLen = 0; hr = buffer->Lock(&dst, &maxLen, &curLen); if (FAILED(hr)) { if (error) *error = "input buffer Lock failed " + HrToString(hr); return false; }
+        DWORD written = 0; const bool copied = CopyI420ToNV12Buffer(*frame, dst, maxLen, &written); buffer->Unlock();
+        if (!copied) { if (error) *error = "I420->NV12 copy failed"; return false; }
+        if (FAILED(buffer->SetCurrentLength(written)) || FAILED(sample->AddBuffer(buffer.Get()))) { if (error) *error = "input sample buffer attach failed"; return false; }
+    }
     const LONGLONG frameTime = static_cast<LONGLONG>((10'000'000.0 * static_cast<double>(inputIndex)) / static_cast<double>(m_fps));
     const LONGLONG frameDuration = static_cast<LONGLONG>(10'000'000.0 / static_cast<double>(m_fps));
     sample->SetSampleTime(frameTime);
     sample->SetSampleDuration(frameDuration);
 
+    if (gpuSurfaceSlot >= 0) m_impl->surfaceInUse[gpuSurfaceSlot] = true;
     hr = m_impl->transform->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) {
-        if (error) *error = "ProcessInput failed " + HrToString(hr);
+        if (gpuSurfaceSlot >= 0) m_impl->surfaceInUse[gpuSurfaceSlot] = false;
+        if (error) *error = std::string(m_gpuMode ? "ProcessInput(DXGI NV12) failed " : "ProcessInput failed ") + HrToString(hr);
         return false;
     }
 
@@ -811,6 +897,7 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
     Impl::PendingInputMeta meta{};
     meta.forceKeyframe = forceKeyframe;
     meta.timestamp90k = static_cast<uint32_t>((inputIndex * 90000ULL) / static_cast<uint64_t>(m_fps));
+    meta.gpuSurfaceSlot = gpuSurfaceSlot;
     m_impl->pendingInputs.push_back(meta);
     ++m_frameIndex;
 

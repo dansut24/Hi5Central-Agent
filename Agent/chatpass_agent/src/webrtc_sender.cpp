@@ -529,9 +529,14 @@ bool WebRtcSender::selectBestAutoCodec(const std::string& reasonPrefix) {
         return switchVideoCodec(codec, reasonPrefix + ": selected hardware " + codecName);
     };
 
-    if (tryHardware("av1", VideoCodec::AV1, m_peerAcceptsAv1, m_av1Failed, g_hwAv1Failed, m_hwAv1Available, m_hwAv1ProbeDone)) return true;
-    if (tryHardware("vp9", VideoCodec::VP9, m_peerAcceptsVp9, m_vp9Failed, g_hwVp9Failed, m_hwVp9Available, m_hwVp9ProbeDone)) return true;
-    if (tryHardware("h265", VideoCodec::H265, m_peerAcceptsH265, m_h265Failed, g_hwH265Failed, m_hwH265Available, m_hwH265ProbeDone)) return true;
+    // 0.1.42: only select a hardware codec whose complete GPU-surface input
+    // path is implemented. AV1/VP9/H.265 remain advertised to the viewer but
+    // are deferred here so enumeration alone cannot allocate/fail several MFTs
+    // before the proven H.264 D3D11 path gets a chance.
+    if (m_peerAcceptsAv1 || m_peerAcceptsVp9 || m_peerAcceptsH265) {
+        LogInfo("[codec] auto GPU policy session=" + m_sessionId +
+            " deferred_hw=av1,vp9,h265 implemented_gpu_hw=h264");
+    }
     if (tryHardware("h264", VideoCodec::H264, m_peerAcceptsH264, m_h264Failed, g_hwH264Failed, m_hwH264Available, m_hwH264ProbeDone)) return true;
 
     std::string swVp9Reason;
@@ -650,6 +655,8 @@ bool WebRtcSender::switchVideoCodec(VideoCodec codec, const std::string& reason)
     m_vp9VpxEncoder.reset();
     m_av1Encoder.reset();
     m_h264Encoder.reset();
+    m_h264GpuEncoder.reset();
+    m_h264GpuFailed = false;
     m_h265Encoder.reset();
     m_externalEncoderWidth = 0;
     m_externalEncoderHeight = 0;
@@ -2073,6 +2080,136 @@ void WebRtcSender::sendH264NalPayloads(const std::vector<std::vector<uint8_t>>& 
             start = false;
         }
     }
+}
+
+bool WebRtcSender::trySendExternalGpuH264(const SharedGpuFrame& frame, uint64_t captureTimestampNs, bool forceKeyframe) {
+    if (m_mode != Mode::ExternalFeed || frame.width <= 0 || frame.height <= 0 || frame.sharedHandle == 0) return false;
+    if (!m_canSend || !m_track || !m_track->isOpen()) return false;
+
+    std::lock_guard<std::mutex> encodeLock(m_externalEncodeMu);
+
+    std::string devCodecRequest;
+    {
+        std::lock_guard<std::mutex> lock(m_codecSwitchMu);
+        devCodecRequest.swap(m_pendingDevCodecSwitch);
+    }
+    if (!devCodecRequest.empty()) {
+        std::string activeCodec;
+        std::string detail;
+        const bool switched = applyDevCodecSwitch(devCodecRequest, activeCodec, detail);
+        sendControlMessage(json{
+            {"type", "dev_codec_switch_result"},
+            {"status", switched ? "accepted" : "failed"},
+            {"requested", devCodecRequest},
+            {"active", activeCodec},
+            {"detail", detail}
+        });
+        if (switched) forceKeyframe = true;
+    }
+
+    if (m_videoCodec != VideoCodec::H264 || m_h264Failed || m_h264GpuFailed || m_codecMode == "h264_sw") {
+        return false;
+    }
+
+    const int h264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 1920, 0, 7680);
+    const int h264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 1080, 0, 4320);
+    if ((h264MaxW > 0 && frame.width > h264MaxW) || (h264MaxH > 0 && frame.height > h264MaxH)) {
+        return false;
+    }
+
+    const int h264Fps = readEnvInt("HI5_H264_ENCODER_FPS", std::min(30, std::max(1, m_fps)), 1, 60);
+    const int h264DesktopFloorKbps = frame.width >= 1600 ? 8000 : (frame.width >= 1200 ? 6000 : 4000);
+    const int h264Kbps = readEnvInt("HI5_H264_ENCODER_KBPS", std::max(m_bitrateKbps, h264DesktopFloorKbps), 1000, 24000);
+    const bool sizeChanged = frame.width != m_externalEncoderWidth || frame.height != m_externalEncoderHeight;
+    const bool profileChanged = h264Fps != m_externalConfiguredFps || h264Kbps != m_externalConfiguredBitrateKbps;
+
+    auto failGpuPath = [&](const std::string& why) {
+        LogWarn("[h264-gpu] path failed session=" + m_sessionId + " error=" + why + " fallback=i420");
+        m_h264GpuEncoder.reset();
+        m_h264GpuFailed = true;
+        m_hwH264Available = false;
+        CacheHardwareCodecFailure(g_hwH264Failed, "h264", "gpu path failed: " + why);
+        if (m_autoCodec) {
+            m_h264Failed = true;
+            selectBestAutoCodec("recovery: GPU H.264 failed");
+        } else {
+            m_codecMode = "h264_sw";
+        }
+        return false;
+    };
+
+    if (!m_h264GpuEncoder || sizeChanged || profileChanged) {
+        m_h264GpuEncoder.reset();
+        auto enc = std::make_unique<H264MfEncoder>();
+        std::string err;
+        if (!enc->initGpu(frame, h264Fps, h264Kbps, &err)) return failGpuPath("init: " + err);
+        m_h264GpuEncoder = std::move(enc);
+        m_externalEncoderWidth = frame.width;
+        m_externalEncoderHeight = frame.height;
+        m_externalConfiguredFps = h264Fps;
+        m_externalConfiguredBitrateKbps = h264Kbps;
+        m_externalProfileName = "d3d11-nv12-h264-hardware";
+        m_externalFrameCounter = 0;
+        m_externalNextStatsLog = {};
+        forceKeyframe = true;
+        LogInfo("[h264-gpu] encoder active session=" + m_sessionId +
+            " name=" + m_h264GpuEncoder->encoderName() +
+            " source=" + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
+            " fps=" + std::to_string(h264Fps) +
+            " bitrate=" + std::to_string(h264Kbps) +
+            " input=dxgi-nv12-zero-copy");
+    }
+
+    ++m_externalFrameCounter;
+    const int keyframeSeconds = readEnvInt("HI5_H264_KEYFRAME_SECONDS", 3, 1, 30);
+    const int keyframeEvery = std::max(1, h264Fps * keyframeSeconds);
+    const bool keyframe = forceKeyframe || (m_externalFrameCounter % keyframeEvery) == 0 || m_forceKeyframe.exchange(false);
+
+    const auto encodeStart = std::chrono::steady_clock::now();
+    H264EncodedFrame encoded{};
+    std::string err;
+    if (!m_h264GpuEncoder->encodeGpu(frame, keyframe, encoded, &err)) return failGpuPath("encode: " + err);
+    const auto encodeEnd = std::chrono::steady_clock::now();
+
+    const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
+    m_externalEncodeMsTotal += encodeMs;
+    m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
+    ++m_externalEncodedFrames;
+
+    if (!encoded.data.empty()) {
+        encoded.timestamp90k = externalRtpTimestamp(captureTimestampNs);
+        const auto sendStart = std::chrono::steady_clock::now();
+        sendRtpH264Frame(encoded);
+        const auto sendEnd = std::chrono::steady_clock::now();
+        const double sendMs = std::chrono::duration<double, std::milli>(sendEnd - sendStart).count();
+        m_externalSendMsTotal += sendMs;
+        m_externalSendMsMax = std::max(m_externalSendMsMax, sendMs);
+        ++m_externalSentFrames;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_externalNextStatsLog.time_since_epoch().count() == 0) m_externalNextStatsLog = now + std::chrono::seconds(5);
+    if (now >= m_externalNextStatsLog) {
+        const double encodedCount = std::max<uint64_t>(1, m_externalEncodedFrames);
+        const double sentCount = std::max<uint64_t>(1, m_externalSentFrames);
+        const double encodeAvgMs = m_externalEncodeMsTotal / encodedCount;
+        const double sendAvgMs = m_externalSendMsTotal / sentCount;
+        LogInfo("[h264-gpu] encode health session=" + m_sessionId +
+            " encoded=" + std::to_string(m_externalEncodedFrames) +
+            " sent=" + std::to_string(m_externalSentFrames) +
+            " encode_avg_ms=" + std::to_string(encodeAvgMs) +
+            " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+            " send_avg_ms=" + std::to_string(sendAvgMs));
+        observeCodecHealth(encodeAvgMs, m_externalEncodeMsMax, sendAvgMs);
+        m_externalEncodedFrames = 0;
+        m_externalSentFrames = 0;
+        m_externalEncodeMsTotal = 0.0;
+        m_externalEncodeMsMax = 0.0;
+        m_externalSendMsTotal = 0.0;
+        m_externalSendMsMax = 0.0;
+        m_externalNextStatsLog = now + std::chrono::seconds(5);
+    }
+    return true;
 }
 
 void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureTimestampNs, bool forceKeyframe) {

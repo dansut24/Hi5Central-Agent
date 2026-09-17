@@ -197,6 +197,7 @@ int RunMediaHostMain(int argc, char** argv) {
 
     bool senderStarted = false;
     bool firstFrameLogged = false;
+    bool gpuZeroCopyLogged = false;
     bool gpuTransportFailureReported = false;
     auto nextMemoryLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     I420Frame frame;
@@ -226,6 +227,7 @@ int RunMediaHostMain(int argc, char** argv) {
             forceKeyframe = forceKeyframe || thisForceKeyframe;
             if (!frameRing.HasFrame()) break;
         }
+        bool gpuH264Consumed = false;
         if (!gotGpuFrame) {
             while (frameRing.ReadRawI420Frame(frame, frameTsNs, &thisForceKeyframe)) {
                 gotFrame = true;
@@ -233,30 +235,43 @@ int RunMediaHostMain(int argc, char** argv) {
                 if (!frameRing.HasFrame()) break;
             }
         } else {
-            std::string gpuError;
-            if (gpuReader.ReadI420(gpuFrame, frame, &gpuError)) {
-                gotFrame = true;
-            } else {
-                LogWarn("[gpu-transport] shared frame readback failed session=" + sessionId +
-                    " error=" + gpuError + " key=" + std::to_string(gpuFrame.syncKey));
-                const bool transientSyncMiss = gpuError.rfind("AcquireSync failed/expired", 0) == 0;
-                if (!transientSyncMiss && !gpuTransportFailureReported) {
-                    gpuTransportFailureReported = true;
-                    sendEvent(json{ {"type", "gpu_transport_failed"}, {"reason", gpuError} });
+            // Normal desktop: first offer the shared D3D11 texture directly to
+            // hardware H.264. Only read back to CPU/I420 when that path is not
+            // active (VP8/forced software) or explicitly asks for fallback.
+            gpuH264Consumed = sender.trySendExternalGpuH264(gpuFrame, frameTsNs, forceKeyframe);
+            if (!gpuH264Consumed) {
+                std::string gpuError;
+                if (gpuReader.ReadI420(gpuFrame, frame, &gpuError)) {
+                    gotFrame = true;
+                } else {
+                    LogWarn("[gpu-transport] shared frame readback failed session=" + sessionId +
+                        " error=" + gpuError + " key=" + std::to_string(gpuFrame.syncKey));
+                    const bool transientSyncMiss = gpuError.rfind("AcquireSync failed/expired", 0) == 0;
+                    if (!transientSyncMiss && !gpuTransportFailureReported) {
+                        gpuTransportFailureReported = true;
+                        sendEvent(json{ {"type", "gpu_transport_failed"}, {"reason", gpuError} });
+                    }
                 }
             }
         }
 
         if (gotFrame) {
             sender.sendExternalRawI420(frame, frameTsNs, forceKeyframe);
-            if (!firstFrameLogged) {
-                firstFrameLogged = true;
-                LogInfo("[gpu-transport] first-frame session=" + sessionId +
-                    " source=" + std::string(gotGpuFrame ? "shared-d3d11" : "raw-i420"));
-                LogMediaMemory(sessionId, "first-frame");
-            }
         }
-        else {
+        if (gpuH264Consumed && !gpuZeroCopyLogged) {
+            gpuZeroCopyLogged = true;
+            LogInfo("[gpu-transport] zero-copy H.264 active session=" + sessionId +
+                " source=shared-d3d11-nv12-mft");
+            LogMediaMemory(sessionId, "gpu-h264-first-frame");
+        }
+        if ((gotFrame || gpuH264Consumed) && !firstFrameLogged) {
+            firstFrameLogged = true;
+            const char* source = gpuH264Consumed ? "shared-d3d11-zero-copy-h264" :
+                (gotGpuFrame ? "shared-d3d11-readback" : "raw-i420");
+            LogInfo("[gpu-transport] first-frame session=" + sessionId + " source=" + source);
+            LogMediaMemory(sessionId, "first-frame");
+        }
+        if (!gotFrame && !gpuH264Consumed) {
             Sleep(2);
         }
 
