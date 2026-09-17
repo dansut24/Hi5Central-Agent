@@ -1,4 +1,4 @@
-name: Sync cursor pipeline checkpoint
+name: Sync complete codec checkpoint
 
 on:
   push:
@@ -25,23 +25,34 @@ jobs:
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 \
-            https://downloads.hi5central.com/bootstrap-agent-sync/cursor-off-video-0.1.30-HEAD.tar.gz \
-            -o /tmp/cursor-off-video-0.1.30.tar.gz
-          echo "12812a53909f2ed148a77b7e6d91d7bdffd40eacbfb538f9dc4c32338e78c5be  /tmp/cursor-off-video-0.1.30.tar.gz" | sha256sum -c -
+            https://downloads.hi5central.com/bootstrap-agent-sync/codec-complete-f9f2369.tar.gz \
+            -o /tmp/codec-complete-f9f2369.tar.gz
+          echo "0860ea6f5ae789d8959029d9065ff135ac4808213c4e355bec88e9ba4e524182  /tmp/codec-complete-f9f2369.tar.gz" | sha256sum -c -
 
       - name: Apply exact changed files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/cursor-off-video-0.1.30
-          tar -xzf /tmp/cursor-off-video-0.1.30.tar.gz -C /tmp/cursor-off-video-0.1.30
-          cp -a /tmp/cursor-off-video-0.1.30/. .
+          mkdir -p /tmp/codec-complete-f9f2369
+          tar -xzf /tmp/codec-complete-f9f2369.tar.gz -C /tmp/codec-complete-f9f2369
+          cp -a /tmp/codec-complete-f9f2369/. .
           git add \
-            Agent/chatpass_agent/src/frame_source.cpp \
-            Agent/chatpass_agent/src/frame_source.h \
-            Agent/chatpass_agent/src/platform/windows/windows_screen.cpp \
-            Agent/chatpass_agent/src/streamer_main.cpp \
-            Agent/chatpass_agent/src/webrtc_sender.cpp
+            Agent/chatpass_agent/CMakeLists.txt \
+            Agent/chatpass_agent/src/av1_mf_encoder.cpp \
+            Agent/chatpass_agent/src/codec_capabilities.cpp \
+            Agent/chatpass_agent/src/codec_capabilities.h \
+            Agent/chatpass_agent/src/codec_policy.cpp \
+            Agent/chatpass_agent/src/h264_mf_encoder.cpp \
+            Agent/chatpass_agent/src/h265_mf_encoder.cpp \
+            Agent/chatpass_agent/src/h265_mf_encoder.h \
+            Agent/chatpass_agent/src/platform/windows/windows_codec.cpp \
+            Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
+            Agent/chatpass_agent/src/vp9_mf_encoder.cpp \
+            Agent/chatpass_agent/src/vp9_vpx_encoder.cpp \
+            Agent/chatpass_agent/src/vp9_vpx_encoder.h \
+            Agent/chatpass_agent/src/webrtc_sender.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.h \
+            Viewer/chatpass_viewer/web/renderer.js
           git status --short
 
       - name: Commit synced checkpoint
@@ -54,5 +65,5 @@ jobs:
             echo "No source changes to sync."
             exit 0
           fi
-          git commit -m "Keep cursor motion off remote video pipeline"
+          git commit -m "Complete adaptive remote video codec stack"
           git push origin HEAD:agent-hardening-v2
