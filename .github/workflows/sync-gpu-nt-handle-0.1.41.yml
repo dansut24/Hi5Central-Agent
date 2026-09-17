@@ -1,0 +1,48 @@
+name: Sync GPU NT handle 0.1.41
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - .github/workflows/sync-gpu-nt-handle-0.1.41.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent-hardening-v2
+          fetch-depth: 0
+
+      - name: Download and verify exact source checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -qO /tmp/gpu-nt-handle-0141.tar.gz 'https://downloads.hi5central.com/bootstrap-agent-sync/gpu-nt-handle-0.1.41-48512ee.tar.gz'
+          echo '53131030bb93c299e660d09559cf5ed346ce203c10a7237985bdab11468b98b9  /tmp/gpu-nt-handle-0141.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/gpu-nt-handle-0141.tar.gz -C .
+
+      - name: Commit exact checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Hi5Central Build Bot'
+          git config user.email 'buildbot@hi5central.com'
+          git add \
+            Agent/chatpass_agent/src/platform/windows/windows_screen.cpp \
+            Agent/chatpass_agent/src/platform/windows/shared_gpu_frame_reader.cpp \
+            Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
+            Agent/chatpass_agent/src/media_host_main.cpp \
+            Agent/chatpass_agent/src/streamer_main.cpp
+          if git diff --cached --quiet; then
+            echo 'Checkpoint already applied.'
+            exit 0
+          fi
+          git commit -m 'Fix cross-session D3D11 shared handles [skip ci]'
+          git push origin HEAD:agent-hardening-v2
