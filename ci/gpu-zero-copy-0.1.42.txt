@@ -1,0 +1,4 @@
+Hi5Central 0.1.42 validation marker
+VPS source: 305cb8f77e98b37cc616afe0e444e6923c65ea8d
+GitHub source sync: ff9098a0696216c193ea1cdab93f0500b13ef69a
+Purpose: D3D11 shared desktop texture -> GPU NV12 -> Media Foundation hardware H.264 -> WebRTC, with I420 fallback.
