@@ -80,6 +80,7 @@ public:
 
     bool sendControlMessage(const nlohmann::json& msg);
     bool sendControlMessageText(const std::string& text);
+    bool hasPendingDevCodecSwitch();
 
     // Called by the service when the capture helper publishes low-CPU stream stats.
     // VP8 uses these hints for runtime tuning; adaptive codec health also uses
@@ -179,6 +180,8 @@ private:
     std::unique_ptr<Vp9VpxEncoder> m_vp9VpxEncoder;
     std::unique_ptr<Av1MfEncoder> m_av1Encoder;
     std::unique_ptr<H265MfEncoder> m_h265Encoder;
+    I420Frame m_vp9ScaleScratch;
+    I420Frame m_h264ScaleScratch;
     std::shared_ptr<rtc::RtpPacketizationConfig> m_nativeVideoRtpConfig;
     bool m_vp9Failed = false;
     bool m_av1Failed = false;
@@ -190,11 +193,14 @@ private:
     bool m_peerAcceptsAv1 = false;
     bool m_peerAcceptsH265 = false;
     bool m_hwAv1Available = false;
+    bool m_swAv1Available = false;
     bool m_hwVp9Available = false;
     bool m_hwH265Available = false;
+    bool m_swH265Available = false;
     bool m_hwH264Available = false;
     bool m_swVp9Allowed = false;
     int m_codecUnhealthyWindows = 0;
+    int m_av1EmptyOutputFrames = 0;
     std::chrono::steady_clock::time_point m_lastCodecSwitchAt{};
     VideoCodec m_videoCodec = VideoCodec::VP8;
     bool m_h264Attempted = false;

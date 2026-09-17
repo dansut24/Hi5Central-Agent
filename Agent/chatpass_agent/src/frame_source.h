@@ -41,6 +41,7 @@ public:
 
     I420Frame nextFrame();
     FrameCaptureResult nextFrameEx(bool includeUnchangedFrame = true);
+    void nextFrameExInto(FrameCaptureResult& result, bool includeUnchangedFrame = true);
 
     std::vector<DisplayInfo> listDisplays() const;
     DisplayInfo currentDisplayInfo() const;

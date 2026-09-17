@@ -627,15 +627,14 @@ struct DesktopFrameSource::Impl {
         return t->info;
     }
 
-    FrameCaptureResult captureAllMonitorsGdiLocked(bool includeUnchangedFrame) {
-        FrameCaptureResult result;
+    void captureAllMonitorsGdiLocked(FrameCaptureResult& result, bool includeUnchangedFrame) {
         const DisplayInfo d = buildAllMonitorsInfo();
         if (d.width <= 0 || d.height <= 0) {
             const bool cached = !lastFrame.y.empty();
             if (includeUnchangedFrame && cached) result.frame = lastFrame;
             result.hasFrame = includeUnchangedFrame && cached;
             result.frameId = frameId;
-            return result;
+            return;
         }
 
         int stride = 0;
@@ -644,34 +643,29 @@ struct DesktopFrameSource::Impl {
             if (includeUnchangedFrame && cached) result.frame = lastFrame;
             result.hasFrame = includeUnchangedFrame && cached;
             result.frameId = frameId;
-            return result;
+            return;
         }
 
-        I420Frame out;
-        bgraToI420(bgraScratch.data(), stride, d.width, d.height, out);
+        bgraToI420(bgraScratch.data(), stride, d.width, d.height, result.frame);
         hasCapturedFrame = true;
         if (includeUnchangedFrame) {
-            lastFrame = out;
-            result.frame = lastFrame;
-        } else {
-            result.frame = std::move(out);
+            lastFrame = result.frame;
         }
         lastGdiRefresh = std::chrono::steady_clock::now();
         result.hasFrame = true;
         result.changed = true;
         result.frameId = ++frameId;
-        return result;
+        return;
     }
 
-    FrameCaptureResult captureCurrentDisplayGdiLocked(bool includeUnchangedFrame) {
-        FrameCaptureResult result;
+    void captureCurrentDisplayGdiLocked(FrameCaptureResult& result, bool includeUnchangedFrame) {
         const DisplayInfo d = currentDisplayInfoLocked();
         if (d.width <= 0 || d.height <= 0) {
             const bool cached = !lastFrame.y.empty();
             if (includeUnchangedFrame && cached) result.frame = lastFrame;
             result.hasFrame = includeUnchangedFrame && cached;
             result.frameId = frameId;
-            return result;
+            return;
         }
 
         int stride = 0;
@@ -680,30 +674,33 @@ struct DesktopFrameSource::Impl {
             if (includeUnchangedFrame && cached) result.frame = lastFrame;
             result.hasFrame = includeUnchangedFrame && cached;
             result.frameId = frameId;
-            return result;
+            return;
         }
 
-        I420Frame out;
-        bgraToI420(bgraScratch.data(), stride, d.width, d.height, out);
+        bgraToI420(bgraScratch.data(), stride, d.width, d.height, result.frame);
         hasCapturedFrame = true;
         if (includeUnchangedFrame) {
-            lastFrame = out;
-            result.frame = lastFrame;
-        } else {
-            result.frame = std::move(out);
+            lastFrame = result.frame;
         }
         lastGdiRefresh = std::chrono::steady_clock::now();
         result.hasFrame = true;
         result.changed = true;
         result.frameId = ++frameId;
-        return result;
+        return;
     }
 
-    FrameCaptureResult captureOneLocked(bool includeUnchangedFrame) {
+    void captureOneLocked(FrameCaptureResult& result, bool includeUnchangedFrame) {
+        // Reset metadata only. Keep result.frame vector capacity so the RemoteHost
+        // reuses one Y/U/V allocation set for the lifetime of the capture loop.
+        result.hasFrame = false;
+        result.changed = false;
+        result.cursorOnly = false;
+        result.frameId = frameId;
         refreshDisplaysLocked();
 
         if (currentIndex == -1) {
-            return captureAllMonitorsGdiLocked(includeUnchangedFrame);
+            captureAllMonitorsGdiLocked(result, includeUnchangedFrame);
+            return;
         }
 
         if (!duplication || !findCurrentTargetLocked()) {
@@ -722,28 +719,28 @@ struct DesktopFrameSource::Impl {
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
             const bool noFrameYet = !hasCapturedFrame;
             if (noFrameYet) {
-                return captureCurrentDisplayGdiLocked(includeUnchangedFrame);
+                captureCurrentDisplayGdiLocked(result, includeUnchangedFrame);
+                return;
             }
 
-            FrameCaptureResult result;
             if (includeUnchangedFrame) result.frame = lastFrame;
             result.hasFrame = includeUnchangedFrame;
             result.changed = false;
             result.frameId = frameId;
-            return result;
+            return;
         }
         if (hr == DXGI_ERROR_ACCESS_LOST) {
             initForCurrentLocked();
             if (lastFrame.y.empty() || lastFrame.width <= 0 || lastFrame.height <= 0) {
-                return captureCurrentDisplayGdiLocked(includeUnchangedFrame);
+                captureCurrentDisplayGdiLocked(result, includeUnchangedFrame);
+                return;
             }
 
-            FrameCaptureResult result;
             if (includeUnchangedFrame) result.frame = lastFrame;
             result.hasFrame = includeUnchangedFrame;
             result.changed = false;
             result.frameId = frameId;
-            return result;
+            return;
         }
         if (FAILED(hr)) {
             throw std::runtime_error("AcquireNextFrame failed");
@@ -758,14 +755,13 @@ struct DesktopFrameSource::Impl {
         // expensive GPU->CPU BGRA->I420->encoder path.
         if (cursorOnly && !Hi5CompositeCursorEnabled()) {
             duplication->ReleaseFrame();
-            FrameCaptureResult result;
             const bool cached = !lastFrame.y.empty() && lastFrame.width > 0 && lastFrame.height > 0;
             if (includeUnchangedFrame && cached) result.frame = lastFrame;
             result.hasFrame = includeUnchangedFrame && cached;
             result.changed = false;
             result.cursorOnly = true;
             result.frameId = frameId;
-            return result;
+            return;
         }
 
         ComPtr<ID3D11Texture2D> tex;
@@ -790,22 +786,17 @@ struct DesktopFrameSource::Impl {
         const DisplayInfo d = currentDisplayInfoLocked();
         compositeCursorBgra(d.x, d.y, width, height, bgraScratch, rowPitch);
 
-        I420Frame out;
-        bgraToI420(bgraScratch.data(), rowPitch, width, height, out);
+        bgraToI420(bgraScratch.data(), rowPitch, width, height, result.frame);
         hasCapturedFrame = true;
 
-        FrameCaptureResult result;
         if (includeUnchangedFrame) {
-            lastFrame = out;
-            result.frame = lastFrame;
-        } else {
-            result.frame = std::move(out);
+            lastFrame = result.frame;
         }
         result.hasFrame = true;
         result.changed = true;
         result.cursorOnly = cursorOnly;
         result.frameId = ++frameId;
-        return result;
+        return;
     }
 };
 
@@ -829,8 +820,14 @@ I420Frame DesktopFrameSource::nextFrame() {
 }
 
 FrameCaptureResult DesktopFrameSource::nextFrameEx(bool includeUnchangedFrame) {
+    FrameCaptureResult result;
+    nextFrameExInto(result, includeUnchangedFrame);
+    return result;
+}
+
+void DesktopFrameSource::nextFrameExInto(FrameCaptureResult& result, bool includeUnchangedFrame) {
     std::lock_guard<std::mutex> lock(m_impl->mu);
-    return m_impl->captureOneLocked(includeUnchangedFrame);
+    m_impl->captureOneLocked(result, includeUnchangedFrame);
 }
 
 std::vector<DisplayInfo> DesktopFrameSource::listDisplays() const {

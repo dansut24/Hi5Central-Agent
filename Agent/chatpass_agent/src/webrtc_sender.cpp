@@ -115,79 +115,29 @@ namespace {
         }
     }
 
-    static I420Frame scaleI420ForH264WebRtc(const I420Frame& src, bool* scaledOut = nullptr) {
+    static const I420Frame& scaleI420ForWebRtc(const I420Frame& src,
+        I420Frame& scratch, int maxW, int maxH, bool* scaledOut = nullptr) {
         if (scaledOut) *scaledOut = false;
         if (src.width <= 0 || src.height <= 0) return src;
-
-        // Browsers frequently answer H.264 Baseline/Constrained-Baseline level 3.1
-        // (profile-level-id=42e01f). Level 3.1 is safe at 1280x720, but not at
-        // desktop sizes such as 2560x1600. If we send oversized frames after an
-        // answer at 42e01f, Chromium/WebView can connect and keep the data channel
-        // alive but render a black video surface. Cap H.264 to 720p by default.
-        const int maxW = readEnvInt("HI5_H264_MAX_WIDTH", 1280, 0, 7680);
-        const int maxH = readEnvInt("HI5_H264_MAX_HEIGHT", 720, 0, 4320);
-        if (maxW <= 0 || maxH <= 0) return src;
-        if (src.width <= maxW && src.height <= maxH) return src;
+        if (maxW <= 0 || maxH <= 0 || (src.width <= maxW && src.height <= maxH)) return src;
 
         const double sx = static_cast<double>(maxW) / static_cast<double>(src.width);
         const double sy = static_cast<double>(maxH) / static_cast<double>(src.height);
         const double scale = std::min(sx, sy);
-        int dstW = makeEvenAtLeast2(static_cast<int>(src.width * scale));
-        int dstH = makeEvenAtLeast2(static_cast<int>(src.height * scale));
-        dstW = std::min(dstW, makeEvenAtLeast2(maxW));
-        dstH = std::min(dstH, makeEvenAtLeast2(maxH));
+        const int dstW = std::min(makeEvenAtLeast2(static_cast<int>(src.width * scale)), makeEvenAtLeast2(maxW));
+        const int dstH = std::min(makeEvenAtLeast2(static_cast<int>(src.height * scale)), makeEvenAtLeast2(maxH));
 
-        I420Frame dst;
-        dst.width = dstW;
-        dst.height = dstH;
-
-        scalePlaneNearest(src.y, src.width, src.height, dst.y, dstW, dstH);
-
+        scratch.width = dstW;
+        scratch.height = dstH;
+        scalePlaneNearest(src.y, src.width, src.height, scratch.y, dstW, dstH);
         const int srcUw = (src.width + 1) / 2;
         const int srcUh = (src.height + 1) / 2;
         const int dstUw = (dstW + 1) / 2;
         const int dstUh = (dstH + 1) / 2;
-        scalePlaneNearest(src.u, srcUw, srcUh, dst.u, dstUw, dstUh);
-        scalePlaneNearest(src.v, srcUw, srcUh, dst.v, dstUw, dstUh);
-
+        scalePlaneNearest(src.u, srcUw, srcUh, scratch.u, dstUw, dstUh);
+        scalePlaneNearest(src.v, srcUw, srcUh, scratch.v, dstUw, dstUh);
         if (scaledOut) *scaledOut = true;
-        return dst;
-    }
-
-    static I420Frame scaleI420ForVp9WebRtc(const I420Frame& src, bool* scaledOut = nullptr) {
-        if (scaledOut) *scaledOut = false;
-        if (src.width <= 0 || src.height <= 0) return src;
-
-        // VP9 does not inherit H.264 Baseline level 3.1's 720p constraint.
-        // Preserve a crisp 1080p desktop by default while keeping an explicit
-        // ceiling for very large/4K desktops and bandwidth-limited sessions.
-        const int maxW = readEnvInt("HI5_VP9_MAX_WIDTH", 1920, 0, 7680);
-        const int maxH = readEnvInt("HI5_VP9_MAX_HEIGHT", 1080, 0, 4320);
-        if (maxW <= 0 || maxH <= 0) return src;
-        if (src.width <= maxW && src.height <= maxH) return src;
-
-        const double sx = static_cast<double>(maxW) / static_cast<double>(src.width);
-        const double sy = static_cast<double>(maxH) / static_cast<double>(src.height);
-        const double scale = std::min(sx, sy);
-        int dstW = makeEvenAtLeast2(static_cast<int>(src.width * scale));
-        int dstH = makeEvenAtLeast2(static_cast<int>(src.height * scale));
-        dstW = std::min(dstW, makeEvenAtLeast2(maxW));
-        dstH = std::min(dstH, makeEvenAtLeast2(maxH));
-
-        I420Frame dst;
-        dst.width = dstW;
-        dst.height = dstH;
-        scalePlaneNearest(src.y, src.width, src.height, dst.y, dstW, dstH);
-
-        const int srcUw = (src.width + 1) / 2;
-        const int srcUh = (src.height + 1) / 2;
-        const int dstUw = (dstW + 1) / 2;
-        const int dstUh = (dstH + 1) / 2;
-        scalePlaneNearest(src.u, srcUw, srcUh, dst.u, dstUw, dstUh);
-        scalePlaneNearest(src.v, srcUw, srcUh, dst.v, dstUw, dstUh);
-
-        if (scaledOut) *scaledOut = true;
-        return dst;
+        return scratch;
     }
 
     struct Vp8RuntimeProfile {
@@ -362,9 +312,9 @@ WebRtcSender::WebRtcSender(std::string sessionId,
     try {
         const auto localCaps = hi5::ProbeCodecCapabilitiesAndSelect("auto");
         for (const auto& c : localCaps.capabilities) {
-            if (c.codec == "av1") m_hwAv1Available = c.hardwareEncodeAvailable;
+            if (c.codec == "av1") { m_hwAv1Available = c.hardwareEncodeAvailable; m_swAv1Available = c.softwareEncodeAvailable; }
             else if (c.codec == "vp9") m_hwVp9Available = c.hardwareEncodeAvailable;
-            else if (c.codec == "h265") m_hwH265Available = c.hardwareEncodeAvailable;
+            else if (c.codec == "h265") { m_hwH265Available = c.hardwareEncodeAvailable; m_swH265Available = c.softwareEncodeAvailable; }
             else if (c.codec == "h264") m_hwH264Available = c.hardwareEncodeAvailable;
         }
     } catch (...) {
@@ -376,8 +326,10 @@ WebRtcSender::WebRtcSender(std::string sessionId,
 #endif
     LogInfo("[codec] endpoint capabilities session=" + m_sessionId +
         " av1_hw=" + std::string(m_hwAv1Available ? "1" : "0") +
+        " av1_sw=" + std::string(m_swAv1Available ? "1" : "0") +
         " vp9_hw=" + std::string(m_hwVp9Available ? "1" : "0") +
         " h265_hw=" + std::string(m_hwH265Available ? "1" : "0") +
+        " h265_sw=" + std::string(m_swH265Available ? "1" : "0") +
         " h264_hw=" + std::string(m_hwH264Available ? "1" : "0") +
         " vp9_sw_allowed=" + std::string(m_swVp9Allowed ? "1" : "0"));
 
@@ -427,6 +379,11 @@ WebRtcSender::WebRtcSender(std::string sessionId,
 
 WebRtcSender::~WebRtcSender() {
     stop();
+}
+
+bool WebRtcSender::hasPendingDevCodecSwitch() {
+    std::lock_guard<std::mutex> lock(m_codecSwitchMu);
+    return !m_pendingDevCodecSwitch.empty();
 }
 
 void WebRtcSender::setInputEventHandler(InputEventFn fn) {
@@ -602,7 +559,9 @@ bool WebRtcSender::applyDevCodecSwitch(const std::string& requestedRaw, std::str
     }
     if (requested == "av1") {
         if (!m_peerAcceptsAv1) return reject("Viewer did not negotiate AV1 for this session");
+        if (!m_hwAv1Available && !m_swAv1Available) return reject("Endpoint has no usable AV1 encoder");
         m_av1Failed = false;
+        m_av1EmptyOutputFrames = 0;
         return choose(VideoCodec::AV1, "av1", "dev selector forced AV1");
     }
     if (requested == "h264") {
@@ -613,6 +572,7 @@ bool WebRtcSender::applyDevCodecSwitch(const std::string& requestedRaw, std::str
     }
     if (requested == "h265") {
         if (!m_peerAcceptsH265) return reject("Viewer did not negotiate H.265/HEVC for this session");
+        if (!m_hwH265Available && !m_swH265Available) return reject("Endpoint has no usable H.265/HEVC encoder");
         m_h265Failed = false;
         return choose(VideoCodec::H265, "h265", "dev selector forced H.265");
     }
@@ -653,6 +613,7 @@ bool WebRtcSender::switchVideoCodec(VideoCodec codec, const std::string& reason)
     m_externalConfiguredBitrateKbps = 0;
     m_externalFrameCounter = 0;
     m_codecUnhealthyWindows = 0;
+    m_av1EmptyOutputFrames = 0;
     m_forceKeyframe = true;
     m_lastCodecSwitchAt = std::chrono::steady_clock::now();
     configureVideoMediaHandler(codec);
@@ -2325,6 +2286,28 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         return false;
     };
 
+    auto recoverForcedCodec = [&](VideoCodec failed, const std::string& requested, const std::string& why) {
+        if (m_autoCodec) return selectNextAutoCodec(failed, why);
+
+        bool recovered = false;
+        if (failed != VideoCodec::VP9 && m_peerAcceptsVp9 && !m_vp9Failed && (m_hwVp9Available || m_swVp9Allowed)) {
+            m_codecMode = m_hwVp9Available ? "vp9" : "vp9_sw";
+            recovered = switchVideoCodec(VideoCodec::VP9, why + "; restoring VP9 after forced codec failure");
+        }
+        if (!recovered && m_peerAcceptsVp8) {
+            m_codecMode = "vp8";
+            recovered = switchVideoCodec(VideoCodec::VP8, why + "; restoring VP8 baseline after forced codec failure");
+        }
+        sendControlMessage(json{
+            {"type", "dev_codec_switch_result"},
+            {"status", "failed"},
+            {"requested", requested},
+            {"active", activeVideoCodecName()},
+            {"detail", why + (recovered ? "; previous working video restored" : "; no fallback codec available")}
+        });
+        return recovered;
+    };
+
     if (m_videoCodec == VideoCodec::AV1 && !m_av1Failed) {
         const int av1Fps = readEnvInt("HI5_AV1_ENCODER_FPS", std::min(30, std::max(1, m_fps)), 1, 60);
         const std::string av1Quality = imageQualityMode();
@@ -2347,7 +2330,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             } else {
                 LogInfo("[av1] init failed session=" + m_sessionId + " error=" + err);
                 m_av1Failed = true;
-                selectNextAutoCodec(VideoCodec::AV1, "AV1 encoder unavailable");
+                recoverForcedCodec(VideoCodec::AV1, "av1", "AV1 encoder unavailable");
                 return;
             }
             forceKeyframe = true;
@@ -2372,13 +2355,28 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         if (!ok) {
             LogInfo("[av1] encode failed session=" + m_sessionId + " error=" + err);
             m_av1Failed = true; m_av1Encoder.reset();
-            selectNextAutoCodec(VideoCodec::AV1, "AV1 encode failed");
+            recoverForcedCodec(VideoCodec::AV1, "av1", "AV1 encode failed");
             return;
         }
         const auto encodeEnd = std::chrono::steady_clock::now();
         const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
         m_externalEncodeMsTotal += encodeMs; m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs); ++m_externalEncodedFrames;
-        if (!encoded.data.empty()) sendNativePacketizedVideo(encoded.data);
+        if (!encoded.data.empty()) {
+            m_av1EmptyOutputFrames = 0;
+            sendNativePacketizedVideo(encoded.data);
+        } else {
+            ++m_av1EmptyOutputFrames;
+            const int maxBufferedFrames = readEnvInt("HI5_AV1_MAX_EMPTY_OUTPUT_FRAMES", 10, 2, 60);
+            if (m_av1EmptyOutputFrames >= maxBufferedFrames) {
+                LogInfo("[av1] encoder produced no output for " + std::to_string(m_av1EmptyOutputFrames) +
+                    " consecutive input frames; abandoning AV1 session=" + m_sessionId);
+                m_av1Failed = true;
+                m_av1Encoder.reset();
+                m_av1EmptyOutputFrames = 0;
+                recoverForcedCodec(VideoCodec::AV1, "av1", "AV1 encoder accepted input but produced no video");
+                return;
+            }
+        }
         reportCodecHealth("av1");
         return;
     }
@@ -2401,7 +2399,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             } else {
                 LogInfo("[h265] init failed session=" + m_sessionId + " error=" + err);
                 m_h265Failed = true;
-                selectNextAutoCodec(VideoCodec::H265, "H.265 encoder unavailable");
+                recoverForcedCodec(VideoCodec::H265, "h265", "H.265 encoder unavailable");
                 return;
             }
             forceKeyframe = true;
@@ -2424,7 +2422,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         if (!ok) {
             LogInfo("[h265] encode failed session=" + m_sessionId + " error=" + err);
             m_h265Failed = true; m_h265Encoder.reset();
-            selectNextAutoCodec(VideoCodec::H265, "H.265 encode failed");
+            recoverForcedCodec(VideoCodec::H265, "h265", "H.265 encode failed");
             return;
         }
         const auto encodeEnd = std::chrono::steady_clock::now();
@@ -2437,7 +2435,9 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
 
     if (m_videoCodec == VideoCodec::VP9 && !m_vp9Failed) {
         bool vp9Scaled = false;
-        const I420Frame vp9Frame = scaleI420ForVp9WebRtc(frame, &vp9Scaled);
+        const int vp9MaxW = readEnvInt("HI5_VP9_MAX_WIDTH", 1920, 0, 7680);
+        const int vp9MaxH = readEnvInt("HI5_VP9_MAX_HEIGHT", 1080, 0, 4320);
+        const I420Frame& vp9Frame = scaleI420ForWebRtc(frame, m_vp9ScaleScratch, vp9MaxW, vp9MaxH, &vp9Scaled);
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
         const int vp9EncoderFps = readEnvInt("HI5_VP9_ENCODER_FPS", std::min(30, std::max(1, m_fps)), 1, 60);
         const std::string vp9Quality = imageQualityMode();
@@ -2531,7 +2531,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                 m_vp9Failed = true;
                 m_vp9Encoder.reset();
                 m_vp9VpxEncoder.reset();
-                if (m_autoCodec && m_peerAcceptsVp8) switchVideoCodec(VideoCodec::VP8, "VP9 encode failed");
+                recoverForcedCodec(VideoCodec::VP9, "vp9", "VP9 encode failed");
                 return;
             }
 
@@ -2576,7 +2576,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             m_vp9Failed = true;
             m_vp9Encoder.reset();
             m_vp9VpxEncoder.reset();
-            if (m_autoCodec && m_peerAcceptsVp8) switchVideoCodec(VideoCodec::VP8, "VP9 exception");
+            recoverForcedCodec(VideoCodec::VP9, "vp9", "VP9 exception");
             return;
         }
     }
@@ -2591,28 +2591,33 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
 
     if (m_videoCodec == VideoCodec::H264 && !m_h264Failed) {
         bool h264Scaled = false;
-        const I420Frame h264Frame = scaleI420ForH264WebRtc(frame, &h264Scaled);
+        const int h264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 1920, 0, 7680);
+        const int h264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 1080, 0, 4320);
+        const I420Frame& h264Frame = scaleI420ForWebRtc(frame, m_h264ScaleScratch, h264MaxW, h264MaxH, &h264Scaled);
+        const int h264Fps = readEnvInt("HI5_H264_ENCODER_FPS", std::min(30, std::max(1, m_fps)), 1, 60);
+        const int h264DesktopFloorKbps = h264Frame.width >= 1600 ? 8000 : (h264Frame.width >= 1200 ? 6000 : 4000);
+        const int h264Kbps = readEnvInt("HI5_H264_ENCODER_KBPS", std::max(profile.bitrateKbps, h264DesktopFloorKbps), 1000, 24000);
         const bool sizeChangedH264 = h264Frame.width != m_externalEncoderWidth || h264Frame.height != m_externalEncoderHeight;
-        const bool profileChangedH264 = profile.fps != m_externalConfiguredFps ||
-            profile.bitrateKbps != m_externalConfiguredBitrateKbps;
+        const bool profileChangedH264 = h264Fps != m_externalConfiguredFps ||
+            h264Kbps != m_externalConfiguredBitrateKbps;
 
         if (!m_h264Encoder || sizeChangedH264) {
             m_externalEncoderWidth = h264Frame.width;
             m_externalEncoderHeight = h264Frame.height;
-            m_externalConfiguredFps = profile.fps;
-            m_externalConfiguredBitrateKbps = profile.bitrateKbps;
-            m_externalProfileName = std::string("hardware-h264-experimental-") + profile.name;
+            m_externalConfiguredFps = h264Fps;
+            m_externalConfiguredBitrateKbps = h264Kbps;
+            m_externalProfileName = std::string("hardware-h264-desktop-") + profile.name;
 
             auto enc = std::make_unique<H264MfEncoder>();
             std::string h264Err;
             const bool preferHardware = (m_codecMode != "h264_sw");
-            if (!enc->init(h264Frame.width, h264Frame.height, profile.fps, profile.bitrateKbps, preferHardware, &h264Err)) {
+            if (!enc->init(h264Frame.width, h264Frame.height, h264Fps, h264Kbps, preferHardware, &h264Err)) {
                 std::cerr << "[h264] init failed session=" << m_sessionId
                     << " error=" << h264Err
                     << " note=staying on negotiated track; set HI5_CODEC=vp8 to return to VP8\n";
                 m_h264Failed = true;
                 m_h264Encoder.reset();
-                selectNextAutoCodec(VideoCodec::H264, "H.264 encoder unavailable");
+                recoverForcedCodec(VideoCodec::H264, "h264", "H.264 encoder unavailable");
                 return;
             }
             else {
@@ -2623,8 +2628,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     " source=" + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
                     " encoded_size=" + std::to_string(h264Frame.width) + "x" + std::to_string(h264Frame.height) +
                     " scaled=" + std::string(h264Scaled ? "1" : "0") +
-                    " fps=" + std::to_string(profile.fps) +
-                    " bitrate=" + std::to_string(profile.bitrateKbps) +
+                    " fps=" + std::to_string(h264Fps) +
+                    " bitrate=" + std::to_string(h264Kbps) +
                     " hw_preferred=" + std::string(preferHardware ? "1" : "0")
                 );
             }
@@ -2647,7 +2652,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                         LogInfo("[h264] hardware-preferred encode failed; retrying same frame with software H.264 session=" + m_sessionId);
                         auto swEnc = std::make_unique<H264MfEncoder>();
                         std::string swErr;
-                        if (swEnc->init(h264Frame.width, h264Frame.height, profile.fps, profile.bitrateKbps, false, &swErr)) {
+                        if (swEnc->init(h264Frame.width, h264Frame.height, h264Fps, h264Kbps, false, &swErr)) {
                             H264EncodedFrame swEncoded{};
                             if (swEnc->encode(h264Frame, true, swEncoded, &swErr)) {
                                 const std::string swName = swEnc->encoderName();
@@ -2670,7 +2675,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     if (!recoveredWithSoftware) {
                         m_h264Failed = true;
                         m_h264Encoder.reset();
-                        selectNextAutoCodec(VideoCodec::H264, "H.264 encode failed");
+                        recoverForcedCodec(VideoCodec::H264, "h264", "H.264 encode failed");
                         return;
                     }
                 }
@@ -2747,7 +2752,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     << " error=" << ex.what() << "\n";
                 m_h264Failed = true;
                 m_h264Encoder.reset();
-                selectNextAutoCodec(VideoCodec::H264, "H.264 exception");
+                recoverForcedCodec(VideoCodec::H264, "h264", "H.264 exception");
                 return;
             }
         }

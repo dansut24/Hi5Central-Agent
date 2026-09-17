@@ -6696,6 +6696,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx.lastSecureLaunchAttempt = {};
                 ctx.lastConsoleSessionPoll = std::chrono::steady_clock::now();
 
+                // Keep raw I420 buffers for the lifetime of the session frame pump.
+                // Recreating several multi-megabyte vector sets on every poll caused
+                // Windows' heap/working set to grow far beyond the live frame data.
+                I420Frame normalFrame;
+                I420Frame secureFrame;
+                uint64_t normalTs = 0;
+                uint64_t secureTs = 0;
+
                 const auto isNearBlackTransitionFrame = [](const I420Frame& frame) -> bool {
                     if (frame.y.empty()) return false;
                     const size_t step = std::max<size_t>(1, frame.y.size() / 4096);
@@ -7160,20 +7168,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         }
                     }
 
-                    I420Frame normalFrame;
-                    I420Frame secureFrame;
-                    I420Frame tmpFrame;
-                    uint64_t normalTs = 0;
-                    uint64_t secureTs = 0;
-                    uint64_t tmpTs = 0;
                     bool gotNormal = false;
                     bool gotSecure = false;
                     bool secureBecameReady = false;
                     bool secureTransitionBlank = false;
 
-                    while (ctx.normalShmem.ReadRawI420Frame(tmpFrame, tmpTs)) {
-                        normalFrame = std::move(tmpFrame);
-                        normalTs = tmpTs;
+                    // Drain directly into the persistent destination buffer. resize()
+                    // reuses vector capacity for same-size frames instead of allocating
+                    // a fresh Y/U/V set and moving it every pump iteration.
+                    while (ctx.normalShmem.ReadRawI420Frame(normalFrame, normalTs)) {
                         gotNormal = true;
                     }
                     if (gotNormal) {
@@ -7188,9 +7191,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     if (ctx.secureStreamerProcess) {
-                        while (ctx.secureShmem.ReadRawI420Frame(tmpFrame, tmpTs)) {
-                            secureFrame = std::move(tmpFrame);
-                            secureTs = tmpTs;
+                        while (ctx.secureShmem.ReadRawI420Frame(secureFrame, secureTs)) {
                             gotSecure = true;
                         }
 
@@ -7362,6 +7363,24 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 }
                                 SyncChatStateToContext(ctx);
                             }
+                        }
+                    }
+
+                    // A dev codec switch is applied at an encoder frame boundary. If
+                    // the desktop is completely static, reuse the already-retained raw frame once
+                    // so the switch completes immediately without waking RemoteHost or allocating
+                    // another I420 buffer.
+                    if (!sent && ctx.sender && ctx.sender->hasPendingDevCodecSwitch()) {
+                        const uint64_t switchTs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                        if ((ctx.activeMode == DesktopMode::Secure || useSecureFallback) && !secureFrame.y.empty()) {
+                            ctx.sender->sendExternalRawI420(secureFrame, switchTs, true);
+                            sent = true;
+                            LogI("dev codec switch reused cached secure frame session=" + ctx.sessionId);
+                        }
+                        else if (ctx.activeMode == DesktopMode::Normal && !normalFrame.y.empty()) {
+                            ctx.sender->sendExternalRawI420(normalFrame, switchTs, true);
+                            sent = true;
+                            LogI("dev codec switch reused cached normal frame session=" + ctx.sessionId);
                         }
                     }
 

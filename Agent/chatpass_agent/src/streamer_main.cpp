@@ -954,6 +954,8 @@ namespace hi5 {
         uint64_t writtenFrames = 0;
         uint64_t inputEvents = 0;
         uint64_t fastMouseApplied = 0;
+        // Reuse one capture result so its multi-megabyte I420 vectors keep their capacity.
+        FrameCaptureResult captured;
         uint64_t fastMouseLastSeq = 0;
         uint64_t cursorOnlyFrames = 0;
         bool localInputBlocked = false;
@@ -1072,7 +1074,7 @@ namespace hi5 {
             try {
                 if (now >= nextCaptureAt) {
                     ++captureAttempts;
-                    FrameCaptureResult captured = source.nextFrameEx(false);
+                    source.nextFrameExInto(captured, false);
                     const bool recentInput = (now - lastInputAt) <= activeHold;
                     const bool recentMotion = (now - lastChangedFrameAt) <= std::chrono::milliseconds(ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
                     const int targetFps = recentInput ? motionFps : (recentMotion ? activeFps : idleFps);
