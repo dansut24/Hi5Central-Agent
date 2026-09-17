@@ -2408,24 +2408,14 @@ LogI(
 
                     if (type == "backstage_start") {
                         LogI("backstage_start session=" + sessionId);
-                        if (IsSessionMode(sessionId, SessionMode::Console)) {
-                            LogW("backstage_start rejected for locked console session=" + sessionId);
-                        }
-                        else {
-                            HandleBackstageStart(sessionId);
-                        }
+                        HandleBackstageStart(sessionId);
                         FlushBridgeOutgoing();
                         return;
                     }
 
                     if (type == "backstage_stop" || type == "console_start") {
                         LogI("backstage_stop/console_start session=" + sessionId);
-                        if (IsSessionMode(sessionId, SessionMode::Backstage)) {
-                            LogW("console_start/backstage_stop rejected for locked backstage session=" + sessionId);
-                        }
-                        else {
-                            HandleBackstageStop(sessionId);
-                        }
+                        HandleBackstageStop(sessionId);
                         FlushBridgeOutgoing();
                         return;
                     }
@@ -5491,24 +5481,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 // This bypasses the control-server relay, which may not forward new message types.
                 if (kind == "backstage_start" || type == "backstage_start") {
                     LogI("backstage_start via datachannel session=" + ctx.sessionId);
-                    if (ctx.sessionMode == SessionMode::Console) {
-                        LogW("backstage_start rejected for locked console session=" + ctx.sessionId);
-                    }
-                    else {
-                        HandleBackstageStart(ctx.sessionId);
-                    }
+                    HandleBackstageStart(ctx.sessionId);
                     return;
                 }
 
                 if (kind == "backstage_stop" || kind == "console_start" ||
                     type == "backstage_stop" || type == "console_start") {
                     LogI("backstage_stop/console_start via datachannel session=" + ctx.sessionId);
-                    if (ctx.sessionMode == SessionMode::Backstage) {
-                        LogW("console_start/backstage_stop rejected for locked backstage session=" + ctx.sessionId);
-                    }
-                    else {
-                        HandleBackstageStop(ctx.sessionId);
-                    }
+                    HandleBackstageStop(ctx.sessionId);
                     return;
                 }
 
@@ -6515,15 +6495,6 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 }
             }
 
-            bool IsSessionMode(const std::string& sessionId, SessionMode expected) {
-                std::lock_guard<std::mutex> lock(sessionsMu_);
-                auto it = sessions_.find(sessionId);
-                if (it == sessions_.end()) {
-                    return false;
-                }
-                return it->second->sessionMode == expected;
-            }
-
             void HandleBackstageStart(const std::string& sessionId) {
                 std::lock_guard<std::mutex> lock(sessionsMu_);
                 auto it = sessions_.find(sessionId);
@@ -6532,13 +6503,32 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     return;
                 }
                 SessionContext& ctx = *it->second;
+                if (ctx.backstageMode && ctx.backstageHostProcess) {
+                    SendSessionState(sessionId, "backstage_ready");
+                    return;
+                }
+
+                SendSessionState(sessionId, "backstage_entering");
                 ctx.backstageMode = true;
                 StopNormalStreamer(ctx);
                 StopSecureStreamer(ctx);
                 ctx.uacRequested = false;
                 ctx.secureStateAnnounced = false;
                 ctx.handoffStateAnnounced = false;
-                LaunchBackstageHost(ctx);
+
+                if (LaunchBackstageHost(ctx)) {
+                    SendSessionState(sessionId, "backstage_ready");
+                    return;
+                }
+
+                LogE("backstage_start failed session=" + sessionId);
+                SendSessionState(sessionId, "backstage_failed");
+                if (ctx.sessionMode == SessionMode::Console) {
+                    ctx.backstageMode = false;
+                    if (LaunchNormalStreamer(ctx)) {
+                        SendSessionState(sessionId, "console_ready");
+                    }
+                }
             }
 
             void HandleBackstageStop(const std::string& sessionId) {
@@ -6551,12 +6541,26 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 SessionContext& ctx = *it->second;
                 if (ctx.sessionMode == SessionMode::Backstage) {
                     LogW("HandleBackstageStop ignored for locked backstage session=" + sessionId);
+                    SendSessionState(sessionId, "backstage_ready");
                     return;
                 }
+                if (!ctx.backstageMode && !ctx.backstageHostProcess) {
+                    SendSessionState(sessionId, "console_ready");
+                    return;
+                }
+
+                SendSessionState(sessionId, "console_entering");
                 if (ctx.backstageHostProcess) {
                     StopBackstageHost(ctx);
                 }
-                LaunchNormalStreamer(ctx);
+                ctx.backstageMode = false;
+                ctx.activeConsoleSessionId = ActiveConsoleSessionId();
+                ctx.interactiveUserReady = InteractiveUserSessionReady(ctx.activeConsoleSessionId);
+                ctx.loginDesktopMode = ctx.activeConsoleSessionId != 0xFFFFFFFF && !ctx.interactiveUserReady;
+                ctx.normalDesktopUnavailable = ctx.loginDesktopMode;
+
+                const bool launched = ctx.loginDesktopMode ? LaunchSecureStreamer(ctx) : LaunchNormalStreamer(ctx);
+                SendSessionState(sessionId, launched ? "console_ready" : "console_failed");
             }
 
             void StopSecureStreamer(SessionContext& ctx) {

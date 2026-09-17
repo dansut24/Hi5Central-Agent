@@ -76,6 +76,9 @@ let devCodecRequested = "auto";
 let lastNegotiatedCodecKey = "";
 
 let currentSession = null;
+let activeDesktopMode = "console";
+let desktopModePending = null;
+let backgroundModeLocked = false;
 let audioEnabled = false;
 let localInputBlocked = false;
 let remoteDescSet = false;
@@ -974,6 +977,41 @@ function sendInput(kind, extra = {}, force = false) {
   }
 }
 
+function normalizeDesktopMode(mode) {
+  const value = String(mode || "console").toLowerCase();
+  return (value === "backstage" || value === "background" || value === "background_mode") ? "backstage" : "console";
+}
+
+function updateDesktopModeButtons() {
+  const connected = !!currentSession;
+  const pending = !!desktopModePending;
+  const backstageActive = activeDesktopMode === "backstage";
+
+  if (elBtnBackstage) {
+    elBtnBackstage.classList.toggle("session-toggle-active", backstageActive);
+    elBtnBackstage.disabled = !connected || pending || backstageActive;
+    elBtnBackstage.title = backstageActive ? "Background Desktop active" : "Switch to Background Desktop";
+  }
+  if (elBtnConsole) {
+    elBtnConsole.classList.toggle("session-toggle-active", !backstageActive);
+    elBtnConsole.disabled = !connected || pending || !backstageActive || backgroundModeLocked;
+    elBtnConsole.title = backgroundModeLocked
+      ? "This session was launched in Background Mode"
+      : (!backstageActive ? "Console Desktop active" : "Return to Console Desktop");
+  }
+}
+
+function setDesktopModePending(mode) {
+  desktopModePending = normalizeDesktopMode(mode);
+  updateDesktopModeButtons();
+}
+
+function setActiveDesktopMode(mode) {
+  activeDesktopMode = normalizeDesktopMode(mode);
+  desktopModePending = null;
+  updateDesktopModeButtons();
+}
+
 function updateSessionToggleButtons() {
   if (elBtnAudio) {
     elBtnAudio.classList.toggle("session-toggle-active", audioEnabled);
@@ -1085,6 +1123,10 @@ window.__hi5NativeShortcut = function(action) {
 function sendBackstageMode(enabled) {
   if (!currentSession) return false;
 
+  const targetMode = enabled ? "backstage" : "console";
+  if (!enabled && backgroundModeLocked) return false;
+  if (!desktopModePending && activeDesktopMode === targetMode) return false;
+
   const type = enabled ? "backstage_start" : "backstage_stop";
   const payload = JSON.stringify({
     type,
@@ -1116,9 +1158,10 @@ function sendBackstageMode(enabled) {
 
   if (!sent) return false;
 
-  setStatus("online", enabled ? "Backstage Desktop" : "Streaming");
+  setDesktopModePending(targetMode);
+  setStatus("online", enabled ? "Background Desktop" : "Returning to Console");
   if (enabled) {
-    showOverlay("Backstage Desktop", "Starting private tools workspace…", { spinner: true, keepVideo: true, passive: true });
+    showOverlay("Background Desktop", "Starting private Windows workspace…", { spinner: true, keepVideo: true, passive: true });
   } else {
     showOverlay("Console", "Returning to interactive console…", { spinner: true, keepVideo: true, passive: true });
   }
@@ -1251,8 +1294,10 @@ function disconnect(reason, options = {}) {
   if (elBtnChat) elBtnChat.disabled = true;
   if (elBtnAudio) elBtnAudio.disabled = true;
   if (elBtnBlockInput) elBtnBlockInput.disabled = true;
-  if (elBtnBackstage) elBtnBackstage.disabled = true;
-  if (elBtnConsole) elBtnConsole.disabled = true;
+  activeDesktopMode = "console";
+  desktopModePending = null;
+  backgroundModeLocked = false;
+  updateDesktopModeButtons();
   if (elBtnStartMenu) elBtnStartMenu.disabled = true;
   if (elBtnCad) elBtnCad.disabled = true;
   if (elDeviceLabel) elDeviceLabel.textContent = "";
@@ -2436,6 +2481,42 @@ async function onSignalMessage(raw) {
     case "session_state": {
       const state = msg.state || "";
 
+      if (state === "backstage_entering") {
+        setDesktopModePending("backstage");
+        setStatus("online", "Background Desktop");
+        showOverlay("Background Desktop", "Starting private Windows workspace…", { spinner: true, keepVideo: true, passive: true });
+        break;
+      }
+
+      if (state === "backstage_ready") {
+        setActiveDesktopMode("backstage");
+        revealOnNextFrame = true;
+        setStatus("online", "Background Desktop");
+        break;
+      }
+
+      if (state === "console_entering") {
+        setDesktopModePending("console");
+        setStatus("online", "Returning to Console");
+        showOverlay("Console", "Returning to interactive console…", { spinner: true, keepVideo: true, passive: true });
+        break;
+      }
+
+      if (state === "console_ready") {
+        setActiveDesktopMode("console");
+        revealOnNextFrame = true;
+        setStatus("online", "Console Desktop");
+        break;
+      }
+
+      if (state === "backstage_failed" || state === "console_failed") {
+        desktopModePending = null;
+        updateDesktopModeButtons();
+        hideOverlay();
+        setStatus("error", state === "backstage_failed" ? "Background switch failed" : "Console switch failed");
+        break;
+      }
+
       if (state === "secure_desktop_entering") {
         secureDesktopActive = true;
         desktopHandoffActive = false;
@@ -2502,6 +2583,7 @@ function startSession(params) {
   const wssUrl = params.wss_url || params.wssUrl || params.signaling_url || params.signalingUrl || "";
   const iceServers = normalizeIceServers(params.ice_servers || params.iceServers || []);
   const viewerClient = params.viewer_client || params.viewerClient || '';
+  const launchMode = normalizeDesktopMode(params.mode || params.session_mode || params.sessionMode || "console");
 
   if (!sessionId || !deviceId || !token || !wssUrl) {
     console.error("[viewer] invalid connection parameters");
@@ -2515,8 +2597,13 @@ function startSession(params) {
     deviceId,
     wssUrl,
     iceServers,
-    viewerClient
+    viewerClient,
+    launchMode
   };
+
+  activeDesktopMode = launchMode;
+  desktopModePending = null;
+  backgroundModeLocked = launchMode === "backstage";
 
   remoteMonitors = [];
   currentMonitorIndex = 0;
@@ -2531,8 +2618,7 @@ function startSession(params) {
   if (elBtnBlockInput) elBtnBlockInput.disabled = false;
   setRemoteAudioEnabled(false);
   setLocalInputBlocked(false, false);
-  if (elBtnBackstage) elBtnBackstage.disabled = false;
-  if (elBtnConsole) elBtnConsole.disabled = false;
+  updateDesktopModeButtons();
   if (elBtnStartMenu) elBtnStartMenu.disabled = false;
   if (elBtnCad) elBtnCad.disabled = false;
   if (elDeviceLabel) elDeviceLabel.textContent = deviceId || "";
