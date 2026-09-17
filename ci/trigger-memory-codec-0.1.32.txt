@@ -1,0 +1,3 @@
+Validation trigger for 0.1.32 candidate.
+Local checkpoint: a59c38c17d0542a191ae886ffd49d439061bab6d
+Synced product source: 001e30ee44e8f092a0d3aad76272f40e5c834b00
