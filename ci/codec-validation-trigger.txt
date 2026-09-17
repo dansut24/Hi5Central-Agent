@@ -1,0 +1,4 @@
+Codec validation checkpoint
+Local source: f9f2369284c2b3710db95f4debe21f0c3e9ee99a
+GitHub source: 49418a7fd64b84c27722e41c2de3571b925ab47d
+Snapshot SHA256: 0860ea6f5ae789d8959029d9065ff135ac4808213c4e355bec88e9ba4e524182
