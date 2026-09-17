@@ -96,13 +96,17 @@ Vp9EncodedFrame Vp9VpxEncoder::encode(const I420Frame& frame, bool forceKeyframe
         throw std::runtime_error("VP9 frame size mismatch");
     }
     vpx_image_t img{};
+    // vpx_img_wrap allocates an owned full-frame backing buffer when img_data
+    // is null. We already own the I420 planes, so wrap the Y plane directly;
+    // otherwise every encoded frame leaks roughly width*height*1.5 bytes.
+    auto* yPlane = const_cast<unsigned char*>(frame.y.data());
     if (!vpx_img_wrap(&img, VPX_IMG_FMT_I420,
         static_cast<unsigned int>(frame.width),
-        static_cast<unsigned int>(frame.height), 1, nullptr)) {
+        static_cast<unsigned int>(frame.height), 1, yPlane)) {
         throw std::runtime_error("vpx_img_wrap VP9 failed");
     }
 
-    img.planes[0] = const_cast<unsigned char*>(frame.y.data());
+    img.planes[0] = yPlane;
     img.planes[1] = const_cast<unsigned char*>(frame.u.data());
     img.planes[2] = const_cast<unsigned char*>(frame.v.data());
     img.stride[0] = frame.width;
