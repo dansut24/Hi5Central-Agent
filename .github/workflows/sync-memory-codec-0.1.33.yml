@@ -1,0 +1,49 @@
+name: Sync remote memory codec 0.1.33
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - .github/workflows/sync-memory-codec-0.1.33.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent-hardening-v2
+          fetch-depth: 0
+
+      - name: Download exact source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://downloads.hi5central.com/bootstrap-agent-sync/remote-memory-codec-0.1.33-666e31a.tar.gz -o /tmp/source.tar.gz
+          echo "3a6622378399412e93d5c851c8fd43974646871ab7697ce77868e7f4dcd8f65f  /tmp/source.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/source.tar.gz -C .
+
+      - name: Commit exact candidate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            Agent/chatpass_agent/src/frame_source.h \
+            Agent/chatpass_agent/src/platform/windows/windows_screen.cpp \
+            Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
+            Agent/chatpass_agent/src/streamer_main.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.h
+          if git diff --cached --quiet; then
+            echo "Source already synchronized"
+            exit 0
+          fi
+          git commit -m "Bound remote memory and harden codec fallback"
+          git push origin HEAD:agent-hardening-v2
