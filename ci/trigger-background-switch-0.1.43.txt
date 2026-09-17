@@ -1,0 +1,7 @@
+Hi5Central Background switch validation 0.1.43
+
+VPS source commit: 03e4ceceeef78e442e7f22eadf45d3b7e46bf866
+GitHub source sync: 899e05117da9daf953b29f8aa93925880abb2ce1
+Source archive: background-switch-0.1.43-03e4cec.tar.gz
+Archive SHA256: 6938181d4b1e45f7d0a22e073c31b5109bc70c10011b94c1ccec4078eff38e54
+Purpose: restore Console <-> Background toolbar switching and explicit mode acknowledgements.
