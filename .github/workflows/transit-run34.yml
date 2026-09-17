@@ -1,4 +1,4 @@
-name: Transit run 34 installers
+name: Transit run 34 cleanup
 
 on:
   push:
@@ -8,39 +8,16 @@ on:
       - .github/workflows/transit-run34.yml
 
 permissions:
-  actions: read
   contents: write
 
 jobs:
-  transit:
+  cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Download exact run 34 artifacts
+      - name: Remove temporary prerelease and tag
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/agent /tmp/viewer /tmp/publish
-          gh run download 35207066169 -R dansut24/Hi5Central-Agent -n Hi5Central-Agent-Windows -D /tmp/agent
-          gh run download 35207066169 -R dansut24/Hi5Central-Agent -n Hi5Central-Viewer-Windows -D /tmp/viewer
-          AGENT_EXE="$(find /tmp/agent -type f -name 'Hi5CentralAgentSetup.exe' -print -quit)"
-          VIEWER_EXE="$(find /tmp/viewer -type f -name 'Hi5CentralViewerSetup.exe' -print -quit)"
-          test -n "$AGENT_EXE"
-          test -n "$VIEWER_EXE"
-          cp "$AGENT_EXE" /tmp/publish/Hi5CentralAgentSetup.exe
-          cp "$VIEWER_EXE" /tmp/publish/Hi5CentralViewerSetup.exe
-          sha256sum /tmp/publish/Hi5CentralAgentSetup.exe /tmp/publish/Hi5CentralViewerSetup.exe
-          stat -c '%n %s bytes' /tmp/publish/Hi5CentralAgentSetup.exe /tmp/publish/Hi5CentralViewerSetup.exe
-
-      - name: Create temporary prerelease
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG=transit-0.1.34-20260917
-          gh release delete "$TAG" -R dansut24/Hi5Central-Agent --cleanup-tag -y >/dev/null 2>&1 || true
-          gh release create "$TAG" -R dansut24/Hi5Central-Agent --prerelease --title "Transit 0.1.34" --notes "Temporary exact artifacts from Windows run 35207066169" \
-            /tmp/publish/Hi5CentralAgentSetup.exe \
-            /tmp/publish/Hi5CentralViewerSetup.exe
+          gh release delete transit-0.1.34-20260917 -R dansut24/Hi5Central-Agent --cleanup-tag -y
