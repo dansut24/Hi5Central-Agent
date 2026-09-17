@@ -1,0 +1,5 @@
+Hi5Central Windows validation trigger
+checkpoint: h264-async-mft
+vps-source: f65a1316a3a7db800d46ae50879690a0438b458e
+source-sync: 8be24403accf009a87b0a84543c51de1145d6104
+archive-sha256: 3893d790699c7afc58b682ffd2b832d926b109387f4786ed502ccef034dabb7c
