@@ -1,0 +1,4 @@
+Hi5Central Windows validation trigger for GPU shared-texture transport 0.1.40.
+VPS source checkpoint: 6d941e86f76d26e0a7a20169565c12cb08663fa8
+GitHub synced source: 6095c71548d371dc096b63aec6a8bc8c7d54b457
+Source archive SHA256: 2d6a91835403ec9b1e0ac5ade8410cb060cf44f918f1d799c3b7a4f14b1aea46
