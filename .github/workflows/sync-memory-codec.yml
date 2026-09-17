@@ -1,0 +1,51 @@
+name: Sync memory and codec candidate
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - .github/workflows/sync-memory-codec.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent-hardening-v2
+          fetch-depth: 0
+
+      - name: Download exact source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://downloads.hi5central.com/bootstrap-agent-sync/memory-codec-a59c38c.tar.gz -o /tmp/source.tar.gz
+          echo "4b43ed8358411586017f323eecd1a58df8f2054f7eb5a9da4803ae51ffadaf6a  /tmp/source.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/source.tar.gz -C .
+
+      - name: Commit exact candidate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            Agent/chatpass_agent/src/ipc/shmem_ring.h \
+            Agent/chatpass_agent/src/platform/windows/windows_screen.cpp \
+            Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
+            Agent/chatpass_agent/src/vp9_vpx_encoder.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.cpp \
+            Agent/chatpass_agent/src/webrtc_sender.h \
+            Viewer/chatpass_viewer/web/index.html \
+            Viewer/chatpass_viewer/web/renderer.js
+          if git diff --cached --quiet; then
+            echo "Source already synchronized"
+            exit 0
+          fi
+          git commit -m "Reduce remote session memory and add live codec switching"
+          git push origin HEAD:agent-hardening-v2
