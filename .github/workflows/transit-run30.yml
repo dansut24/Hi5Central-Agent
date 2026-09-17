@@ -24,9 +24,15 @@ jobs:
           mkdir -p /tmp/agent /tmp/viewer
           gh run download 35189607021 --repo "$GITHUB_REPOSITORY" --name "Hi5Central-Agent-Windows" --dir /tmp/agent
           gh run download 35189607021 --repo "$GITHUB_REPOSITORY" --name "Hi5Central-Viewer-Windows" --dir /tmp/viewer
-          test -f /tmp/agent/Hi5CentralAgentSetup.exe
-          test -f /tmp/viewer/Hi5CentralViewerSetup.exe
-          sha256sum /tmp/agent/Hi5CentralAgentSetup.exe /tmp/viewer/Hi5CentralViewerSetup.exe
+          find /tmp/agent -maxdepth 4 -type f -print
+          find /tmp/viewer -maxdepth 4 -type f -print
+          AGENT_EXE="$(find /tmp/agent -type f -iname '*Agent*Setup*.exe' | head -n 1)"
+          VIEWER_EXE="$(find /tmp/viewer -type f -iname '*Viewer*Setup*.exe' | head -n 1)"
+          test -n "$AGENT_EXE" && test -f "$AGENT_EXE"
+          test -n "$VIEWER_EXE" && test -f "$VIEWER_EXE"
+          cp "$AGENT_EXE" /tmp/Hi5CentralAgentSetup.exe
+          cp "$VIEWER_EXE" /tmp/Hi5CentralViewerSetup.exe
+          sha256sum /tmp/Hi5CentralAgentSetup.exe /tmp/Hi5CentralViewerSetup.exe
 
       - name: Create temporary prerelease
         env:
@@ -36,8 +42,8 @@ jobs:
           set -euo pipefail
           gh release delete transit-0.1.31-20260917 --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes >/dev/null 2>&1 || true
           gh release create transit-0.1.31-20260917 \
-            /tmp/agent/Hi5CentralAgentSetup.exe#Hi5CentralAgentSetup.exe \
-            /tmp/viewer/Hi5CentralViewerSetup.exe#Hi5CentralViewerSetup.exe \
+            /tmp/Hi5CentralAgentSetup.exe#Hi5CentralAgentSetup.exe \
+            /tmp/Hi5CentralViewerSetup.exe#Hi5CentralViewerSetup.exe \
             --repo "$GITHUB_REPOSITORY" \
             --target agent-hardening-v2 \
             --prerelease \
