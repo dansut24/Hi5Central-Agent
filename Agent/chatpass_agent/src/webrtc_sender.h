@@ -106,6 +106,8 @@ private:
     void signalLocalOfferIfReady();
     uint32_t externalRtpTimestamp(uint64_t captureTimestampNs);
     void selectAutoCodecFromAnswer(const std::string& sdp);
+    bool applyDevCodecSwitch(const std::string& requested, std::string& activeCodec, std::string& detail);
+    std::string activeVideoCodecName() const;
     bool switchVideoCodec(VideoCodec codec, const std::string& reason);
     void configureVideoMediaHandler(VideoCodec codec);
     void observeCodecHealth(double encodeAvgMs, double encodeMaxMs, double sendAvgMs);
@@ -198,6 +200,8 @@ private:
     bool m_h264Attempted = false;
     bool m_h264Failed = false;
     std::string m_codecMode = "vp8";
+    std::mutex m_codecSwitchMu;
+    std::string m_pendingDevCodecSwitch;
     InputInjector m_injector;
 
     std::thread m_streamThread;

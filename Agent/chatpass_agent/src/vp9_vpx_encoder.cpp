@@ -71,7 +71,7 @@ struct Vp9VpxEncoder::Impl {
 #ifdef VP9E_SET_TILE_COLUMNS
         // Two tile columns lets modern CPUs parallelise desktop frames without
         // forcing a high thread count on smaller endpoints.
-        vpx_codec_control(&codec, VP9E_SET_TILE_COLUMNS, width >= 1920 ? 2 : 1);
+        vpx_codec_control(&codec, VP9E_SET_TILE_COLUMNS, width >= 3840 ? 2 : (width >= 1920 ? 1 : 0));
 #endif
 #ifdef VP9E_SET_ROW_MT
         vpx_codec_control(&codec, VP9E_SET_ROW_MT, 1);

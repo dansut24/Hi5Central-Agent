@@ -213,6 +213,8 @@ namespace hi5 {
                 hdr->readIdx.load(std::memory_order_relaxed);
         }
 
+        bool IsOpen() const { return base_ != nullptr && hMap_ != nullptr; }
+
         void Close() {
             if (base_) {
                 UnmapViewOfFile(base_);

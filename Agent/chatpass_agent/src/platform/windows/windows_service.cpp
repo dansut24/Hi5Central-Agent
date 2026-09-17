@@ -6244,6 +6244,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 const std::string exePath = RemoteHostExePath();
 
+                if (!ctx.secureShmem.IsOpen()) {
+                    if (!ctx.secureShmem.CreateProducer(ctx.secureShmemName)) {
+                        LogE("create secure shmem FAILED session=" + ctx.sessionId +
+                            " err=" + std::to_string(GetLastError()));
+                        return false;
+                    }
+                    LogI("secure shmem allocated on demand session=" + ctx.sessionId);
+                }
+
                 ResetEvent(ctx.secureStopEvent);
 
                 std::string cmdLine =
@@ -6265,6 +6274,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 if (!ctx.secureStreamerProcess) {
                     LogE("launch secure streamer FAILED session=" + ctx.sessionId);
                     ctx.secureLaunchInProgress = false;
+                    ctx.secureShmem.Close();
                     return false;
                 }
 
@@ -6406,6 +6416,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx.secureRetiring = false;
                 ctx.secureReady = false;
                 ctx.secureLaunchInProgress = false;
+                ctx.secureShmem.Close();
             }
 
             void StopNormalStreamer(SessionContext& ctx) {
@@ -6503,12 +6514,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     return;
                 }
 
-                if (!ctx->secureShmem.CreateProducer(ctx->secureShmemName)) {
-                    LogE("create secure shmem FAILED session=" + sessionId +
-                        " err=" + std::to_string(GetLastError()));
-                    ctx->normalShmem.Close();
-                    return;
-                }
+                // Secure-desktop frame memory is allocated lazily only when a
+                // fallback secure helper is actually needed. Most sessions never
+                // need it, so avoid carrying another 32 MB mapping for the entire
+                // session.
 
                 if (!ctx->normalInputPipe.Create(ctx->normalInputPipeName)) {
                     LogW("create normal input pipe FAILED session=" + sessionId +
@@ -7068,6 +7077,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ctx.secureRetiring = false;
                             ctx.secureReady = false;
                             ctx.secureLaunchInProgress = false;
+                            ctx.secureShmem.Close();
                         }
                     }
 

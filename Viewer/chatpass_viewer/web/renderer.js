@@ -43,6 +43,7 @@ const elStatRes      = document.getElementById("stat-res");
 const elStatState    = document.getElementById("stat-state");
 const elStatCodec    = document.getElementById("stat-codec");
 const elCodecDevBadge = document.getElementById("codec-dev-badge");
+const elCodecDevSelect = document.getElementById("codec-dev-select");
 const elDiagIceState = document.getElementById("diag-ice-state");
 const elDiagConnState = document.getElementById("diag-connection-state");
 const elDiagCandidatePair = document.getElementById("diag-candidate-pair");
@@ -67,8 +68,12 @@ if (elVideo) {
 let ws = null;
 let pc = null;
 let inputDc = null;
+let controlDc = null;
 let mouseMoveDc = null;
 let mouseMoveSeq = 0;
+let devCodecSwitchTimer = null;
+let devCodecRequested = "auto";
+let lastNegotiatedCodecKey = "";
 
 let currentSession = null;
 let audioEnabled = false;
@@ -1206,11 +1211,24 @@ function disconnect(reason, options = {}) {
     try { inputDc.close(); } catch {}
     inputDc = null;
   }
+  if (controlDc) {
+    try { controlDc.close(); } catch {}
+    controlDc = null;
+  }
   if (mouseMoveDc) {
     try { mouseMoveDc.close(); } catch {}
     mouseMoveDc = null;
   }
   mouseMoveSeq = 0;
+  if (devCodecSwitchTimer) clearTimeout(devCodecSwitchTimer);
+  devCodecSwitchTimer = null;
+  devCodecRequested = "auto";
+  lastNegotiatedCodecKey = "";
+  if (elCodecDevSelect) {
+    elCodecDevSelect.value = "auto";
+    elCodecDevSelect.disabled = true;
+    elCodecDevSelect.title = "Development codec override";
+  }
 
   if (pc) {
     try { pc.close(); } catch {}
@@ -1874,9 +1892,21 @@ function logSdpCodecSummary(label, sdp) {
   return codecs;
 }
 
+function codecKeyFromLabel(value) {
+  const text = String(value || "").toLowerCase();
+  if (text.includes("av1")) return "av1";
+  if (text.includes("vp9")) return "vp9";
+  if (text.includes("vp8")) return "vp8";
+  if (text.includes("h.265") || text.includes("h265") || text.includes("hevc")) return "h265";
+  if (text.includes("h.264") || text.includes("h264") || text.includes("avc")) return "h264";
+  return "";
+}
+
 function setViewerCodecLabel(value) {
   const detail = String(value || "—").trim() || "—";
   if (elStatCodec) elStatCodec.textContent = detail;
+  const key = codecKeyFromLabel(detail);
+  if (key) lastNegotiatedCodecKey = key;
   if (elCodecDevBadge) {
     let codec = detail === "—" ? "—" : detail.split(/\s+/)[0].toUpperCase();
     if (codec === "H264") codec = "H.264";
@@ -1886,6 +1916,102 @@ function setViewerCodecLabel(value) {
       ? "Negotiated remote video codec"
       : `Negotiated remote video codec: ${detail}`;
   }
+
+  if (devCodecRequested !== "auto" && key === devCodecRequested && devCodecSwitchTimer) {
+    clearTimeout(devCodecSwitchTimer);
+    devCodecSwitchTimer = null;
+    if (elCodecDevSelect) {
+      elCodecDevSelect.disabled = false;
+      elCodecDevSelect.title = `Development codec override · active ${detail}`;
+    }
+  }
+}
+
+function handleDevCodecSwitchResult(msg) {
+  const status = String(msg?.status || "");
+  const requested = String(msg?.requested || devCodecRequested || "auto").toLowerCase();
+  const detail = String(msg?.detail || "");
+
+  if (status === "queued") {
+    if (elCodecDevSelect) elCodecDevSelect.title = detail || `Switching to ${requested}…`;
+    return;
+  }
+
+  if (status === "failed") {
+    if (devCodecSwitchTimer) clearTimeout(devCodecSwitchTimer);
+    devCodecSwitchTimer = null;
+    if (elCodecDevSelect) {
+      elCodecDevSelect.disabled = false;
+      const activeKey = codecKeyFromLabel(msg?.active || "");
+      if (activeKey) elCodecDevSelect.value = activeKey;
+      elCodecDevSelect.title = `Codec switch failed: ${detail || "unsupported codec"}`;
+    }
+    if (elCodecDevBadge) elCodecDevBadge.title = `Codec switch failed: ${detail || "unsupported codec"}`;
+    console.warn("[codec] dev switch failed", msg);
+    return;
+  }
+
+  if (status === "accepted") {
+    if (elCodecDevSelect) elCodecDevSelect.title = detail || `Switch accepted: ${requested}`;
+    if (requested === "auto" || lastNegotiatedCodecKey === requested) {
+      if (devCodecSwitchTimer) clearTimeout(devCodecSwitchTimer);
+      devCodecSwitchTimer = null;
+      if (elCodecDevSelect) elCodecDevSelect.disabled = false;
+    }
+    setTimeout(updateSelectedCodecFromStats, 250);
+    setTimeout(updateSelectedCodecFromStats, 1000);
+  }
+}
+
+function handleAgentControlData(raw) {
+  if (typeof raw !== "string") return;
+  try {
+    const msg = JSON.parse(raw);
+    if (msg?.type === "dev_codec_switch_result") handleDevCodecSwitchResult(msg);
+  } catch {}
+}
+
+function sendDevCodecSwitch(requested) {
+  const codec = String(requested || "auto").toLowerCase();
+  const channel = controlDc && controlDc.readyState === "open"
+    ? controlDc
+    : (inputDc && inputDc.readyState === "open" ? inputDc : null);
+  if (!currentSession || !channel) {
+    if (elCodecDevSelect) {
+      elCodecDevSelect.disabled = false;
+      elCodecDevSelect.title = "Codec control channel is not open yet";
+    }
+    return false;
+  }
+
+  devCodecRequested = codec;
+  if (elCodecDevSelect) {
+    elCodecDevSelect.disabled = true;
+    elCodecDevSelect.title = `Switching to ${codec === "auto" ? "Auto" : codec.toUpperCase()}…`;
+  }
+  try {
+    channel.send(JSON.stringify({ kind: "dev_codec_switch", codec }));
+  } catch (e) {
+    if (elCodecDevSelect) {
+      elCodecDevSelect.disabled = false;
+      elCodecDevSelect.title = `Codec switch send failed: ${e?.message || e}`;
+    }
+    return false;
+  }
+
+  if (devCodecSwitchTimer) clearTimeout(devCodecSwitchTimer);
+  devCodecSwitchTimer = setTimeout(() => {
+    devCodecSwitchTimer = null;
+    if (elCodecDevSelect) {
+      elCodecDevSelect.disabled = false;
+      if (codec !== "auto" && lastNegotiatedCodecKey !== codec) {
+        elCodecDevSelect.title = `No ${codec.toUpperCase()} video arrived within 5 seconds`;
+        if (elCodecDevBadge) elCodecDevBadge.title = `Dev test warning: no ${codec.toUpperCase()} video arrived after the switch`;
+        console.warn("[codec] dev switch watchdog expired", { requested: codec, active: lastNegotiatedCodecKey });
+      }
+    }
+  }, 5000);
+  return true;
 }
 
 async function updateSelectedCodecFromStats() {
@@ -1964,14 +2090,26 @@ async function handleOffer(msg) {
   pc.ondatachannel = (ev) => {
     if (!ev.channel) return;
 
-    if (ev.channel.label === "input") {
-      inputDc = ev.channel;
+    if (ev.channel.label === "input" || ev.channel.label === "input-control") {
+      const channel = ev.channel;
+      if (channel.label === "input") inputDc = channel;
+      else controlDc = channel;
 
-      inputDc.onopen = () => {};
-      inputDc.onclose = () => {
-        inputDc = null;
+      channel.onopen = () => {
+        if (elCodecDevSelect) {
+          elCodecDevSelect.disabled = false;
+          elCodecDevSelect.title = "Development codec override · switches live without reconnecting";
+        }
       };
-      inputDc.onerror = () => {};
+      channel.onmessage = (messageEvent) => handleAgentControlData(messageEvent.data);
+      channel.onclose = () => {
+        if (channel.label === "input") inputDc = null;
+        else controlDc = null;
+        if (elCodecDevSelect && !(inputDc?.readyState === "open") && !(controlDc?.readyState === "open")) {
+          elCodecDevSelect.disabled = true;
+        }
+      };
+      channel.onerror = () => {};
     }
   };
 
@@ -2438,6 +2576,11 @@ if (elBtnStartMenu) {
 }
 if (elBtnCad) {
   elBtnCad.addEventListener("click", () => sendShortcut("ctrl_alt_del"));
+}
+if (elCodecDevSelect) {
+  elCodecDevSelect.addEventListener("change", () => {
+    sendDevCodecSwitch(elCodecDevSelect.value || "auto");
+  });
 }
 
 /* -----------------------------------------

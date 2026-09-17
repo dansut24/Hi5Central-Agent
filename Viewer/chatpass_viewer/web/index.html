@@ -122,6 +122,20 @@
       flex: 0 0 auto;
     }
 
+    #codec-dev-select {
+      height: 22px;
+      min-width: 76px;
+      padding: 0 6px;
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--text);
+      font-size: 10px;
+      font-weight: 700;
+      outline: none;
+    }
+    #codec-dev-select:disabled { opacity: 0.55; cursor: not-allowed; }
+
     #device-label {
       font-size: 12px;
       color: var(--muted);
@@ -551,6 +565,14 @@
         <div id="status-dot"></div>
         <div id="status-label">Waiting for connection…</div>
         <div id="codec-dev-badge" title="Negotiated remote video codec">Codec: —</div>
+        <select id="codec-dev-select" title="Development codec override" disabled>
+          <option value="auto">Auto</option>
+          <option value="vp8">VP8</option>
+          <option value="vp9">VP9</option>
+          <option value="av1">AV1</option>
+          <option value="h264">H.264</option>
+          <option value="h265">H.265 / HEVC</option>
+        </select>
       </div>
     </div>
   </div>

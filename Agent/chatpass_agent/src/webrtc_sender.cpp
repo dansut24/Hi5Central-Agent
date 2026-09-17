@@ -486,8 +486,6 @@ uint32_t WebRtcSender::externalRtpTimestamp(uint64_t captureTimestampNs) {
 }
 
 void WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
-    if (!m_autoCodec) return;
-
     std::string upper = sdp;
     std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
         return static_cast<char>(std::toupper(c));
@@ -505,6 +503,8 @@ void WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
         " h265=" + std::string(m_peerAcceptsH265 ? "1" : "0") +
         " h264=" + std::string(m_peerAcceptsH264 ? "1" : "0") +
         " vp8=" + std::string(m_peerAcceptsVp8 ? "1" : "0"));
+
+    if (!m_autoCodec) return;
 
     const std::string quality = imageQualityMode();
     if (quality == "lossless" && m_peerAcceptsVp9) {
@@ -539,6 +539,84 @@ void WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
     else {
         LogInfo("[codec] adaptive offer answer exposed no recognised usable video payload; keeping current codec session=" + m_sessionId);
     }
+}
+
+std::string WebRtcSender::activeVideoCodecName() const {
+    if (m_videoCodec == VideoCodec::AV1) return "AV1";
+    if (m_videoCodec == VideoCodec::VP9) return "VP9";
+    if (m_videoCodec == VideoCodec::H265) return "H.265";
+    if (m_videoCodec == VideoCodec::H264) return "H.264";
+    return "VP8";
+}
+
+bool WebRtcSender::applyDevCodecSwitch(const std::string& requestedRaw, std::string& activeCodec, std::string& detail) {
+    std::string requested = requestedRaw;
+    std::transform(requested.begin(), requested.end(), requested.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+        });
+    requested.erase(std::remove(requested.begin(), requested.end(), '.'), requested.end());
+    if (requested == "hevc") requested = "h265";
+
+    auto reject = [&](const std::string& why) {
+        activeCodec = activeVideoCodecName();
+        detail = why;
+        return false;
+        };
+    auto choose = [&](VideoCodec codec, const std::string& mode, const std::string& why) {
+        m_codecMode = mode;
+        const bool ok = switchVideoCodec(codec, why);
+        activeCodec = activeVideoCodecName();
+        detail = ok ? "Switch accepted; waiting for the first encoded frame" : "Codec switch was rejected";
+        return ok;
+        };
+
+    if (requested == "auto") {
+        m_autoCodec = true;
+        const std::string quality = imageQualityMode();
+        if (quality == "lossless" && m_peerAcceptsVp9 && !m_vp9Failed)
+            return choose(VideoCodec::VP9, "vp9_sw", "dev selector: Auto lossless -> VP9 software");
+        if (m_peerAcceptsAv1 && m_hwAv1Available && !m_av1Failed)
+            return choose(VideoCodec::AV1, "auto", "dev selector: Auto -> hardware AV1");
+        if (m_peerAcceptsVp9 && m_hwVp9Available && !m_vp9Failed)
+            return choose(VideoCodec::VP9, "auto", "dev selector: Auto -> hardware VP9");
+        if (m_peerAcceptsH265 && m_hwH265Available && !m_h265Failed)
+            return choose(VideoCodec::H265, "auto", "dev selector: Auto -> hardware H.265");
+        if (m_peerAcceptsH264 && m_hwH264Available && !m_h264Failed)
+            return choose(VideoCodec::H264, "auto", "dev selector: Auto -> hardware H.264");
+        if (m_peerAcceptsVp9 && m_swVp9Allowed && !m_vp9Failed)
+            return choose(VideoCodec::VP9, "vp9_sw", "dev selector: Auto -> software VP9");
+        if (m_peerAcceptsVp8)
+            return choose(VideoCodec::VP8, "vp8", "dev selector: Auto -> VP8 fallback");
+        return reject("No mutually negotiated Auto codec is currently healthy");
+    }
+
+    m_autoCodec = false;
+    if (requested == "vp8") {
+        if (!m_peerAcceptsVp8) return reject("Viewer did not negotiate VP8 for this session");
+        return choose(VideoCodec::VP8, "vp8", "dev selector forced VP8");
+    }
+    if (requested == "vp9") {
+        if (!m_peerAcceptsVp9) return reject("Viewer did not negotiate VP9 for this session");
+        m_vp9Failed = false;
+        return choose(VideoCodec::VP9, "vp9", "dev selector forced VP9");
+    }
+    if (requested == "av1") {
+        if (!m_peerAcceptsAv1) return reject("Viewer did not negotiate AV1 for this session");
+        m_av1Failed = false;
+        return choose(VideoCodec::AV1, "av1", "dev selector forced AV1");
+    }
+    if (requested == "h264") {
+        if (!m_peerAcceptsH264) return reject("Viewer did not negotiate H.264 for this session");
+        m_h264Failed = false;
+        m_h264Attempted = false;
+        return choose(VideoCodec::H264, "h264", "dev selector forced H.264");
+    }
+    if (requested == "h265") {
+        if (!m_peerAcceptsH265) return reject("Viewer did not negotiate H.265/HEVC for this session");
+        m_h265Failed = false;
+        return choose(VideoCodec::H265, "h265", "dev selector forced H.265");
+    }
+    return reject("Unknown codec request: " + requestedRaw);
 }
 
 bool WebRtcSender::switchVideoCodec(VideoCodec codec, const std::string& reason) {
@@ -867,7 +945,8 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
         std::cout << "[dc] " << label << " closed session=" << m_sessionId << "\n";
         });
 
-    dc->onMessage([this, label](rtc::message_variant data) {
+    const std::weak_ptr<rtc::DataChannel> weakDc = dc;
+    dc->onMessage([this, label, weakDc](rtc::message_variant data) {
         try {
             if (const auto* b = std::get_if<rtc::binary>(&data)) {
                 if (handleBinaryMousePacket(*b, label)) {
@@ -885,6 +964,29 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         m_viewerJitterMs = msg.value("jitter_ms", 0.0);
                         m_viewerJitterBufferMs = msg.value("jitter_buffer_ms", 0.0);
                         m_viewerBitrateKbps = msg.value("bitrate_kbps", 0.0);
+                        return;
+                    }
+
+                    if (kind == "dev_codec_switch") {
+                        const std::string requested = msg.value("codec", std::string());
+                        {
+                            std::lock_guard<std::mutex> lock(m_codecSwitchMu);
+                            m_pendingDevCodecSwitch = requested;
+                        }
+                        if (auto replyDc = weakDc.lock()) {
+                            try {
+                                replyDc->send(json{
+                                    {"type", "dev_codec_switch_result"},
+                                    {"status", "queued"},
+                                    {"requested", requested},
+                                    {"active", activeVideoCodecName()},
+                                    {"detail", "Codec switch queued for the next video frame boundary"}
+                                }.dump());
+                            }
+                            catch (...) {
+                            }
+                        }
+                        LogInfo("[codec] dev switch queued session=" + m_sessionId + " requested=" + requested);
                         return;
                     }
 
@@ -2006,6 +2108,25 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
 
     std::lock_guard<std::mutex> encodeLock(m_externalEncodeMu);
 
+    std::string devCodecRequest;
+    {
+        std::lock_guard<std::mutex> lock(m_codecSwitchMu);
+        devCodecRequest.swap(m_pendingDevCodecSwitch);
+    }
+    if (!devCodecRequest.empty()) {
+        std::string activeCodec;
+        std::string detail;
+        const bool switched = applyDevCodecSwitch(devCodecRequest, activeCodec, detail);
+        sendControlMessage(json{
+            {"type", "dev_codec_switch_result"},
+            {"status", switched ? "accepted" : "failed"},
+            {"requested", devCodecRequest},
+            {"active", activeCodec},
+            {"detail", detail}
+        });
+        if (switched) forceKeyframe = true;
+    }
+
     const uint32_t captureRtpTimestamp = externalRtpTimestamp(captureTimestampNs);
     const auto nowForProfile = std::chrono::steady_clock::now();
     if (m_externalLastFrameAt.time_since_epoch().count() != 0) {
@@ -2335,7 +2456,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     readEnvInt("HI5_VP9_CPUUSED", 8, 0, 9),
                     readEnvInt("HI5_VP9_MIN_Q", vp9DefaultMinQ, 0, 63),
                     readEnvInt("HI5_VP9_MAX_Q", vp9DefaultMaxQ, 0, 63),
-                    readEnvInt("HI5_VP9_THREADS", 4, 1, 8));
+                    readEnvInt("HI5_VP9_THREADS", vp9Frame.width >= 3840 ? 4 : 2, 1, 8));
                 m_externalProfileName = "libvpx-vp9-interaction-ready";
                 m_codecMode = "vp9_sw";
                 m_vp9Failed = false;
