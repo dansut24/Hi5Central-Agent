@@ -1,0 +1,32 @@
+name: Sync H264 async output 0.1.43
+
+on:
+  push:
+    branches: [agent-hardening-v2]
+    paths:
+      - ".github/workflows/sync-h264-async-output-0.1.43.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply verified VPS source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -q -O /tmp/source.tar.gz https://downloads.hi5central.com/bootstrap-agent-sync/h264-async-output-0.1.43-da14f57.tar.gz
+          echo "839248f6655ec5e8e75890fe80448062268f8ac1b61c872fa316d5bee5c454d5  /tmp/source.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/source.tar.gz
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Agent/chatpass_agent/src/h264_mf_encoder.cpp
+          if git diff --cached --quiet; then
+            echo "No source changes to sync"
+            exit 0
+          fi
+          git commit -m "Treat async H264 E_UNEXPECTED as output pending [skip ci]"
+          git push origin HEAD:agent-hardening-v2
