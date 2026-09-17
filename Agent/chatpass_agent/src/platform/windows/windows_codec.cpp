@@ -152,6 +152,31 @@ static std::string NormalizeMode(std::string mode) {
 
 } // namespace
 
+bool ProbeHardwareCodecAvailable(const std::string& codecRaw, std::string* encoderName) {
+    std::string codec = NormalizeMode(codecRaw);
+    GUID subtype{};
+    if (codec == "av1") subtype = MakeMfVideoSubtype(FourCC('A','V','0','1'));
+    else if (codec == "vp9") subtype = MakeMfVideoSubtype(FourCC('V','P','9','0'));
+    else if (codec == "h265" || codec == "hevc") subtype = MakeMfVideoSubtype(FourCC('H','E','V','C'));
+    else if (codec == "h264") subtype = MakeMfVideoSubtype(FourCC('H','2','6','4'));
+    else return false;
+
+    HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool coInit = SUCCEEDED(coHr);
+    HRESULT mfHr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    if (FAILED(mfHr)) {
+        if (coInit) CoUninitialize();
+        return false;
+    }
+
+    const auto names = EnumerateEncoderNames(subtype, true);
+    MFShutdown();
+    if (coInit) CoUninitialize();
+    if (names.empty()) return false;
+    if (encoderName) *encoderName = names.front();
+    return true;
+}
+
 CodecSelectionResult ProbeCodecCapabilitiesAndSelect(const std::string& requestedModeRaw) {
     CodecSelectionResult result{};
     result.requestedMode = NormalizeMode(requestedModeRaw);

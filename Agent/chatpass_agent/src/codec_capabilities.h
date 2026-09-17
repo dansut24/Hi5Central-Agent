@@ -28,6 +28,18 @@ struct CodecSelectionResult {
 // endpoint capability with the Viewer SDP answer and live encode-health telemetry.
 CodecSelectionResult ProbeCodecCapabilitiesAndSelect(const std::string& requestedMode);
 
+// Lightweight one-codec hardware probe used by adaptive Auto after Viewer SDP
+// negotiation. Unlike the full diagnostics probe, this does not enumerate
+// unrelated codecs or software MFTs.
+#ifdef _WIN32
+bool ProbeHardwareCodecAvailable(const std::string& codec, std::string* encoderName = nullptr);
+#else
+inline bool ProbeHardwareCodecAvailable(const std::string&, std::string* encoderName = nullptr) {
+    if (encoderName) encoderName->clear();
+    return false;
+}
+#endif
+
 std::string CodecCapabilitiesToLogString(const CodecSelectionResult& result);
 
 } // namespace hi5

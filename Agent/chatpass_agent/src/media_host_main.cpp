@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -53,6 +54,21 @@ bool OpenConsumerWithRetry(ShmemRing& ring, const std::string& name) {
     return false;
 }
 
+void LogMediaMemory(const std::string& sessionId, const char* stage) {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+        return;
+    }
+    constexpr double kMb = 1024.0 * 1024.0;
+    LogInfo("[media-memory] session=" + sessionId +
+        " stage=" + std::string(stage) +
+        " working_set_mb=" + std::to_string(static_cast<double>(pmc.WorkingSetSize) / kMb) +
+        " private_mb=" + std::to_string(static_cast<double>(pmc.PrivateUsage) / kMb) +
+        " peak_ws_mb=" + std::to_string(static_cast<double>(pmc.PeakWorkingSetSize) / kMb));
+}
+
 } // namespace
 
 int RunMediaHostMain(int argc, char** argv) {
@@ -75,6 +91,7 @@ int RunMediaHostMain(int argc, char** argv) {
         return 2;
     }
 
+    LogMediaMemory(sessionId, "process-start");
     rtc::InitLogger(rtc::LogLevel::Info);
 
     ShmemRing frameRing;
@@ -134,6 +151,8 @@ int RunMediaHostMain(int argc, char** argv) {
         return 5;
     }
 
+    LogMediaMemory(sessionId, "ipc-ready");
+
     WebRtcSender sender(
         sessionId,
         iceServers,
@@ -147,6 +166,8 @@ int RunMediaHostMain(int argc, char** argv) {
         WebRtcSender::Mode::ExternalFeed,
         codecMode,
         enableAudio);
+
+    LogMediaMemory(sessionId, "sender-constructed");
 
     sender.setInputEventHandler([&](const json& input) {
         sendEvent(json{ {"type", "input_event"}, {"payload", input} });
@@ -174,6 +195,8 @@ int RunMediaHostMain(int argc, char** argv) {
         " audio=" + std::string(enableAudio ? "1" : "0"));
 
     bool senderStarted = false;
+    bool firstFrameLogged = false;
+    auto nextMemoryLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     I420Frame frame;
     uint64_t frameTsNs = 0;
     while (!closed.load(std::memory_order_acquire) &&
@@ -182,6 +205,7 @@ int RunMediaHostMain(int argc, char** argv) {
             sender.start();
             senderStarted = true;
             LogInfo("[media-host] WebRTC started session=" + sessionId);
+            LogMediaMemory(sessionId, "sender-started");
         }
         if (!senderStarted) {
             Sleep(2);
@@ -200,9 +224,19 @@ int RunMediaHostMain(int argc, char** argv) {
 
         if (gotFrame) {
             sender.sendExternalRawI420(frame, frameTsNs, forceKeyframe);
+            if (!firstFrameLogged) {
+                firstFrameLogged = true;
+                LogMediaMemory(sessionId, "first-frame");
+            }
         }
         else {
             Sleep(2);
+        }
+
+        const auto memoryNow = std::chrono::steady_clock::now();
+        if (memoryNow >= nextMemoryLog) {
+            LogMediaMemory(sessionId, "steady");
+            nextMemoryLog = memoryNow + std::chrono::seconds(5);
         }
     }
     senderPtr.store(nullptr, std::memory_order_release);

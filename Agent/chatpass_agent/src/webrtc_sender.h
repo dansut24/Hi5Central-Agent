@@ -107,6 +107,7 @@ private:
     void signalLocalOfferIfReady();
     uint32_t externalRtpTimestamp(uint64_t captureTimestampNs);
     void selectAutoCodecFromAnswer(const std::string& sdp);
+    bool selectBestAutoCodec(const std::string& reasonPrefix);
     bool applyDevCodecSwitch(const std::string& requested, std::string& activeCodec, std::string& detail);
     std::string activeVideoCodecName() const;
     bool switchVideoCodec(VideoCodec codec, const std::string& reason);
@@ -193,11 +194,15 @@ private:
     bool m_peerAcceptsAv1 = false;
     bool m_peerAcceptsH265 = false;
     bool m_hwAv1Available = false;
+    bool m_hwAv1ProbeDone = false;
     bool m_swAv1Available = false;
     bool m_hwVp9Available = false;
+    bool m_hwVp9ProbeDone = false;
     bool m_hwH265Available = false;
+    bool m_hwH265ProbeDone = false;
     bool m_swH265Available = false;
     bool m_hwH264Available = false;
+    bool m_hwH264ProbeDone = false;
     bool m_swVp9Allowed = false;
     int m_codecUnhealthyWindows = 0;
     int m_av1EmptyOutputFrames = 0;
@@ -245,6 +250,7 @@ private:
     std::atomic<int> m_externalHintMode{ 0 };       // 0=idle, 1=active, 2=motion
     std::atomic<int> m_externalHintFps{ 0 };
     std::atomic<int> m_externalLastNonIdleMode{ 2 };
+    std::atomic<int64_t> m_externalInputWakeUntilMs{ 0 };
     std::atomic<bool> m_externalHintBackstage{ false };
     std::atomic<bool> m_externalHintSecure{ false };
     std::atomic<double> m_viewerRttMs{ 0.0 };

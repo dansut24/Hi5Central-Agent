@@ -1334,15 +1334,15 @@ namespace hi5 {
         }
 
         static void CleanupOrphanStreamerProcesses(const std::string& sessionId = std::string()) {
-            // Last-resort cleanup for session-scoped RemoteHost processes. Capture workers use
-            // --mode streamer and the WebRTC/encoder worker uses --mode media-host. If the viewer
-            // closes without a clean control-server stop message, neither worker may outlive the
-            // session. This cleanup intentionally targets only those helper modes, never --service.
+            // Last-resort cleanup for session-scoped helpers. Capture workers remain
+            // Hi5CentralRemoteHost.exe --mode streamer; WebRTC/codecs/audio now live in the
+            // dedicated Hi5CentralMediaHost.exe. Neither process may outlive its session.
             std::wstring ps =
                 L"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \""
                 L"$ErrorActionPreference='SilentlyContinue'; "
                 L"$procs = Get-CimInstance Win32_Process | "
-                L"Where-Object { ($_.Name -eq 'Hi5CentralRemoteHost.exe' -or $_.Name -eq 'Hi5CentralAgentService.exe' -or $_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+(streamer|media-host)|--mode=(streamer|media-host)' }; ";
+                L"Where-Object { $_.Name -eq 'Hi5CentralMediaHost.exe' -or "
+                L"(($_.Name -eq 'Hi5CentralRemoteHost.exe' -or $_.Name -eq 'Hi5CentralAgentService.exe' -or $_.Name -eq 'Hi5CentralAgent.exe' -or $_.Name -eq 'native_vp8_stream.exe') -and $_.CommandLine -match '--mode\\\\s+streamer|--mode=streamer') }; ";
 
             if (!sessionId.empty()) {
                 const std::wstring wsid = ToWidePath(EscapePowerShellSingleQuoted(sessionId));
@@ -1477,6 +1477,10 @@ namespace hi5 {
 
         static std::string RemoteHostExePath() {
             return SiblingExecutablePath("Hi5CentralRemoteHost.exe");
+        }
+
+        static std::string MediaHostExePath() {
+            return SiblingExecutablePath("Hi5CentralMediaHost.exe");
         }
 
         static HANDLE LaunchServiceChildProcess(const std::string& exePath, const std::string& args) {
@@ -6291,10 +6295,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 const std::vector<std::string>& iceServers,
                 int width, int height, int fps, int bitrateKbps,
                 const std::string& codecMode, bool enableAudio) {
-                const std::string exePath = RemoteHostExePath();
+                const std::string exePath = MediaHostExePath();
                 std::string cmdLine =
-                    "--mode media-host"
-                    " --session " + QuoteArg(ctx.sessionId) +
+                    "--session " + QuoteArg(ctx.sessionId) +
                     " --shmem " + QuoteArg(ctx.mediaShmemName) +
                     " --control-pipe " + QuoteArg(ctx.mediaControlPipeName) +
                     " --event-pipe " + QuoteArg(ctx.mediaEventPipeName) +
@@ -7635,7 +7638,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                     if (now >= nextMemoryDiagnostics) {
                         LogProcessMemorySnapshot(ctx.sessionId, "agent-service", GetCurrentProcess());
-                        if (ctx.mediaHostProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-media", ctx.mediaHostProcess);
+                        if (ctx.mediaHostProcess) LogProcessMemorySnapshot(ctx.sessionId, "media-host", ctx.mediaHostProcess);
                         if (ctx.normalStreamerProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-normal", ctx.normalStreamerProcess);
                         if (ctx.secureStreamerProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-secure", ctx.secureStreamerProcess);
                         if (ctx.backstageHostProcess) LogProcessMemorySnapshot(ctx.sessionId, "remote-host-backstage", ctx.backstageHostProcess);

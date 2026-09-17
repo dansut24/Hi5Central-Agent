@@ -94,6 +94,41 @@ namespace {
         return value;
     }
 
+    static int64_t steadyNowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    static bool autoSoftwareVp9Allowed(std::string* reason = nullptr) {
+#ifdef _WIN32
+        const DWORD cores = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        MEMORYSTATUSEX mem{};
+        mem.dwLength = sizeof(mem);
+        const bool haveMem = GlobalMemoryStatusEx(&mem) != FALSE;
+        const int minCores = readEnvInt("HI5_AUTO_VP9_MIN_CORES", 8, 2, 64);
+        const int maxLoad = readEnvInt("HI5_AUTO_VP9_MAX_MEMORY_LOAD", 80, 40, 98);
+        const int minAvailMb = readEnvInt("HI5_AUTO_VP9_MIN_AVAILABLE_MB", 2048, 512, 32768);
+        const int minTotalMb = readEnvInt("HI5_AUTO_VP9_MIN_TOTAL_MB", 8192, 2048, 131072);
+        const uint64_t availMb = haveMem ? mem.ullAvailPhys / (1024ull * 1024ull) : 0;
+        const uint64_t totalMb = haveMem ? mem.ullTotalPhys / (1024ull * 1024ull) : 0;
+        const int load = haveMem ? static_cast<int>(mem.dwMemoryLoad) : 100;
+        const bool allowed = cores >= static_cast<DWORD>(minCores) && haveMem &&
+            load <= maxLoad && availMb >= static_cast<uint64_t>(minAvailMb) &&
+            totalMb >= static_cast<uint64_t>(minTotalMb);
+        if (reason) {
+            *reason = "cores=" + std::to_string(cores) +
+                " memory_load=" + std::to_string(load) +
+                " avail_mb=" + std::to_string(availMb) +
+                " total_mb=" + std::to_string(totalMb) +
+                " allowed=" + std::string(allowed ? "1" : "0");
+        }
+        return allowed;
+#else
+        if (reason) *reason = "non-windows software VP9 allowed";
+        return true;
+#endif
+    }
+
     static std::string imageQualityMode() {
         std::string value = readEnvString("HI5_IMAGE_QUALITY", "balanced");
         if (value == "near-lossless" || value == "near_lossless") value = "near_lossless";
@@ -322,36 +357,19 @@ WebRtcSender::WebRtcSender(std::string sessionId,
 
     LogInfo("[codec] WebRtcSender codec mode=" + m_codecMode);
 
-    // Cache real endpoint encoder capability once per session. Auto only promotes
-    // expensive codecs when the endpoint has a hardware encoder, with libvpx VP9
-    // permitted on sufficiently capable CPUs as a measured software fallback.
-    try {
-        const auto localCaps = hi5::ProbeCodecCapabilitiesAndSelect("auto");
-        for (const auto& c : localCaps.capabilities) {
-            if (c.codec == "av1") { m_hwAv1Available = c.hardwareEncodeAvailable; m_swAv1Available = c.softwareEncodeAvailable; }
-            else if (c.codec == "vp9") m_hwVp9Available = c.hardwareEncodeAvailable;
-            else if (c.codec == "h265") { m_hwH265Available = c.hardwareEncodeAvailable; m_swH265Available = c.softwareEncodeAvailable; }
-            else if (c.codec == "h264") m_hwH264Available = c.hardwareEncodeAvailable;
-        }
-    } catch (...) {
-    }
+    // Do not enumerate every Media Foundation encoder at session startup.
+    // Auto is deliberately memory-first and starts/stays on VP8; explicitly
+    // selected codecs probe/instantiate their own encoder lazily on first frame.
     if (g_hwAv1Failed.load(std::memory_order_acquire)) m_hwAv1Available = false;
     if (g_hwVp9Failed.load(std::memory_order_acquire)) m_hwVp9Available = false;
     if (g_hwH265Failed.load(std::memory_order_acquire)) m_hwH265Available = false;
     if (g_hwH264Failed.load(std::memory_order_acquire)) m_hwH264Available = false;
-#ifdef _WIN32
-    m_swVp9Allowed = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) >= 8;
-#else
-    m_swVp9Allowed = true;
-#endif
-    LogInfo("[codec] endpoint capabilities session=" + m_sessionId +
-        " av1_hw=" + std::string(m_hwAv1Available ? "1" : "0") +
-        " av1_sw=" + std::string(m_swAv1Available ? "1" : "0") +
-        " vp9_hw=" + std::string(m_hwVp9Available ? "1" : "0") +
-        " h265_hw=" + std::string(m_hwH265Available ? "1" : "0") +
-        " h265_sw=" + std::string(m_swH265Available ? "1" : "0") +
-        " h264_hw=" + std::string(m_hwH264Available ? "1" : "0") +
-        " vp9_sw_allowed=" + std::string(m_swVp9Allowed ? "1" : "0"));
+    std::string swVp9Reason;
+    m_swVp9Allowed = autoSoftwareVp9Allowed(&swVp9Reason);
+    LogInfo("[codec] eager Media Foundation capability probe disabled session=" + m_sessionId +
+        " policy=adaptive-lazy-init vp9_sw_allowed=" +
+        std::string(m_swVp9Allowed ? "1" : "0") +
+        " " + swVp9Reason);
 
     m_autoCodec = (m_codecMode == "auto");
     if (m_autoCodec) {
@@ -481,41 +499,60 @@ void WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
         " h264=" + std::string(m_peerAcceptsH264 ? "1" : "0") +
         " vp8=" + std::string(m_peerAcceptsVp8 ? "1" : "0"));
 
-    if (!m_autoCodec) return;
+    if (m_autoCodec) selectBestAutoCodec("answer");
+}
 
+bool WebRtcSender::selectBestAutoCodec(const std::string& reasonPrefix) {
     const std::string quality = imageQualityMode();
-    if (quality == "lossless" && m_peerAcceptsVp9) {
-        // True lossless is implemented by the bundled libvpx VP9 path. Hardware
-        // MFT encoders are not assumed lossless because their rate-control APIs vary.
+    if (quality == "lossless" && m_peerAcceptsVp9 && !m_vp9Failed) {
         m_codecMode = "vp9_sw";
-        switchVideoCodec(VideoCodec::VP9, "auto: true lossless mode requires libvpx VP9");
+        return switchVideoCodec(VideoCodec::VP9, reasonPrefix + ": lossless requires VP9 software");
     }
-    else if (m_peerAcceptsAv1 && m_hwAv1Available) {
-        switchVideoCodec(VideoCodec::AV1, "auto: hardware AV1 available on endpoint and Viewer");
-    }
-    else if (m_peerAcceptsVp9 && m_hwVp9Available) {
-        switchVideoCodec(VideoCodec::VP9, "auto: hardware VP9 available on endpoint and Viewer");
-    }
-    else if (m_peerAcceptsH265 && m_hwH265Available) {
-        switchVideoCodec(VideoCodec::H265, "auto: hardware H.265 available on endpoint and Viewer");
-    }
-    else if (m_peerAcceptsH264 && m_hwH264Available) {
-        switchVideoCodec(VideoCodec::H264, "auto: hardware H.264 available on endpoint and Viewer");
-    }
-    else if (m_peerAcceptsVp9 && m_swVp9Allowed) {
+
+    auto tryHardware = [&](const char* codecName, VideoCodec codec, bool negotiated,
+        bool failed, std::atomic<bool>& processFailed, bool& availableFlag, bool& probeDone) -> bool {
+        if (!negotiated || failed || processFailed.load(std::memory_order_acquire)) {
+            availableFlag = false;
+            return false;
+        }
+        std::string encoderName;
+        if (!probeDone) {
+            availableFlag = hi5::ProbeHardwareCodecAvailable(codecName, &encoderName);
+            probeDone = true;
+            LogInfo("[codec] auto hardware probe session=" + m_sessionId +
+                " codec=" + std::string(codecName) +
+                " available=" + std::string(availableFlag ? "1" : "0") +
+                (encoderName.empty() ? std::string() : " encoder=" + encoderName));
+        }
+        if (!availableFlag) return false;
+        m_codecMode = std::string(codecName) + "_hw";
+        return switchVideoCodec(codec, reasonPrefix + ": selected hardware " + codecName);
+    };
+
+    if (tryHardware("av1", VideoCodec::AV1, m_peerAcceptsAv1, m_av1Failed, g_hwAv1Failed, m_hwAv1Available, m_hwAv1ProbeDone)) return true;
+    if (tryHardware("vp9", VideoCodec::VP9, m_peerAcceptsVp9, m_vp9Failed, g_hwVp9Failed, m_hwVp9Available, m_hwVp9ProbeDone)) return true;
+    if (tryHardware("h265", VideoCodec::H265, m_peerAcceptsH265, m_h265Failed, g_hwH265Failed, m_hwH265Available, m_hwH265ProbeDone)) return true;
+    if (tryHardware("h264", VideoCodec::H264, m_peerAcceptsH264, m_h264Failed, g_hwH264Failed, m_hwH264Available, m_hwH264ProbeDone)) return true;
+
+    std::string swVp9Reason;
+    m_swVp9Allowed = autoSoftwareVp9Allowed(&swVp9Reason);
+    LogInfo("[codec] auto software policy session=" + m_sessionId + " " + swVp9Reason);
+
+    if (m_peerAcceptsVp9 && !m_vp9Failed && m_swVp9Allowed) {
         m_codecMode = "vp9_sw";
-        switchVideoCodec(VideoCodec::VP9, "auto: software VP9 allowed; live health fallback to VP8 enabled");
+        return switchVideoCodec(VideoCodec::VP9, reasonPrefix + ": no usable hardware codec; resource-aware software VP9");
     }
-    else if (m_peerAcceptsVp8) {
-        switchVideoCodec(VideoCodec::VP8, "auto: low-CPU VP8 fallback");
+    if (m_peerAcceptsVp8) {
+        m_codecMode = "vp8";
+        return switchVideoCodec(VideoCodec::VP8, reasonPrefix + ": VP8 selected under endpoint resource pressure or no higher codec");
     }
-    else if (m_peerAcceptsVp9) {
+    if (m_peerAcceptsVp9 && !m_vp9Failed) {
         m_codecMode = "vp9_sw";
-        switchVideoCodec(VideoCodec::VP9, "auto: Viewer has no VP8; software VP9 required");
+        return switchVideoCodec(VideoCodec::VP9, reasonPrefix + ": Viewer has no VP8; software VP9 required");
     }
-    else {
-        LogInfo("[codec] adaptive offer answer exposed no recognised usable video payload; keeping current codec session=" + m_sessionId);
-    }
+
+    LogWarn("[codec] Auto found no healthy mutually negotiated codec session=" + m_sessionId);
+    return false;
 }
 
 std::string WebRtcSender::activeVideoCodecName() const {
@@ -549,22 +586,11 @@ bool WebRtcSender::applyDevCodecSwitch(const std::string& requestedRaw, std::str
 
     if (requested == "auto") {
         m_autoCodec = true;
-        const std::string quality = imageQualityMode();
-        if (quality == "lossless" && m_peerAcceptsVp9 && !m_vp9Failed)
-            return choose(VideoCodec::VP9, "vp9_sw", "dev selector: Auto lossless -> VP9 software");
-        if (m_peerAcceptsAv1 && m_hwAv1Available && !m_av1Failed)
-            return choose(VideoCodec::AV1, "auto", "dev selector: Auto -> hardware AV1");
-        if (m_peerAcceptsVp9 && m_hwVp9Available && !m_vp9Failed)
-            return choose(VideoCodec::VP9, "auto", "dev selector: Auto -> hardware VP9");
-        if (m_peerAcceptsH265 && m_hwH265Available && !m_h265Failed)
-            return choose(VideoCodec::H265, "auto", "dev selector: Auto -> hardware H.265");
-        if (m_peerAcceptsH264 && m_hwH264Available && !m_h264Failed)
-            return choose(VideoCodec::H264, "auto", "dev selector: Auto -> hardware H.264");
-        if (m_peerAcceptsVp9 && m_swVp9Allowed && !m_vp9Failed)
-            return choose(VideoCodec::VP9, "vp9_sw", "dev selector: Auto -> software VP9");
-        if (m_peerAcceptsVp8)
-            return choose(VideoCodec::VP8, "vp8", "dev selector: Auto -> VP8 fallback");
-        return reject("No mutually negotiated Auto codec is currently healthy");
+        const bool ok = selectBestAutoCodec("dev selector Auto");
+        activeCodec = activeVideoCodecName();
+        detail = ok ? "Auto selected the best healthy codec for current endpoint resources" :
+            "Auto could not find a healthy negotiated codec";
+        return ok;
     }
 
     m_autoCodec = false;
@@ -579,7 +605,6 @@ bool WebRtcSender::applyDevCodecSwitch(const std::string& requestedRaw, std::str
     }
     if (requested == "av1") {
         if (!m_peerAcceptsAv1) return reject("Viewer did not negotiate AV1 for this session");
-        if (!m_hwAv1Available && !m_swAv1Available) return reject("Endpoint has no usable AV1 encoder");
         m_av1Failed = false;
         m_av1EmptyOutputFrames = 0;
         return choose(VideoCodec::AV1, "av1", "dev selector forced AV1");
@@ -592,7 +617,6 @@ bool WebRtcSender::applyDevCodecSwitch(const std::string& requestedRaw, std::str
     }
     if (requested == "h265") {
         if (!m_peerAcceptsH265) return reject("Viewer did not negotiate H.265/HEVC for this session");
-        if (!m_hwH265Available && !m_swH265Available) return reject("Endpoint has no usable H.265/HEVC encoder");
         m_h265Failed = false;
         return choose(VideoCodec::H265, "h265", "dev selector forced H.265");
     }
@@ -726,36 +750,13 @@ void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, do
     // Require two consecutive 5-second health windows before a codec change.
     if (m_codecUnhealthyWindows < 2) return;
 
-    if (m_videoCodec == VideoCodec::AV1) {
-        if (m_peerAcceptsVp9 && !m_vp9Failed)
-            switchVideoCodec(VideoCodec::VP9, "AV1 encode/send latency remained high");
-        else if (m_peerAcceptsH265 && !m_h265Failed)
-            switchVideoCodec(VideoCodec::H265, "AV1 latency remained high and VP9 was unavailable");
-        else if (m_peerAcceptsH264 && !m_h264Failed)
-            switchVideoCodec(VideoCodec::H264, "AV1 latency remained high; using H.264 fallback");
-        else if (m_peerAcceptsVp8)
-            switchVideoCodec(VideoCodec::VP8, "AV1 latency remained high; using VP8 baseline");
-    }
-    else if (m_videoCodec == VideoCodec::H265) {
-        if (m_peerAcceptsH264 && !m_h264Failed)
-            switchVideoCodec(VideoCodec::H264, "H.265 encode/send latency remained high");
-        else if (m_peerAcceptsVp9 && !m_vp9Failed && m_swVp9Allowed) {
-            m_codecMode = "vp9_sw";
-            switchVideoCodec(VideoCodec::VP9, "H.265 latency remained high; trying software VP9");
-        }
-        else if (m_peerAcceptsVp8)
-            switchVideoCodec(VideoCodec::VP8, "H.265 latency remained high; using VP8 baseline");
-    }
-    else if (m_videoCodec == VideoCodec::H264 && m_peerAcceptsVp9 && !m_vp9Failed && m_swVp9Allowed) {
-        m_codecMode = "vp9_sw";
-        switchVideoCodec(VideoCodec::VP9, "H.264 encode/send latency remained high");
-    }
-    else if (m_videoCodec == VideoCodec::VP9 && m_peerAcceptsVp8) {
-        switchVideoCodec(VideoCodec::VP8, "VP9 encode/send latency remained high");
-    }
-    else if (m_videoCodec == VideoCodec::H264 && m_peerAcceptsVp8) {
-        switchVideoCodec(VideoCodec::VP8, "H.264 latency remained high and VP9 was unavailable");
-    }
+    if (m_videoCodec == VideoCodec::AV1) m_av1Failed = true;
+    else if (m_videoCodec == VideoCodec::VP9) m_vp9Failed = true;
+    else if (m_videoCodec == VideoCodec::H265) m_h265Failed = true;
+    else if (m_videoCodec == VideoCodec::H264) m_h264Failed = true;
+    else return;
+
+    selectBestAutoCodec("health fallback after sustained encode latency");
 }
 
 void WebRtcSender::ensureDirectCaptureInitialized() {
@@ -976,7 +977,19 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                     // full-motion VP8 profile for every single mouse packet. Clicks,
                     // wheel and keyboard still boost to motion immediately.
                     if (kind != "mouse_move") {
-                        m_externalHintMode = std::max(m_externalHintMode.load(), 2);
+                        // Clicks/keys/wheel must wake both the stream mode and the
+                        // cadence immediately. Previously the mode changed to motion
+                        // but the stale idle 2-FPS hint survived until the next 5s
+                        // stats publication, making the picture look frozen even
+                        // though input had already reached the endpoint.
+                        const int wakeFps = readEnvInt("HI5_INPUT_WAKE_FPS",
+                            std::min(20, std::max(8, m_fps)), 4, 60);
+                        m_externalHintMode.store(2, std::memory_order_release);
+                        m_externalHintFps.store(std::max(m_externalHintFps.load(), wakeFps),
+                            std::memory_order_release);
+                        const int wakeHoldMs = readEnvInt("HI5_INPUT_WAKE_HOLD_MS", 1200, 250, 5000);
+                        m_externalInputWakeUntilMs.store(steadyNowMs() + wakeHoldMs,
+                            std::memory_order_release);
                     }
                     if (m_mode == Mode::ExternalFeed && m_inputEventFn) {
                         m_inputEventFn(msg);
@@ -1136,8 +1149,14 @@ bool WebRtcSender::sendControlMessageText(const std::string& text) {
 }
 
 void WebRtcSender::setExternalStreamHint(int streamMode, int targetFps, bool backstageMode, bool secureDesktop) {
-    const int requestedMode = std::max(0, std::min(2, streamMode));
-    const int requestedFps = std::max(0, std::min(120, targetFps));
+    int requestedMode = std::max(0, std::min(2, streamMode));
+    int requestedFps = std::max(0, std::min(120, targetFps));
+    const int64_t inputWakeUntilMs = m_externalInputWakeUntilMs.load(std::memory_order_acquire);
+    if (inputWakeUntilMs > steadyNowMs()) {
+        requestedMode = std::max(requestedMode, 2);
+        requestedFps = std::max(requestedFps,
+            readEnvInt("HI5_INPUT_WAKE_FPS", std::min(20, std::max(8, m_fps)), 4, 60));
+    }
     const int idleDelayMs = readEnvInt("HI5_VP8_IDLE_DELAY_MS", 1000, 0, 30000);
     const auto now = std::chrono::steady_clock::now();
 
@@ -2130,7 +2149,14 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
     }
     m_externalLastFrameAt = nowForProfile;
 
-    const int requestedMode = std::max(0, std::min(2, m_externalHintMode.load()));
+    int requestedMode = std::max(0, std::min(2, m_externalHintMode.load()));
+    if (m_externalInputWakeUntilMs.load(std::memory_order_acquire) > steadyNowMs()) {
+        requestedMode = std::max(requestedMode, 2);
+        const int wakeFps = readEnvInt("HI5_INPUT_WAKE_FPS",
+            std::min(20, std::max(8, m_fps)), 4, 60);
+        m_externalHintFps.store(std::max(m_externalHintFps.load(), wakeFps),
+            std::memory_order_release);
+    }
     const int previousEffectiveMode = m_externalEffectiveMode;
     const int wakeHoldMs = readEnvInt("HI5_VP8_WAKE_HOLD_MS", 250, 0, 5000);
     int effectiveMode = requestedMode;
@@ -2187,7 +2213,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             profile.cpuUsed,
             profile.minQuantizer,
             profile.maxQuantizer,
-            readEnvInt("HI5_VP8_THREADS", 2, 1, 8));
+            readEnvInt("HI5_VP8_THREADS", frame.width > 1920 ? 2 : 1, 1, 8));
         m_externalFrameCounter = 0;
         forceKeyframe = true;
         m_externalLastProfileChange = nowForProfile;
@@ -2288,26 +2314,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
     };
 
-    auto selectNextAutoCodec = [&](VideoCodec failed, const std::string& why) {
-        if (!m_autoCodec) return false;
-        if (failed == VideoCodec::AV1) {
-            if (m_peerAcceptsVp9 && !m_vp9Failed) return switchVideoCodec(VideoCodec::VP9, why + "; falling back from AV1");
-            if (m_peerAcceptsH265 && !m_h265Failed) return switchVideoCodec(VideoCodec::H265, why + "; falling back from AV1");
-            if (m_peerAcceptsH264 && !m_h264Failed) return switchVideoCodec(VideoCodec::H264, why + "; falling back from AV1");
-        }
-        if (failed == VideoCodec::H265) {
-            if (m_peerAcceptsH264 && !m_h264Failed) return switchVideoCodec(VideoCodec::H264, why + "; falling back from H.265");
-            if (m_peerAcceptsVp9 && !m_vp9Failed) return switchVideoCodec(VideoCodec::VP9, why + "; falling back from H.265");
-        }
-        if (failed == VideoCodec::H264 && m_peerAcceptsVp9 && !m_vp9Failed)
-            return switchVideoCodec(VideoCodec::VP9, why + "; falling back from H.264");
-        if ((failed == VideoCodec::VP9 || failed == VideoCodec::H264 || failed == VideoCodec::H265 || failed == VideoCodec::AV1) && m_peerAcceptsVp8)
-            return switchVideoCodec(VideoCodec::VP8, why + "; using VP8 baseline");
-        return false;
-    };
-
     auto recoverForcedCodec = [&](VideoCodec failed, const std::string& requested, const std::string& why) {
-        if (m_autoCodec) return selectNextAutoCodec(failed, why);
+        if (m_autoCodec) return selectBestAutoCodec("recovery: " + why);
 
         bool recovered = false;
         if (failed != VideoCodec::VP9 && m_peerAcceptsVp9 && !m_vp9Failed && (m_hwVp9Available || m_swVp9Allowed)) {
@@ -2364,7 +2372,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         Av1EncodedFrame encoded{};
         std::string err;
         bool ok = m_av1Encoder->encode(frame, keyframe || av1SizeChanged, encoded, &err);
-        if (!ok && m_codecMode != "av1_sw" && !g_hwAv1Failed.load(std::memory_order_acquire)) {
+        if (!ok && !m_autoCodec && m_codecMode != "av1_sw" && !g_hwAv1Failed.load(std::memory_order_acquire)) {
             LogInfo("[av1] hardware-preferred encode failed; same-frame software retry session=" + m_sessionId + " error=" + err);
             m_hwAv1Available = false;
             CacheHardwareCodecFailure(g_hwAv1Failed, "av1", "encode failed: " + err);
@@ -2438,7 +2446,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         const auto encodeStart = std::chrono::steady_clock::now();
         H265EncodedFrame encoded{}; std::string err;
         bool ok = m_h265Encoder->encode(frame, keyframe || h265SizeChanged, encoded, &err);
-        if (!ok && m_codecMode != "h265_sw" && !g_hwH265Failed.load(std::memory_order_acquire)) {
+        if (!ok && !m_autoCodec && m_codecMode != "h265_sw" && !g_hwH265Failed.load(std::memory_order_acquire)) {
             LogInfo("[h265] hardware-preferred encode failed; same-frame software retry session=" + m_sessionId + " error=" + err);
             m_hwH265Available = false;
             CacheHardwareCodecFailure(g_hwH265Failed, "h265", "encode failed: " + err);
@@ -2488,7 +2496,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     readEnvInt("HI5_VP9_CPUUSED", 8, 0, 9),
                     readEnvInt("HI5_VP9_MIN_Q", vp9DefaultMinQ, 0, 63),
                     readEnvInt("HI5_VP9_MAX_Q", vp9DefaultMaxQ, 0, 63),
-                    readEnvInt("HI5_VP9_THREADS", vp9Frame.width >= 3840 ? 4 : 2, 1, 8));
+                    readEnvInt("HI5_VP9_THREADS", vp9Frame.width >= 3840 ? 4 : (vp9Frame.width > 1920 ? 2 : 1), 1, 8));
                 m_externalProfileName = "libvpx-vp9-interaction-ready";
                 m_codecMode = "vp9_sw";
                 m_vp9Failed = false;
@@ -2523,7 +2531,14 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                 } else {
                     m_hwVp9Available = false;
                     CacheHardwareCodecFailure(g_hwVp9Failed, "vp9", "init failed: " + vp9Err);
-                    LogInfo("[vp9] hardware init failed; falling back to libvpx session=" + m_sessionId +
+                    if (m_autoCodec) {
+                        LogInfo("[vp9] hardware init failed; Auto trying next ranked codec session=" + m_sessionId +
+                            " error=" + vp9Err);
+                        m_vp9Encoder.reset();
+                        selectBestAutoCodec("recovery: VP9 hardware init failed");
+                        return;
+                    }
+                    LogInfo("[vp9] hardware init failed; forced VP9 falling back to libvpx session=" + m_sessionId +
                         " error=" + vp9Err);
                     createSoftwareVp9();
                 }
@@ -2554,7 +2569,14 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                 if (!ok) {
                     m_hwVp9Available = false;
                     CacheHardwareCodecFailure(g_hwVp9Failed, "vp9", "encode failed: " + vp9Err);
-                    LogInfo("[vp9] hardware encode failed; same-frame libvpx fallback session=" + m_sessionId +
+                    if (m_autoCodec) {
+                        LogInfo("[vp9] hardware encode failed; Auto trying next ranked codec session=" + m_sessionId +
+                            " error=" + vp9Err);
+                        m_vp9Encoder.reset();
+                        selectBestAutoCodec("recovery: VP9 hardware encode failed");
+                        return;
+                    }
+                    LogInfo("[vp9] hardware encode failed; forced VP9 same-frame libvpx fallback session=" + m_sessionId +
                         " error=" + vp9Err);
                     if (createSoftwareVp9()) {
                         encoded = m_vp9VpxEncoder->encode(vp9Frame, true);
@@ -2689,9 +2711,11 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     const bool hardwarePreferredMode = m_codecMode != "h264_sw" && !g_hwH264Failed.load(std::memory_order_acquire);
                     bool recoveredWithSoftware = false;
                     if (hardwarePreferredMode) {
-                        LogInfo("[h264] hardware-preferred encode failed; retrying same frame with software H.264 session=" + m_sessionId);
                         m_hwH264Available = false;
                         CacheHardwareCodecFailure(g_hwH264Failed, "h264", "encode failed: " + h264Err);
+                    }
+                    if (hardwarePreferredMode && !m_autoCodec) {
+                        LogInfo("[h264] forced H.264 hardware encode failed; retrying same frame with software H.264 session=" + m_sessionId);
                         auto swEnc = std::make_unique<H264MfEncoder>();
                         std::string swErr;
                         if (swEnc->init(h264Frame.width, h264Frame.height, h264Fps, h264Kbps, false, &swErr)) {

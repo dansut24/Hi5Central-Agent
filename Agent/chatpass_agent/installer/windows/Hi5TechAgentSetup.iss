@@ -3,6 +3,7 @@
 #define MyAppExeName "Hi5CentralAgentService.exe"
 #define MyUserExeName "Hi5CentralUser.exe"
 #define MyRemoteHostExeName "Hi5CentralRemoteHost.exe"
+#define MyMediaHostExeName "Hi5CentralMediaHost.exe"
 #define MyServiceName "Hi5CentralAgent"
 #define MyAppVersion GetEnv("HI5_AGENT_VERSION")
 #if MyAppVersion == ""
@@ -25,6 +26,9 @@
 #endif
 #ifndef RemoteHostExePath
   #define RemoteHostExePath SourceDir + "\" + MyRemoteHostExeName
+#endif
+#ifndef MediaHostExePath
+  #define MediaHostExePath SourceDir + "\" + MyMediaHostExeName
 #endif
 
 
@@ -59,6 +63,7 @@ Name: "{commonappdata}\Hi5Central\Agent\ChatLogs"; Permissions: users-readexec a
 Source: "{#AgentExePath}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "{#UserExePath}"; DestDir: "{app}"; DestName: "{#MyUserExeName}"; Flags: ignoreversion
 Source: "{#RemoteHostExePath}"; DestDir: "{app}"; DestName: "{#MyRemoteHostExeName}"; Flags: ignoreversion
+Source: "{#MediaHostExePath}"; DestDir: "{app}"; DestName: "{#MyMediaHostExeName}"; Flags: ignoreversion
 
 [InstallDelete]
 Type: files; Name: "{app}\Hi5CentralAgent.exe"

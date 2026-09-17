@@ -298,11 +298,33 @@ if(WIN32)
 
   add_executable(hi5central_remote_host
     src/remote_host_main.cpp
-    src/media_host_main.cpp
     src/streamer_main.cpp
     src/backstage/backstage_host.cpp
     src/backstage/backstage_browser_host.cpp
     src/backstage/backstage_cef_browser.cpp
+    src/ipc/named_pipe.cpp
+    src/platform/windows/windows_input.cpp
+    src/platform/windows/windows_screen.cpp
+  )
+  hi5_use_static_msvc_runtime(hi5central_remote_host)
+  target_include_directories(hi5central_remote_host PRIVATE
+    ${WEBVIEW2_INCLUDE_DIR}
+    src
+  )
+  target_compile_definitions(hi5central_remote_host PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
+  target_link_libraries(hi5central_remote_host PRIVATE
+    ${WEBVIEW2_LOADER_STATIC}
+    nlohmann_json::nlohmann_json Threads::Threads
+    d3d11 dxgi windowscodecs advapi32 user32 gdi32 shell32 shlwapi
+    ole32 oleaut32 uuid wtsapi32 userenv psapi dwmapi
+  )
+  set_target_properties(hi5central_remote_host PROPERTIES OUTPUT_NAME "Hi5CentralRemoteHost")
+
+  # Session-scoped media worker. Keep WebRTC/codecs/audio out of the long-lived
+  # service and out of the multifunction capture/backstage RemoteHost binary.
+  add_executable(hi5central_media_host
+    src/media_host_entry.cpp
+    src/media_host_main.cpp
     src/ipc/named_pipe.cpp
     src/webrtc_sender.cpp
     src/vp8_encoder.cpp
@@ -316,26 +338,24 @@ if(WIN32)
     src/platform/windows/windows_codec.cpp
     src/platform/windows/wasapi_loopback.cpp
   )
-  hi5_use_static_msvc_runtime(hi5central_remote_host)
-  target_include_directories(hi5central_remote_host BEFORE PRIVATE
+  hi5_use_static_msvc_runtime(hi5central_media_host)
+  target_include_directories(hi5central_media_host BEFORE PRIVATE
     ${HI5_LIBDATACHANNEL_INCLUDE_DIRS}
-    ${WEBVIEW2_INCLUDE_DIR}
     ${VPX_INCLUDE_DIRS}
     ${OPUS_INCLUDE_DIR}
     src
   )
-  target_compile_definitions(hi5central_remote_host PRIVATE
+  target_compile_definitions(hi5central_media_host PRIVATE
     RTC_ENABLE_MEDIA=1 RTC_ENABLE_WEBSOCKET=1 RTC_STATIC
     NOMINMAX _WIN32_WINNT=0x0A00
   )
-  target_link_libraries(hi5central_remote_host PRIVATE
+  target_link_libraries(hi5central_media_host PRIVATE
     ${HI5_LIBDATACHANNEL_LINK_LIBS}
-    ${WEBVIEW2_LOADER_STATIC}
     nlohmann_json::nlohmann_json Threads::Threads
     OpenSSL::SSL OpenSSL::Crypto ${VPX_LIBRARIES} ${OPUS_LIBRARY}
     d3d11 dxgi windowscodecs mf mfplat mfuuid strmiids
     ws2_32 crypt32 winhttp urlmon bcrypt advapi32 user32 gdi32 shell32 shlwapi
     ole32 oleaut32 uuid wtsapi32 userenv psapi dwmapi iphlpapi
   )
-  set_target_properties(hi5central_remote_host PROPERTIES OUTPUT_NAME "Hi5CentralRemoteHost")
+  set_target_properties(hi5central_media_host PROPERTIES OUTPUT_NAME "Hi5CentralMediaHost")
 endif()

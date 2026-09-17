@@ -6,7 +6,6 @@
 
 namespace hi5 {
     int RunStreamerMain(int argc, char** argv);
-    int RunMediaHostMain(int argc, char** argv);
     int MaybeRunCefSubprocess(int argc, char** argv);
 }
 
@@ -18,7 +17,6 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) != "--mode") continue;
         const std::string mode = argv[i + 1];
         if (mode == "streamer") return hi5::RunStreamerMain(argc, argv);
-        if (mode == "media-host") return hi5::RunMediaHostMain(argc, argv);
         if (mode == "backstage-host") return hi5::RunBackstageHostMain(argc, argv);
         if (mode == "backstage-browser") return hi5::RunBackstageBrowserMain(argc, argv);
     }
