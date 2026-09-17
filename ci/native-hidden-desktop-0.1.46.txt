@@ -1,0 +1,3 @@
+Trigger Windows validation for native hidden Background desktop 0.1.46.
+Source checkpoint: fa5258817f50b3d26418a1df1b86d0e04e0c83ac
+VPS checkpoint: b943ef6f5aa43362c34af5e2aca5749c8e5539c0
