@@ -1,0 +1,14 @@
+Hi5Central Windows validation trigger for the session-scoped media-host refactor.
+
+Expected build: 0.1.37
+Branch: agent-hardening-v2
+VPS source checkpoint: 0dd692fefa9cb074c77a4e7f2c5f17f32ab15497
+GitHub source sync: 557700c2ea87f4f3ef57743df274fcfc6937af1c
+
+Validation goals:
+- Hi5CentralAgentService no longer owns the live WebRTC/encoder instance.
+- Hi5CentralRemoteHost --mode media-host owns PeerConnection, VP8/VP9/H264/AV1/H265 codec state, RTP and remote audio.
+- Existing normal/secure/backstage raw capture selection remains in the service for this first boundary.
+- Memory telemetry reports role=remote-host-media separately from agent-service and capture hosts.
+- Media process exits with the remote session so codec/WebRTC private memory is reclaimed by process teardown.
+- /latest remains unchanged during test validation.
