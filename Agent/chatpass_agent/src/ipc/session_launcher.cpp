@@ -294,6 +294,43 @@ namespace hi5 {
         return pi.hProcess;
     }
 
+    HANDLE LaunchInInteractiveSessionOnDesktop(const std::string& exePath,
+        const std::string& cmdLine, const std::wstring& desktopName) {
+        EnableLaunchPrivileges();
+
+        const DWORD sessionId = WTSGetActiveConsoleSessionId();
+        if (sessionId == 0xFFFFFFFF || desktopName.empty()) {
+            LogError("[launcher][private-desktop] invalid console session or desktop");
+            return nullptr;
+        }
+
+        HANDLE hUserToken = nullptr;
+        if (!WTSQueryUserToken(sessionId, &hUserToken)) {
+            LogError("[launcher][private-desktop] WTSQueryUserToken failed err=" +
+                std::to_string(GetLastError()));
+            return nullptr;
+        }
+
+        HANDLE hPrimary = nullptr;
+        if (!DuplicateTokenEx(hUserToken, MAXIMUM_ALLOWED, nullptr,
+            SecurityImpersonation, TokenPrimary, &hPrimary)) {
+            LogError("[launcher][private-desktop] DuplicateTokenEx failed err=" +
+                std::to_string(GetLastError()));
+            CloseHandle(hUserToken);
+            return nullptr;
+        }
+        CloseHandle(hUserToken);
+
+        const std::wstring wExePath = ToWide(exePath);
+        const std::wstring wCmd = L"\"" + wExePath + L"\" " + ToWide(cmdLine);
+        const std::wstring wDir = DirOf(wExePath);
+        HANDLE hProc = LaunchWithToken(hPrimary, wExePath, wCmd, wDir,
+            desktopName.c_str(), "InteractiveUser(private-desktop)",
+            "[launcher][private-desktop]", true);
+        CloseHandle(hPrimary);
+        return hProc;
+    }
+
     HANDLE LaunchInInteractiveSession(const std::string& exePath,
         const std::string& cmdLine) {
         EnableLaunchPrivileges();

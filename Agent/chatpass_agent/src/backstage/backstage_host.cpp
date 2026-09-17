@@ -3,6 +3,7 @@
 #include "frame_source.h"
 #include "ipc/input_pipe.h"
 #include "ipc/shmem_ring.h"
+#include "ipc/session_launcher.h"
 #include "util/log.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -14,6 +15,7 @@
 #include <winsvc.h>
 #include <cstdio>
 #include <shlwapi.h>
+#include <sddl.h>
 
 #include <algorithm>
 #include <atomic>
@@ -63,7 +65,13 @@ namespace {
         int fps = 15;
         int width = 1280;
         int height = 720;
+        bool nativeDesktop = false;
     };
+
+    bool HasArg(int argc, char** argv, const std::string& key) {
+        for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == key) return true;
+        return false;
+    }
 
     std::optional<std::string> GetArgValue(int argc, char** argv, const std::string& key) {
         for (int i = 1; i + 1 < argc; ++i) {
@@ -81,6 +89,7 @@ namespace {
         if (auto v = GetArgValue(argc, argv, "--fps")) a.fps = std::max(5, std::min(30, std::stoi(*v)));
         if (auto v = GetArgValue(argc, argv, "--width")) a.width = std::max(800, std::min(3840, std::stoi(*v)));
         if (auto v = GetArgValue(argc, argv, "--height")) a.height = std::max(600, std::min(2160, std::stoi(*v)));
+        a.nativeDesktop = HasArg(argc, argv, "--native-desktop");
         return a;
     }
 
@@ -305,14 +314,16 @@ namespace {
 
     class BackstageRenderer {
     public:
-        BackstageRenderer(int width, int height, const std::string& sessionId)
-            : w_(width), h_(height), sessionId_(sessionId) {
+        BackstageRenderer(int width, int height, const std::string& sessionId, bool nativeDesktop)
+            : w_(width), h_(height), sessionId_(sessionId), nativeModeRequested_(nativeDesktop) {
             CreateDib();
             InitDesktopIcons();
+            if (nativeModeRequested_) nativeModeActive_ = InitializeNativeDesktop();
         }
 
         ~BackstageRenderer() {
             for (auto& win : windows_) if (!win.closed) StopTerminal(win);
+            StopNativeDesktopProcesses();
             if (privateDesktop_) { CloseDesktop(privateDesktop_); privateDesktop_ = nullptr; }
             if (dib_) DeleteObject(dib_);
             if (memDc_) DeleteDC(memDc_);
@@ -326,6 +337,7 @@ namespace {
         }
 
         int HandleInput(hi5::InputPipeReader& pipe) {
+            if (nativeModeActive_) return HandleNativeDesktopInput(pipe);
             int handled = 0;
             hi5::InputCmd cmd{};
             while (pipe.Read(cmd)) {
@@ -368,10 +380,20 @@ namespace {
 
         bool Render(I420Frame& out) {
             SyncBackgroundJobs();
-            DrawSynthetic();
+            if (nativeModeActive_) {
+                if (!DrawNativeDesktop()) {
+                    nativeModeActive_ = false;
+                    LogWarn("[background-native] private desktop render unavailable; fallback=synthetic");
+                    DrawSynthetic();
+                }
+            } else {
+                DrawSynthetic();
+            }
             BgraToI420(reinterpret_cast<const uint8_t*>(bits_), w_ * 4, w_, h_, out);
             return true;
         }
+
+        bool NativeModeActive() const { return nativeModeActive_; }
 
         bool HasActiveBackgroundJob() const {
             for (const auto& win : windows_) {
@@ -2177,18 +2199,339 @@ namespace {
 
         bool EnsurePrivateDesktop() {
             if (privateDesktop_) return true;
-            privateDesktopName_ = Utf8ToWide("Hi5CentralBackstageNative_" + sessionId_);
+            privateDesktopName_ = Utf8ToWide("Hi5CentralBackground_" + sessionId_);
+            privateDesktopFullName_ = L"winsta0\\" + privateDesktopName_;
+
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            SECURITY_ATTRIBUTES sa{};
+            sa.nLength = sizeof(sa);
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)", SDDL_REVISION_1, &sd, nullptr)) {
+                LogWarn("[background-native] desktop ACL create failed err=" + std::to_string(GetLastError()));
+                return false;
+            }
+            sa.lpSecurityDescriptor = sd;
             privateDesktop_ = CreateDesktopW(privateDesktopName_.c_str(), nullptr, nullptr, 0,
                 DESKTOP_CREATEWINDOW | DESKTOP_CREATEMENU | DESKTOP_ENUMERATE |
                 DESKTOP_HOOKCONTROL | DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP |
-                DESKTOP_WRITEOBJECTS | GENERIC_ALL,
-                nullptr);
+                DESKTOP_WRITEOBJECTS | GENERIC_ALL, &sa);
+            LocalFree(sd);
             if (!privateDesktop_) {
-                LogWarn("[backstage] private native desktop create failed err=" + std::to_string(GetLastError()));
+                LogWarn("[background-native] private desktop create failed err=" + std::to_string(GetLastError()));
                 return false;
             }
-            LogInfo("[backstage] private native desktop ready name=" + WideToUtf8(privateDesktopName_));
+            LogInfo("[background-native] private desktop ready name=" + WideToUtf8(privateDesktopFullName_));
             return true;
+        }
+
+        struct NativeDesktopWindowInfo {
+            HWND hwnd = nullptr;
+            RECT sourceRect{};
+            std::wstring className;
+            std::wstring title;
+        };
+
+        struct NativeDesktopEnumCtx {
+            std::vector<NativeDesktopWindowInfo>* windows = nullptr;
+        };
+
+        static BOOL CALLBACK EnumNativeDesktopCaptureProc(HWND hwnd, LPARAM lparam) {
+            auto* ctx = reinterpret_cast<NativeDesktopEnumCtx*>(lparam);
+            if (!ctx || !ctx->windows || !hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) return TRUE;
+            RECT r{};
+            if (!GetWindowRect(hwnd, &r)) return TRUE;
+            if ((r.right - r.left) < 32 || (r.bottom - r.top) < 24) return TRUE;
+            wchar_t cls[128]{};
+            wchar_t title[256]{};
+            GetClassNameW(hwnd, cls, 128);
+            GetWindowTextW(hwnd, title, 256);
+            NativeDesktopWindowInfo info{};
+            info.hwnd = hwnd;
+            info.sourceRect = r;
+            info.className = cls;
+            info.title = title;
+            ctx->windows->push_back(std::move(info));
+            return TRUE;
+        }
+
+        std::vector<NativeDesktopWindowInfo> NativeDesktopWindows() const {
+            std::vector<NativeDesktopWindowInfo> out;
+            if (!privateDesktop_) return out;
+            NativeDesktopEnumCtx ctx{ &out };
+            EnumDesktopWindows(privateDesktop_, EnumNativeDesktopCaptureProc, reinterpret_cast<LPARAM>(&ctx));
+            return out;
+        }
+
+        RECT NativeViewerRect(const RECT& source) const {
+            const int sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            const int sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            const int sw = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+            const int sh = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+            RECT r{};
+            r.left = static_cast<LONG>((static_cast<long long>(source.left - sx) * w_) / sw);
+            r.top = static_cast<LONG>((static_cast<long long>(source.top - sy) * h_) / sh);
+            r.right = static_cast<LONG>((static_cast<long long>(source.right - sx) * w_) / sw);
+            r.bottom = static_cast<LONG>((static_cast<long long>(source.bottom - sy) * h_) / sh);
+            r.left = std::max<LONG>(0, std::min<LONG>(w_ - 1, r.left));
+            r.top = std::max<LONG>(0, std::min<LONG>(h_ - 1, r.top));
+            r.right = std::max<LONG>(r.left + 1, std::min<LONG>(w_, r.right));
+            r.bottom = std::max<LONG>(r.top + 1, std::min<LONG>(h_, r.bottom));
+            return r;
+        }
+
+        POINT NativeScreenPoint(int viewerX, int viewerY) const {
+            const int sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            const int sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            const int sw = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+            const int sh = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+            return POINT{
+                sx + static_cast<LONG>((static_cast<long long>(std::max(0, std::min(w_ - 1, viewerX))) * sw) / std::max(1, w_)),
+                sy + static_cast<LONG>((static_cast<long long>(std::max(0, std::min(h_ - 1, viewerY))) * sh) / std::max(1, h_))
+            };
+        }
+
+        bool CaptureNativeDesktopWindow(const NativeDesktopWindowInfo& info, HDC targetDc) {
+            const int srcW = PositiveDim(info.sourceRect.right - info.sourceRect.left, 32);
+            const int srcH = PositiveDim(info.sourceRect.bottom - info.sourceRect.top, 24);
+            const RECT dst = NativeViewerRect(info.sourceRect);
+            HDC captureDc = CreateCompatibleDC(targetDc);
+            if (!captureDc) return false;
+            BITMAPINFO bi{};
+            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = srcW;
+            bi.bmiHeader.biHeight = -srcH;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            void* captureBits = nullptr;
+            HBITMAP bmp = CreateDIBSection(captureDc, &bi, DIB_RGB_COLORS, &captureBits, nullptr, 0);
+            if (!bmp || !captureBits) {
+                if (bmp) DeleteObject(bmp);
+                DeleteDC(captureDc);
+                return false;
+            }
+            HGDIOBJ old = SelectObject(captureDc, bmp);
+            FillRectColor(captureDc, 0, 0, srcW, srcH, RGB(32, 36, 45));
+            BOOL ok = PrintWindow(info.hwnd, captureDc, 0x00000002);
+            if (!ok) ok = PrintWindow(info.hwnd, captureDc, 0);
+            if (ok) {
+                StretchBlt(targetDc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                    captureDc, 0, 0, srcW, srcH, SRCCOPY);
+            }
+            SelectObject(captureDc, old);
+            DeleteObject(bmp);
+            DeleteDC(captureDc);
+            return ok != FALSE;
+        }
+
+        bool LaunchNativeUserProcess(const std::string& exe, const std::string& args) {
+            if (!EnsurePrivateDesktop()) return false;
+            HANDLE process = hi5::LaunchInInteractiveSessionOnDesktop(exe, args, privateDesktopFullName_);
+            if (!process) return false;
+            nativeDesktopProcesses_.push_back(process);
+            LogInfo("[background-native] user process launched exe=" + exe +
+                " pid=" + std::to_string(GetProcessId(process)) +
+                " desktop=" + WideToUtf8(privateDesktopFullName_));
+            return true;
+        }
+
+        bool InitializeNativeDesktop() {
+            if (!EnsurePrivateDesktop()) return false;
+            nativeStartupAt_ = std::chrono::steady_clock::now();
+            // First containment proof uses classic MMC. Explorer is deliberately not
+            // auto-launched until we prove no shell redirection can reach Default.
+            if (!LaunchNativeUserProcess("C:\\Windows\\System32\\mmc.exe", "services.msc")) {
+                LogWarn("[background-native] MMC launch failed; fallback=synthetic");
+                return false;
+            }
+            LogInfo("[background-native] mode=private-hdesk proof=mmc-services explorer=deferred");
+            return true;
+        }
+
+        void StopNativeDesktopProcesses() {
+            for (HANDLE process : nativeDesktopProcesses_) {
+                if (!process) continue;
+                if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT) TerminateProcess(process, 0);
+                WaitForSingleObject(process, 500);
+                CloseHandle(process);
+            }
+            nativeDesktopProcesses_.clear();
+            nativeFocusHwnd_ = nullptr;
+        }
+
+        bool DrawNativeDesktop() {
+            FillRectColor(memDc_, 0, 0, w_, h_, RGB(22, 30, 43));
+            auto windows = NativeDesktopWindows();
+            if (windows.empty()) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - nativeStartupAt_).count();
+                TextClipped(memDc_, RECT{ 32, 32, w_ - 32, 80 },
+                    L"Starting private Windows desktop...", 20, RGB(232, 238, 246), true);
+                DrawCursor(memDc_);
+                if (elapsed > 5000) {
+                    LogWarn("[background-native] no private desktop windows after startup; fallback=synthetic");
+                    StopNativeDesktopProcesses();
+                    return false;
+                }
+                return true;
+            }
+
+            if (!nativeWindowInventoryLogged_) {
+                nativeWindowInventoryLogged_ = true;
+                LogInfo("[background-native] first private desktop windows=" + std::to_string(windows.size()));
+                for (size_t i = 0; i < windows.size() && i < 8; ++i) {
+                    LogInfo("[background-native] hwnd=0x" + PtrToHex(reinterpret_cast<uintptr_t>(windows[i].hwnd)) +
+                        " class=" + WideToUtf8(windows[i].className) + " title=" + WideToUtf8(windows[i].title));
+                }
+            }
+
+            // EnumDesktopWindows follows top-level z-order; paint bottom-to-top.
+            size_t captured = 0;
+            for (auto it = windows.rbegin(); it != windows.rend(); ++it) {
+                if (CaptureNativeDesktopWindow(*it, memDc_)) ++captured;
+            }
+            if (captured == 0) {
+                ++nativeCaptureFailureFrames_;
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - nativeStartupAt_).count();
+                if (nativeCaptureFailureFrames_ == 1 || (nativeCaptureFailureFrames_ % 30) == 0) {
+                    LogWarn("[background-native] private HWNDs found but PrintWindow captured=0 windows=" +
+                        std::to_string(windows.size()) + " failure_frames=" + std::to_string(nativeCaptureFailureFrames_));
+                }
+                if (elapsed > 5000) {
+                    LogWarn("[background-native] private windows are not renderable; fallback=synthetic");
+                    StopNativeDesktopProcesses();
+                    return false;
+                }
+            } else if (!nativeFirstCaptureLogged_) {
+                nativeFirstCaptureLogged_ = true;
+                LogInfo("[background-native] first native capture ok captured=" + std::to_string(captured) +
+                    " windows=" + std::to_string(windows.size()));
+            }
+            DrawCursor(memDc_);
+            return true;
+        }
+
+        HWND NativeTopLevelAt(int x, int y) const {
+            POINT p{ x, y };
+            auto windows = NativeDesktopWindows();
+            for (const auto& info : windows) {
+                RECT dst = NativeViewerRect(info.sourceRect);
+                if (PtInRect(&dst, p)) return info.hwnd;
+            }
+            return nullptr;
+        }
+
+        HWND NativeTargetAt(int x, int y, POINT& clientPoint) const {
+            HWND top = NativeTopLevelAt(x, y);
+            if (!top) return nullptr;
+            POINT screen = NativeScreenPoint(x, y);
+            POINT p = screen;
+            ScreenToClient(top, &p);
+            HWND target = top;
+            for (int depth = 0; depth < 8; ++depth) {
+                HWND child = ChildWindowFromPointEx(target, p, CWP_SKIPDISABLED | CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT);
+                if (!child || child == target) break;
+                POINT childPoint = p;
+                MapWindowPoints(target, child, &childPoint, 1);
+                target = child;
+                p = childPoint;
+            }
+            clientPoint = p;
+            return target;
+        }
+
+        void NativeMouseMove(int x, int y) {
+            POINT client{};
+            HWND target = NativeTargetAt(x, y, client);
+            if (!target) return;
+            PostMessageW(target, WM_MOUSEMOVE, nativeLeftDown_ ? MK_LBUTTON : 0,
+                MAKELPARAM(static_cast<SHORT>(client.x), static_cast<SHORT>(client.y)));
+        }
+
+        void NativeMouseButton(const hi5::InputCmd& cmd, int x, int y) {
+            POINT client{};
+            HWND target = NativeTargetAt(x, y, client);
+            if (!target && nativeFocusHwnd_ && IsWindow(nativeFocusHwnd_)) {
+                target = nativeFocusHwnd_;
+                POINT screen = NativeScreenPoint(x, y);
+                client = screen;
+                ScreenToClient(target, &client);
+            }
+            if (!target) return;
+            const bool down = cmd.mouseButton.down != 0;
+            UINT msg = 0;
+            WPARAM wp = 0;
+            if (cmd.mouseButton.button == 0) { msg = down ? WM_LBUTTONDOWN : WM_LBUTTONUP; wp = down ? MK_LBUTTON : 0; nativeLeftDown_ = down; }
+            else if (cmd.mouseButton.button == 1) { msg = down ? WM_RBUTTONDOWN : WM_RBUTTONUP; wp = down ? MK_RBUTTON : 0; }
+            else { msg = down ? WM_MBUTTONDOWN : WM_MBUTTONUP; wp = down ? MK_MBUTTON : 0; }
+            if (down) {
+                nativeFocusHwnd_ = target;
+                PostMessageW(target, WM_SETFOCUS, 0, 0);
+            }
+            PostMessageW(target, msg, wp, MAKELPARAM(static_cast<SHORT>(client.x), static_cast<SHORT>(client.y)));
+        }
+
+        void NativeMouseWheel(int deltaY, int x, int y) {
+            POINT client{};
+            HWND target = NativeTargetAt(x, y, client);
+            if (!target) return;
+            POINT screen = NativeScreenPoint(x, y);
+            PostMessageW(target, WM_MOUSEWHEEL, MAKEWPARAM(0, static_cast<SHORT>(deltaY)),
+                MAKELPARAM(static_cast<SHORT>(screen.x), static_cast<SHORT>(screen.y)));
+        }
+
+        void NativeKey(const hi5::InputCmd& cmd) {
+            HWND target = nativeFocusHwnd_;
+            if (!target || !IsWindow(target)) {
+                auto windows = NativeDesktopWindows();
+                if (!windows.empty()) target = windows.front().hwnd;
+            }
+            if (!target) return;
+            const UINT msg = cmd.key.down ? WM_KEYDOWN : WM_KEYUP;
+            const LPARAM lp = 1 | (static_cast<LPARAM>(cmd.key.scanCode) << 16) |
+                (cmd.key.isExtended ? (1LL << 24) : 0) |
+                (!cmd.key.down ? ((1LL << 30) | (1LL << 31)) : 0);
+            PostMessageW(target, msg, static_cast<WPARAM>(cmd.key.vk), lp);
+        }
+
+        void NativeText(const std::wstring& text) {
+            HWND target = nativeFocusHwnd_;
+            if (!target || !IsWindow(target)) return;
+            for (wchar_t ch : text) PostMessageW(target, WM_CHAR, static_cast<WPARAM>(ch), 1);
+        }
+
+        int HandleNativeDesktopInput(hi5::InputPipeReader& pipe) {
+            int handled = 0;
+            hi5::InputCmd cmd{};
+            while (pipe.Read(cmd)) {
+                ++handled;
+                switch (cmd.type) {
+                case hi5::InputCmdType::MouseMove:
+                    mouseX_ = std::max(0, std::min(w_ - 1, cmd.mouseMove.x));
+                    mouseY_ = std::max(0, std::min(h_ - 1, cmd.mouseMove.y));
+                    NativeMouseMove(mouseX_, mouseY_);
+                    break;
+                case hi5::InputCmdType::MouseButton:
+                    NativeMouseButton(cmd, mouseX_, mouseY_);
+                    break;
+                case hi5::InputCmdType::MouseWheel:
+                    NativeMouseWheel(cmd.mouseWheel.deltaY, mouseX_, mouseY_);
+                    break;
+                case hi5::InputCmdType::KeyEvent:
+                    NativeKey(cmd);
+                    break;
+                case hi5::InputCmdType::PasteText:
+                case hi5::InputCmdType::ClipboardPaste: {
+                    std::string text;
+                    if (pipe.ReadClipboard(cmd.clipboard.offsetInClip, cmd.clipboard.length, text)) NativeText(Utf8ToWide(text));
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
+            return handled;
         }
 
         bool LaunchOnPrivateDesktop(const std::wstring& exe, const std::wstring& args, DWORD& outPid, HANDLE& outProcess) {
@@ -2995,6 +3338,16 @@ namespace {
         size_t taskbarPage_ = 0;
         HDESK privateDesktop_ = nullptr;
         std::wstring privateDesktopName_;
+        std::wstring privateDesktopFullName_;
+        bool nativeModeRequested_ = false;
+        bool nativeModeActive_ = false;
+        bool nativeWindowInventoryLogged_ = false;
+        bool nativeFirstCaptureLogged_ = false;
+        uint64_t nativeCaptureFailureFrames_ = 0;
+        bool nativeLeftDown_ = false;
+        HWND nativeFocusHwnd_ = nullptr;
+        std::vector<HANDLE> nativeDesktopProcesses_;
+        std::chrono::steady_clock::time_point nativeStartupAt_{};
 
         DragMode dragMode_ = DragMode::None;
         int dragWindowId_ = 0;
@@ -3016,7 +3369,8 @@ namespace hi5 {
         LogInfo("[backstage] start session=" + args.sessionId +
             " shmem=" + args.shmemName +
             " input=" + args.inputPipeName +
-            " fps=" + std::to_string(args.fps));
+            " fps=" + std::to_string(args.fps) +
+            " native_desktop=" + std::string(args.nativeDesktop ? "1" : "0"));
 
         HANDLE stopEvent = nullptr;
         if (!args.stopEventName.empty()) {
@@ -3038,7 +3392,8 @@ namespace hi5 {
             if (!inputPipeOk) LogWarn("[backstage] failed to open input pipe err=" + std::to_string(GetLastError()));
         }
 
-        BackstageRenderer renderer(args.width, args.height, args.sessionId);
+        BackstageRenderer renderer(args.width, args.height, args.sessionId, args.nativeDesktop);
+        LogInfo("[backstage] renderer mode=" + std::string(renderer.NativeModeActive() ? "native-private-desktop" : "synthetic"));
         if (inputPipeOk) renderer.PublishMonitorInfo(inputPipe);
 
         const int idleFps = EnvInt("HI5_BACKSTAGE_IDLE_FPS", 1, 1, 10);
@@ -3098,9 +3453,8 @@ namespace hi5 {
             const auto frameInterval = IntervalForFps(targetFps);
             const bool dueForFrame = (loopStart - lastRender) >= frameInterval;
 
-            // Backstage is a synthetic desktop. The expensive part is rendering + BGRA->I420.
-            // Only do that when there has been input, or at the very low idle FPS so terminal
-            // output / progress text can still appear without burning CPU continuously.
+            // Background frames are still converted to I420 in this first native-desktop proof.
+            // Keep rendering adaptive while we validate hidden-desktop containment and input.
             if (dueForFrame && (dirty || !active || activeJob)) {
                 I420Frame frame;
                 if (renderer.Render(frame)) {

@@ -13,6 +13,12 @@ namespace hi5 {
     HANDLE LaunchInInteractiveSession(const std::string& exePath,
         const std::string& cmdLine);
 
+    // Launches a GUI process as the active interactive user on an existing named
+    // desktop within WinSta0. Used by Background Mode so the elevated broker can
+    // host a private desktop while visible applications keep the user's profile.
+    HANDLE LaunchInInteractiveSessionOnDesktop(const std::string& exePath,
+        const std::string& cmdLine, const std::wstring& desktopName);
+
     // Launches exePath with cmdLine in the active console session
     // using a session-bound LocalSystem token on the normal desktop: winsta0\default.
     // This is intended for high-integrity input/capture when elevated/admin windows

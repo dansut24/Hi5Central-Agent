@@ -303,6 +303,7 @@ if(WIN32)
     src/backstage/backstage_browser_host.cpp
     src/backstage/backstage_cef_browser.cpp
     src/ipc/named_pipe.cpp
+    src/ipc/session_launcher.cpp
     src/platform/windows/windows_input.cpp
     src/platform/windows/windows_screen.cpp
   )

@@ -6465,7 +6465,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " --width 1280"
                     " --height 720";
 
-                LogI("launch backstage host session=" + ctx.sessionId + " cmd=" + cmdLine);
+                std::string nativeBackground = ReadConfigString("HI5_BACKGROUND_NATIVE_DESKTOP", "1");
+                std::transform(nativeBackground.begin(), nativeBackground.end(), nativeBackground.begin(),
+                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                const bool nativeRequested = nativeBackground != "0" && nativeBackground != "false" && nativeBackground != "off";
+                if (nativeRequested) cmdLine += " --native-desktop";
+
+                LogI("launch backstage host session=" + ctx.sessionId +
+                    " native_desktop=" + std::string(nativeRequested ? "true" : "false") +
+                    " cmd=" + cmdLine);
 
                 ctx.backstageHostProcess = LaunchInElevatedDefaultSession(std::string(exePath), cmdLine);
                 if (!ctx.backstageHostProcess) {
