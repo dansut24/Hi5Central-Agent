@@ -331,6 +331,41 @@ namespace hi5 {
         return hProc;
     }
 
+    HANDLE LaunchInElevatedSessionOnDesktop(const std::string& exePath,
+        const std::string& cmdLine, const std::wstring& desktopName) {
+        if (desktopName.empty()) {
+            LogError("[launcher][private-desktop-elevated] desktop name is empty");
+            return nullptr;
+        }
+        if (!IsRunningAsLocalSystem()) {
+            LogError("[launcher][private-desktop-elevated] LocalSystem token required");
+            return nullptr;
+        }
+
+        EnableLaunchPrivileges();
+        DWORD sessionId = 0xFFFFFFFF;
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) || sessionId == 0xFFFFFFFF) {
+            LogError("[launcher][private-desktop-elevated] unable to resolve process session err=" +
+                std::to_string(GetLastError()));
+            return nullptr;
+        }
+
+        HANDLE hPrimary = nullptr;
+        if (!DuplicateCurrentProcessPrimaryTokenForSession(sessionId, hPrimary)) {
+            LogError("[launcher][private-desktop-elevated] failed to duplicate session-bound LocalSystem token");
+            return nullptr;
+        }
+
+        const std::wstring wExePath = ToWide(exePath);
+        const std::wstring wCmd = L"\"" + wExePath + L"\" " + ToWide(cmdLine);
+        const std::wstring wDir = DirOf(wExePath);
+        HANDLE hProc = LaunchWithToken(hPrimary, wExePath, wCmd, wDir,
+            desktopName.c_str(), "LocalSystem(private-desktop)",
+            "[launcher][private-desktop-elevated]", true);
+        CloseHandle(hPrimary);
+        return hProc;
+    }
+
     HANDLE LaunchInInteractiveSession(const std::string& exePath,
         const std::string& cmdLine) {
         EnableLaunchPrivileges();

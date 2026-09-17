@@ -19,6 +19,12 @@ namespace hi5 {
     HANDLE LaunchInInteractiveSessionOnDesktop(const std::string& exePath,
         const std::string& cmdLine, const std::wstring& desktopName);
 
+    // Launches a GUI process with the session-bound LocalSystem token onto an
+    // existing private desktop. Used for admin tools that require elevation,
+    // without displaying UAC or placing UI on WinSta0\\Default.
+    HANDLE LaunchInElevatedSessionOnDesktop(const std::string& exePath,
+        const std::string& cmdLine, const std::wstring& desktopName);
+
     // Launches exePath with cmdLine in the active console session
     // using a session-bound LocalSystem token on the normal desktop: winsta0\default.
     // This is intended for high-integrity input/capture when elevated/admin windows

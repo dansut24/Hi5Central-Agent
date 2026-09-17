@@ -2335,16 +2335,37 @@ namespace {
             return true;
         }
 
+        bool LaunchNativeElevatedProcess(const std::string& exe, const std::string& args) {
+            if (!EnsurePrivateDesktop()) return false;
+            HANDLE process = hi5::LaunchInElevatedSessionOnDesktop(exe, args, privateDesktopFullName_);
+            if (!process) return false;
+            nativeDesktopProcesses_.push_back(process);
+            LogInfo("[background-native] elevated process launched exe=" + exe +
+                " pid=" + std::to_string(GetProcessId(process)) +
+                " desktop=" + WideToUtf8(privateDesktopFullName_));
+            return true;
+        }
+
         bool InitializeNativeDesktop() {
             if (!EnsurePrivateDesktop()) return false;
             nativeStartupAt_ = std::chrono::steady_clock::now();
-            // First containment proof uses classic MMC. Explorer is deliberately not
-            // auto-launched until we prove no shell redirection can reach Default.
-            if (!LaunchNativeUserProcess("C:\\Windows\\System32\\mmc.exe", "services.msc")) {
-                LogWarn("[background-native] MMC launch failed; fallback=synthetic");
+
+            // Prove an ordinary user GUI can live on the private HDESK without any
+            // elevation or shell activation. Winver is classic, in-box and as-invoker.
+            if (!LaunchNativeUserProcess("C:\\Windows\\System32\\winver.exe", "")) {
+                LogWarn("[background-native] winver launch failed; fallback=synthetic");
                 return false;
             }
-            LogInfo("[background-native] mode=private-hdesk proof=mmc-services explorer=deferred");
+
+            // Admin tools use a separate elevated broker path. A failure here does
+            // not invalidate the private desktop proof; winver can still prove capture.
+            const bool mmcElevated = LaunchNativeElevatedProcess(
+                "C:\\Windows\\System32\\mmc.exe", "services.msc");
+            if (!mmcElevated) {
+                LogWarn("[background-native] elevated MMC launch failed; continuing user-GUI proof");
+            }
+            LogInfo("[background-native] mode=private-hdesk proof=winver elevated_mmc=" +
+                std::string(mmcElevated ? "1" : "0") + " explorer=deferred");
             return true;
         }
 
