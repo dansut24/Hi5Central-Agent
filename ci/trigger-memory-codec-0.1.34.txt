@@ -1,0 +1,3 @@
+Validation trigger for bounded-memory codec candidate.
+Local checkpoint: 666e31aba4d3bcceba30bf417be2911373055432
+Synced product source: d590252771871a81cab059662603ab7ba88931c2
