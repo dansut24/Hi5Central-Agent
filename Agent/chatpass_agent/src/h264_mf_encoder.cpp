@@ -304,6 +304,8 @@ struct H264MfEncoder::Impl {
     int needInputCredits = 0;
     uint64_t noCreditDrops = 0;
     int consecutiveNoCreditDrops = 0;
+    uint64_t unexpectedOutputWaits = 0;
+    int consecutiveGpuPoolBusy = 0;
     bool asyncMode = false;
     bool sequenceHeaderLogged = false;
     bool mfStarted = false;
@@ -679,7 +681,10 @@ bool H264MfEncoder::encodeInternal(const I420Frame* frame, const SharedGpuFrame*
             meta = m_impl->pendingInputs.front();
             m_impl->pendingInputs.pop_front();
         }
-        if (meta.gpuSurfaceSlot >= 0 && meta.gpuSurfaceSlot < static_cast<int>(m_impl->surfaceInUse.size())) m_impl->surfaceInUse[meta.gpuSurfaceSlot] = false;
+        if (meta.gpuSurfaceSlot >= 0 && meta.gpuSurfaceSlot < static_cast<int>(m_impl->surfaceInUse.size())) {
+            m_impl->surfaceInUse[meta.gpuSurfaceSlot] = false;
+            m_impl->consecutiveGpuPoolBusy = 0;
+        }
 
         if (encoded.data.empty()) {
             encoded.timestamp90k = meta.timestamp90k;
@@ -754,6 +759,19 @@ bool H264MfEncoder::encodeInternal(const I420Frame* frame, const SharedGpuFrame*
                 if (output.pEvents) output.pEvents->Release();
                 return true;
             }
+            // Intel Quick Sync async MFTs can transiently return E_UNEXPECTED
+            // even after METransformHaveOutput. This means the output surface is
+            // not ready yet; it is not an encoder failure. Keep the accepted
+            // input/surface queued and wait for the next output event.
+            if (m_impl->asyncMode && hr == E_UNEXPECTED) {
+                if (output.pEvents) output.pEvents->Release();
+                ++m_impl->unexpectedOutputWaits;
+                if (m_impl->unexpectedOutputWaits == 1 || (m_impl->unexpectedOutputWaits % 120) == 0) {
+                    std::cout << "[h264] async ProcessOutput E_UNEXPECTED; output not ready count="
+                        << m_impl->unexpectedOutputWaits << "\n";
+                }
+                return true;
+            }
             if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
                 if (output.pEvents) output.pEvents->Release();
                 ComPtr<IMFMediaType> newOut;
@@ -772,6 +790,7 @@ bool H264MfEncoder::encodeInternal(const I420Frame* frame, const SharedGpuFrame*
                 return false;
             }
 
+            m_impl->unexpectedOutputWaits = 0;
             ComPtr<IMFSample> got;
             if (output.pSample) {
                 if (m_impl->outputInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) {
@@ -866,7 +885,18 @@ bool H264MfEncoder::encodeInternal(const I420Frame* frame, const SharedGpuFrame*
     const uint64_t inputIndex = m_frameIndex;
     if (gpuFrame) {
         if (!m_impl->MakeGpuSample(*gpuFrame, m_width, m_height, inputIndex, m_fps, sample, gpuSurfaceSlot, error)) return false;
-        if (!sample) return true;
+        if (!sample) {
+            ++m_impl->consecutiveGpuPoolBusy;
+            if (m_impl->consecutiveGpuPoolBusy == 1) {
+                std::cout << "[h264-gpu] NV12 surface pool busy; dropping capture frame\n";
+            }
+            if (m_impl->consecutiveGpuPoolBusy >= 12) {
+                if (error) *error = "GPU NV12 surface pool stalled waiting for async encoder output";
+                return false;
+            }
+            return true;
+        }
+        m_impl->consecutiveGpuPoolBusy = 0;
     } else {
         const int uvWidth = (frame->width + 1) / 2; const int uvHeight = (frame->height + 1) / 2;
         const size_t ySize = static_cast<size_t>(frame->width) * static_cast<size_t>(frame->height); const size_t uvPlaneSize = static_cast<size_t>(uvWidth) * static_cast<size_t>(uvHeight); const size_t nv12Size = ySize + (uvPlaneSize * 2);
