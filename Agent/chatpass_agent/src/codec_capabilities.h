@@ -17,16 +17,15 @@ struct CodecEncoderCapability {
 };
 
 struct CodecSelectionResult {
-    std::string requestedMode;     // auto, vp8, h264_hw, etc.
-    std::string selectedCodec;     // currently vp8 until H.264 sender path is implemented
+    std::string requestedMode;     // auto, av1[_hw/_sw], vp9[_hw/_sw], h265, h264, vp8
+    std::string selectedCodec;     // auto or the explicitly requested codec
     std::string selectedReason;
     bool hardwareH264Available = false;
     std::vector<CodecEncoderCapability> capabilities;
 };
 
-// Probes local Windows encoder availability. This is intentionally detection-only;
-// the production stream still uses the current stable VP8 path until each codec
-// sender path is implemented and enabled safely.
+// Probes local Windows encoder availability. Runtime selection intersects this
+// endpoint capability with the Viewer SDP answer and live encode-health telemetry.
 CodecSelectionResult ProbeCodecCapabilitiesAndSelect(const std::string& requestedMode);
 
 std::string CodecCapabilitiesToLogString(const CodecSelectionResult& result);

@@ -6589,9 +6589,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
                         std::transform(requestedCodec.begin(), requestedCodec.end(), requestedCodec.begin(),
                             [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-                        if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw" ||
-                            requestedCodec == "vp8" || requestedCodec == "h264_hw" || requestedCodec == "h264" ||
-                            requestedCodec == "h264_sw") {
+                        if (requestedCodec == "av1_hw" || requestedCodec == "av1" || requestedCodec == "av1_sw" ||
+                            requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw" ||
+                            requestedCodec == "h265_hw" || requestedCodec == "h265" || requestedCodec == "h265_sw" ||
+                            requestedCodec == "h264_hw" || requestedCodec == "h264" || requestedCodec == "h264_sw" ||
+                            requestedCodec == "vp8") {
                             return requestedCodec;
                         }
                         return std::string("auto");

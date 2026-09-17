@@ -121,12 +121,24 @@ static CodecEncoderCapability ProbeOne(const std::string& codec,
         }
     }
     else if (codec == "vp8") {
-        c.recommendation = "current stable fallback; implemented via libvpx";
+        c.recommendation = "stable low-CPU fallback; implemented via bundled libvpx";
         c.softwareEncodeAvailable = true;
         if (c.softwareEncoders.empty()) c.softwareEncoders.push_back("libvpx VP8 encoder (bundled/current)");
     }
+    else if (codec == "vp9") {
+        c.recommendation = c.hardwareEncodeAvailable ? "hardware-first with bundled libvpx software fallback" : "bundled libvpx software fallback available";
+        c.softwareEncodeAvailable = true;
+        if (std::find(c.softwareEncoders.begin(), c.softwareEncoders.end(), "libvpx VP9 encoder (bundled)") == c.softwareEncoders.end())
+            c.softwareEncoders.push_back("libvpx VP9 encoder (bundled)");
+    }
+    else if (codec == "av1") {
+        c.recommendation = c.hardwareEncodeAvailable ? "prefer in Auto when Viewer also negotiates AV1" : "use only when a usable encoder is available";
+    }
+    else if (codec == "h265") {
+        c.recommendation = c.hardwareEncodeAvailable ? "hardware HEVC available; select only when Viewer negotiates H.265" : "fallback only when local encoder exists";
+    }
     else {
-        c.recommendation = "future codec; detect only until sender/browser path is implemented";
+        c.recommendation = "codec available subject to live endpoint/Viewer validation";
     }
 
     return c;
@@ -144,7 +156,7 @@ CodecSelectionResult ProbeCodecCapabilitiesAndSelect(const std::string& requeste
     CodecSelectionResult result{};
     result.requestedMode = NormalizeMode(requestedModeRaw);
     result.selectedCodec = "vp8";
-    result.selectedReason = "VP8 stable fallback; H.264 hardware sender enabled only when HI5_CODEC=h264_hw/h264/h264_sw";
+    result.selectedReason = "adaptive codec capability probe";
 
     HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool coInit = SUCCEEDED(coHr);
@@ -175,29 +187,31 @@ CodecSelectionResult ProbeCodecCapabilitiesAndSelect(const std::string& requeste
 
     if (result.requestedMode == "vp8") {
         result.selectedCodec = "vp8";
-        result.selectedReason = "HI5_CODEC=vp8 requested; using current stable VP8 path";
+        result.selectedReason = "HI5_CODEC=vp8 requested; using bundled libvpx VP8";
+    }
+    else if (result.requestedMode == "vp9" || result.requestedMode == "vp9_hw" || result.requestedMode == "vp9_sw") {
+        result.selectedCodec = "vp9";
+        result.selectedReason = result.requestedMode == "vp9_sw" ? "bundled libvpx VP9 requested" : "VP9 hardware-first with bundled libvpx fallback";
+    }
+    else if (result.requestedMode == "av1" || result.requestedMode == "av1_hw" || result.requestedMode == "av1_sw") {
+        result.selectedCodec = "av1";
+        result.selectedReason = "AV1 requested; live encoder and Viewer negotiation validation required";
+    }
+    else if (result.requestedMode == "h265" || result.requestedMode == "h265_hw" || result.requestedMode == "h265_sw") {
+        result.selectedCodec = "h265";
+        result.selectedReason = "H.265 requested; live encoder and Viewer negotiation validation required";
     }
     else if (result.requestedMode == "h264_hw" || result.requestedMode == "h264" || result.requestedMode == "h264_sw") {
-        if (result.requestedMode == "h264_sw") {
-            result.selectedCodec = "h264";
-            result.selectedReason = "HI5_CODEC=h264_sw requested; using Media Foundation H.264 software/hybrid sender path";
-        }
-        else if (result.hardwareH264Available) {
-            result.selectedCodec = "h264";
-            result.selectedReason = "HI5_CODEC=" + result.requestedMode + " requested; hardware H.264 available and sender path enabled";
-        }
-        else {
-            result.selectedCodec = "vp8";
-            result.selectedReason = "hardware H.264 not detected; VP8 stable fallback selected";
-        }
+        result.selectedCodec = "h264";
+        result.selectedReason = "H.264 requested with hardware/software fallback policy";
     }
     else if (result.requestedMode == "auto") {
         result.selectedCodec = "auto";
-        result.selectedReason = "adaptive session mode: negotiate VP9/VP8/H.264 with the Viewer, prefer VP9, and fall back using live encoder health";
+        result.selectedReason = "adaptive mode negotiates AV1/VP9/H.265/H.264/VP8 and selects by endpoint hardware plus live encode health";
     }
     else {
         result.selectedCodec = "vp8";
-        result.selectedReason = "requested codec mode is not implemented yet; VP8 stable fallback selected";
+        result.selectedReason = "unknown codec mode; safe VP8 fallback selected";
     }
 
     MFShutdown();

@@ -160,7 +160,9 @@ add_executable(native_vp8_stream
   src/h264_mf_encoder.cpp
   src/vp8_encoder.cpp
   src/vp9_mf_encoder.cpp
-  src/av1_mf_encoder.cpp	
+  src/vp9_vpx_encoder.cpp
+  src/av1_mf_encoder.cpp
+  src/h265_mf_encoder.cpp
   src/webrtc_sender.cpp
   src/codec_policy.cpp
   src/agent_identity.cpp

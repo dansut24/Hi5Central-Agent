@@ -599,7 +599,8 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
 
         hr = m_impl->transform->ProcessOutput(0, 1, &output, &status);
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            return !out.data.empty();
+            // ProcessInput succeeded; the MFT buffered this frame and simply has no output yet.
+            return true;
         }
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
             ComPtr<IMFMediaType> newOut;

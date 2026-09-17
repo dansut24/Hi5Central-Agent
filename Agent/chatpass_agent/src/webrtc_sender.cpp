@@ -1,5 +1,6 @@
 ﻿#include "webrtc_sender.h"
 #include "frame_source.h"
+#include "codec_capabilities.h"
 #include "util/log.h"
 #ifdef _WIN32
 #include "platform/windows/wasapi_loopback.h"
@@ -7,6 +8,10 @@
 #endif
 
 #include <rtc/rtc.hpp>
+#include <rtc/av1rtppacketizer.hpp>
+#include <rtc/h265rtppacketizer.hpp>
+#include <rtc/rtcpnackresponder.hpp>
+#include <rtc/rtcpsrreporter.hpp>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -61,6 +66,24 @@ namespace {
         catch (...) {
             return fallbackValue;
         }
+    }
+
+    static std::string readEnvString(const char* name, const char* fallbackValue = "") {
+        char buf[128]{};
+        DWORD n = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+        std::string value = (n > 0 && n < sizeof(buf)) ? std::string(buf, buf + n) : std::string(fallbackValue);
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return value;
+    }
+
+    static std::string imageQualityMode() {
+        std::string value = readEnvString("HI5_IMAGE_QUALITY", "balanced");
+        if (value == "near-lossless" || value == "near_lossless") value = "near_lossless";
+        if (value != "balanced" && value != "text" && value != "near_lossless" && value != "lossless")
+            value = "balanced";
+        return value;
     }
 
 
@@ -185,7 +208,10 @@ namespace {
         int originalMaxBitrateKbps) {
         const int mode = std::max(0, std::min(3, streamMode)); // 3 = wake-from-idle profile
         const int maxFps = std::max(1, originalMaxFps);
-        const int maxKbps = std::max(300, originalMaxBitrateKbps);
+        const std::string quality = imageQualityMode();
+        const int qualityCeilingKbps = quality == "lossless" ? 20000 :
+            (quality == "near_lossless" ? 16000 : (quality == "text" ? 10000 : originalMaxBitrateKbps));
+        const int maxKbps = std::max(300, std::max(originalMaxBitrateKbps, qualityCeilingKbps));
 
         Vp8RuntimeProfile p{};
 
@@ -275,9 +301,24 @@ namespace {
             p.fps = std::min(p.fps, std::max(1, hintedFps));
         }
 
+        if (quality == "text") {
+            p.bitrateKbps = std::min(maxKbps, std::max(p.bitrateKbps, (p.bitrateKbps * 3) / 2));
+            p.maxQuantizer = std::min(p.maxQuantizer, 22);
+        }
+        else if (quality == "near_lossless") {
+            p.bitrateKbps = std::min(maxKbps, std::max(p.bitrateKbps, p.bitrateKbps * 2));
+            p.maxQuantizer = std::min(p.maxQuantizer, 10);
+        }
+        else if (quality == "lossless") {
+            // VP8 does not expose the true VP9 lossless control used by Hi5Central.
+            // If VP8 is explicitly forced, keep it visually near-lossless instead.
+            p.bitrateKbps = maxKbps;
+            p.maxQuantizer = std::min(p.maxQuantizer, 6);
+        }
+
         p.fps = std::max(1, std::min(maxFps, p.fps));
         p.bitrateKbps = std::max(250, std::min(maxKbps, p.bitrateKbps));
-        p.minQuantizer = 4;
+        p.minQuantizer = quality == "near_lossless" ? 0 : 4;
         return p;
     }
 }
@@ -315,6 +356,31 @@ WebRtcSender::WebRtcSender(std::string sessionId,
 
     LogInfo("[codec] WebRtcSender codec mode=" + m_codecMode);
 
+    // Cache real endpoint encoder capability once per session. Auto only promotes
+    // expensive codecs when the endpoint has a hardware encoder, with libvpx VP9
+    // permitted on sufficiently capable CPUs as a measured software fallback.
+    try {
+        const auto localCaps = hi5::ProbeCodecCapabilitiesAndSelect("auto");
+        for (const auto& c : localCaps.capabilities) {
+            if (c.codec == "av1") m_hwAv1Available = c.hardwareEncodeAvailable;
+            else if (c.codec == "vp9") m_hwVp9Available = c.hardwareEncodeAvailable;
+            else if (c.codec == "h265") m_hwH265Available = c.hardwareEncodeAvailable;
+            else if (c.codec == "h264") m_hwH264Available = c.hardwareEncodeAvailable;
+        }
+    } catch (...) {
+    }
+#ifdef _WIN32
+    m_swVp9Allowed = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) >= 8;
+#else
+    m_swVp9Allowed = true;
+#endif
+    LogInfo("[codec] endpoint capabilities session=" + m_sessionId +
+        " av1_hw=" + std::string(m_hwAv1Available ? "1" : "0") +
+        " vp9_hw=" + std::string(m_hwVp9Available ? "1" : "0") +
+        " h265_hw=" + std::string(m_hwH265Available ? "1" : "0") +
+        " h264_hw=" + std::string(m_hwH264Available ? "1" : "0") +
+        " vp9_sw_allowed=" + std::string(m_swVp9Allowed ? "1" : "0"));
+
     m_autoCodec = (m_codecMode == "auto");
     if (m_autoCodec) {
         // Remote-support Auto favours predictable endpoint CPU/RAM over maximum
@@ -325,16 +391,28 @@ WebRtcSender::WebRtcSender(std::string sessionId,
         m_payloadType = 96;
         LogInfo("[codec] adaptive auto mode enabled, VP8 low-CPU baseline preferred session=" + m_sessionId);
     }
-    else if (m_codecMode == "h264_hw" || m_codecMode == "h264" || m_codecMode == "h264_sw") {
-        m_videoCodec = VideoCodec::H264;
-        m_payloadType = 102;
-        LogInfo("[codec] WebRtcSender experimental H.264 requested mode=" + m_codecMode +
+    else if (m_codecMode == "av1_hw" || m_codecMode == "av1" || m_codecMode == "av1_sw") {
+        m_videoCodec = VideoCodec::AV1;
+        m_payloadType = 100;
+        LogInfo("[codec] WebRtcSender AV1 requested mode=" + m_codecMode +
             " session=" + m_sessionId);
     }
     else if (m_codecMode == "vp9_hw" || m_codecMode == "vp9" || m_codecMode == "vp9_sw") {
         m_videoCodec = VideoCodec::VP9;
         m_payloadType = 98;
         LogInfo("[codec] WebRtcSender VP9 requested mode=" + m_codecMode +
+            " session=" + m_sessionId);
+    }
+    else if (m_codecMode == "h265_hw" || m_codecMode == "h265" || m_codecMode == "h265_sw") {
+        m_videoCodec = VideoCodec::H265;
+        m_payloadType = 104;
+        LogInfo("[codec] WebRtcSender H.265 requested mode=" + m_codecMode +
+            " session=" + m_sessionId);
+    }
+    else if (m_codecMode == "h264_hw" || m_codecMode == "h264" || m_codecMode == "h264_sw") {
+        m_videoCodec = VideoCodec::H264;
+        m_payloadType = 102;
+        LogInfo("[codec] WebRtcSender H.264 requested mode=" + m_codecMode +
             " session=" + m_sessionId);
     }
     else {
@@ -415,26 +493,51 @@ void WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
         return static_cast<char>(std::toupper(c));
         });
 
+    m_peerAcceptsAv1 = upper.find("A=RTPMAP:100 AV1/90000") != std::string::npos;
     m_peerAcceptsVp9 = upper.find("A=RTPMAP:98 VP9/90000") != std::string::npos;
-    m_peerAcceptsVp8 = upper.find("A=RTPMAP:96 VP8/90000") != std::string::npos;
+    m_peerAcceptsH265 = upper.find("A=RTPMAP:104 H265/90000") != std::string::npos;
     m_peerAcceptsH264 = upper.find("A=RTPMAP:102 H264/90000") != std::string::npos;
+    m_peerAcceptsVp8 = upper.find("A=RTPMAP:96 VP8/90000") != std::string::npos;
 
     LogInfo("[codec] viewer answer capabilities session=" + m_sessionId +
+        " av1=" + std::string(m_peerAcceptsAv1 ? "1" : "0") +
         " vp9=" + std::string(m_peerAcceptsVp9 ? "1" : "0") +
-        " vp8=" + std::string(m_peerAcceptsVp8 ? "1" : "0") +
-        " h264=" + std::string(m_peerAcceptsH264 ? "1" : "0"));
+        " h265=" + std::string(m_peerAcceptsH265 ? "1" : "0") +
+        " h264=" + std::string(m_peerAcceptsH264 ? "1" : "0") +
+        " vp8=" + std::string(m_peerAcceptsVp8 ? "1" : "0"));
 
-    if (m_peerAcceptsVp8) {
-        switchVideoCodec(VideoCodec::VP8, "auto initial selection: low-CPU VP8 baseline accepted");
+    const std::string quality = imageQualityMode();
+    if (quality == "lossless" && m_peerAcceptsVp9) {
+        // True lossless is implemented by the bundled libvpx VP9 path. Hardware
+        // MFT encoders are not assumed lossless because their rate-control APIs vary.
+        m_codecMode = "vp9_sw";
+        switchVideoCodec(VideoCodec::VP9, "auto: true lossless mode requires libvpx VP9");
+    }
+    else if (m_peerAcceptsAv1 && m_hwAv1Available) {
+        switchVideoCodec(VideoCodec::AV1, "auto: hardware AV1 available on endpoint and Viewer");
+    }
+    else if (m_peerAcceptsVp9 && m_hwVp9Available) {
+        switchVideoCodec(VideoCodec::VP9, "auto: hardware VP9 available on endpoint and Viewer");
+    }
+    else if (m_peerAcceptsH265 && m_hwH265Available) {
+        switchVideoCodec(VideoCodec::H265, "auto: hardware H.265 available on endpoint and Viewer");
+    }
+    else if (m_peerAcceptsH264 && m_hwH264Available) {
+        switchVideoCodec(VideoCodec::H264, "auto: hardware H.264 available on endpoint and Viewer");
+    }
+    else if (m_peerAcceptsVp9 && m_swVp9Allowed) {
+        m_codecMode = "vp9_sw";
+        switchVideoCodec(VideoCodec::VP9, "auto: software VP9 allowed; live health fallback to VP8 enabled");
+    }
+    else if (m_peerAcceptsVp8) {
+        switchVideoCodec(VideoCodec::VP8, "auto: low-CPU VP8 fallback");
     }
     else if (m_peerAcceptsVp9) {
-        switchVideoCodec(VideoCodec::VP9, "auto initial selection: VP8 unavailable, Viewer accepts VP9");
-    }
-    else if (m_peerAcceptsH264) {
-        switchVideoCodec(VideoCodec::H264, "auto initial selection: VP8/VP9 unavailable, Viewer accepts H.264");
+        m_codecMode = "vp9_sw";
+        switchVideoCodec(VideoCodec::VP9, "auto: Viewer has no VP8; software VP9 required");
     }
     else {
-        LogInfo("[codec] adaptive offer answer exposed no recognised video payload; keeping current codec session=" + m_sessionId);
+        LogInfo("[codec] adaptive offer answer exposed no recognised usable video payload; keeping current codec session=" + m_sessionId);
     }
 }
 
@@ -442,22 +545,30 @@ bool WebRtcSender::switchVideoCodec(VideoCodec codec, const std::string& reason)
     int payload = 96;
     const char* name = "VP8";
     if (codec == VideoCodec::VP9) { payload = 98; name = "VP9"; }
+    else if (codec == VideoCodec::AV1) { payload = 100; name = "AV1"; }
     else if (codec == VideoCodec::H264) { payload = 102; name = "H.264"; }
+    else if (codec == VideoCodec::H265) { payload = 104; name = "H.265"; }
 
+    if (codec == VideoCodec::AV1 && m_autoCodec && !m_peerAcceptsAv1) return false;
     if (codec == VideoCodec::VP9 && m_autoCodec && !m_peerAcceptsVp9) return false;
-    if (codec == VideoCodec::VP8 && m_autoCodec && !m_peerAcceptsVp8) return false;
+    if (codec == VideoCodec::H265 && m_autoCodec && !m_peerAcceptsH265) return false;
     if (codec == VideoCodec::H264 && m_autoCodec && !m_peerAcceptsH264) return false;
+    if (codec == VideoCodec::VP8 && m_autoCodec && !m_peerAcceptsVp8) return false;
 
     const bool changed = codec != m_videoCodec || payload != m_payloadType;
     m_videoCodec = codec;
     m_payloadType = payload;
-    if (!changed) return true;
+    if (!changed) {
+        configureVideoMediaHandler(codec);
+        return true;
+    }
 
-    // Keep SSRC/sequence/RTP clock continuous. Only the codec payload and encoder
-    // change, which lets a negotiated receiver switch decoders on a keyframe.
     m_encoder.reset();
     m_vp9Encoder.reset();
+    m_vp9VpxEncoder.reset();
+    m_av1Encoder.reset();
     m_h264Encoder.reset();
+    m_h265Encoder.reset();
     m_externalEncoderWidth = 0;
     m_externalEncoderHeight = 0;
     m_externalConfiguredFps = 0;
@@ -466,11 +577,47 @@ bool WebRtcSender::switchVideoCodec(VideoCodec codec, const std::string& reason)
     m_codecUnhealthyWindows = 0;
     m_forceKeyframe = true;
     m_lastCodecSwitchAt = std::chrono::steady_clock::now();
+    configureVideoMediaHandler(codec);
 
     LogInfo("[codec] live switch session=" + m_sessionId + " codec=" + name +
         " payload=" + std::to_string(payload) + " reason=" + reason);
     LogSupportEvent(std::string("Codec switched to ") + name + " - " + reason);
     return true;
+}
+
+void WebRtcSender::configureVideoMediaHandler(VideoCodec codec) {
+    if (!m_track) return;
+
+    if (m_nativeVideoRtpConfig) {
+        m_sequence = m_nativeVideoRtpConfig->sequenceNumber;
+        m_externalLastRtpTimestamp = m_nativeVideoRtpConfig->timestamp;
+        m_nativeVideoRtpConfig.reset();
+    }
+
+    // VP8/VP9/H.264 use Hi5Central's existing manual RTP packetization.
+    if (codec != VideoCodec::AV1 && codec != VideoCodec::H265) {
+        m_track->setMediaHandler(nullptr);
+        return;
+    }
+
+    auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(
+        m_ssrc, "video-stream", static_cast<uint8_t>(m_payloadType), 90000);
+    cfg->sequenceNumber = m_sequence;
+    cfg->timestamp = m_externalLastRtpTimestamp != 0 ? m_externalLastRtpTimestamp : randomU32();
+
+    std::shared_ptr<rtc::MediaHandler> packetizer;
+    if (codec == VideoCodec::AV1) {
+        packetizer = std::make_shared<rtc::AV1RtpPacketizer>(
+            rtc::AV1RtpPacketizer::Packetization::TemporalUnit, cfg);
+    }
+    else {
+        packetizer = std::make_shared<rtc::H265RtpPacketizer>(
+            rtc::NalUnit::Separator::StartSequence, cfg);
+    }
+    packetizer->addToChain(std::make_shared<rtc::RtcpSrReporter>(cfg));
+    packetizer->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+    m_track->setMediaHandler(packetizer);
+    m_nativeVideoRtpConfig = cfg;
 }
 
 void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, double sendAvgMs) {
@@ -520,7 +667,28 @@ void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, do
     // Require two consecutive 5-second health windows before a codec change.
     if (m_codecUnhealthyWindows < 2) return;
 
-    if (m_videoCodec == VideoCodec::H264 && m_peerAcceptsVp9 && !m_vp9Failed) {
+    if (m_videoCodec == VideoCodec::AV1) {
+        if (m_peerAcceptsVp9 && !m_vp9Failed)
+            switchVideoCodec(VideoCodec::VP9, "AV1 encode/send latency remained high");
+        else if (m_peerAcceptsH265 && !m_h265Failed)
+            switchVideoCodec(VideoCodec::H265, "AV1 latency remained high and VP9 was unavailable");
+        else if (m_peerAcceptsH264 && !m_h264Failed)
+            switchVideoCodec(VideoCodec::H264, "AV1 latency remained high; using H.264 fallback");
+        else if (m_peerAcceptsVp8)
+            switchVideoCodec(VideoCodec::VP8, "AV1 latency remained high; using VP8 baseline");
+    }
+    else if (m_videoCodec == VideoCodec::H265) {
+        if (m_peerAcceptsH264 && !m_h264Failed)
+            switchVideoCodec(VideoCodec::H264, "H.265 encode/send latency remained high");
+        else if (m_peerAcceptsVp9 && !m_vp9Failed && m_swVp9Allowed) {
+            m_codecMode = "vp9_sw";
+            switchVideoCodec(VideoCodec::VP9, "H.265 latency remained high; trying software VP9");
+        }
+        else if (m_peerAcceptsVp8)
+            switchVideoCodec(VideoCodec::VP8, "H.265 latency remained high; using VP8 baseline");
+    }
+    else if (m_videoCodec == VideoCodec::H264 && m_peerAcceptsVp9 && !m_vp9Failed && m_swVp9Allowed) {
+        m_codecMode = "vp9_sw";
         switchVideoCodec(VideoCodec::VP9, "H.264 encode/send latency remained high");
     }
     else if (m_videoCodec == VideoCodec::VP9 && m_peerAcceptsVp8) {
@@ -1049,13 +1217,38 @@ void WebRtcSender::createPeerConnection() {
 
     rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
     if (m_autoCodec) {
-        // Keep all adaptive candidates negotiated on the same media section/SSRC.
-        // RTP payload type can then change with a fresh keyframe without tearing
-        // down input channels or the remote session.
+        // Keep every supported candidate negotiated on the same media section/SSRC.
+        // Auto will only select codecs the Viewer answers and the endpoint can encode.
+        media.addAV1Codec(100);
         media.addVP9Codec(98);
-        media.addVP8Codec(96);
+        media.addH265Codec(104);
         media.addH264Codec(102);
-        LogInfo("[codec] SDP adaptive offer VP9=98 VP8=96 H264=102 session=" + m_sessionId);
+        media.addVP8Codec(96);
+        LogInfo("[codec] SDP adaptive offer AV1=100 VP9=98 H265=104 H264=102 VP8=96 session=" + m_sessionId);
+    }
+    else if (m_videoCodec == VideoCodec::AV1) {
+        try {
+            media.addAV1Codec(m_payloadType);
+            LogInfo("[codec] SDP offering AV1 payload=" + std::to_string(m_payloadType) +
+                " session=" + m_sessionId);
+        } catch (...) {
+            LogInfo("[codec] addAV1Codec failed before offer; falling back to VP8 session=" + m_sessionId);
+            m_videoCodec = VideoCodec::VP8;
+            m_payloadType = 96;
+            media.addVP8Codec(m_payloadType);
+        }
+    }
+    else if (m_videoCodec == VideoCodec::H265) {
+        try {
+            media.addH265Codec(m_payloadType);
+            LogInfo("[codec] SDP offering H.265 payload=" + std::to_string(m_payloadType) +
+                " session=" + m_sessionId);
+        } catch (...) {
+            LogInfo("[codec] addH265Codec failed before offer; falling back to VP8 session=" + m_sessionId);
+            m_videoCodec = VideoCodec::VP8;
+            m_payloadType = 96;
+            media.addVP8Codec(m_payloadType);
+        }
     }
     else if (m_videoCodec == VideoCodec::H264) {
         try {
@@ -1090,14 +1283,17 @@ void WebRtcSender::createPeerConnection() {
     }
 
     const std::string selectedCodecName =
+        m_videoCodec == VideoCodec::AV1 ? "AV1" :
+        m_videoCodec == VideoCodec::H265 ? "H.265" :
         m_videoCodec == VideoCodec::H264 ? "H.264" :
-        (m_videoCodec == VideoCodec::VP9 ? "VP9" : "VP8");
+        m_videoCodec == VideoCodec::VP9 ? "VP9" : "VP8";
     LogSupportEvent("Codec: " + selectedCodecName);
 
     media.addSSRC(m_ssrc, "video-stream");
     media.setBitrate(m_bitrateKbps * 1000);
 
     m_track = m_pc->addTrack(media);
+    configureVideoMediaHandler(m_videoCodec);
 
 #ifdef _WIN32
     if (m_enableAudio) {
@@ -1786,8 +1982,11 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             "[external] raw entry session=" + m_sessionId +
             " codec=" + m_codecMode +
             " video_codec=" + std::string(
+                m_videoCodec == VideoCodec::AV1 ? "av1" :
+                m_videoCodec == VideoCodec::H265 ? "h265" :
                 m_videoCodec == VideoCodec::H264 ? "h264" :
-                (m_videoCodec == VideoCodec::VP9 ? "vp9" : "vp8")) +
+                m_videoCodec == VideoCodec::VP9 ? "vp9" : "vp8") +
+            " quality=" + imageQualityMode() +
             " h264_failed=" + std::string(m_h264Failed ? "true" : "false") +
             " mode=" + std::string(m_mode == Mode::ExternalFeed ? "external" : "direct") +
             " can_send=" + std::string(m_canSend ? "true" : "false") +
@@ -1870,7 +2069,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         profile.cpuUsed != m_externalConfiguredCpuUsed ||
         profile.maxQuantizer != m_externalConfiguredMaxQuantizer;
 
-    if (((m_videoCodec == VideoCodec::VP8) || m_h264Failed) && (!m_encoder || sizeChanged)) {
+    if (m_videoCodec == VideoCodec::VP8 && (!m_encoder || sizeChanged)) {
         m_externalEncoderWidth = frame.width;
         m_externalEncoderHeight = frame.height;
         m_externalConfiguredFps = profile.fps;
@@ -1899,7 +2098,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             << " qmax=" << profile.maxQuantizer
             << "\n";
     }
-    else if (((m_videoCodec == VideoCodec::VP8) || m_h264Failed) && profileChanged) {
+    else if (m_videoCodec == VideoCodec::VP8 && profileChanged) {
         const bool ok = m_encoder->reconfigure(
             profile.fps,
             profile.bitrateKbps,
@@ -1948,217 +2147,324 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
     const bool periodicKeyframe = (m_externalFrameCounter % m_externalKeyframeEvery) == 0;
     const bool keyframe = forceKeyframe || periodicKeyframe || m_forceKeyframe.exchange(false);
 
+    auto sendNativePacketizedVideo = [&](const std::vector<uint8_t>& bytes) {
+        if (bytes.empty() || !m_track || !m_track->isOpen() || !m_nativeVideoRtpConfig) return false;
+        m_nativeVideoRtpConfig->timestamp = captureRtpTimestamp;
+        rtc::binary payload;
+        payload.reserve(bytes.size());
+        for (uint8_t b : bytes) payload.push_back(static_cast<std::byte>(b));
+        const auto sendStart = std::chrono::steady_clock::now();
+        m_track->send(payload);
+        const auto sendEnd = std::chrono::steady_clock::now();
+        const double sendMs = std::chrono::duration<double, std::milli>(sendEnd - sendStart).count();
+        m_externalSendMsTotal += sendMs;
+        m_externalSendMsMax = std::max(m_externalSendMsMax, sendMs);
+        ++m_externalSentFrames;
+        m_sequence = m_nativeVideoRtpConfig->sequenceNumber;
+        return true;
+    };
+
+    auto reportCodecHealth = [&](const char* codecName) {
+        const auto healthNow = std::chrono::steady_clock::now();
+        if (m_externalNextStatsLog.time_since_epoch().count() == 0)
+            m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
+        if (healthNow < m_externalNextStatsLog) return;
+
+        const double encodedCount = std::max<uint64_t>(1, m_externalEncodedFrames);
+        const double sentCount = std::max<uint64_t>(1, m_externalSentFrames);
+        const double encodeAvgMs = m_externalEncodeMsTotal / encodedCount;
+        const double sendAvgMs = m_externalSendMsTotal / sentCount;
+        LogInfo(std::string("[") + codecName + "] encode health session=" + m_sessionId +
+            " encode_avg_ms=" + std::to_string(encodeAvgMs) +
+            " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+            " send_avg_ms=" + std::to_string(sendAvgMs) +
+            " send_max_ms=" + std::to_string(m_externalSendMsMax));
+        observeCodecHealth(encodeAvgMs, m_externalEncodeMsMax, sendAvgMs);
+        m_externalEncodedFrames = 0; m_externalSentFrames = 0;
+        m_externalEncodeMsTotal = 0.0; m_externalEncodeMsMax = 0.0;
+        m_externalSendMsTotal = 0.0; m_externalSendMsMax = 0.0;
+        m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
+    };
+
+    auto selectNextAutoCodec = [&](VideoCodec failed, const std::string& why) {
+        if (!m_autoCodec) return false;
+        if (failed == VideoCodec::AV1) {
+            if (m_peerAcceptsVp9 && !m_vp9Failed) return switchVideoCodec(VideoCodec::VP9, why + "; falling back from AV1");
+            if (m_peerAcceptsH265 && !m_h265Failed) return switchVideoCodec(VideoCodec::H265, why + "; falling back from AV1");
+            if (m_peerAcceptsH264 && !m_h264Failed) return switchVideoCodec(VideoCodec::H264, why + "; falling back from AV1");
+        }
+        if (failed == VideoCodec::H265) {
+            if (m_peerAcceptsH264 && !m_h264Failed) return switchVideoCodec(VideoCodec::H264, why + "; falling back from H.265");
+            if (m_peerAcceptsVp9 && !m_vp9Failed) return switchVideoCodec(VideoCodec::VP9, why + "; falling back from H.265");
+        }
+        if (failed == VideoCodec::H264 && m_peerAcceptsVp9 && !m_vp9Failed)
+            return switchVideoCodec(VideoCodec::VP9, why + "; falling back from H.264");
+        if ((failed == VideoCodec::VP9 || failed == VideoCodec::H264 || failed == VideoCodec::H265 || failed == VideoCodec::AV1) && m_peerAcceptsVp8)
+            return switchVideoCodec(VideoCodec::VP8, why + "; using VP8 baseline");
+        return false;
+    };
+
+    if (m_videoCodec == VideoCodec::AV1 && !m_av1Failed) {
+        const int av1Fps = readEnvInt("HI5_AV1_ENCODER_FPS", std::min(30, std::max(1, m_fps)), 1, 60);
+        const std::string av1Quality = imageQualityMode();
+        const int av1DefaultKbps = av1Quality == "lossless" ? std::max(20000, m_bitrateKbps) :
+            (av1Quality == "near_lossless" ? std::max(12000, m_bitrateKbps) :
+            (av1Quality == "text" ? std::max(8000, m_bitrateKbps) : std::max(250, m_bitrateKbps)));
+        const int av1Kbps = readEnvInt("HI5_AV1_ENCODER_KBPS", av1DefaultKbps, 500, 30000);
+        const bool av1SizeChanged = frame.width != m_externalEncoderWidth || frame.height != m_externalEncoderHeight;
+        if (!m_av1Encoder || av1SizeChanged) {
+            m_av1Encoder.reset();
+            m_externalEncoderWidth = frame.width; m_externalEncoderHeight = frame.height;
+            m_externalConfiguredFps = av1Fps; m_externalConfiguredBitrateKbps = av1Kbps;
+            auto enc = std::make_unique<Av1MfEncoder>();
+            std::string err;
+            const bool preferHardware = m_codecMode != "av1_sw";
+            if (enc->init(frame.width, frame.height, av1Fps, av1Kbps, preferHardware, &err)) {
+                m_av1Encoder = std::move(enc);
+                m_externalProfileName = preferHardware ? "mediafoundation-av1-hardware-preferred" : "mediafoundation-av1-software";
+                LogInfo("[av1] encoder active session=" + m_sessionId + " name=" + m_av1Encoder->encoderName());
+            } else {
+                LogInfo("[av1] init failed session=" + m_sessionId + " error=" + err);
+                m_av1Failed = true;
+                selectNextAutoCodec(VideoCodec::AV1, "AV1 encoder unavailable");
+                return;
+            }
+            forceKeyframe = true;
+        }
+
+        const auto encodeStart = std::chrono::steady_clock::now();
+        Av1EncodedFrame encoded{};
+        std::string err;
+        bool ok = m_av1Encoder->encode(frame, keyframe || av1SizeChanged, encoded, &err);
+        if (!ok && m_codecMode != "av1_sw") {
+            LogInfo("[av1] hardware-preferred encode failed; same-frame software retry session=" + m_sessionId + " error=" + err);
+            auto sw = std::make_unique<Av1MfEncoder>();
+            std::string swErr;
+            if (sw->init(frame.width, frame.height, av1Fps, av1Kbps, false, &swErr)) {
+                Av1EncodedFrame retry{};
+                if (sw->encode(frame, true, retry, &swErr)) {
+                    m_av1Encoder = std::move(sw); m_codecMode = "av1_sw"; encoded = std::move(retry); ok = true;
+                    m_externalProfileName = "mediafoundation-av1-software-fallback";
+                }
+            }
+        }
+        if (!ok) {
+            LogInfo("[av1] encode failed session=" + m_sessionId + " error=" + err);
+            m_av1Failed = true; m_av1Encoder.reset();
+            selectNextAutoCodec(VideoCodec::AV1, "AV1 encode failed");
+            return;
+        }
+        const auto encodeEnd = std::chrono::steady_clock::now();
+        const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
+        m_externalEncodeMsTotal += encodeMs; m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs); ++m_externalEncodedFrames;
+        if (!encoded.data.empty()) sendNativePacketizedVideo(encoded.data);
+        reportCodecHealth("av1");
+        return;
+    }
+
+    if (m_videoCodec == VideoCodec::H265 && !m_h265Failed) {
+        const int h265Fps = std::max(1, profile.fps);
+        const int h265Kbps = std::max(500, profile.bitrateKbps);
+        const bool h265SizeChanged = frame.width != m_externalEncoderWidth || frame.height != m_externalEncoderHeight;
+        if (!m_h265Encoder || h265SizeChanged) {
+            m_h265Encoder.reset();
+            m_externalEncoderWidth = frame.width; m_externalEncoderHeight = frame.height;
+            m_externalConfiguredFps = h265Fps; m_externalConfiguredBitrateKbps = h265Kbps;
+            auto enc = std::make_unique<H265MfEncoder>();
+            std::string err;
+            const bool preferHardware = m_codecMode != "h265_sw";
+            if (enc->init(frame.width, frame.height, h265Fps, h265Kbps, preferHardware, &err)) {
+                m_h265Encoder = std::move(enc);
+                m_externalProfileName = preferHardware ? "mediafoundation-h265-hardware-preferred" : "mediafoundation-h265-software";
+                LogInfo("[h265] encoder active session=" + m_sessionId + " name=" + m_h265Encoder->encoderName());
+            } else {
+                LogInfo("[h265] init failed session=" + m_sessionId + " error=" + err);
+                m_h265Failed = true;
+                selectNextAutoCodec(VideoCodec::H265, "H.265 encoder unavailable");
+                return;
+            }
+            forceKeyframe = true;
+        }
+
+        const auto encodeStart = std::chrono::steady_clock::now();
+        H265EncodedFrame encoded{}; std::string err;
+        bool ok = m_h265Encoder->encode(frame, keyframe || h265SizeChanged, encoded, &err);
+        if (!ok && m_codecMode != "h265_sw") {
+            LogInfo("[h265] hardware-preferred encode failed; same-frame software retry session=" + m_sessionId + " error=" + err);
+            auto sw = std::make_unique<H265MfEncoder>(); std::string swErr;
+            if (sw->init(frame.width, frame.height, h265Fps, h265Kbps, false, &swErr)) {
+                H265EncodedFrame retry{};
+                if (sw->encode(frame, true, retry, &swErr)) {
+                    m_h265Encoder = std::move(sw); m_codecMode = "h265_sw"; encoded = std::move(retry); ok = true;
+                    m_externalProfileName = "mediafoundation-h265-software-fallback";
+                }
+            }
+        }
+        if (!ok) {
+            LogInfo("[h265] encode failed session=" + m_sessionId + " error=" + err);
+            m_h265Failed = true; m_h265Encoder.reset();
+            selectNextAutoCodec(VideoCodec::H265, "H.265 encode failed");
+            return;
+        }
+        const auto encodeEnd = std::chrono::steady_clock::now();
+        const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
+        m_externalEncodeMsTotal += encodeMs; m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs); ++m_externalEncodedFrames;
+        if (!encoded.data.empty()) sendNativePacketizedVideo(encoded.data);
+        reportCodecHealth("h265");
+        return;
+    }
+
     if (m_videoCodec == VideoCodec::VP9 && !m_vp9Failed) {
         bool vp9Scaled = false;
         const I420Frame vp9Frame = scaleI420ForVp9WebRtc(frame, &vp9Scaled);
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
+        const int vp9EncoderFps = readEnvInt("HI5_VP9_ENCODER_FPS", std::min(30, std::max(1, m_fps)), 1, 60);
+        const std::string vp9Quality = imageQualityMode();
+        const int vp9DefaultKbps = vp9Quality == "lossless" ? std::max(16000, m_bitrateKbps) :
+            (vp9Quality == "near_lossless" ? std::max(12000, m_bitrateKbps) :
+            (vp9Quality == "text" ? std::max(8000, m_bitrateKbps) : std::max(250, m_bitrateKbps)));
+        const int vp9EncoderBitrateKbps = readEnvInt("HI5_VP9_ENCODER_KBPS", vp9DefaultKbps, 500, 30000);
+        const int vp9DefaultMinQ = vp9Quality == "lossless" ? 0 : (vp9Quality == "near_lossless" ? 0 : (vp9Quality == "text" ? 2 : 4));
+        const int vp9DefaultMaxQ = vp9Quality == "lossless" ? 0 : (vp9Quality == "near_lossless" ? 10 : (vp9Quality == "text" ? 22 : 38));
 
-        // Media Foundation VP9 does not currently have the lightweight runtime
-        // reconfigure path that our libvpx VP8 encoder has. Creating VP9 while
-        // the desktop is idle used to lock it to 2 FPS / 1.2 Mbps; when motion
-        // immediately jumped to 20-30 FPS that caused a brief blocky/fuzzy
-        // burst. Keep VP9 configured at the session interaction ceiling while
-        // the capture helper is still free to idle at 2 FPS. A static desktop
-        // does not consume the ceiling bitrate simply because it is available.
-        const int vp9EncoderFps = readEnvInt(
-            "HI5_VP9_ENCODER_FPS",
-            std::min(30, std::max(1, m_fps)),
-            1,
-            60);
-        const int vp9EncoderBitrateKbps = readEnvInt(
-            "HI5_VP9_ENCODER_KBPS",
-            std::max(250, m_bitrateKbps),
-            500,
-            30000);
+        auto createSoftwareVp9 = [&]() -> bool {
+            try {
+                m_vp9Encoder.reset();
+                m_vp9VpxEncoder = std::make_unique<Vp9VpxEncoder>(
+                    vp9Frame.width, vp9Frame.height, vp9EncoderFps, vp9EncoderBitrateKbps,
+                    readEnvInt("HI5_VP9_CPUUSED", 8, 0, 9),
+                    readEnvInt("HI5_VP9_MIN_Q", vp9DefaultMinQ, 0, 63),
+                    readEnvInt("HI5_VP9_MAX_Q", vp9DefaultMaxQ, 0, 63),
+                    readEnvInt("HI5_VP9_THREADS", 4, 1, 8));
+                m_externalProfileName = "libvpx-vp9-interaction-ready";
+                m_codecMode = "vp9_sw";
+                m_vp9Failed = false;
+                LogInfo("[vp9] libvpx software encoder active session=" + m_sessionId +
+                    " quality=" + vp9Quality +
+                    " q=" + std::to_string(vp9DefaultMinQ) + "-" + std::to_string(vp9DefaultMaxQ));
+                return true;
+            } catch (const std::exception& ex) {
+                LogInfo("[vp9] libvpx software init failed session=" + m_sessionId + " error=" + ex.what());
+                m_vp9VpxEncoder.reset();
+                return false;
+            }
+        };
 
-        if (!m_vp9Encoder || sizeChangedVp9) {
+        if ((!m_vp9Encoder && !m_vp9VpxEncoder) || sizeChangedVp9) {
+            m_vp9Encoder.reset();
+            m_vp9VpxEncoder.reset();
             m_externalEncoderWidth = vp9Frame.width;
             m_externalEncoderHeight = vp9Frame.height;
             m_externalConfiguredFps = vp9EncoderFps;
             m_externalConfiguredBitrateKbps = vp9EncoderBitrateKbps;
             m_externalProfileName = "mediafoundation-vp9-interaction-ready";
 
-            auto enc = std::make_unique<Vp9MfEncoder>();
-            std::string vp9Err;
-            const bool preferHardware = (m_codecMode == "vp9_hw" || m_codecMode == "vp9" || m_codecMode == "auto");
-
-            if (!enc->init(vp9Frame.width, vp9Frame.height, vp9EncoderFps, vp9EncoderBitrateKbps, preferHardware, &vp9Err)) {
-                LogInfo("[vp9] init failed session=" + m_sessionId +
-                    " error=" + vp9Err);
-                m_vp9Failed = true;
-                m_vp9Encoder.reset();
-                if (m_autoCodec && m_peerAcceptsVp8) {
-                    switchVideoCodec(VideoCodec::VP8, "VP9 encoder unavailable on endpoint");
-                    return;
+            const bool forceSoftware = m_codecMode == "vp9_sw" || (m_autoCodec && !m_hwVp9Available);
+            if (!forceSoftware) {
+                auto enc = std::make_unique<Vp9MfEncoder>();
+                std::string vp9Err;
+                if (enc->init(vp9Frame.width, vp9Frame.height, vp9EncoderFps, vp9EncoderBitrateKbps, true, &vp9Err)) {
+                    m_vp9Encoder = std::move(enc);
+                    LogInfo("[vp9] Media Foundation encoder active session=" + m_sessionId +
+                        " name=" + m_vp9Encoder->encoderName());
+                } else {
+                    LogInfo("[vp9] hardware init failed; falling back to libvpx session=" + m_sessionId +
+                        " error=" + vp9Err);
+                    createSoftwareVp9();
                 }
-            }
-            else {
-                m_vp9Encoder = std::move(enc);
-                LogInfo(
-                    "[vp9] encoder created session=" + m_sessionId +
-                    " name=" + m_vp9Encoder->encoderName() +
-                    " source=" + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
-                    " encoded_size=" + std::to_string(vp9Frame.width) + "x" + std::to_string(vp9Frame.height) +
-                    " scaled=" + std::string(vp9Scaled ? "1" : "0") +
-                    " fps=" + std::to_string(vp9EncoderFps) +
-                    " bitrate=" + std::to_string(vp9EncoderBitrateKbps) +
-                    " hw_preferred=" + std::string(preferHardware ? "1" : "0")
-                );
+            } else {
+                createSoftwareVp9();
             }
 
+            if (!m_vp9Encoder && !m_vp9VpxEncoder) {
+                m_vp9Failed = true;
+                if (m_autoCodec && m_peerAcceptsVp8) switchVideoCodec(VideoCodec::VP8, "VP9 encoder unavailable");
+                return;
+            }
             forceKeyframe = true;
         }
 
-        if (m_vp9Encoder && !m_vp9Failed) {
-            try {
-                const auto encodeStart = std::chrono::steady_clock::now();
+        try {
+            const auto encodeStart = std::chrono::steady_clock::now();
+            Vp9EncodedFrame encoded{};
+            const bool vp9Keyframe = keyframe || sizeChangedVp9;
+            bool ok = false;
 
-                Vp9EncodedFrame encoded{};
+            if (m_vp9VpxEncoder) {
+                encoded = m_vp9VpxEncoder->encode(vp9Frame, vp9Keyframe);
+                ok = true;
+            } else if (m_vp9Encoder) {
                 std::string vp9Err;
-                const bool vp9Keyframe = keyframe || sizeChangedVp9;
-
-                if (!m_vp9Encoder->encode(vp9Frame, vp9Keyframe, encoded, &vp9Err)) {
-                    LogInfo("[vp9] encode failed session=" + m_sessionId +
-                        " mode=" + m_codecMode +
+                ok = m_vp9Encoder->encode(vp9Frame, vp9Keyframe, encoded, &vp9Err);
+                if (!ok) {
+                    LogInfo("[vp9] hardware encode failed; same-frame libvpx fallback session=" + m_sessionId +
                         " error=" + vp9Err);
-
-                    const bool hardwareInputUnsupported =
-                        m_codecMode == "vp9_hw" &&
-                        vp9Err.find("0xc00d36b5") != std::string::npos;
-
-                    if (hardwareInputUnsupported) {
-                        LogInfo("[vp9] hardware ProcessInput failed; retrying with software VP9 session=" + m_sessionId);
-
-                        auto swEnc = std::make_unique<Vp9MfEncoder>();
-                        std::string swErr;
-
-                        if (swEnc->init(vp9Frame.width, vp9Frame.height, vp9EncoderFps, vp9EncoderBitrateKbps, false, &swErr)) {
-                            m_vp9Encoder = std::move(swEnc);
-                            m_codecMode = "vp9_sw";
-                            m_externalEncoderWidth = vp9Frame.width;
-                            m_externalEncoderHeight = vp9Frame.height;
-                            m_externalConfiguredFps = vp9EncoderFps;
-                            m_externalConfiguredBitrateKbps = vp9EncoderBitrateKbps;
-                            m_externalProfileName = "software-vp9-fallback-interaction-ready";
-                            m_vp9Failed = false;
-                            m_forceKeyframe = true;
-
-                            LogInfo("[vp9] software fallback encoder created session=" + m_sessionId +
-                                " name=" + m_vp9Encoder->encoderName());
-
-                            return;
-                        }
-
-                        LogInfo("[vp9] software fallback init failed session=" + m_sessionId +
-                            " error=" + swErr);
-                    }
-
-                    m_vp9Failed = true;
-                    m_vp9Encoder.reset();
-                    if (m_autoCodec && m_peerAcceptsVp8) {
-                        switchVideoCodec(VideoCodec::VP8, "VP9 encoder failed during session");
-                    }
-                    return;
-                }
-
-                const auto encodeEnd = std::chrono::steady_clock::now();
-
-                const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
-                m_externalEncodeMsTotal += encodeMs;
-                m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
-                ++m_externalEncodedFrames;
-
-                // A rare long Media Foundation encode can complete after the desktop has
-                // already moved on. Sending that result creates a single visibly stale/fuzzy
-                // frame even though the transport is healthy. Drop it and force the next
-                // fresh frame to be a keyframe instead of letting old pixels reach the Viewer.
-                const uint64_t postEncodeNowNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
-                const uint64_t postEncodeAgeNs = captureTimestampNs != 0 && postEncodeNowNs > captureTimestampNs
-                    ? postEncodeNowNs - captureTimestampNs
-                    : 0;
-                const uint64_t maxPostEncodeAgeNs = static_cast<uint64_t>(readEnvInt(
-                    "HI5_MAX_POST_ENCODE_FRAME_AGE_MS", 250, 80, 2000)) * 1000000ull;
-                if (postEncodeAgeNs > maxPostEncodeAgeNs) {
-                    static std::atomic<uint64_t> staleVp9EncodeDrops{ 0 };
-                    const uint64_t dropCount = ++staleVp9EncodeDrops;
-                    m_forceKeyframe = true;
-                    if (dropCount <= 10 || (dropCount % 60) == 0) {
-                        LogInfo("[vp9] stale post-encode frame dropped session=" + m_sessionId +
-                            " age_ms=" + std::to_string(postEncodeAgeNs / 1000000ull) +
-                            " encode_ms=" + std::to_string(encodeMs) +
-                            " count=" + std::to_string(dropCount));
-                    }
-                    return;
-                }
-
-                if (!encoded.data.empty()) {
-                    encoded.timestamp90k = captureRtpTimestamp;
-                    const auto sendStart = std::chrono::steady_clock::now();
-                    sendRtpVp9Frame(encoded);
-                    const auto sendEnd = std::chrono::steady_clock::now();
-
-                    const double sendMs = std::chrono::duration<double, std::milli>(sendEnd - sendStart).count();
-                    m_externalSendMsTotal += sendMs;
-                    m_externalSendMsMax = std::max(m_externalSendMsMax, sendMs);
-                    ++m_externalSentFrames;
-                }
-                else {
-                    static std::atomic<uint64_t> vp9EmptyCounter{ 0 };
-                    const uint64_t emptyCount = ++vp9EmptyCounter;
-                    if (emptyCount <= 10 || emptyCount % 60 == 0) {
-                        LogInfo("[vp9] encode returned empty session=" + m_sessionId +
-                            " count=" + std::to_string(emptyCount) +
-                            " frame=" + std::to_string(vp9Frame.width) + "x" + std::to_string(vp9Frame.height) +
-                            " keyframe=" + std::string(vp9Keyframe ? "true" : "false"));
+                    if (createSoftwareVp9()) {
+                        encoded = m_vp9VpxEncoder->encode(vp9Frame, true);
+                        ok = true;
                     }
                 }
-
-                const auto healthNow = std::chrono::steady_clock::now();
-                if (m_externalNextStatsLog.time_since_epoch().count() == 0) {
-                    m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
-                }
-                if (healthNow >= m_externalNextStatsLog) {
-                    const double encodedCount = std::max<uint64_t>(1, m_externalEncodedFrames);
-                    const double sentCount = std::max<uint64_t>(1, m_externalSentFrames);
-                    const double encodeAvgMs = m_externalEncodeMsTotal / encodedCount;
-                    const double sendAvgMs = m_externalSendMsTotal / sentCount;
-                    const int liveHintFps = m_externalHintFps.load();
-                    const int liveCaptureFps = std::max(1, liveHintFps > 0
-                        ? liveHintFps
-                        : m_externalConfiguredFps);
-                    LogInfo("[vp9] encode health session=" + m_sessionId +
-                        " encode_avg_ms=" + std::to_string(encodeAvgMs) +
-                        " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
-                        " send_avg_ms=" + std::to_string(sendAvgMs) +
-                        " capture_fps=" + std::to_string(liveCaptureFps) +
-                        " encoder_fps=" + std::to_string(m_externalConfiguredFps) +
-                        " encoder_bitrate_kbps=" + std::to_string(m_externalConfiguredBitrateKbps));
-                    observeCodecHealth(encodeAvgMs, m_externalEncodeMsMax, sendAvgMs);
-                    m_externalEncodedFrames = 0;
-                    m_externalSentFrames = 0;
-                    m_externalEncodeMsTotal = 0.0;
-                    m_externalEncodeMsMax = 0.0;
-                    m_externalSendMsTotal = 0.0;
-                    m_externalSendMsMax = 0.0;
-                    m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
-                }
-
-                return;
             }
-            catch (const std::exception& ex) {
-                LogInfo("[vp9] exception session=" + m_sessionId +
-                    " error=" + std::string(ex.what()));
+
+            if (!ok) {
                 m_vp9Failed = true;
                 m_vp9Encoder.reset();
+                m_vp9VpxEncoder.reset();
+                if (m_autoCodec && m_peerAcceptsVp8) switchVideoCodec(VideoCodec::VP8, "VP9 encode failed");
                 return;
             }
+
+            const auto encodeEnd = std::chrono::steady_clock::now();
+            const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
+            m_externalEncodeMsTotal += encodeMs;
+            m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
+            ++m_externalEncodedFrames;
+
+            if (!encoded.data.empty()) {
+                encoded.timestamp90k = captureRtpTimestamp;
+                const auto sendStart = std::chrono::steady_clock::now();
+                sendRtpVp9Frame(encoded);
+                const auto sendEnd = std::chrono::steady_clock::now();
+                const double sendMs = std::chrono::duration<double, std::milli>(sendEnd - sendStart).count();
+                m_externalSendMsTotal += sendMs;
+                m_externalSendMsMax = std::max(m_externalSendMsMax, sendMs);
+                ++m_externalSentFrames;
+            }
+
+            const auto healthNow = std::chrono::steady_clock::now();
+            if (m_externalNextStatsLog.time_since_epoch().count() == 0) m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
+            if (healthNow >= m_externalNextStatsLog) {
+                const double encodedCount = std::max<uint64_t>(1, m_externalEncodedFrames);
+                const double sentCount = std::max<uint64_t>(1, m_externalSentFrames);
+                const double encodeAvgMs = m_externalEncodeMsTotal / encodedCount;
+                const double sendAvgMs = m_externalSendMsTotal / sentCount;
+                LogInfo("[vp9] encode health session=" + m_sessionId +
+                    " engine=" + std::string(m_vp9VpxEncoder ? "libvpx" : "mediafoundation") +
+                    " encode_avg_ms=" + std::to_string(encodeAvgMs) +
+                    " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+                    " send_avg_ms=" + std::to_string(sendAvgMs));
+                observeCodecHealth(encodeAvgMs, m_externalEncodeMsMax, sendAvgMs);
+                m_externalEncodedFrames = 0; m_externalSentFrames = 0;
+                m_externalEncodeMsTotal = 0.0; m_externalEncodeMsMax = 0.0;
+                m_externalSendMsTotal = 0.0; m_externalSendMsMax = 0.0;
+                m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
+            }
+            return;
+        } catch (const std::exception& ex) {
+            LogInfo("[vp9] exception session=" + m_sessionId + " error=" + ex.what());
+            m_vp9Failed = true;
+            m_vp9Encoder.reset();
+            m_vp9VpxEncoder.reset();
+            if (m_autoCodec && m_peerAcceptsVp8) switchVideoCodec(VideoCodec::VP8, "VP9 exception");
+            return;
         }
     }
 
-    // Important: if VP9 was negotiated in SDP, never send VP8/H.264 bytes on
-    // that same payload type/track. If VP9 fails after the offer is negotiated,
-    // drop frames and keep the session alive long enough for logs.
-    if (m_videoCodec == VideoCodec::VP9) {
+    // Never fall through to another encoder while the negotiated payload still
+    // belongs to a failed codec. Auto switches payload explicitly; forced modes
+    // keep the session/input channels alive and drop video for diagnostics.
+    if (m_videoCodec == VideoCodec::AV1 || m_videoCodec == VideoCodec::H265 ||
+        m_videoCodec == VideoCodec::VP9) {
         return;
     }
 
@@ -2178,13 +2484,15 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
 
             auto enc = std::make_unique<H264MfEncoder>();
             std::string h264Err;
-            const bool preferHardware = (m_codecMode == "h264_hw" || m_codecMode == "auto");
+            const bool preferHardware = (m_codecMode != "h264_sw");
             if (!enc->init(h264Frame.width, h264Frame.height, profile.fps, profile.bitrateKbps, preferHardware, &h264Err)) {
                 std::cerr << "[h264] init failed session=" << m_sessionId
                     << " error=" << h264Err
                     << " note=staying on negotiated track; set HI5_CODEC=vp8 to return to VP8\n";
                 m_h264Failed = true;
                 m_h264Encoder.reset();
+                selectNextAutoCodec(VideoCodec::H264, "H.264 encoder unavailable");
+                return;
             }
             else {
                 m_h264Encoder = std::move(enc);
@@ -2209,46 +2517,41 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                 std::string h264Err;
                 const bool h264Keyframe = keyframe || sizeChangedH264 || profileChangedH264;
                 if (!m_h264Encoder->encode(h264Frame, h264Keyframe, encoded, &h264Err)) {
-                    LogInfo(
-                        "[h264] encode failed session=" + m_sessionId +
-                        " mode=" + m_codecMode +
-                        " error=" + h264Err
-                    );
+                    LogInfo("[h264] encode failed session=" + m_sessionId +
+                        " mode=" + m_codecMode + " error=" + h264Err);
 
-                    const bool hardwareInputUnsupported =
-                        m_codecMode == "h264_hw" &&
-                        h264Err.find("0xc00d36b5") != std::string::npos;
-
-                    if (hardwareInputUnsupported) {
-                        LogInfo("[h264] hardware ProcessInput failed; retrying with software H.264 session=" + m_sessionId);
-
+                    const bool hardwarePreferredMode = m_codecMode != "h264_sw";
+                    bool recoveredWithSoftware = false;
+                    if (hardwarePreferredMode) {
+                        LogInfo("[h264] hardware-preferred encode failed; retrying same frame with software H.264 session=" + m_sessionId);
                         auto swEnc = std::make_unique<H264MfEncoder>();
                         std::string swErr;
-
                         if (swEnc->init(h264Frame.width, h264Frame.height, profile.fps, profile.bitrateKbps, false, &swErr)) {
-                            m_h264Encoder = std::move(swEnc);
-                            m_codecMode = "h264_sw";
-                            m_externalEncoderWidth = h264Frame.width;
-                            m_externalEncoderHeight = h264Frame.height;
-                            m_externalConfiguredFps = profile.fps;
-                            m_externalConfiguredBitrateKbps = profile.bitrateKbps;
-                            m_externalProfileName = std::string("software-h264-fallback-") + profile.name;
-                            m_h264Failed = false;
-                            m_forceKeyframe = true;
-
-                            LogInfo("[h264] software fallback encoder created session=" + m_sessionId +
-                                " name=" + m_h264Encoder->encoderName());
-
-                            return;
+                            H264EncodedFrame swEncoded{};
+                            if (swEnc->encode(h264Frame, true, swEncoded, &swErr)) {
+                                const std::string swName = swEnc->encoderName();
+                                m_h264Encoder = std::move(swEnc);
+                                m_codecMode = "h264_sw";
+                                m_externalProfileName = std::string("software-h264-fallback-") + profile.name;
+                                m_h264Failed = false;
+                                encoded = std::move(swEncoded);
+                                recoveredWithSoftware = true;
+                                LogInfo("[h264] software fallback active session=" + m_sessionId +
+                                    " name=" + swName + " same_frame_retry=1");
+                            } else {
+                                LogInfo("[h264] software fallback encode failed session=" + m_sessionId + " error=" + swErr);
+                            }
+                        } else {
+                            LogInfo("[h264] software fallback init failed session=" + m_sessionId + " error=" + swErr);
                         }
-
-                        LogInfo("[h264] software fallback init failed session=" + m_sessionId +
-                            " error=" + swErr);
                     }
 
-                    m_h264Failed = true;
-                    m_h264Encoder.reset();
-                    return;
+                    if (!recoveredWithSoftware) {
+                        m_h264Failed = true;
+                        m_h264Encoder.reset();
+                        selectNextAutoCodec(VideoCodec::H264, "H.264 encode failed");
+                        return;
+                    }
                 }
 
                 if (encoded.data.empty()) {
@@ -2323,6 +2626,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                     << " error=" << ex.what() << "\n";
                 m_h264Failed = true;
                 m_h264Encoder.reset();
+                selectNextAutoCodec(VideoCodec::H264, "H.264 exception");
                 return;
             }
         }

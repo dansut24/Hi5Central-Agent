@@ -49,9 +49,18 @@ namespace hi5 {
             return decision;
         }
 
+        if (requested == "av1" || requested == "av1_hw" || requested == "av1_sw") {
+            decision.selectedCodec = "av1";
+            decision.encoder = requested == "av1_sw" ? "mediafoundation-av1-sw" : "mediafoundation-av1-hw-fallback-sw";
+            decision.fps = 20; decision.bitrateKbps = 6000;
+            decision.hardware = requested != "av1_sw"; decision.stable = true;
+            decision.reason = "AV1 requested; endpoint capability and Viewer negotiation validated per session";
+            return decision;
+        }
+
         if (requested == "vp9" || requested == "vp9_hw") {
             decision.selectedCodec = "vp9";
-            decision.encoder = "mediafoundation-vp9-hw-fallback-sw";
+            decision.encoder = "mediafoundation-vp9-hw-fallback-libvpx";
             decision.fps = 20;
             decision.bitrateKbps = 6000;
             decision.hardware = true;
@@ -62,12 +71,21 @@ namespace hi5 {
 
         if (requested == "vp9_sw") {
             decision.selectedCodec = "vp9";
-            decision.encoder = "mediafoundation-vp9-sw";
+            decision.encoder = "libvpx-vp9";
             decision.fps = 20;
             decision.bitrateKbps = 6000;
             decision.hardware = false;
             decision.stable = true;
             decision.reason = "Software VP9 explicitly requested";
+            return decision;
+        }
+
+        if (requested == "h265" || requested == "h265_hw" || requested == "h265_sw") {
+            decision.selectedCodec = "h265";
+            decision.encoder = requested == "h265_sw" ? "mediafoundation-h265-sw" : "mediafoundation-h265-hw-fallback-sw";
+            decision.fps = 20; decision.bitrateKbps = 6000;
+            decision.hardware = requested != "h265_sw"; decision.stable = true;
+            decision.reason = "H.265 requested; Viewer SDP support required";
             return decision;
         }
 
@@ -99,7 +117,7 @@ namespace hi5 {
         decision.bitrateKbps = 6000;
         decision.hardware = false;
         decision.stable = true;
-        decision.reason = "Auto negotiates VP9, VP8 and H.264 per session and selects from the Viewer SDP answer";
+        decision.reason = "Auto negotiates AV1/VP9/H.265/H.264/VP8 and selects the lowest-cost healthy codec supported by both endpoint and Viewer";
 
         return decision;
     }

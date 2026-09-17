@@ -1880,6 +1880,7 @@ function setViewerCodecLabel(value) {
   if (elCodecDevBadge) {
     let codec = detail === "—" ? "—" : detail.split(/\s+/)[0].toUpperCase();
     if (codec === "H264") codec = "H.264";
+    if (codec === "H265" || codec === "HEVC") codec = "H.265";
     elCodecDevBadge.textContent = `Codec: ${codec}`;
     elCodecDevBadge.title = detail === "—"
       ? "Negotiated remote video codec"
@@ -1945,16 +1946,16 @@ async function handleOffer(msg) {
     const codecs = caps?.codecs || [];
 
     if (transceiver && transceiver.setCodecPreferences && codecs.length) {
-      // Prefer hardware-friendly H.264 from the agent, then fall back to VP8.
-      // Keep RTX/RED/ULPFEC after the primary codecs.
-      const h264 = codecs.filter(c => String(c.mimeType).toLowerCase() === "video/h264");
-      const vp8 = codecs.filter(c => String(c.mimeType).toLowerCase() === "video/vp8");
-      const rest = codecs.filter(c => {
-        const mt = String(c.mimeType).toLowerCase();
-        return mt !== "video/h264" && mt !== "video/vp8";
-      });
-      console.log("[codec] viewer codec preference", { h264: h264.length, vp8: vp8.length, rest: rest.length });
-      transceiver.setCodecPreferences([...h264, ...vp8, ...rest]);
+      // Prefer modern codecs, but keep every browser-supported fallback. The Agent
+      // makes the final selection using endpoint hardware and live encode health.
+      const primaryOrder = ["video/av1", "video/vp9", "video/h265", "video/hevc", "video/h264", "video/vp8"];
+      const primary = [];
+      for (const wanted of primaryOrder) {
+        primary.push(...codecs.filter(c => String(c.mimeType).toLowerCase() === wanted));
+      }
+      const rest = codecs.filter(c => !primaryOrder.includes(String(c.mimeType).toLowerCase()));
+      console.log("[codec] viewer codec preference", primary.map(c => c.mimeType));
+      transceiver.setCodecPreferences([...primary, ...rest]);
     }
   } catch (e) {
     console.warn("[webrtc] codec preference step failed:", e?.message || e);

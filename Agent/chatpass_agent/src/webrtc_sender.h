@@ -2,7 +2,10 @@
 
 #include "vp8_encoder.h"
 #include "vp9_mf_encoder.h"
+#include "vp9_vpx_encoder.h"
 #include "h264_mf_encoder.h"
+#include "h265_mf_encoder.h"
+#include "av1_mf_encoder.h"
 #include "input_injector.h"
 
 #include <rtc/rtc.hpp>
@@ -40,8 +43,10 @@ public:
 
     enum class VideoCodec {
         VP8,
+        VP9,
+        AV1,
         H264,
-        VP9
+        H265
     };
 
     WebRtcSender(
@@ -102,6 +107,7 @@ private:
     uint32_t externalRtpTimestamp(uint64_t captureTimestampNs);
     void selectAutoCodecFromAnswer(const std::string& sdp);
     bool switchVideoCodec(VideoCodec codec, const std::string& reason);
+    void configureVideoMediaHandler(VideoCodec codec);
     void observeCodecHealth(double encodeAvgMs, double encodeMaxMs, double sendAvgMs);
 #ifdef _WIN32
     void startAudioLoopback();
@@ -168,11 +174,24 @@ private:
     std::unique_ptr<Vp8Encoder> m_encoder;
     std::unique_ptr<H264MfEncoder> m_h264Encoder;
     std::unique_ptr<Vp9MfEncoder> m_vp9Encoder;
+    std::unique_ptr<Vp9VpxEncoder> m_vp9VpxEncoder;
+    std::unique_ptr<Av1MfEncoder> m_av1Encoder;
+    std::unique_ptr<H265MfEncoder> m_h265Encoder;
+    std::shared_ptr<rtc::RtpPacketizationConfig> m_nativeVideoRtpConfig;
     bool m_vp9Failed = false;
+    bool m_av1Failed = false;
+    bool m_h265Failed = false;
     bool m_autoCodec = false;
     bool m_peerAcceptsVp8 = false;
     bool m_peerAcceptsVp9 = false;
     bool m_peerAcceptsH264 = false;
+    bool m_peerAcceptsAv1 = false;
+    bool m_peerAcceptsH265 = false;
+    bool m_hwAv1Available = false;
+    bool m_hwVp9Available = false;
+    bool m_hwH265Available = false;
+    bool m_hwH264Available = false;
+    bool m_swVp9Allowed = false;
     int m_codecUnhealthyWindows = 0;
     std::chrono::steady_clock::time_point m_lastCodecSwitchAt{};
     VideoCodec m_videoCodec = VideoCodec::VP8;
