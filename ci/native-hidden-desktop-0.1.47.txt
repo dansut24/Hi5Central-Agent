@@ -1,0 +1,5 @@
+Hi5Central native hidden desktop validation 0.1.47
+
+VPS source: 83fbf1e39cb959b928f9746bef3588b8e2eae26a
+GitHub synced source: e60e69c8a82179f8c440ebc9b726b3c6c591fd25
+Purpose: validate user-token Winver capture plus elevated private-desktop MMC launch after error 740 fallback in 0.1.46.
