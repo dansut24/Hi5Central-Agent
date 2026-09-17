@@ -79,6 +79,9 @@ let currentSession = null;
 let activeDesktopMode = "console";
 let desktopModePending = null;
 let backgroundModeLocked = false;
+let desktopModeSwitchStartedAt = 0;
+let desktopModePendingFrames = 0;
+let desktopModeSwitchTimer = null;
 let audioEnabled = false;
 let localInputBlocked = false;
 let remoteDescSet = false;
@@ -184,6 +187,7 @@ function showOverlay(title, sub, {
   else if (passive) mode = "passive";
 
   setOverlayMode(mode);
+  passiveOverlayActive = mode === "passive";
 
   if (elVideo) {
     if (keepVideo) elVideo.classList.add("visible");
@@ -256,6 +260,14 @@ function markFrameRendered() {
 
   if (secureDesktopActive || desktopHandoffActive) {
     return;
+  }
+
+  if (desktopModePending) {
+    desktopModePendingFrames += 1;
+    if (desktopModePendingFrames >= 2 && Date.now() - desktopModeSwitchStartedAt >= 700) {
+      completeDesktopModeTransition(desktopModePending);
+      return;
+    }
   }
 
   if (revealOnNextFrame) {
@@ -1003,13 +1015,80 @@ function updateDesktopModeButtons() {
 
 function setDesktopModePending(mode) {
   desktopModePending = normalizeDesktopMode(mode);
+  desktopModeSwitchStartedAt = Date.now();
+  desktopModePendingFrames = 0;
+  if (desktopModeSwitchTimer) clearTimeout(desktopModeSwitchTimer);
+  const requested = desktopModePending;
+  desktopModeSwitchTimer = setTimeout(() => {
+    desktopModeSwitchTimer = null;
+    if (desktopModePending === requested) {
+      desktopModePending = null;
+      updateDesktopModeButtons();
+      hideOverlay();
+      setStatus("online", activeDesktopMode === "backstage" ? "Background Desktop" : "Console Desktop");
+    }
+  }, 7000);
   updateDesktopModeButtons();
 }
 
 function setActiveDesktopMode(mode) {
   activeDesktopMode = normalizeDesktopMode(mode);
   desktopModePending = null;
+  desktopModeSwitchStartedAt = 0;
+  desktopModePendingFrames = 0;
+  if (desktopModeSwitchTimer) clearTimeout(desktopModeSwitchTimer);
+  desktopModeSwitchTimer = null;
   updateDesktopModeButtons();
+}
+
+function completeDesktopModeTransition(mode) {
+  const resolved = normalizeDesktopMode(mode);
+  setActiveDesktopMode(resolved);
+  revealOnNextFrame = false;
+  secureDesktopLikely = false;
+  hideOverlay();
+  if (elVideo) elVideo.classList.add("visible");
+  if (elStatsBar) elStatsBar.classList.add("visible");
+  setStatus("online", resolved === "backstage" ? "Background Desktop" : "Console Desktop");
+}
+
+function reconcileDesktopModeFromDiagnostics(msg) {
+  if (!msg || typeof msg.backstage !== "boolean" || !desktopModePending) return;
+  const observed = msg.backstage ? "backstage" : "console";
+  if (desktopModePending === observed) completeDesktopModeTransition(observed);
+}
+
+function handleDesktopSessionState(state) {
+  if (state === "backstage_entering") {
+    setDesktopModePending("backstage");
+    hideOverlay();
+    setStatus("online", "Switching to Background…");
+    return true;
+  }
+  if (state === "backstage_ready") {
+    completeDesktopModeTransition("backstage");
+    return true;
+  }
+  if (state === "console_entering") {
+    setDesktopModePending("console");
+    hideOverlay();
+    setStatus("online", "Returning to Console…");
+    return true;
+  }
+  if (state === "console_ready") {
+    completeDesktopModeTransition("console");
+    return true;
+  }
+  if (state === "backstage_failed" || state === "console_failed") {
+    desktopModePending = null;
+    if (desktopModeSwitchTimer) clearTimeout(desktopModeSwitchTimer);
+    desktopModeSwitchTimer = null;
+    updateDesktopModeButtons();
+    hideOverlay();
+    setStatus("error", state === "backstage_failed" ? "Background switch failed" : "Console switch failed");
+    return true;
+  }
+  return false;
 }
 
 function updateSessionToggleButtons() {
@@ -1159,12 +1238,9 @@ function sendBackstageMode(enabled) {
   if (!sent) return false;
 
   setDesktopModePending(targetMode);
-  setStatus("online", enabled ? "Background Desktop" : "Returning to Console");
-  if (enabled) {
-    showOverlay("Background Desktop", "Starting private Windows workspace…", { spinner: true, keepVideo: true, passive: true });
-  } else {
-    showOverlay("Console", "Returning to interactive console…", { spinner: true, keepVideo: true, passive: true });
-  }
+  hideOverlay();
+  if (elVideo) elVideo.classList.add("visible");
+  setStatus("online", enabled ? "Switching to Background…" : "Returning to Console…");
   return true;
 }
 
@@ -1297,6 +1373,10 @@ function disconnect(reason, options = {}) {
   activeDesktopMode = "console";
   desktopModePending = null;
   backgroundModeLocked = false;
+  desktopModeSwitchStartedAt = 0;
+  desktopModePendingFrames = 0;
+  if (desktopModeSwitchTimer) clearTimeout(desktopModeSwitchTimer);
+  desktopModeSwitchTimer = null;
   updateDesktopModeButtons();
   if (elBtnStartMenu) elBtnStartMenu.disabled = true;
   if (elBtnCad) elBtnCad.disabled = true;
@@ -2012,7 +2092,17 @@ function handleAgentControlData(raw) {
   if (typeof raw !== "string") return;
   try {
     const msg = JSON.parse(raw);
-    if (msg?.type === "dev_codec_switch_result") handleDevCodecSwitchResult(msg);
+    if (msg?.type === "dev_codec_switch_result") {
+      handleDevCodecSwitchResult(msg);
+      return;
+    }
+    if (msg?.type === "session_state") {
+      handleDesktopSessionState(msg.state || "");
+      return;
+    }
+    if (msg?.type === "stream_diagnostics") {
+      reconcileDesktopModeFromDiagnostics(msg);
+    }
   } catch {}
 }
 
@@ -2478,44 +2568,14 @@ async function onSignalMessage(raw) {
       break;
     }
 
+    case "stream_diagnostics": {
+      reconcileDesktopModeFromDiagnostics(msg);
+      break;
+    }
+
     case "session_state": {
       const state = msg.state || "";
-
-      if (state === "backstage_entering") {
-        setDesktopModePending("backstage");
-        setStatus("online", "Background Desktop");
-        showOverlay("Background Desktop", "Starting private Windows workspace…", { spinner: true, keepVideo: true, passive: true });
-        break;
-      }
-
-      if (state === "backstage_ready") {
-        setActiveDesktopMode("backstage");
-        revealOnNextFrame = true;
-        setStatus("online", "Background Desktop");
-        break;
-      }
-
-      if (state === "console_entering") {
-        setDesktopModePending("console");
-        setStatus("online", "Returning to Console");
-        showOverlay("Console", "Returning to interactive console…", { spinner: true, keepVideo: true, passive: true });
-        break;
-      }
-
-      if (state === "console_ready") {
-        setActiveDesktopMode("console");
-        revealOnNextFrame = true;
-        setStatus("online", "Console Desktop");
-        break;
-      }
-
-      if (state === "backstage_failed" || state === "console_failed") {
-        desktopModePending = null;
-        updateDesktopModeButtons();
-        hideOverlay();
-        setStatus("error", state === "backstage_failed" ? "Background switch failed" : "Console switch failed");
-        break;
-      }
+      if (handleDesktopSessionState(state)) break;
 
       if (state === "secure_desktop_entering") {
         secureDesktopActive = true;

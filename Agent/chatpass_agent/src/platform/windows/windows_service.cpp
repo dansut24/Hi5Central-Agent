@@ -5746,6 +5746,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 signaling_->send(msg.dump());
             }
 
+            void SendSessionStateDirect(SessionContext& ctx, const std::string& state) {
+                json msg = { {"type", "session_state"}, {"session_id", ctx.sessionId}, {"state", state} };
+                SendSessionState(ctx.sessionId, state);
+                const bool direct = SendMediaControl(ctx, json{ {"type", "viewer_control"}, {"payload", msg} });
+                LogI("desktop state session=" + ctx.sessionId + " state=" + state +
+                    " direct_webrtc=" + std::string(direct ? "true" : "false"));
+            }
+
             static const char* StreamModeName(int mode) {
                 switch (mode) {
                 case 2: return "motion";
@@ -6504,11 +6512,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 }
                 SessionContext& ctx = *it->second;
                 if (ctx.backstageMode && ctx.backstageHostProcess) {
-                    SendSessionState(sessionId, "backstage_ready");
+                    SendSessionStateDirect(ctx, "backstage_ready");
                     return;
                 }
 
-                SendSessionState(sessionId, "backstage_entering");
+                SendSessionStateDirect(ctx, "backstage_entering");
                 ctx.backstageMode = true;
                 StopNormalStreamer(ctx);
                 StopSecureStreamer(ctx);
@@ -6517,16 +6525,16 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx.handoffStateAnnounced = false;
 
                 if (LaunchBackstageHost(ctx)) {
-                    SendSessionState(sessionId, "backstage_ready");
+                    SendSessionStateDirect(ctx, "backstage_ready");
                     return;
                 }
 
                 LogE("backstage_start failed session=" + sessionId);
-                SendSessionState(sessionId, "backstage_failed");
+                SendSessionStateDirect(ctx, "backstage_failed");
                 if (ctx.sessionMode == SessionMode::Console) {
                     ctx.backstageMode = false;
                     if (LaunchNormalStreamer(ctx)) {
-                        SendSessionState(sessionId, "console_ready");
+                        SendSessionStateDirect(ctx, "console_ready");
                     }
                 }
             }
@@ -6541,15 +6549,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 SessionContext& ctx = *it->second;
                 if (ctx.sessionMode == SessionMode::Backstage) {
                     LogW("HandleBackstageStop ignored for locked backstage session=" + sessionId);
-                    SendSessionState(sessionId, "backstage_ready");
+                    SendSessionStateDirect(ctx, "backstage_ready");
                     return;
                 }
                 if (!ctx.backstageMode && !ctx.backstageHostProcess) {
-                    SendSessionState(sessionId, "console_ready");
+                    SendSessionStateDirect(ctx, "console_ready");
                     return;
                 }
 
-                SendSessionState(sessionId, "console_entering");
+                SendSessionStateDirect(ctx, "console_entering");
                 if (ctx.backstageHostProcess) {
                     StopBackstageHost(ctx);
                 }
@@ -6560,7 +6568,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx.normalDesktopUnavailable = ctx.loginDesktopMode;
 
                 const bool launched = ctx.loginDesktopMode ? LaunchSecureStreamer(ctx) : LaunchNormalStreamer(ctx);
-                SendSessionState(sessionId, launched ? "console_ready" : "console_failed");
+                SendSessionStateDirect(ctx, launched ? "console_ready" : "console_failed");
             }
 
             void StopSecureStreamer(SessionContext& ctx) {

@@ -136,6 +136,12 @@ int RunMediaHostMain(int argc, char** argv) {
             if (!payload.empty()) sender->handleSignalingMessage(payload);
             return;
         }
+        if (type == "viewer_control") {
+            if (message.contains("payload") && message["payload"].is_object()) {
+                sender->sendControlMessage(message["payload"]);
+            }
+            return;
+        }
         if (type == "stream_hint") {
             sender->setExternalStreamHint(
                 message.value("stream_mode", 0),
