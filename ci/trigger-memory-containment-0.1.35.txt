@@ -1,0 +1,7 @@
+Hi5Central Windows validation trigger
+
+Target build: 0.1.35
+Source checkpoint: 2d32c2258e4cb0a739725bb619f0526551d71beb
+Baseline: 666e31aba4d3bcceba30bf417be2911373055432
+Purpose: validate AgentService memory containment, Media Foundation lifecycle/resource reuse, hardware codec failure caching, secure-host restart circuit breaker, and per-process memory telemetry.
+/latest must remain unchanged from 0.1.34.
