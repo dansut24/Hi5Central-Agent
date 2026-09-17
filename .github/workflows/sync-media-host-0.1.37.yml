@@ -1,0 +1,51 @@
+name: Sync media host refactor 0.1.37
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - .github/workflows/sync-media-host-0.1.37.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent-hardening-v2
+          fetch-depth: 0
+
+      - name: Download and verify source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=/tmp/media-host-0.1.37.tar.gz
+          curl -fsSL 'https://downloads.hi5central.com/bootstrap-agent-sync/media-host-0.1.37-0dd692f.tar.gz' -o "$archive"
+          echo '7eb1939d8ca88ce2c15111d61dfdf0c67ab01ea594c0fe0cd347a4abe10bcafd  /tmp/media-host-0.1.37.tar.gz' | sha256sum -c -
+          tar -xzf "$archive" -C .
+          git diff --check
+
+      - name: Commit exact media host source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add \
+            Agent/chatpass_agent/CMakeLists.txt \
+            Agent/chatpass_agent/src/ipc/named_pipe.cpp \
+            Agent/chatpass_agent/src/ipc/shmem_ring.h \
+            Agent/chatpass_agent/src/platform/windows/windows_service.cpp \
+            Agent/chatpass_agent/src/remote_host_main.cpp \
+            Agent/chatpass_agent/src/media_host_main.cpp
+          if git diff --cached --quiet; then
+            echo 'Source is already synchronized.'
+            exit 0
+          fi
+          git config user.name 'Hi5Central Build Bot'
+          git config user.email 'buildbot@hi5central.com'
+          git commit -m 'Move WebRTC media ownership into RemoteHost'
+          git push origin HEAD:agent-hardening-v2
