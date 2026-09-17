@@ -1,0 +1,7 @@
+Target validation build: 0.1.36
+Source checkpoint: 3d8b49f8d911ad8006fbacca4aa5a3b75ed4d1b2
+Local source commit: 0b361aab2749d610ff88869c9d062cf13140ed70
+Baseline build: 0.1.35
+Purpose: validate the VP8/VP9 libvpx per-frame image allocation leak fix identified from 0.1.35 per-process memory telemetry.
+Expected result: AgentService private bytes should plateau during VP8/VP9 instead of growing by multiple MB per second.
+/latest must remain unchanged.
