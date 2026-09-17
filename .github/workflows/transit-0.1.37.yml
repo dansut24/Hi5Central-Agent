@@ -1,0 +1,54 @@
+name: Transit 0.1.37 installers
+
+on:
+  push:
+    branches:
+      - agent-hardening-v2
+    paths:
+      - .github/workflows/transit-0.1.37.yml
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  transit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent-hardening-v2
+
+      - name: Download run 37 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/agent /tmp/viewer /tmp/transit
+          gh api repos/dansut24/Hi5Central-Agent/actions/artifacts/10498528927/zip > /tmp/agent.zip
+          gh api repos/dansut24/Hi5Central-Agent/actions/artifacts/10498598793/zip > /tmp/viewer.zip
+          unzip -q /tmp/agent.zip -d /tmp/agent
+          unzip -q /tmp/viewer.zip -d /tmp/viewer
+          agent=$(find /tmp/agent -type f -name Hi5CentralAgentSetup.exe -print -quit)
+          viewer=$(find /tmp/viewer -type f -name Hi5CentralViewerSetup.exe -print -quit)
+          test -n "$agent"
+          test -n "$viewer"
+          cp "$agent" /tmp/transit/Hi5CentralAgentSetup.exe
+          cp "$viewer" /tmp/transit/Hi5CentralViewerSetup.exe
+          sha256sum /tmp/transit/*.exe | tee /tmp/transit/SHA256SUMS.txt
+
+      - name: Publish temporary transit branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Hi5Central Build Bot'
+          git config user.email 'buildbot@hi5central.com'
+          git switch --orphan artifact-transit-0.1.37
+          git rm -rf .
+          cp /tmp/transit/* .
+          printf 'run=35223680760\nversion=0.1.37\nhead=e56b4d837194e89e22a043a7f7acee016d40ad2c\n' > build.txt
+          git add Hi5CentralAgentSetup.exe Hi5CentralViewerSetup.exe SHA256SUMS.txt build.txt
+          git commit -m 'Transit Windows installers 0.1.37'
+          git push --force origin HEAD:artifact-transit-0.1.37
