@@ -1973,6 +1973,10 @@ namespace hi5 {
             HANDLE secureStreamerProcess = nullptr;
             HANDLE backstageHostProcess = nullptr;
             HANDLE mediaHostProcess = nullptr;
+            DWORD gpuHandleSourcePid = 0;
+            std::unordered_map<uint64_t, uint64_t> gpuHandleMap;
+            std::atomic<bool> gpuTransportFallbackRequested{ false };
+            bool disableGpuTransport = false;
             DWORD normalStreamerSessionId = 0xFFFFFFFF;
             DWORD secureStreamerSessionId = 0xFFFFFFFF;
             bool backstageMode = false;
@@ -6366,7 +6370,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " --chat-pipe " + ctx.chatPipeName +
                     " --fps " + std::to_string(ctx.fps) +
                     " --display " + std::to_string(ctx.displayIndex) +
-                    (ctx.unifiedDesktopStreamer ? " --dynamic-desktop" : "");
+                    (ctx.unifiedDesktopStreamer ? " --dynamic-desktop" : "") +
+                    (ctx.disableGpuTransport ? " --disable-gpu-transport" : "");
 
                 LogI("launch normal streamer [NORMAL_SHMEM_EXPECTED_NO_UAC] session=" + ctx.sessionId + " cmd=" + cmdLine);
 
@@ -6811,6 +6816,13 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             DispatchInputToPipe(*rawCtx, message["payload"]);
                             return;
                         }
+                        if (type == "gpu_transport_failed") {
+                            const std::string reason = message.value("reason", std::string("unknown"));
+                            LogW("GPU transport failed in media host session=" + sid + " reason=" + reason +
+                                "; requesting raw-I420 fallback");
+                            rawCtx->gpuTransportFallbackRequested.store(true, std::memory_order_release);
+                            return;
+                        }
                         if (type == "mouse_move") {
                             DispatchMediaFastMouse(*rawCtx,
                                 message.value("x_norm", 0.0), message.value("y_norm", 0.0),
@@ -6939,6 +6951,39 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t normalTs = 0;
                 uint64_t secureTs = 0;
 
+                auto duplicateGpuHandleForMedia = [&](const SharedGpuFrame& source, SharedGpuFrame& target) -> bool {
+                    target = source;
+                    if (!ctx.normalStreamerProcess || !ctx.mediaHostProcess || source.sharedHandle == 0) return false;
+                    const DWORD sourcePid = GetProcessId(ctx.normalStreamerProcess);
+                    if (sourcePid == 0) return false;
+                    if (ctx.gpuHandleSourcePid != sourcePid) {
+                        ctx.gpuHandleMap.clear();
+                        ctx.gpuHandleSourcePid = sourcePid;
+                    }
+                    auto it = ctx.gpuHandleMap.find(source.sharedHandle);
+                    if (it == ctx.gpuHandleMap.end()) {
+                        HANDLE duplicated = nullptr;
+                        const HANDLE sourceHandle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(source.sharedHandle));
+                        if (!DuplicateHandle(ctx.normalStreamerProcess, sourceHandle, ctx.mediaHostProcess,
+                            &duplicated, 0, FALSE, DUPLICATE_SAME_ACCESS) || !duplicated) {
+                            LogW("[gpu-transport] DuplicateHandle failed session=" + ctx.sessionId +
+                                " source_pid=" + std::to_string(sourcePid) +
+                                " media_pid=" + std::to_string(GetProcessId(ctx.mediaHostProcess)) +
+                                " err=" + std::to_string(GetLastError()));
+                            return false;
+                        }
+                        const uint64_t mediaHandle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(duplicated));
+                        it = ctx.gpuHandleMap.emplace(source.sharedHandle, mediaHandle).first;
+                        LogI("[gpu-transport] duplicated NT handle session=" + ctx.sessionId +
+                            " source_pid=" + std::to_string(sourcePid) +
+                            " media_pid=" + std::to_string(GetProcessId(ctx.mediaHostProcess)) +
+                            " source_handle=" + std::to_string(source.sharedHandle) +
+                            " media_handle=" + std::to_string(mediaHandle));
+                    }
+                    target.sharedHandle = it->second;
+                    return true;
+                };
+
                 const auto isNearBlackTransitionFrame = [](const I420Frame& frame) -> bool {
                     if (frame.y.empty()) return false;
                     const size_t step = std::max<size_t>(1, frame.y.size() / 4096);
@@ -6958,6 +7003,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 while (!ctx.framePumpStop.load()) {
                     const auto now = std::chrono::steady_clock::now();
+
+                    if (ctx.gpuTransportFallbackRequested.exchange(false, std::memory_order_acq_rel) &&
+                        !ctx.disableGpuTransport) {
+                        ctx.disableGpuTransport = true;
+                        ctx.gpuHandleMap.clear();
+                        ctx.gpuHandleSourcePid = 0;
+                        LogW("[gpu-transport] switching normal streamer to raw-I420 fallback session=" + ctx.sessionId);
+                        if (ctx.normalStreamerProcess && ctx.normalStopEvent) SetEvent(ctx.normalStopEvent);
+                    }
 
                     if (ConsumePresenceBannerAction(ctx.sessionId, true)) {
                         LogI("[presence] local user opened chat session=" + ctx.sessionId);
@@ -7584,9 +7638,18 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ctx.secureFallbackOwnsInput.store(false, std::memory_order_release);
                             ++framesForwarded;
                             const bool forceKf = wasSecure || completedConsoleHandoff || framesForwarded == 1;
-                            sent = gotNormalGpu
-                                ? ctx.mediaShmem.WriteSharedGpuFrame(normalGpuFrame, normalTs, forceKf)
-                                : ctx.mediaShmem.WriteRawI420Frame(normalFrame, normalTs, forceKf);
+                            if (gotNormalGpu) {
+                                SharedGpuFrame mediaGpuFrame;
+                                if (duplicateGpuHandleForMedia(normalGpuFrame, mediaGpuFrame)) {
+                                    sent = ctx.mediaShmem.WriteSharedGpuFrame(mediaGpuFrame, normalTs, forceKf);
+                                } else {
+                                    ctx.gpuTransportFallbackRequested.store(true, std::memory_order_release);
+                                    LogW("[gpu-transport] unable to duplicate shared texture; frame dropped pending raw fallback session=" +
+                                        ctx.sessionId);
+                                }
+                            } else {
+                                sent = ctx.mediaShmem.WriteRawI420Frame(normalFrame, normalTs, forceKf);
+                            }
 
                             if (completedConsoleHandoff) {
                                 ctx.consoleHandoffActive = false;

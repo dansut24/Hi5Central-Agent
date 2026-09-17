@@ -5,6 +5,7 @@
 #endif
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
@@ -79,9 +80,11 @@ struct SharedGpuFrameReader::Impl {
     struct OpenedFrame {
         ComPtr<ID3D11Texture2D> texture;
         ComPtr<IDXGIKeyedMutex> mutex;
+        HANDLE duplicatedHandle = nullptr;
     };
 
     ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11Device1> device1;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11Texture2D> staging;
     std::unordered_map<uint64_t, OpenedFrame> opened;
@@ -92,8 +95,12 @@ struct SharedGpuFrameReader::Impl {
 
     void Reset() {
         staging.Reset();
+        for (auto& kv : opened) {
+            if (kv.second.duplicatedHandle) CloseHandle(kv.second.duplicatedHandle);
+        }
         opened.clear();
         context.Reset();
+        device1.Reset();
         device.Reset();
         adapterLuid = {};
         width = 0;
@@ -142,6 +149,12 @@ struct SharedGpuFrameReader::Impl {
             Reset();
             return false;
         }
+        hr = device.As(&device1);
+        if (FAILED(hr) || !device1) {
+            if (error) *error = "ID3D11Device1 unavailable " + HrString(hr);
+            Reset();
+            return false;
+        }
         return true;
     }
 
@@ -177,13 +190,17 @@ struct SharedGpuFrameReader::Impl {
         if (it == opened.end()) {
             OpenedFrame entry;
             const HANDLE handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(frame.sharedHandle));
-            HRESULT hr = device->OpenSharedResource(handle, IID_PPV_ARGS(&entry.texture));
+            HRESULT hr = device1->OpenSharedResource1(handle, IID_PPV_ARGS(&entry.texture));
             if (FAILED(hr) || !entry.texture) {
-                if (error) *error = "OpenSharedResource failed " + HrString(hr);
+                CloseHandle(handle);
+                if (error) *error = "OpenSharedResource1 failed " + HrString(hr);
                 return false;
             }
+            entry.duplicatedHandle = handle;
             hr = entry.texture.As(&entry.mutex);
             if (FAILED(hr) || !entry.mutex) {
+                CloseHandle(entry.duplicatedHandle);
+                entry.duplicatedHandle = nullptr;
                 if (error) *error = "shared texture missing IDXGIKeyedMutex " + HrString(hr);
                 return false;
             }

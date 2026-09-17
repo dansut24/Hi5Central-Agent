@@ -92,6 +92,7 @@ namespace {
         int fps = 45;
         int display = 0;
         bool dynamicDesktop = false;
+        bool disableGpuTransport = false;
     };
 
     std::optional<std::string> GetArgValue(int argc, char** argv, const std::string& key) {
@@ -119,6 +120,7 @@ namespace {
         if (auto v = GetArgValue(argc, argv, "--fps")) a.fps = std::max(1, std::stoi(*v));
         if (auto v = GetArgValue(argc, argv, "--display")) a.display = std::stoi(*v);
         a.dynamicDesktop = HasArg(argc, argv, "--dynamic-desktop");
+        a.disableGpuTransport = HasArg(argc, argv, "--disable-gpu-transport");
         return a;
     }
 
@@ -975,7 +977,7 @@ namespace hi5 {
             " idle_fps=" + std::to_string(idleFps) +
             " motion_fps=" + std::to_string(motionFps) +
             " cursor_refresh=disabled gpu_transport=" +
-            std::to_string(ReadEnvInt("HI5_GPU_FRAME_TRANSPORT", 1, 0, 1)));
+            std::to_string((!args.disableGpuTransport && ReadEnvInt("HI5_GPU_FRAME_TRANSPORT", 1, 0, 1) != 0) ? 1 : 0));
 
         while (g_running.load()) {
             if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) {
@@ -1088,7 +1090,7 @@ namespace hi5 {
                     nextCaptureAt = now + frameInterval;
 
                     bool handledByGpu = false;
-                    const bool gpuTransportAllowed = !isSecureHelper && !lastSecureState && currentDisplay >= 0 &&
+                    const bool gpuTransportAllowed = !args.disableGpuTransport && !isSecureHelper && !lastSecureState && currentDisplay >= 0 &&
                         ReadEnvInt("HI5_GPU_FRAME_TRANSPORT", 1, 0, 1) != 0;
                     if (gpuTransportAllowed) {
                         source.nextSharedGpuFrameExInto(gpuCaptured);

@@ -197,6 +197,7 @@ int RunMediaHostMain(int argc, char** argv) {
 
     bool senderStarted = false;
     bool firstFrameLogged = false;
+    bool gpuTransportFailureReported = false;
     auto nextMemoryLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     I420Frame frame;
     SharedGpuFrame gpuFrame;
@@ -238,6 +239,11 @@ int RunMediaHostMain(int argc, char** argv) {
             } else {
                 LogWarn("[gpu-transport] shared frame readback failed session=" + sessionId +
                     " error=" + gpuError + " key=" + std::to_string(gpuFrame.syncKey));
+                const bool transientSyncMiss = gpuError.rfind("AcquireSync failed/expired", 0) == 0;
+                if (!transientSyncMiss && !gpuTransportFailureReported) {
+                    gpuTransportFailureReported = true;
+                    sendEvent(json{ {"type", "gpu_transport_failed"}, {"reason", gpuError} });
+                }
             }
         }
 

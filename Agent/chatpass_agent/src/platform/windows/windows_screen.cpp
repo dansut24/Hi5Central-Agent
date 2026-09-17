@@ -474,7 +474,10 @@ struct DesktopFrameSource::Impl {
         for (auto& slot : gpuSlots) {
             slot.mutex.Reset();
             slot.texture.Reset();
-            slot.sharedHandle = nullptr;
+            if (slot.sharedHandle) {
+                CloseHandle(slot.sharedHandle);
+                slot.sharedHandle = nullptr;
+            }
             slot.readyKey = 0;
         }
         gpuNextSlot = 0;
@@ -651,7 +654,17 @@ struct DesktopFrameSource::Impl {
 
     bool ensureGpuSlotsLocked() {
         if (!device || width <= 0 || height <= 0) return false;
-        if (gpuSlots[0].texture && gpuSlots[0].mutex && gpuSlots[0].sharedHandle) return true;
+        const bool allReady = std::all_of(gpuSlots.begin(), gpuSlots.end(), [](const GpuSlot& slot) {
+            return slot.texture && slot.mutex && slot.sharedHandle;
+        });
+        if (allReady) return true;
+
+        for (auto& slot : gpuSlots) {
+            slot.mutex.Reset();
+            slot.texture.Reset();
+            if (slot.sharedHandle) { CloseHandle(slot.sharedHandle); slot.sharedHandle = nullptr; }
+            slot.readyKey = 0;
+        }
 
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = static_cast<UINT>(width);
@@ -662,14 +675,30 @@ struct DesktopFrameSource::Impl {
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
         for (auto& slot : gpuSlots) {
-            if (FAILED(device->CreateTexture2D(&desc, nullptr, &slot.texture)) || !slot.texture) return false;
-            if (FAILED(slot.texture.As(&slot.mutex)) || !slot.mutex) return false;
-            ComPtr<IDXGIResource> sharedResource;
+            if (FAILED(device->CreateTexture2D(&desc, nullptr, &slot.texture)) || !slot.texture ||
+                FAILED(slot.texture.As(&slot.mutex)) || !slot.mutex) {
+                for (auto& cleanup : gpuSlots) {
+                    cleanup.mutex.Reset(); cleanup.texture.Reset();
+                    if (cleanup.sharedHandle) { CloseHandle(cleanup.sharedHandle); cleanup.sharedHandle = nullptr; }
+                    cleanup.readyKey = 0;
+                }
+                return false;
+            }
+            ComPtr<IDXGIResource1> sharedResource;
             if (FAILED(slot.texture.As(&sharedResource)) || !sharedResource) return false;
-            if (FAILED(sharedResource->GetSharedHandle(&slot.sharedHandle)) || !slot.sharedHandle) return false;
+            const HRESULT shareHr = sharedResource->CreateSharedHandle(
+                nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &slot.sharedHandle);
+            if (FAILED(shareHr) || !slot.sharedHandle) {
+                for (auto& cleanup : gpuSlots) {
+                    cleanup.mutex.Reset(); cleanup.texture.Reset();
+                    if (cleanup.sharedHandle) { CloseHandle(cleanup.sharedHandle); cleanup.sharedHandle = nullptr; }
+                    cleanup.readyKey = 0;
+                }
+                return false;
+            }
             slot.readyKey = 0;
         }
         return true;
