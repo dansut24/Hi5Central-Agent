@@ -14,6 +14,7 @@
 
 #include "../util/log.h"
 
+#include <cwctype>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,13 @@ namespace hi5 {
         const auto pos = path.find_last_of(L"\\/");
         if (pos == std::wstring::npos) return L".";
         return path.substr(0, pos);
+    }
+
+    static bool NeedsPrivateDesktopConsole(const std::wstring& path) {
+        const auto pos = path.find_last_of(L"\\/");
+        std::wstring base = pos == std::wstring::npos ? path : path.substr(pos + 1);
+        for (auto& ch : base) ch = static_cast<wchar_t>(towlower(ch));
+        return base == L"cmd.exe" || base == L"powershell.exe" || base == L"pwsh.exe";
     }
 
     static bool EnablePrivilege(const wchar_t* privName) {
@@ -253,7 +261,10 @@ namespace hi5 {
         }
 
         PROCESS_INFORMATION pi{};
-        DWORD flags = CREATE_NO_WINDOW;
+        DWORD flags = 0;
+        const bool visibleConsole = allowGui && NeedsPrivateDesktopConsole(wExePath);
+        if (!allowGui) flags |= CREATE_NO_WINDOW;
+        else if (visibleConsole) flags |= CREATE_NEW_CONSOLE;
         if (envBlock) flags |= CREATE_UNICODE_ENVIRONMENT;
 
         const char* effectivePrefix = allowGui ? "[launcher][interactive-gui]" : logPrefix;
@@ -262,7 +273,8 @@ namespace hi5 {
             " exe=" + Narrow(wExePath) +
             " dir=" + Narrow(wDir) +
             " token=" + tokenDesc +
-            " allow_gui=" + std::to_string(allowGui ? 1 : 0));
+            " allow_gui=" + std::to_string(allowGui ? 1 : 0) +
+            " visible_console=" + std::to_string(visibleConsole ? 1 : 0));
 
         const BOOL ok = CreateProcessAsUserW(
             hPrimary,

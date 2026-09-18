@@ -10,6 +10,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <winsvc.h>
@@ -34,6 +35,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 #include <deque>
 
 namespace {
@@ -472,6 +474,14 @@ namespace {
                 { L"Windows Accessories", L"PowerShell", L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", L"" },
                 { L"Windows Accessories", L"Notepad", L"C:\\Windows\\System32\\notepad.exe", L"" },
                 { L"Windows Accessories", L"System Information", L"C:\\Windows\\System32\\msinfo32.exe", L"" },
+                { L"System Settings", L"Control Panel", L"C:\\Windows\\System32\\control.exe", L"" },
+                { L"System Settings", L"System Properties", L"C:\\Windows\\System32\\SystemPropertiesAdvanced.exe", L"" },
+                { L"System Settings", L"Network Connections", L"C:\\Windows\\System32\\control.exe", L"ncpa.cpl" },
+                { L"System Settings", L"Windows Features", L"C:\\Windows\\System32\\OptionalFeatures.exe", L"" },
+                { L"System Settings", L"Task Scheduler", L"C:\\Windows\\System32\\mmc.exe", L"taskschd.msc" },
+                { L"System Settings", L"Resource Monitor", L"C:\\Windows\\System32\\resmon.exe", L"" },
+                { L"System Settings", L"Local Users and Groups", L"C:\\Windows\\System32\\mmc.exe", L"lusrmgr.msc" },
+                { L"System Settings", L"System Configuration", L"C:\\Windows\\System32\\msconfig.exe", L"" },
             };
             return apps;
         }
@@ -2252,6 +2262,7 @@ namespace {
 
         struct NativeDesktopWindowInfo {
             HWND hwnd = nullptr;
+            RECT windowRect{};
             RECT sourceRect{};
             std::wstring className;
             std::wstring title;
@@ -2273,7 +2284,21 @@ namespace {
             GetWindowTextW(hwnd, title, 256);
             NativeDesktopWindowInfo info{};
             info.hwnd = hwnd;
+            info.windowRect = r;
             info.sourceRect = r;
+
+            // GetWindowRect includes invisible resize/shadow margins on modern
+            // Windows. PrintWindow commonly leaves those margins black on an
+            // inactive private desktop, so composite only the visible DWM frame
+            // when Windows exposes one.
+            RECT frameBounds{};
+            if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                &frameBounds, sizeof(frameBounds))) &&
+                frameBounds.right > frameBounds.left &&
+                frameBounds.bottom > frameBounds.top) {
+                info.sourceRect = frameBounds;
+            }
+
             info.className = cls;
             info.title = title;
             ctx->windows->push_back(std::move(info));
@@ -2317,15 +2342,22 @@ namespace {
         }
 
         bool CaptureNativeDesktopWindow(const NativeDesktopWindowInfo& info, HDC targetDc) {
-            const int srcW = PositiveDim(info.sourceRect.right - info.sourceRect.left, 32);
-            const int srcH = PositiveDim(info.sourceRect.bottom - info.sourceRect.top, 24);
+            const int fullW = PositiveDim(info.windowRect.right - info.windowRect.left, 32);
+            const int fullH = PositiveDim(info.windowRect.bottom - info.windowRect.top, 24);
+            const int cropX = std::max(0, static_cast<int>(info.sourceRect.left - info.windowRect.left));
+            const int cropY = std::max(0, static_cast<int>(info.sourceRect.top - info.windowRect.top));
+            const int cropW = std::max(1, std::min(fullW - cropX,
+                static_cast<int>(info.sourceRect.right - info.sourceRect.left)));
+            const int cropH = std::max(1, std::min(fullH - cropY,
+                static_cast<int>(info.sourceRect.bottom - info.sourceRect.top)));
             const RECT dst = NativeViewerRect(info.sourceRect);
+
             HDC captureDc = CreateCompatibleDC(targetDc);
             if (!captureDc) return false;
             BITMAPINFO bi{};
             bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            bi.bmiHeader.biWidth = srcW;
-            bi.bmiHeader.biHeight = -srcH;
+            bi.bmiHeader.biWidth = fullW;
+            bi.bmiHeader.biHeight = -fullH;
             bi.bmiHeader.biPlanes = 1;
             bi.bmiHeader.biBitCount = 32;
             bi.bmiHeader.biCompression = BI_RGB;
@@ -2336,13 +2368,15 @@ namespace {
                 DeleteDC(captureDc);
                 return false;
             }
+
             HGDIOBJ old = SelectObject(captureDc, bmp);
-            FillRectColor(captureDc, 0, 0, srcW, srcH, RGB(32, 36, 45));
+            FillRectColor(captureDc, 0, 0, fullW, fullH, RGB(0, 0, 0));
             BOOL ok = PrintWindow(info.hwnd, captureDc, 0x00000002);
             if (!ok) ok = PrintWindow(info.hwnd, captureDc, 0);
             if (ok) {
+                SetStretchBltMode(targetDc, HALFTONE);
                 StretchBlt(targetDc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
-                    captureDc, 0, 0, srcW, srcH, SRCCOPY);
+                    captureDc, cropX, cropY, cropW, cropH, SRCCOPY);
             }
             SelectObject(captureDc, old);
             DeleteObject(bmp);
@@ -2409,6 +2443,28 @@ namespace {
             return RECT{ m.left + 14, top, m.right - 14, top + 38 };
         }
 
+        RECT NativeRunDialogRect() const {
+            const int ww = std::min(620, std::max(420, w_ - 80));
+            const int hh = 190;
+            return RECT{ (w_ - ww) / 2, std::max(24, (h_ - hh) / 2),
+                (w_ + ww) / 2, std::max(24, (h_ - hh) / 2) + hh };
+        }
+
+        RECT NativeRunInputRect() const {
+            RECT d = NativeRunDialogRect();
+            return RECT{ d.left + 22, d.top + 72, d.right - 22, d.top + 108 };
+        }
+
+        RECT NativeRunOkRect() const {
+            RECT d = NativeRunDialogRect();
+            return RECT{ d.right - 200, d.bottom - 52, d.right - 112, d.bottom - 18 };
+        }
+
+        RECT NativeRunCancelRect() const {
+            RECT d = NativeRunDialogRect();
+            return RECT{ d.right - 104, d.bottom - 52, d.right - 16, d.bottom - 18 };
+        }
+
         std::vector<size_t> NativeLauncherRows() const {
             std::vector<size_t> rows;
             const auto& apps = NativeMaintenanceApps();
@@ -2438,7 +2494,7 @@ namespace {
                 if (!info.hwnd) continue;
                 if (x + 150 > maxX) break;
                 RECT r{ x, bar.top + 5, x + 146, bar.bottom - 5 };
-                const bool active = info.hwnd == nativeFocusHwnd_;
+                const bool active = info.hwnd == NativeFocusedTopLevel();
                 RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
                     active ? RGB(72, 72, 72) : RGB(45, 45, 45), RGB(80, 80, 80), 6);
                 std::wstring title = info.title.empty() ? info.className : info.title;
@@ -2464,13 +2520,16 @@ namespace {
                 18, RGB(245, 245, 245), true);
 
             if (nativeLauncherFolder_.empty()) {
-                const std::vector<std::wstring> folders{ L"Windows Tools", L"Windows Accessories" };
+                const std::vector<std::wstring> folders{ L"Windows Tools", L"Windows Accessories", L"System Settings" };
                 for (size_t i = 0; i < folders.size(); ++i) {
                     RECT r = NativeMenuRowRect(i);
                     FillRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, RGB(39, 39, 39));
                     TextClipped(dc, RECT{ r.left + 14, r.top, r.right - 40, r.bottom }, folders[i], 14, RGB(245, 245, 245), true);
                     TextClipped(dc, RECT{ r.right - 34, r.top, r.right - 12, r.bottom }, L">", 15, RGB(210, 210, 210), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 }
+                RECT run = NativeMenuRowRect(3);
+                FillRectColor(dc, run.left, run.top, run.right - run.left, run.bottom - run.top, RGB(39, 39, 39));
+                TextClipped(dc, RECT{ run.left + 14, run.top, run.right - 12, run.bottom }, L"Run...", 14, RGB(245, 245, 245), true);
                 TextClipped(dc, RECT{ m.left + 18, m.bottom - 56, m.right - 18, m.bottom - 20 },
                     L"Maintenance desktop - apps run as SYSTEM", 11, RGB(160, 160, 160));
                 return;
@@ -2491,6 +2550,120 @@ namespace {
             }
         }
 
+        static std::wstring TrimNativeRunText(std::wstring value) {
+            const auto first = value.find_first_not_of(L" \t\r\n");
+            if (first == std::wstring::npos) return {};
+            const auto last = value.find_last_not_of(L" \t\r\n");
+            return value.substr(first, last - first + 1);
+        }
+
+        static std::wstring LowerNativePath(std::wstring value) {
+            for (auto& ch : value) ch = static_cast<wchar_t>(towlower(ch));
+            return value;
+        }
+
+        bool ParseNativeRunCommand(const std::wstring& command, std::wstring& exe, std::wstring& args) {
+            std::wstring text = TrimNativeRunText(command);
+            if (text.empty()) return false;
+            if (text.front() == L'"') {
+                const size_t end = text.find(L'"', 1);
+                if (end == std::wstring::npos) return false;
+                exe = text.substr(1, end - 1);
+                args = TrimNativeRunText(text.substr(end + 1));
+                return !exe.empty();
+            }
+
+            const size_t firstSpace = text.find_first_of(L" \t");
+            if (firstSpace == std::wstring::npos) {
+                exe = text;
+                args.clear();
+                return true;
+            }
+
+            // Unquoted paths containing spaces should be quoted, exactly like the
+            // Windows Run dialog. Keep parsing deterministic rather than guessing.
+            exe = text.substr(0, firstSpace);
+            args = TrimNativeRunText(text.substr(firstSpace + 1));
+            return !exe.empty();
+        }
+
+        bool LaunchNativeRunCommand(const std::wstring& command) {
+            std::wstring exe;
+            std::wstring args;
+            if (!ParseNativeRunCommand(command, exe, args)) {
+                nativeRunStatus_ = L"Enter an executable/package path. Quote paths that contain spaces.";
+                return false;
+            }
+
+            const std::wstring lower = LowerNativePath(exe);
+            auto endsWith = [&](const wchar_t* suffix) {
+                const std::wstring sfx = suffix;
+                return lower.size() >= sfx.size() &&
+                    lower.compare(lower.size() - sfx.size(), sfx.size(), sfx) == 0;
+            };
+
+            std::wstring launchExe = exe;
+            std::wstring launchArgs = args;
+            if (endsWith(L".msi")) {
+                launchExe = L"C:\\Windows\\System32\\msiexec.exe";
+                launchArgs = L"/i \"" + exe + L"\"";
+                if (!args.empty()) launchArgs += L" " + args;
+            } else if (endsWith(L".cmd") || endsWith(L".bat") || endsWith(L".com")) {
+                launchExe = L"C:\\Windows\\System32\\cmd.exe";
+                launchArgs = L"/c \"\"" + exe + L"\"";
+                if (!args.empty()) launchArgs += L" " + args;
+                launchArgs += L"\"";
+            } else if (endsWith(L".ps1")) {
+                launchExe = L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+                launchArgs = L"-NoExit -ExecutionPolicy Bypass -File \"" + exe + L"\"";
+                if (!args.empty()) launchArgs += L" " + args;
+            } else if (!endsWith(L".exe")) {
+                nativeRunStatus_ = L"Supported: .exe, .com, .msi, .cmd, .bat and .ps1.";
+                return false;
+            }
+
+            const bool ok = LaunchNativeElevatedProcess(WideToUtf8(launchExe), WideToUtf8(launchArgs));
+            if (ok) {
+                nativeRunStatus_.clear();
+                nativeRunDialogOpen_ = false;
+                nativeRunText_.clear();
+            } else {
+                nativeRunStatus_ = L"Launch failed. Check the Agent diagnostics for the Windows error.";
+            }
+            LogInfo("[background-native] run command=" + WideToUtf8(command) +
+                " resolved_exe=" + WideToUtf8(launchExe) + " ok=" + (ok ? std::string("1") : std::string("0")));
+            return ok;
+        }
+
+        void DrawNativeRunDialog(HDC dc) {
+            if (!nativeRunDialogOpen_) return;
+            RECT d = NativeRunDialogRect();
+            RoundRectColor(dc, d.left, d.top, d.right - d.left, d.bottom - d.top,
+                RGB(31, 31, 31), RGB(92, 92, 92), 10);
+            TextClipped(dc, RECT{ d.left + 22, d.top + 14, d.right - 22, d.top + 45 },
+                L"Run on Background desktop", 17, RGB(245, 245, 245), true);
+            TextClipped(dc, RECT{ d.left + 22, d.top + 42, d.right - 22, d.top + 68 },
+                L"Run an EXE, MSI, CMD/BAT or PowerShell script as SYSTEM.", 11, RGB(170, 170, 170));
+
+            RECT input = NativeRunInputRect();
+            FillRectColor(dc, input.left, input.top, input.right - input.left, input.bottom - input.top, RGB(255, 255, 255));
+            TextClipped(dc, RECT{ input.left + 10, input.top, input.right - 10, input.bottom },
+                nativeRunText_.empty() ? L"C:\path\to\setup.exe" : nativeRunText_ + L"_",
+                13, nativeRunText_.empty() ? RGB(125, 125, 125) : RGB(20, 20, 20));
+
+            if (!nativeRunStatus_.empty()) {
+                TextClipped(dc, RECT{ d.left + 22, d.top + 112, d.right - 220, d.bottom - 16 },
+                    nativeRunStatus_, 10, RGB(245, 170, 90), false, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            }
+
+            RECT ok = NativeRunOkRect();
+            RECT cancel = NativeRunCancelRect();
+            RoundRectColor(dc, ok.left, ok.top, ok.right - ok.left, ok.bottom - ok.top, RGB(0, 103, 192), RGB(0, 103, 192), 6);
+            TextClipped(dc, ok, L"Run", 12, RGB(255, 255, 255), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            RoundRectColor(dc, cancel.left, cancel.top, cancel.right - cancel.left, cancel.bottom - cancel.top, RGB(52, 52, 52), RGB(92, 92, 92), 6);
+            TextClipped(dc, cancel, L"Cancel", 12, RGB(235, 235, 235), false, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
         bool LaunchNativeMaintenanceApp(size_t index) {
             const auto& apps = NativeMaintenanceApps();
             if (index >= apps.size()) return false;
@@ -2503,6 +2676,21 @@ namespace {
 
         bool HandleNativeShellClick(int x, int y) {
             POINT pt{ x, y };
+
+            if (nativeRunDialogOpen_) {
+                RECT d = NativeRunDialogRect();
+                RECT ok = NativeRunOkRect();
+                RECT cancel = NativeRunCancelRect();
+                if (PtInRect(&ok, pt)) { LaunchNativeRunCommand(nativeRunText_); return true; }
+                if (PtInRect(&cancel, pt)) {
+                    nativeRunDialogOpen_ = false;
+                    nativeRunText_.clear();
+                    nativeRunStatus_.clear();
+                    return true;
+                }
+                return true;
+            }
+
             RECT start = NativeStartButtonRect();
             if (PtInRect(&start, pt)) {
                 nativeLauncherOpen_ = !nativeLauncherOpen_;
@@ -2521,8 +2709,19 @@ namespace {
                 if (nativeLauncherFolder_.empty()) {
                     RECT toolsRow = NativeMenuRowRect(0);
                     RECT accessoriesRow = NativeMenuRowRect(1);
+                    RECT settingsRow = NativeMenuRowRect(2);
+                    RECT runRow = NativeMenuRowRect(3);
                     if (PtInRect(&toolsRow, pt)) { nativeLauncherFolder_ = L"Windows Tools"; return true; }
                     if (PtInRect(&accessoriesRow, pt)) { nativeLauncherFolder_ = L"Windows Accessories"; return true; }
+                    if (PtInRect(&settingsRow, pt)) { nativeLauncherFolder_ = L"System Settings"; return true; }
+                    if (PtInRect(&runRow, pt)) {
+                        nativeLauncherOpen_ = false;
+                        nativeLauncherFolder_.clear();
+                        nativeRunDialogOpen_ = true;
+                        nativeRunText_.clear();
+                        nativeRunStatus_.clear();
+                        return true;
+                    }
                     return true;
                 }
 
@@ -2555,10 +2754,7 @@ namespace {
                     if (bx + 150 > maxX) break;
                     RECT r{ bx, bar.top + 5, bx + 146, bar.bottom - 5 };
                     if (PtInRect(&r, pt)) {
-                        ShowWindow(info.hwnd, SW_RESTORE);
-                        SetWindowPos(info.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-                        nativeFocusHwnd_ = info.hwnd;
-                        PostMessageW(info.hwnd, WM_SETFOCUS, 0, 0);
+                        NativeActivateTopLevel(info.hwnd);
                         return true;
                     }
                     bx += 152;
@@ -2576,6 +2772,18 @@ namespace {
             if (!nativeWindowInventoryLogged_ && !windows.empty()) {
                 nativeWindowInventoryLogged_ = true;
                 LogInfo("[background-native] first private desktop windows=" + std::to_string(windows.size()));
+                for (size_t i = 0; i < windows.size() && i < 12; ++i) {
+                    const auto& info = windows[i];
+                    LogInfo("[background-native] window hwnd=0x" +
+                        PtrToHex(reinterpret_cast<uintptr_t>(info.hwnd)) +
+                        " class=" + WideToUtf8(info.className) +
+                        " title=" + WideToUtf8(info.title) +
+                        " rect=" + std::to_string(info.windowRect.left) + "," + std::to_string(info.windowRect.top) +
+                        "," + std::to_string(info.windowRect.right) + "," + std::to_string(info.windowRect.bottom) +
+                        " frame=" + std::to_string(info.sourceRect.left) + "," + std::to_string(info.sourceRect.top) +
+                        "," + std::to_string(info.sourceRect.right) + "," + std::to_string(info.sourceRect.bottom) +
+                        " iconic=" + std::string(IsIconic(info.hwnd) ? "1" : "0"));
+                }
             }
 
             size_t captured = 0;
@@ -2591,6 +2799,7 @@ namespace {
 
             DrawNativeLauncher(memDc_);
             DrawNativeTaskbar(memDc_, windows);
+            DrawNativeRunDialog(memDc_);
             DrawCursor(memDc_);
             return true;
         }
@@ -2624,7 +2833,147 @@ namespace {
             return target;
         }
 
+        HWND NativeFocusedTopLevel() const {
+            if (!nativeFocusHwnd_ || !IsWindow(nativeFocusHwnd_)) return nullptr;
+            HWND root = GetAncestor(nativeFocusHwnd_, GA_ROOT);
+            return root && IsWindow(root) ? root : nativeFocusHwnd_;
+        }
+
+        LRESULT NativeNonClientHitTest(HWND hwnd, int viewerX, int viewerY) const {
+            if (!hwnd || !IsWindow(hwnd)) return HTNOWHERE;
+            POINT screen = NativeScreenPoint(viewerX, viewerY);
+            DWORD_PTR result = HTNOWHERE;
+            if (!SendMessageTimeoutW(hwnd, WM_NCHITTEST, 0,
+                MAKELPARAM(static_cast<SHORT>(screen.x), static_cast<SHORT>(screen.y)),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &result)) {
+                return HTNOWHERE;
+            }
+            return static_cast<LRESULT>(result);
+        }
+
+        static bool NativeHitIsResize(LRESULT hit) {
+            return hit == HTLEFT || hit == HTRIGHT || hit == HTTOP || hit == HTBOTTOM ||
+                hit == HTTOPLEFT || hit == HTTOPRIGHT || hit == HTBOTTOMLEFT || hit == HTBOTTOMRIGHT;
+        }
+
+        void NativeActivateTopLevel(HWND hwnd) {
+            if (!hwnd || !IsWindow(hwnd)) return;
+            ShowWindow(hwnd, SW_RESTORE);
+            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+            nativeFocusHwnd_ = hwnd;
+            PostMessageW(hwnd, WM_NCACTIVATE, TRUE, 0);
+            PostMessageW(hwnd, WM_SETFOCUS, 0, 0);
+        }
+
+        void NativeToggleMaximize(HWND hwnd) {
+            if (!hwnd || !IsWindow(hwnd)) return;
+            auto it = nativeRestoreRects_.find(hwnd);
+            if (it != nativeRestoreRects_.end()) {
+                const RECT restore = it->second;
+                SetWindowPos(hwnd, HWND_TOP, restore.left, restore.top,
+                    std::max<LONG>(120, restore.right - restore.left),
+                    std::max<LONG>(80, restore.bottom - restore.top),
+                    SWP_SHOWWINDOW | SWP_NOACTIVATE);
+                nativeRestoreRects_.erase(it);
+                NativeActivateTopLevel(hwnd);
+                return;
+            }
+
+            RECT current{};
+            if (!GetWindowRect(hwnd, &current)) return;
+            nativeRestoreRects_[hwnd] = current;
+
+            const int sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            const int sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            const int sw = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+            const int sh = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+            const int reserved = std::max(1,
+                static_cast<int>((static_cast<long long>(nativeTaskbarH_) * sh) / std::max(1, h_)));
+            SetWindowPos(hwnd, HWND_TOP, sx, sy, sw, std::max(100, sh - reserved),
+                SWP_SHOWWINDOW | SWP_NOACTIVATE);
+            NativeActivateTopLevel(hwnd);
+        }
+
+        void NativeBeginNonClientDrag(HWND hwnd, LRESULT hit, int x, int y) {
+            if (!hwnd || !IsWindow(hwnd)) return;
+            nativeNonClientHwnd_ = hwnd;
+            nativeNonClientHit_ = hit;
+            nativeNonClientStartScreen_ = NativeScreenPoint(x, y);
+            GetWindowRect(hwnd, &nativeNonClientStartRect_);
+            nativeLeftDown_ = true;
+            NativeActivateTopLevel(hwnd);
+        }
+
+        void NativeUpdateNonClientDrag(int x, int y) {
+            if (!nativeNonClientHwnd_ || !IsWindow(nativeNonClientHwnd_) || !nativeLeftDown_) return;
+            if (nativeNonClientHit_ != HTCAPTION && !NativeHitIsResize(nativeNonClientHit_)) return;
+
+            POINT now = NativeScreenPoint(x, y);
+            const int dx = now.x - nativeNonClientStartScreen_.x;
+            const int dy = now.y - nativeNonClientStartScreen_.y;
+            RECT r = nativeNonClientStartRect_;
+
+            if (nativeNonClientHit_ == HTCAPTION) {
+                OffsetRect(&r, dx, dy);
+            } else {
+                if (nativeNonClientHit_ == HTLEFT || nativeNonClientHit_ == HTTOPLEFT || nativeNonClientHit_ == HTBOTTOMLEFT) r.left += dx;
+                if (nativeNonClientHit_ == HTRIGHT || nativeNonClientHit_ == HTTOPRIGHT || nativeNonClientHit_ == HTBOTTOMRIGHT) r.right += dx;
+                if (nativeNonClientHit_ == HTTOP || nativeNonClientHit_ == HTTOPLEFT || nativeNonClientHit_ == HTTOPRIGHT) r.top += dy;
+                if (nativeNonClientHit_ == HTBOTTOM || nativeNonClientHit_ == HTBOTTOMLEFT || nativeNonClientHit_ == HTBOTTOMRIGHT) r.bottom += dy;
+                if (r.right - r.left < 220) {
+                    if (nativeNonClientHit_ == HTLEFT || nativeNonClientHit_ == HTTOPLEFT || nativeNonClientHit_ == HTBOTTOMLEFT) r.left = r.right - 220;
+                    else r.right = r.left + 220;
+                }
+                if (r.bottom - r.top < 140) {
+                    if (nativeNonClientHit_ == HTTOP || nativeNonClientHit_ == HTTOPLEFT || nativeNonClientHit_ == HTTOPRIGHT) r.top = r.bottom - 140;
+                    else r.bottom = r.top + 140;
+                }
+            }
+
+            SetWindowPos(nativeNonClientHwnd_, HWND_TOP, r.left, r.top,
+                r.right - r.left, r.bottom - r.top, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        }
+
+        bool NativeHandleNonClientButton(const hi5::InputCmd& cmd, int x, int y) {
+            if (cmd.mouseButton.button != 0) return false;
+            const bool down = cmd.mouseButton.down != 0;
+
+            if (down) {
+                HWND top = NativeTopLevelAt(x, y);
+                if (!top) return false;
+                const LRESULT hit = NativeNonClientHitTest(top, x, y);
+                if (hit == HTCLIENT || hit == HTNOWHERE || hit == HTERROR) return false;
+                NativeBeginNonClientDrag(top, hit, x, y);
+                return true;
+            }
+
+            if (!nativeNonClientHwnd_) return false;
+            HWND hwnd = nativeNonClientHwnd_;
+            const LRESULT hit = nativeNonClientHit_;
+            nativeLeftDown_ = false;
+            nativeNonClientHwnd_ = nullptr;
+            nativeNonClientHit_ = HTNOWHERE;
+
+            const LRESULT releaseHit = NativeNonClientHitTest(hwnd, x, y);
+            if (hit == HTMINBUTTON && releaseHit == HTMINBUTTON) {
+                ShowWindow(hwnd, SW_MINIMIZE);
+                if (NativeFocusedTopLevel() == hwnd) nativeFocusHwnd_ = nullptr;
+            } else if (hit == HTMAXBUTTON && releaseHit == HTMAXBUTTON) {
+                NativeToggleMaximize(hwnd);
+            } else if (hit == HTCLOSE && releaseHit == HTCLOSE) {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                nativeRestoreRects_.erase(hwnd);
+                if (NativeFocusedTopLevel() == hwnd) nativeFocusHwnd_ = nullptr;
+            }
+            return true;
+        }
+
         void NativeMouseMove(int x, int y) {
+            if (nativeNonClientHwnd_ && nativeLeftDown_) {
+                NativeUpdateNonClientDrag(x, y);
+                return;
+            }
             POINT client{};
             HWND target = NativeTargetAt(x, y, client);
             if (!target) return;
@@ -2633,6 +2982,8 @@ namespace {
         }
 
         void NativeMouseButton(const hi5::InputCmd& cmd, int x, int y) {
+            if (NativeHandleNonClientButton(cmd, x, y)) return;
+
             POINT client{};
             HWND target = NativeTargetAt(x, y, client);
             if (!target && nativeFocusHwnd_ && IsWindow(nativeFocusHwnd_)) {
@@ -2665,6 +3016,23 @@ namespace {
         }
 
         void NativeKey(const hi5::InputCmd& cmd) {
+            if (nativeRunDialogOpen_) {
+                if (!cmd.key.down) return;
+                if (cmd.key.vk == VK_RETURN) { LaunchNativeRunCommand(nativeRunText_); return; }
+                if (cmd.key.vk == VK_ESCAPE) {
+                    nativeRunDialogOpen_ = false;
+                    nativeRunText_.clear();
+                    nativeRunStatus_.clear();
+                    return;
+                }
+                if (cmd.key.vk == VK_BACK) {
+                    if (!nativeRunText_.empty()) nativeRunText_.pop_back();
+                    nativeRunStatus_.clear();
+                    return;
+                }
+                return;
+            }
+
             HWND target = nativeFocusHwnd_;
             if (!target || !IsWindow(target)) {
                 auto windows = NativeDesktopWindows();
@@ -2679,6 +3047,16 @@ namespace {
         }
 
         void NativeText(const std::wstring& text) {
+            if (nativeRunDialogOpen_) {
+                for (wchar_t ch : text) {
+                    if (ch == L'' || ch == L'
+') continue;
+                    if (ch >= 32 && nativeRunText_.size() < 2048) nativeRunText_.push_back(ch);
+                }
+                nativeRunStatus_.clear();
+                return;
+            }
+
             HWND target = nativeFocusHwnd_;
             if (!target || !IsWindow(target)) return;
             for (wchar_t ch : text) PostMessageW(target, WM_CHAR, static_cast<WPARAM>(ch), 1);
@@ -2689,8 +3067,14 @@ namespace {
             switch (action) {
             case hi5::ShortcutAction::StartMenu:
             case hi5::ShortcutAction::CtrlEsc:
-                nativeLauncherOpen_ = !nativeLauncherOpen_;
-                if (!nativeLauncherOpen_) nativeLauncherFolder_.clear();
+                if (nativeRunDialogOpen_) {
+                    nativeRunDialogOpen_ = false;
+                    nativeRunText_.clear();
+                    nativeRunStatus_.clear();
+                } else {
+                    nativeLauncherOpen_ = !nativeLauncherOpen_;
+                    if (!nativeLauncherOpen_) nativeLauncherFolder_.clear();
+                }
                 break;
             case hi5::ShortcutAction::TaskManager:
             case hi5::ShortcutAction::CtrlShiftEsc: {
@@ -2708,12 +3092,12 @@ namespace {
                 nativeLauncherFolder_.clear();
                 break;
             }
-            case hi5::ShortcutAction::AltF4:
-                if (nativeFocusHwnd_ && IsWindow(nativeFocusHwnd_)) {
-                    PostMessageW(nativeFocusHwnd_, WM_CLOSE, 0, 0);
-                    nativeFocusHwnd_ = nullptr;
-                }
+            case hi5::ShortcutAction::AltF4: {
+                HWND top = NativeFocusedTopLevel();
+                if (top) PostMessageW(top, WM_CLOSE, 0, 0);
+                nativeFocusHwnd_ = nullptr;
                 break;
+            }
             case hi5::ShortcutAction::AltTab:
             case hi5::ShortcutAction::AltTabBegin:
             case hi5::ShortcutAction::AltTabNext:
@@ -2722,7 +3106,7 @@ namespace {
                 if (windows.empty()) break;
                 size_t next = 0;
                 for (size_t i = 0; i < windows.size(); ++i) {
-                    if (windows[i].hwnd == nativeFocusHwnd_) { next = (i + 1) % windows.size(); break; }
+                    if (windows[i].hwnd == NativeFocusedTopLevel()) { next = (i + 1) % windows.size(); break; }
                 }
                 HWND hwnd = windows[next].hwnd;
                 if (hwnd) {
@@ -3599,9 +3983,17 @@ namespace {
         bool nativeLauncherOpen_ = false;
         bool nativeShellPointerCaptured_ = false;
         std::wstring nativeLauncherFolder_;
+        bool nativeRunDialogOpen_ = false;
+        std::wstring nativeRunText_;
+        std::wstring nativeRunStatus_;
         const int nativeTaskbarH_ = 48;
         bool nativeLeftDown_ = false;
         HWND nativeFocusHwnd_ = nullptr;
+        HWND nativeNonClientHwnd_ = nullptr;
+        LRESULT nativeNonClientHit_ = HTNOWHERE;
+        POINT nativeNonClientStartScreen_{};
+        RECT nativeNonClientStartRect_{};
+        std::unordered_map<HWND, RECT> nativeRestoreRects_;
         std::vector<HANDLE> nativeDesktopProcesses_;
 
         DragMode dragMode_ = DragMode::None;
