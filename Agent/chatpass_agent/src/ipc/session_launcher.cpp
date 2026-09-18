@@ -261,10 +261,14 @@ namespace hi5 {
         }
 
         PROCESS_INFORMATION pi{};
-        DWORD flags = 0;
         const bool visibleConsole = allowGui && NeedsPrivateDesktopConsole(wExePath);
-        if (!allowGui) flags |= CREATE_NO_WINDOW;
-        else if (visibleConsole) flags |= CREATE_NEW_CONSOLE;
+
+        // Most Hi5 interactive helpers are console-subsystem executables that
+        // create their own GUI windows. Keep their inherited console suppressed
+        // so session start never flashes a command window on WinSta0\Default.
+        // Only explicit CMD/PowerShell tools on the private Background desktop
+        // should receive a visible console.
+        DWORD flags = visibleConsole ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
         if (envBlock) flags |= CREATE_UNICODE_ENVIRONMENT;
 
         const char* effectivePrefix = allowGui ? "[launcher][interactive-gui]" : logPrefix;
