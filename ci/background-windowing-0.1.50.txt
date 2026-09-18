@@ -1,0 +1,15 @@
+Hi5Central Background maintenance practicality validation
+
+VPS source: 2936041cf75ae28862b911898792ebd54489ea1e
+GitHub source sync: a088f7a6049df09f2a00e3c24aa7d36575d061b4
+Source archive SHA256: 293bedda0ee46bba0152bb22008d7d0a6605492376d9cc77c5cb201c56c5b29a
+
+Purpose:
+- visible private CMD/PowerShell consoles (CREATE_NEW_CONSOLE)
+- proper native non-client handling for move/resize/minimize/maximize/restore/close
+- custom maximize respects the Hi5 Background taskbar
+- crop DWM invisible frame margins to remove black side strips
+- richer System Settings Start folder
+- Background Run dialog for EXE/MSI/CMD/BAT/PS1 as SYSTEM
+- preserve private HDESK isolation and no Explorer shell
+- add HWND diagnostics for console/window capture troubleshooting
