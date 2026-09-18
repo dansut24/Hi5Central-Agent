@@ -1,0 +1,16 @@
+Hi5Central SYSTEM maintenance Background validation
+
+VPS source: 74a9ecef75bc399940611c08f2a7c62dcc74ca1a
+GitHub source sync: 3f4c0526b11b8fd28e371b5f0a995bf7eb44af83
+Source archive SHA256: ff6e81360563c2d69062a7385d16d040fae6ab539e469d224503e9a6bfbf0f5c
+
+Purpose:
+- private Win32 desktop remains the real isolation boundary
+- no Explorer shell and no user wallpaper/icons
+- black maintenance desktop with Hi5 taskbar and Start/Apps menu
+- grouped Windows Tools and Windows Accessories
+- launch real native Windows apps as LocalSystem on the private HDESK
+- no apps open by default
+- preserve synthetic Backstage only as private-desktop creation fallback
+- use last known console monitor geometry for sharper Background rendering
+- Viewer Start button becomes Apps while Background is active
