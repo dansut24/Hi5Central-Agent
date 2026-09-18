@@ -1,0 +1,18 @@
+Hi5Central Background hybrid responsiveness compile-fix validation
+
+VPS hybrid source: a96e35d0576636285f8d02cd52a13a6467bcd55e
+VPS compile fix: 5b6a155e03278d947cf0b1b3638a18247633b48a
+GitHub corrected source: d903a20e9a29eac533be3fd540fe10883265053d
+Compile-fix archive SHA256: 80748a7ab86e004b110f94a90016e230d23a2696b21b47011f2c38902f236799
+
+Fix:
+- replace stale scheduler health-log 'dragging' identifier with current 'interacting' state
+
+Retains:
+- cursor overlay only / no frame-baked cursor
+- pointer-only movement does not dirty video
+- cached native HWND compositor
+- adaptive 30 FPS interaction rendering
+- combined Hi5/native taskbar and z-order
+- Hi5-managed core admin tools
+- Users & Sessions SYSTEM-context view
