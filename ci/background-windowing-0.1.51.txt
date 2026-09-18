@@ -1,0 +1,17 @@
+Hi5Central Background maintenance windowing compile-fix validation
+
+VPS functional checkpoint: 2936041cf75ae28862b911898792ebd54489ea1e
+VPS compile fix: f84a6824ffe1239abba67351edbf809e4b2cf675
+GitHub corrected source: fb6cb1eac48db7c1f1e932842757f60a73b4996b
+Compile-fix archive SHA256: 30f49cd8a7302fc0350d50ebd236626784e90e50b8bbf70af39b5bd47535a959
+
+Fixes only:
+- repair malformed wide-character CR/LF literals in Background Run dialog input
+- escape Run dialog example path correctly
+
+Retains 0.1.50 functionality:
+- visible private CMD/PowerShell consoles
+- native move/resize/minimize/maximize/restore/close
+- DWM frame cropping
+- System Settings folder
+- Run dialog for EXE/MSI/CMD/BAT/PS1
