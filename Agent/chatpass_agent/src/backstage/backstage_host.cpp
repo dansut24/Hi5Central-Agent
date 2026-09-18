@@ -2648,7 +2648,7 @@ namespace {
             RECT input = NativeRunInputRect();
             FillRectColor(dc, input.left, input.top, input.right - input.left, input.bottom - input.top, RGB(255, 255, 255));
             TextClipped(dc, RECT{ input.left + 10, input.top, input.right - 10, input.bottom },
-                nativeRunText_.empty() ? L"C:\path\to\setup.exe" : nativeRunText_ + L"_",
+                nativeRunText_.empty() ? L"C:\\path\\to\\setup.exe" : nativeRunText_ + L"_",
                 13, nativeRunText_.empty() ? RGB(125, 125, 125) : RGB(20, 20, 20));
 
             if (!nativeRunStatus_.empty()) {
@@ -3049,8 +3049,7 @@ namespace {
         void NativeText(const std::wstring& text) {
             if (nativeRunDialogOpen_) {
                 for (wchar_t ch : text) {
-                    if (ch == L'' || ch == L'
-') continue;
+                    if (ch == L'\r' || ch == L'\n') continue;
                     if (ch >= 32 && nativeRunText_.size() < 2048) nativeRunText_.push_back(ch);
                 }
                 nativeRunStatus_.clear();
