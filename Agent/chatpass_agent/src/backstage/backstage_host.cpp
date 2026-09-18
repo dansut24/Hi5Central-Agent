@@ -2350,22 +2350,23 @@ namespace {
             if (!EnsurePrivateDesktop()) return false;
             nativeStartupAt_ = std::chrono::steady_clock::now();
 
-            // Prove an ordinary user GUI can live on the private HDESK without any
-            // elevation or shell activation. Winver is classic, in-box and as-invoker.
-            if (!LaunchNativeUserProcess("C:\\Windows\\System32\\winver.exe", "")) {
-                LogWarn("[background-native] winver launch failed; fallback=synthetic");
+            // Start the real Windows shell on the private HDESK. Do not launch any
+            // application by default: the technician should arrive at an empty
+            // Windows desktop and choose what to open from Start/taskbar.
+            //
+            // Explorer is deliberately launched with the interactive user's token so
+            // it receives the normal user profile/environment. lpDesktop is bound to
+            // our private HDESK by LaunchInInteractiveSessionOnDesktop(). If Windows
+            // refuses to create a private shell (or proxies to the existing Default
+            // shell), NativeDesktopWindows() remains empty and the existing bounded
+            // startup watchdog falls back rather than streaming the local desktop.
+            if (!LaunchNativeUserProcess("C:\\Windows\\explorer.exe", "")) {
+                LogWarn("[background-native] Explorer shell launch failed; fallback=synthetic");
                 return false;
             }
 
-            // Admin tools use a separate elevated broker path. A failure here does
-            // not invalidate the private desktop proof; winver can still prove capture.
-            const bool mmcElevated = LaunchNativeElevatedProcess(
-                "C:\\Windows\\System32\\mmc.exe", "services.msc");
-            if (!mmcElevated) {
-                LogWarn("[background-native] elevated MMC launch failed; continuing user-GUI proof");
-            }
-            LogInfo("[background-native] mode=private-hdesk proof=winver elevated_mmc=" +
-                std::string(mmcElevated ? "1" : "0") + " explorer=deferred");
+            nativeShellProbePending_ = true;
+            LogInfo("[background-native] mode=private-hdesk shell=explorer apps_opened=0 waiting_for=Shell_TrayWnd");
             return true;
         }
 
@@ -2383,6 +2384,65 @@ namespace {
         bool DrawNativeDesktop() {
             FillRectColor(memDc_, 0, 0, w_, h_, RGB(22, 30, 43));
             auto windows = NativeDesktopWindows();
+
+            if (nativeShellProbePending_ && !windows.empty()) {
+                bool hasTaskbar = false;
+                bool hasDesktop = false;
+                std::vector<HWND> startupExplorerWindows;
+                for (const auto& info : windows) {
+                    if (_wcsicmp(info.className.c_str(), L"Shell_TrayWnd") == 0 ||
+                        _wcsicmp(info.className.c_str(), L"Shell_SecondaryTrayWnd") == 0) {
+                        hasTaskbar = true;
+                    }
+                    if (_wcsicmp(info.className.c_str(), L"Progman") == 0 ||
+                        _wcsicmp(info.className.c_str(), L"WorkerW") == 0) {
+                        hasDesktop = true;
+                    }
+                    if (_wcsicmp(info.className.c_str(), L"CabinetWClass") == 0 ||
+                        _wcsicmp(info.className.c_str(), L"ExploreWClass") == 0) {
+                        startupExplorerWindows.push_back(info.hwnd);
+                    }
+                }
+
+                // Starting the shell must not leave an application window open. If
+                // Explorer created a folder window on the private HDESK, close only
+                // that private-desktop HWND and wait for the next inventory pass.
+                if (hasTaskbar && !startupExplorerWindows.empty()) {
+                    if (!nativeStartupExplorerCloseLogged_) {
+                        nativeStartupExplorerCloseLogged_ = true;
+                        LogWarn("[background-native] Explorer shell opened startup folder window count=" +
+                            std::to_string(startupExplorerWindows.size()) + " closing_before_ready=1");
+                    }
+                    for (HWND hwnd : startupExplorerWindows) {
+                        if (hwnd && IsWindow(hwnd)) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    }
+                } else if (hasTaskbar) {
+                    nativeShellProbePending_ = false;
+                    nativeShellReady_ = true;
+                    LogInfo("[background-native] private Explorer shell detected taskbar=1 desktop=" +
+                        std::string(hasDesktop ? "1" : "0") + " apps_opened=0");
+                }
+            }
+
+            if (nativeShellProbePending_) {
+                const auto shellElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - nativeStartupAt_).count();
+                if (shellElapsed > 7000) {
+                    LogWarn("[background-native] Explorer did not create private Shell_TrayWnd; windows=" +
+                        std::to_string(windows.size()) + " fallback=synthetic");
+                    StopNativeDesktopProcesses();
+                    return false;
+                }
+
+                // Do not expose transient Explorer setup/folder windows while the
+                // private shell is being validated. The first rendered shell frame is
+                // emitted only after Shell_TrayWnd exists and startup app windows are gone.
+                TextClipped(memDc_, RECT{ 32, 32, w_ - 32, 80 },
+                    L"Starting private Windows desktop...", 20, RGB(232, 238, 246), true);
+                DrawCursor(memDc_);
+                return true;
+            }
+
             if (windows.empty()) {
                 const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - nativeStartupAt_).count();
@@ -3364,6 +3424,9 @@ namespace {
         bool nativeModeActive_ = false;
         bool nativeWindowInventoryLogged_ = false;
         bool nativeFirstCaptureLogged_ = false;
+        bool nativeShellProbePending_ = false;
+        bool nativeShellReady_ = false;
+        bool nativeStartupExplorerCloseLogged_ = false;
         uint64_t nativeCaptureFailureFrames_ = 0;
         bool nativeLeftDown_ = false;
         HWND nativeFocusHwnd_ = nullptr;
