@@ -30,6 +30,7 @@ HWND g_refreshButton = nullptr;
 HWND g_addressEdit = nullptr;
 HWND g_goButton = nullptr;
 HWND g_contextLabel = nullptr;
+HWND g_statusLabel = nullptr;
 WNDPROC g_addressOriginalProc = nullptr;
 
 bool g_showingHome = false;
@@ -174,7 +175,7 @@ h1{font-size:42px;letter-spacing:-1.4px;margin:0}.sub{color:#65758b;margin:8px 0
     <a class="card" href="http://nas.local"><b>NAS</b><span>http://nas.local</span></a>
     <a class="card" href="http://192.168.0.1"><b>Switch</b><span>192.168.0.1</span></a>
     <a class="card" href="https://firewall/"><b>Firewall</b><span>https://firewall/</span></a>
-    <div class="card"><b>Add shortcut</b><span>Custom shortcuts are coming next</span></div>
+    <a class="card" href="https://example.com"><b>Web test</b><span>Known public test page</span></a>
   </div>
   <div class="badge">SYSTEM &nbsp;|&nbsp; isolated profile &nbsp;|&nbsp; background desktop</div>
 </main>
@@ -317,6 +318,12 @@ void CreateBrowserControls(HWND parent) {
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(IDC_BROWSER_CONTEXT),
         GetModuleHandleW(nullptr), nullptr);
 
+    g_statusLabel = CreateWindowExW(0, L"STATIC",
+        L"Starting Hi5 Web browser engine...\r\n\r\nThis page will be replaced when WebView2 is ready.",
+        WS_CHILD | WS_VISIBLE | SS_CENTER,
+        0, 0, 0, 0, parent, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+
     ApplyUiFont(g_backButton);
     ApplyUiFont(g_forwardButton);
     ApplyUiFont(g_homeButton);
@@ -324,6 +331,7 @@ void CreateBrowserControls(HWND parent) {
     ApplyUiFont(g_addressEdit);
     ApplyUiFont(g_goButton);
     ApplyUiFont(g_contextLabel);
+    ApplyUiFont(g_statusLabel);
 
     if (g_addressEdit) {
         g_addressOriginalProc = reinterpret_cast<WNDPROC>(
@@ -367,6 +375,11 @@ void ResizeBrowserUi() {
 
     if (g_contextLabel) {
         MoveWindow(g_contextLabel, x, buttonY + 7, std::max(90, width - x - kToolbarGap), 22, TRUE);
+    }
+
+    if (g_statusLabel) {
+        MoveWindow(g_statusLabel, 24, kToolbarHeight + 72,
+            std::max(120, width - 48), 120, TRUE);
     }
 
     if (g_controller) {
@@ -415,6 +428,11 @@ void InitWebView2() {
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
                 if (FAILED(result) || !env) {
+                    if (g_statusLabel) {
+                        SetWindowTextW(g_statusLabel,
+                            L"Hi5 Web could not start the WebView2 environment.\r\n\r\n"
+                            L"Install or repair Microsoft Edge WebView2 Runtime on the target device.");
+                    }
                     LogWarn("[backstage-browser] CreateCoreWebView2Environment failed hr=" + std::to_string(static_cast<long>(result)));
                     return S_OK;
                 }
@@ -424,12 +442,18 @@ void InitWebView2() {
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                         [](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
                             if (FAILED(result) || !controller) {
+                                if (g_statusLabel) {
+                                    SetWindowTextW(g_statusLabel,
+                                        L"Hi5 Web started, but its browser surface could not be created.\r\n\r\n"
+                                        L"Check the Agent diagnostics for the WebView2 error code.");
+                                }
                                 LogWarn("[backstage-browser] CreateCoreWebView2Controller failed hr=" + std::to_string(static_cast<long>(result)));
                                 return S_OK;
                             }
 
                             g_controller = controller;
                             g_controller->get_CoreWebView2(&g_webview);
+                            if (g_statusLabel && g_webview) ShowWindow(g_statusLabel, SW_HIDE);
                             ResizeBrowserUi();
 
                             ComPtr<ICoreWebView2Settings> settings;
@@ -481,6 +505,11 @@ void InitWebView2() {
             }).Get());
 
     if (FAILED(hr)) {
+        if (g_statusLabel) {
+            SetWindowTextW(g_statusLabel,
+                L"Hi5 Web could not initialise WebView2.\r\n\r\n"
+                L"Check the target device's WebView2 Runtime installation.");
+        }
         LogWarn("[backstage-browser] CreateCoreWebView2EnvironmentWithOptions call failed hr=" + std::to_string(static_cast<long>(hr)));
     }
 }
@@ -553,6 +582,7 @@ LRESULT CALLBACK BrowserWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_addressEdit = nullptr;
         g_goButton = nullptr;
         g_contextLabel = nullptr;
+        g_statusLabel = nullptr;
         PostQuitMessage(0);
         return 0;
 

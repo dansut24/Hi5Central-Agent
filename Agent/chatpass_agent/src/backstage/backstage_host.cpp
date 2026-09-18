@@ -571,15 +571,19 @@ namespace {
             return RECT{ win.rect.left + 1, win.rect.top + titleH_, win.rect.right - 1, win.rect.bottom - 1 };
         }
 
-        RECT DefaultManagedWindowRect(size_t ordinal) const {
+        RECT ManagedWorkspaceRect() const {
             const int shellTaskbar = nativeModeActive_ ? nativeTaskbarH_ : taskbarH_;
+            const int top = nativeModeActive_ ? kNativeShellTopH : 0;
+            return RECT{ 0, top, w_, std::max(top + 120, h_ - shellTaskbar) };
+        }
+
+        RECT DefaultManagedWindowRect(size_t ordinal) const {
             const int margin = 14;
-            const int chromeTop = nativeModeActive_ ? kNativeShellTopH : 0;
-            const int chromeLeft = (nativeModeActive_ && NativeShellSidebarVisible()) ? kNativeShellSideW : 0;
-            const int workLeft = chromeLeft + margin;
-            const int workTop = chromeTop + margin;
-            const int workRight = std::max(workLeft + 360, w_ - margin);
-            const int workBottom = std::max(workTop + 280, h_ - shellTaskbar - margin);
+            const RECT workspace = ManagedWorkspaceRect();
+            const int workLeft = workspace.left + margin;
+            const int workTop = workspace.top + margin;
+            const int workRight = std::max(workLeft + 360L, workspace.right - margin);
+            const int workBottom = std::max(workTop + 280L, workspace.bottom - margin);
             const int workW = std::max(360, workRight - workLeft);
             const int workH = std::max(280, workBottom - workTop);
 
@@ -714,7 +718,7 @@ namespace {
         void ToggleMaximize(BackstageWindow& win) {
             if (!win.maximized) {
                 win.restoreRect = win.rect;
-                win.rect = RECT{ 0, 0, w_, h_ - taskbarH_ };
+                win.rect = ManagedWorkspaceRect();
                 win.maximized = true;
                 win.snappedLeft = win.snappedRight = false;
             }
@@ -725,17 +729,20 @@ namespace {
         }
 
         void SnapWindow(BackstageWindow& win, int mode) {
+            const RECT work = ManagedWorkspaceRect();
+            const int gap = 8;
+            const int mid = work.left + (work.right - work.left) / 2;
             win.restoreRect = win.rect;
             if (mode == 1) {
-                win.rect = RECT{ 10, 10, (w_ / 2) - 5, h_ - taskbarH_ - 10 };
+                win.rect = RECT{ work.left + gap, work.top + gap, mid - (gap / 2), work.bottom - gap };
                 win.snappedLeft = true; win.snappedRight = false; win.maximized = false;
             }
             else if (mode == 2) {
-                win.rect = RECT{ (w_ / 2) + 5, 10, w_ - 10, h_ - taskbarH_ - 10 };
+                win.rect = RECT{ mid + (gap / 2), work.top + gap, work.right - gap, work.bottom - gap };
                 win.snappedLeft = false; win.snappedRight = true; win.maximized = false;
             }
             else if (mode == 3) {
-                win.rect = RECT{ 0, 0, w_, h_ - taskbarH_ };
+                win.rect = work;
                 win.maximized = true; win.snappedLeft = win.snappedRight = false;
             }
         }
@@ -898,12 +905,27 @@ namespace {
         }
 
         void ClampWindowRect(RECT& r) const {
+            const RECT work = ManagedWorkspaceRect();
             const int ww = std::max(300, static_cast<int>(r.right - r.left));
             const int wh = std::max(220, static_cast<int>(r.bottom - r.top));
-            if (r.left > w_ - 80) { r.left = w_ - 80; r.right = r.left + ww; }
-            if (r.top > h_ - taskbarH_ - 40) { r.top = h_ - taskbarH_ - 40; r.bottom = r.top + wh; }
-            if (r.right < 80) { r.right = 80; r.left = r.right - ww; }
-            if (r.bottom < 60) { r.bottom = 60; r.top = r.bottom - wh; }
+            const int titleVisible = 72;
+
+            if (r.left > work.right - titleVisible) {
+                r.left = work.right - titleVisible;
+                r.right = r.left + ww;
+            }
+            if (r.top < work.top) {
+                r.top = work.top;
+                r.bottom = r.top + wh;
+            }
+            if (r.top > work.bottom - titleH_) {
+                r.top = work.bottom - titleH_;
+                r.bottom = r.top + wh;
+            }
+            if (r.right < work.left + titleVisible) {
+                r.right = work.left + titleVisible;
+                r.left = r.right - ww;
+            }
         }
 
         bool HandleTaskbarClick(int x, int y) {
@@ -2705,23 +2727,22 @@ namespace {
             return RECT{ d.right - 104, d.bottom - 52, d.right - 16, d.bottom - 18 };
         }
 
-        static constexpr int kNativeShellTopH = 74;
-        static constexpr int kNativeShellSideW = 252;
+        static constexpr int kNativeShellTopH = 70;
+        static constexpr int kNativeShellSideW = 252; // retained for dormant launcher helpers
 
         bool NativeShellSidebarVisible() const {
-            return w_ >= 1180 && h_ >= 680;
+            return false;
         }
 
         RECT NativeShellWorkspaceRect() const {
-            const int left = NativeShellSidebarVisible() ? kNativeShellSideW : 0;
-            return RECT{ left, kNativeShellTopH, w_, h_ - nativeTaskbarH_ };
+            return RECT{ 0, kNativeShellTopH, w_, h_ - nativeTaskbarH_ };
         }
 
         RECT NativeShellTopActionRect(size_t index) const {
-            const int startX = NativeShellSidebarVisible() ? (kNativeShellSideW + 8) : 170;
-            const int itemW = 88;
+            const int startX = 176;
+            const int itemW = 86;
             const int x = startX + static_cast<int>(index) * itemW;
-            return RECT{ x, 7, x + itemW - 4, kNativeShellTopH - 7 };
+            return RECT{ x, 5, x + itemW - 4, kNativeShellTopH - 5 };
         }
 
         RECT NativeShellSearchRect() const {
@@ -3182,6 +3203,22 @@ namespace {
             TextClipped(dc, cancel, L"Cancel", 12, RGB(235, 235, 235), false, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
+        HWND FindNativeWindowByTitle(const std::wstring& title) const {
+            if (title.empty()) return nullptr;
+            std::wstring needle = title;
+            std::transform(needle.begin(), needle.end(), needle.begin(),
+                [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+
+            for (const auto& info : NativeDesktopWindows()) {
+                if (!info.hwnd || !IsWindow(info.hwnd) || info.title.empty()) continue;
+                std::wstring hay = info.title;
+                std::transform(hay.begin(), hay.end(), hay.begin(),
+                    [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+                if (hay == needle || hay.find(needle) != std::wstring::npos) return info.hwnd;
+            }
+            return nullptr;
+        }
+
         const ToolSpec* HybridToolForMaintenanceTitle(const std::wstring& title) const {
             struct Map { const wchar_t* title; const wchar_t* toolId; };
             static const Map maps[] = {
@@ -3211,6 +3248,12 @@ namespace {
             const auto& app = apps[index];
 
             if (app.title == L"Hi5 Web") {
+                if (HWND existing = FindNativeWindowByTitle(L"Hi5 Web")) {
+                    NativeActivateTopLevel(existing);
+                    LogInfo("[background-native] launcher app=Hi5 Web reused existing private window");
+                    return true;
+                }
+
                 const std::wstring currentExe = CurrentExePathW();
                 const bool ok = !currentExe.empty() &&
                     LaunchNativeElevatedProcess(
@@ -3233,6 +3276,13 @@ namespace {
                     " group=" + WideToUtf8(app.group) +
                     " surface=hi5-managed account=SYSTEM ok=" + (ok ? std::string("1") : std::string("0")));
                 return ok;
+            }
+
+            if (HWND existing = FindNativeWindowByTitle(app.title)) {
+                NativeActivateTopLevel(existing);
+                LogInfo("[background-native] launcher reused existing native window title=" +
+                    WideToUtf8(app.title));
+                return true;
             }
 
             const bool ok = LaunchNativeElevatedProcess(WideToUtf8(app.exe), WideToUtf8(app.args));
@@ -3510,9 +3560,12 @@ namespace {
             const int sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
             const int sw = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
             const int sh = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
-            const int reserved = std::max(1,
+            const int reservedBottom = std::max(1,
                 static_cast<int>((static_cast<long long>(nativeTaskbarH_) * sh) / std::max(1, h_)));
-            SetWindowPos(hwnd, HWND_TOP, sx, sy, sw, std::max(100, sh - reserved),
+            const int reservedTop = std::max(1,
+                static_cast<int>((static_cast<long long>(kNativeShellTopH) * sh) / std::max(1, h_)));
+            SetWindowPos(hwnd, HWND_TOP, sx, sy + reservedTop, sw,
+                std::max(100, sh - reservedTop - reservedBottom),
                 SWP_SHOWWINDOW | SWP_NOACTIVATE);
             NativeActivateTopLevel(hwnd);
         }
