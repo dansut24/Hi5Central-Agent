@@ -1011,6 +1011,14 @@ function updateDesktopModeButtons() {
       ? "This session was launched in Background Mode"
       : (!backstageActive ? "Console Desktop active" : "Return to Console Desktop");
   }
+  if (elBtnStartMenu) {
+    elBtnStartMenu.disabled = !connected || pending;
+    elBtnStartMenu.innerHTML = backstageActive
+      ? '▦<span class="label">Apps</span>'
+      : '⊞<span class="label">Start</span>';
+    elBtnStartMenu.title = backstageActive ? "Background apps" : "Start Menu";
+    elBtnStartMenu.setAttribute("aria-label", backstageActive ? "Background apps" : "Start Menu");
+  }
 }
 
 function setDesktopModePending(mode) {

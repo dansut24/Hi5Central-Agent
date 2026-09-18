@@ -231,6 +231,13 @@ namespace {
         std::wstring args;
     };
 
+    struct NativeMaintenanceApp {
+        std::wstring group;
+        std::wstring title;
+        std::wstring exe;
+        std::wstring args;
+    };
+
     struct ServiceRow {
         std::wstring name;
         std::wstring display;
@@ -446,6 +453,25 @@ namespace {
                 { L"Task Manager", L"C:\\Windows\\System32\\taskmgr.exe", L"" },
                 { L"Command Prompt", L"C:\\Windows\\System32\\cmd.exe", L"" },
                 { L"PowerShell", L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", L"" },
+            };
+            return apps;
+        }
+
+
+        const std::vector<NativeMaintenanceApp>& NativeMaintenanceApps() const {
+            static const std::vector<NativeMaintenanceApp> apps = {
+                { L"Windows Tools", L"Services", L"C:\\Windows\\System32\\mmc.exe", L"services.msc" },
+                { L"Windows Tools", L"Computer Management", L"C:\\Windows\\System32\\mmc.exe", L"compmgmt.msc" },
+                { L"Windows Tools", L"Event Viewer", L"C:\\Windows\\System32\\mmc.exe", L"eventvwr.msc" },
+                { L"Windows Tools", L"Device Manager", L"C:\\Windows\\System32\\mmc.exe", L"devmgmt.msc" },
+                { L"Windows Tools", L"Disk Management", L"C:\\Windows\\System32\\mmc.exe", L"diskmgmt.msc" },
+                { L"Windows Tools", L"Registry Editor", L"C:\\Windows\\regedit.exe", L"" },
+                { L"Windows Tools", L"Task Manager", L"C:\\Windows\\System32\\taskmgr.exe", L"" },
+                { L"Windows Tools", L"Programs and Features", L"C:\\Windows\\System32\\control.exe", L"appwiz.cpl" },
+                { L"Windows Accessories", L"Command Prompt", L"C:\\Windows\\System32\\cmd.exe", L"" },
+                { L"Windows Accessories", L"PowerShell", L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", L"" },
+                { L"Windows Accessories", L"Notepad", L"C:\\Windows\\System32\\notepad.exe", L"" },
+                { L"Windows Accessories", L"System Information", L"C:\\Windows\\System32\\msinfo32.exe", L"" },
             };
             return apps;
         }
@@ -2348,25 +2374,7 @@ namespace {
 
         bool InitializeNativeDesktop() {
             if (!EnsurePrivateDesktop()) return false;
-            nativeStartupAt_ = std::chrono::steady_clock::now();
-
-            // Start the real Windows shell on the private HDESK. Do not launch any
-            // application by default: the technician should arrive at an empty
-            // Windows desktop and choose what to open from Start/taskbar.
-            //
-            // Explorer is deliberately launched with the interactive user's token so
-            // it receives the normal user profile/environment. lpDesktop is bound to
-            // our private HDESK by LaunchInInteractiveSessionOnDesktop(). If Windows
-            // refuses to create a private shell (or proxies to the existing Default
-            // shell), NativeDesktopWindows() remains empty and the existing bounded
-            // startup watchdog falls back rather than streaming the local desktop.
-            if (!LaunchNativeUserProcess("C:\\Windows\\explorer.exe", "")) {
-                LogWarn("[background-native] Explorer shell launch failed; fallback=synthetic");
-                return false;
-            }
-
-            nativeShellProbePending_ = true;
-            LogInfo("[background-native] mode=private-hdesk shell=explorer apps_opened=0 waiting_for=Shell_TrayWnd");
+            LogInfo("[background-native] mode=private-hdesk shell=hi5-system-maintenance apps_opened=0 account=SYSTEM");
             return true;
         }
 
@@ -2381,114 +2389,208 @@ namespace {
             nativeFocusHwnd_ = nullptr;
         }
 
+        RECT NativeTaskbarRect() const {
+            return RECT{ 0, h_ - nativeTaskbarH_, w_, h_ };
+        }
+
+        RECT NativeStartButtonRect() const {
+            return RECT{ 8, h_ - nativeTaskbarH_ + 6, 50, h_ - 6 };
+        }
+
+        RECT NativeStartMenuRect() const {
+            const int menuW = std::min(520, std::max(360, w_ - 32));
+            const int menuH = std::min(580, std::max(360, h_ - nativeTaskbarH_ - 24));
+            return RECT{ 8, h_ - nativeTaskbarH_ - menuH - 8, 8 + menuW, h_ - nativeTaskbarH_ - 8 };
+        }
+
+        RECT NativeMenuRowRect(size_t row) const {
+            RECT m = NativeStartMenuRect();
+            const int top = m.top + 72 + static_cast<int>(row) * 42;
+            return RECT{ m.left + 14, top, m.right - 14, top + 38 };
+        }
+
+        std::vector<size_t> NativeLauncherRows() const {
+            std::vector<size_t> rows;
+            const auto& apps = NativeMaintenanceApps();
+            if (nativeLauncherFolder_.empty()) return rows;
+            for (size_t i = 0; i < apps.size(); ++i) {
+                if (apps[i].group == nativeLauncherFolder_) rows.push_back(i);
+            }
+            return rows;
+        }
+
+        void DrawNativeTaskbar(HDC dc, const std::vector<NativeDesktopWindowInfo>& windows) {
+            const RECT bar = NativeTaskbarRect();
+            FillRectColor(dc, bar.left, bar.top, bar.right - bar.left, bar.bottom - bar.top, RGB(32, 32, 32));
+            HPEN edge = CreatePen(PS_SOLID, 1, RGB(66, 66, 66));
+            HGDIOBJ old = SelectObject(dc, edge);
+            MoveToEx(dc, 0, bar.top, nullptr); LineTo(dc, w_, bar.top);
+            SelectObject(dc, old); DeleteObject(edge);
+
+            RECT start = NativeStartButtonRect();
+            if (nativeLauncherOpen_) FillRectColor(dc, start.left, start.top, start.right - start.left, start.bottom - start.top, RGB(62, 62, 62));
+            DrawStartIcon(dc, start.left + 12, start.top + 9, 18);
+
+            int x = start.right + 8;
+            const int maxX = std::max(x, w_ - 150);
+            size_t shown = 0;
+            for (const auto& info : windows) {
+                if (!info.hwnd) continue;
+                if (x + 150 > maxX) break;
+                RECT r{ x, bar.top + 5, x + 146, bar.bottom - 5 };
+                const bool active = info.hwnd == nativeFocusHwnd_;
+                RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                    active ? RGB(72, 72, 72) : RGB(45, 45, 45), RGB(80, 80, 80), 6);
+                std::wstring title = info.title.empty() ? info.className : info.title;
+                TextClipped(dc, RECT{ r.left + 10, r.top, r.right - 8, r.bottom }, title, 12, RGB(238, 238, 238), false);
+                x += 152;
+                ++shown;
+                if (shown >= 8) break;
+            }
+
+            SYSTEMTIME st{};
+            GetLocalTime(&st);
+            wchar_t clock[32]{};
+            swprintf_s(clock, L"%02u:%02u", st.wHour, st.wMinute);
+            TextClipped(dc, RECT{ std::max(0, w_ - 112), bar.top, w_ - 12, bar.bottom }, clock, 12, RGB(235, 235, 235), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        void DrawNativeLauncher(HDC dc) {
+            if (!nativeLauncherOpen_) return;
+            RECT m = NativeStartMenuRect();
+            RoundRectColor(dc, m.left, m.top, m.right - m.left, m.bottom - m.top, RGB(28, 28, 28), RGB(74, 74, 74), 10);
+            Text(dc, m.left + 18, m.top + 18,
+                nativeLauncherFolder_.empty() ? L"Hi5Central Background" : nativeLauncherFolder_,
+                18, RGB(245, 245, 245), true);
+
+            if (nativeLauncherFolder_.empty()) {
+                const std::vector<std::wstring> folders{ L"Windows Tools", L"Windows Accessories" };
+                for (size_t i = 0; i < folders.size(); ++i) {
+                    RECT r = NativeMenuRowRect(i);
+                    FillRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, RGB(39, 39, 39));
+                    TextClipped(dc, RECT{ r.left + 14, r.top, r.right - 40, r.bottom }, folders[i], 14, RGB(245, 245, 245), true);
+                    TextClipped(dc, RECT{ r.right - 34, r.top, r.right - 12, r.bottom }, L">", 15, RGB(210, 210, 210), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+                TextClipped(dc, RECT{ m.left + 18, m.bottom - 56, m.right - 18, m.bottom - 20 },
+                    L"Maintenance desktop - apps run as SYSTEM", 11, RGB(160, 160, 160));
+                return;
+            }
+
+            RECT back = NativeMenuRowRect(0);
+            FillRectColor(dc, back.left, back.top, back.right - back.left, back.bottom - back.top, RGB(39, 39, 39));
+            TextClipped(dc, RECT{ back.left + 14, back.top, back.right - 12, back.bottom }, L"<  Back", 13, RGB(225, 225, 225), true);
+
+            auto rows = NativeLauncherRows();
+            const auto& apps = NativeMaintenanceApps();
+            for (size_t j = 0; j < rows.size() && j < 10; ++j) {
+                const auto& app = apps[rows[j]];
+                RECT r = NativeMenuRowRect(j + 1);
+                FillRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, RGB(39, 39, 39));
+                DrawIconFromFile(dc, app.exe, r.left + 10, r.top + 6, 26);
+                TextClipped(dc, RECT{ r.left + 46, r.top, r.right - 12, r.bottom }, app.title, 13, RGB(245, 245, 245), false);
+            }
+        }
+
+        bool LaunchNativeMaintenanceApp(size_t index) {
+            const auto& apps = NativeMaintenanceApps();
+            if (index >= apps.size()) return false;
+            const auto& app = apps[index];
+            const bool ok = LaunchNativeElevatedProcess(WideToUtf8(app.exe), WideToUtf8(app.args));
+            LogInfo("[background-native] launcher app=" + WideToUtf8(app.title) +
+                " group=" + WideToUtf8(app.group) + " account=SYSTEM ok=" + (ok ? std::string("1") : std::string("0")));
+            return ok;
+        }
+
+        bool HandleNativeShellClick(int x, int y) {
+            POINT pt{ x, y };
+            RECT start = NativeStartButtonRect();
+            if (PtInRect(&start, pt)) {
+                nativeLauncherOpen_ = !nativeLauncherOpen_;
+                if (!nativeLauncherOpen_) nativeLauncherFolder_.clear();
+                return true;
+            }
+
+            if (nativeLauncherOpen_) {
+                RECT menu = NativeStartMenuRect();
+                if (!PtInRect(&menu, pt)) {
+                    nativeLauncherOpen_ = false;
+                    nativeLauncherFolder_.clear();
+                    return false;
+                }
+
+                if (nativeLauncherFolder_.empty()) {
+                    RECT toolsRow = NativeMenuRowRect(0);
+                    RECT accessoriesRow = NativeMenuRowRect(1);
+                    if (PtInRect(&toolsRow, pt)) { nativeLauncherFolder_ = L"Windows Tools"; return true; }
+                    if (PtInRect(&accessoriesRow, pt)) { nativeLauncherFolder_ = L"Windows Accessories"; return true; }
+                    return true;
+                }
+
+                RECT backRow = NativeMenuRowRect(0);
+                if (PtInRect(&backRow, pt)) {
+                    nativeLauncherFolder_.clear();
+                    return true;
+                }
+                auto rows = NativeLauncherRows();
+                for (size_t j = 0; j < rows.size() && j < 10; ++j) {
+                    RECT r = NativeMenuRowRect(j + 1);
+                    if (PtInRect(&r, pt)) {
+                        LaunchNativeMaintenanceApp(rows[j]);
+                        nativeLauncherOpen_ = false;
+                        nativeLauncherFolder_.clear();
+                        return true;
+                    }
+                }
+                return true;
+            }
+
+            RECT bar = NativeTaskbarRect();
+            if (PtInRect(&bar, pt)) {
+                auto windows = NativeDesktopWindows();
+                int bx = NativeStartButtonRect().right + 8;
+                const int maxX = std::max(bx, w_ - 150);
+                size_t shown = 0;
+                for (const auto& info : windows) {
+                    if (!info.hwnd) continue;
+                    if (bx + 150 > maxX) break;
+                    RECT r{ bx, bar.top + 5, bx + 146, bar.bottom - 5 };
+                    if (PtInRect(&r, pt)) {
+                        ShowWindow(info.hwnd, SW_RESTORE);
+                        SetWindowPos(info.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                        nativeFocusHwnd_ = info.hwnd;
+                        PostMessageW(info.hwnd, WM_SETFOCUS, 0, 0);
+                        return true;
+                    }
+                    bx += 152;
+                    if (++shown >= 8) break;
+                }
+                return true;
+            }
+            return false;
+        }
+
         bool DrawNativeDesktop() {
-            FillRectColor(memDc_, 0, 0, w_, h_, RGB(22, 30, 43));
+            FillRectColor(memDc_, 0, 0, w_, h_, RGB(0, 0, 0));
             auto windows = NativeDesktopWindows();
 
-            if (nativeShellProbePending_ && !windows.empty()) {
-                bool hasTaskbar = false;
-                bool hasDesktop = false;
-                std::vector<HWND> startupExplorerWindows;
-                for (const auto& info : windows) {
-                    if (_wcsicmp(info.className.c_str(), L"Shell_TrayWnd") == 0 ||
-                        _wcsicmp(info.className.c_str(), L"Shell_SecondaryTrayWnd") == 0) {
-                        hasTaskbar = true;
-                    }
-                    if (_wcsicmp(info.className.c_str(), L"Progman") == 0 ||
-                        _wcsicmp(info.className.c_str(), L"WorkerW") == 0) {
-                        hasDesktop = true;
-                    }
-                    if (_wcsicmp(info.className.c_str(), L"CabinetWClass") == 0 ||
-                        _wcsicmp(info.className.c_str(), L"ExploreWClass") == 0) {
-                        startupExplorerWindows.push_back(info.hwnd);
-                    }
-                }
-
-                // Starting the shell must not leave an application window open. If
-                // Explorer created a folder window on the private HDESK, close only
-                // that private-desktop HWND and wait for the next inventory pass.
-                if (hasTaskbar && !startupExplorerWindows.empty()) {
-                    if (!nativeStartupExplorerCloseLogged_) {
-                        nativeStartupExplorerCloseLogged_ = true;
-                        LogWarn("[background-native] Explorer shell opened startup folder window count=" +
-                            std::to_string(startupExplorerWindows.size()) + " closing_before_ready=1");
-                    }
-                    for (HWND hwnd : startupExplorerWindows) {
-                        if (hwnd && IsWindow(hwnd)) PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                    }
-                } else if (hasTaskbar) {
-                    nativeShellProbePending_ = false;
-                    nativeShellReady_ = true;
-                    LogInfo("[background-native] private Explorer shell detected taskbar=1 desktop=" +
-                        std::string(hasDesktop ? "1" : "0") + " apps_opened=0");
-                }
-            }
-
-            if (nativeShellProbePending_) {
-                const auto shellElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - nativeStartupAt_).count();
-                if (shellElapsed > 7000) {
-                    LogWarn("[background-native] Explorer did not create private Shell_TrayWnd; windows=" +
-                        std::to_string(windows.size()) + " fallback=synthetic");
-                    StopNativeDesktopProcesses();
-                    return false;
-                }
-
-                // Do not expose transient Explorer setup/folder windows while the
-                // private shell is being validated. The first rendered shell frame is
-                // emitted only after Shell_TrayWnd exists and startup app windows are gone.
-                TextClipped(memDc_, RECT{ 32, 32, w_ - 32, 80 },
-                    L"Starting private Windows desktop...", 20, RGB(232, 238, 246), true);
-                DrawCursor(memDc_);
-                return true;
-            }
-
-            if (windows.empty()) {
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - nativeStartupAt_).count();
-                TextClipped(memDc_, RECT{ 32, 32, w_ - 32, 80 },
-                    L"Starting private Windows desktop...", 20, RGB(232, 238, 246), true);
-                DrawCursor(memDc_);
-                if (elapsed > 5000) {
-                    LogWarn("[background-native] no private desktop windows after startup; fallback=synthetic");
-                    StopNativeDesktopProcesses();
-                    return false;
-                }
-                return true;
-            }
-
-            if (!nativeWindowInventoryLogged_) {
+            if (!nativeWindowInventoryLogged_ && !windows.empty()) {
                 nativeWindowInventoryLogged_ = true;
                 LogInfo("[background-native] first private desktop windows=" + std::to_string(windows.size()));
-                for (size_t i = 0; i < windows.size() && i < 8; ++i) {
-                    LogInfo("[background-native] hwnd=0x" + PtrToHex(reinterpret_cast<uintptr_t>(windows[i].hwnd)) +
-                        " class=" + WideToUtf8(windows[i].className) + " title=" + WideToUtf8(windows[i].title));
-                }
             }
 
-            // EnumDesktopWindows follows top-level z-order; paint bottom-to-top.
             size_t captured = 0;
             for (auto it = windows.rbegin(); it != windows.rend(); ++it) {
+                if (IsIconic(it->hwnd)) continue;
                 if (CaptureNativeDesktopWindow(*it, memDc_)) ++captured;
             }
-            if (captured == 0) {
-                ++nativeCaptureFailureFrames_;
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - nativeStartupAt_).count();
-                if (nativeCaptureFailureFrames_ == 1 || (nativeCaptureFailureFrames_ % 30) == 0) {
-                    LogWarn("[background-native] private HWNDs found but PrintWindow captured=0 windows=" +
-                        std::to_string(windows.size()) + " failure_frames=" + std::to_string(nativeCaptureFailureFrames_));
-                }
-                if (elapsed > 5000) {
-                    LogWarn("[background-native] private windows are not renderable; fallback=synthetic");
-                    StopNativeDesktopProcesses();
-                    return false;
-                }
-            } else if (!nativeFirstCaptureLogged_) {
+            if (captured > 0 && !nativeFirstCaptureLogged_) {
                 nativeFirstCaptureLogged_ = true;
                 LogInfo("[background-native] first native capture ok captured=" + std::to_string(captured) +
                     " windows=" + std::to_string(windows.size()));
             }
+
+            DrawNativeLauncher(memDc_);
+            DrawNativeTaskbar(memDc_, windows);
             DrawCursor(memDc_);
             return true;
         }
@@ -2582,6 +2684,64 @@ namespace {
             for (wchar_t ch : text) PostMessageW(target, WM_CHAR, static_cast<WPARAM>(ch), 1);
         }
 
+        void HandleNativeShortcut(const hi5::InputCmd& cmd) {
+            const auto action = static_cast<hi5::ShortcutAction>(cmd.shortcut.action);
+            switch (action) {
+            case hi5::ShortcutAction::StartMenu:
+            case hi5::ShortcutAction::CtrlEsc:
+                nativeLauncherOpen_ = !nativeLauncherOpen_;
+                if (!nativeLauncherOpen_) nativeLauncherFolder_.clear();
+                break;
+            case hi5::ShortcutAction::TaskManager:
+            case hi5::ShortcutAction::CtrlShiftEsc: {
+                const auto& apps = NativeMaintenanceApps();
+                for (size_t i = 0; i < apps.size(); ++i) {
+                    if (apps[i].title == L"Task Manager") { LaunchNativeMaintenanceApp(i); break; }
+                }
+                break;
+            }
+            case hi5::ShortcutAction::WinD: {
+                auto windows = NativeDesktopWindows();
+                for (const auto& info : windows) if (info.hwnd) ShowWindow(info.hwnd, SW_MINIMIZE);
+                nativeFocusHwnd_ = nullptr;
+                nativeLauncherOpen_ = false;
+                nativeLauncherFolder_.clear();
+                break;
+            }
+            case hi5::ShortcutAction::AltF4:
+                if (nativeFocusHwnd_ && IsWindow(nativeFocusHwnd_)) {
+                    PostMessageW(nativeFocusHwnd_, WM_CLOSE, 0, 0);
+                    nativeFocusHwnd_ = nullptr;
+                }
+                break;
+            case hi5::ShortcutAction::AltTab:
+            case hi5::ShortcutAction::AltTabBegin:
+            case hi5::ShortcutAction::AltTabNext:
+            case hi5::ShortcutAction::WinTab: {
+                auto windows = NativeDesktopWindows();
+                if (windows.empty()) break;
+                size_t next = 0;
+                for (size_t i = 0; i < windows.size(); ++i) {
+                    if (windows[i].hwnd == nativeFocusHwnd_) { next = (i + 1) % windows.size(); break; }
+                }
+                HWND hwnd = windows[next].hwnd;
+                if (hwnd) {
+                    ShowWindow(hwnd, SW_RESTORE);
+                    SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                    nativeFocusHwnd_ = hwnd;
+                    PostMessageW(hwnd, WM_SETFOCUS, 0, 0);
+                }
+                break;
+            }
+            case hi5::ShortcutAction::Explorer:
+            case hi5::ShortcutAction::WinE:
+                LogInfo("[background-native] Explorer shortcut ignored; use Viewer Files to avoid user-shell activation");
+                break;
+            default:
+                break;
+            }
+        }
+
         int HandleNativeDesktopInput(hi5::InputPipeReader& pipe) {
             int handled = 0;
             hi5::InputCmd cmd{};
@@ -2594,6 +2754,15 @@ namespace {
                     NativeMouseMove(mouseX_, mouseY_);
                     break;
                 case hi5::InputCmdType::MouseButton:
+                    if (cmd.mouseButton.button == 0) {
+                        if (cmd.mouseButton.down) {
+                            nativeShellPointerCaptured_ = HandleNativeShellClick(mouseX_, mouseY_);
+                            if (nativeShellPointerCaptured_) break;
+                        } else if (nativeShellPointerCaptured_) {
+                            nativeShellPointerCaptured_ = false;
+                            break;
+                        }
+                    }
                     NativeMouseButton(cmd, mouseX_, mouseY_);
                     break;
                 case hi5::InputCmdType::MouseWheel:
@@ -2608,6 +2777,9 @@ namespace {
                     if (pipe.ReadClipboard(cmd.clipboard.offsetInClip, cmd.clipboard.length, text)) NativeText(Utf8ToWide(text));
                     break;
                 }
+                case hi5::InputCmdType::Shortcut:
+                    HandleNativeShortcut(cmd);
+                    break;
                 default:
                     break;
                 }
@@ -3424,14 +3596,13 @@ namespace {
         bool nativeModeActive_ = false;
         bool nativeWindowInventoryLogged_ = false;
         bool nativeFirstCaptureLogged_ = false;
-        bool nativeShellProbePending_ = false;
-        bool nativeShellReady_ = false;
-        bool nativeStartupExplorerCloseLogged_ = false;
-        uint64_t nativeCaptureFailureFrames_ = 0;
+        bool nativeLauncherOpen_ = false;
+        bool nativeShellPointerCaptured_ = false;
+        std::wstring nativeLauncherFolder_;
+        const int nativeTaskbarH_ = 48;
         bool nativeLeftDown_ = false;
         HWND nativeFocusHwnd_ = nullptr;
         std::vector<HANDLE> nativeDesktopProcesses_;
-        std::chrono::steady_clock::time_point nativeStartupAt_{};
 
         DragMode dragMode_ = DragMode::None;
         int dragWindowId_ = 0;

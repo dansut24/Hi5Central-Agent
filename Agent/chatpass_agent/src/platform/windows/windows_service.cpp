@@ -6455,6 +6455,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 ResetEvent(ctx.normalStopEvent);
 
+                int backgroundWidth = ctx.lastCaptureMonitorWidth > 0
+                    ? ctx.lastCaptureMonitorWidth : ctx.displayGeometryAtStart.primaryWidth;
+                int backgroundHeight = ctx.lastCaptureMonitorHeight > 0
+                    ? ctx.lastCaptureMonitorHeight : ctx.displayGeometryAtStart.primaryHeight;
+                if (backgroundWidth <= 0) backgroundWidth = 1280;
+                if (backgroundHeight <= 0) backgroundHeight = 720;
+                backgroundWidth = std::clamp(backgroundWidth, 800, 2560);
+                backgroundHeight = std::clamp(backgroundHeight, 600, 1600);
+
                 std::string cmdLine =
                     "--mode backstage-host"
                     " --session " + ctx.sessionId +
@@ -6462,8 +6471,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " --input-pipe " + ctx.normalInputPipeName +
                     " --stop-event " + ctx.normalStopEventName +
                     " --fps 15"
-                    " --width 1280"
-                    " --height 720";
+                    " --width " + std::to_string(backgroundWidth) +
+                    " --height " + std::to_string(backgroundHeight);
 
                 std::string nativeBackground = ReadConfigString("HI5_BACKGROUND_NATIVE_DESKTOP", "1");
                 std::transform(nativeBackground.begin(), nativeBackground.end(), nativeBackground.begin(),
@@ -6473,6 +6482,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 LogI("launch backstage host session=" + ctx.sessionId +
                     " native_desktop=" + std::string(nativeRequested ? "true" : "false") +
+                    " geometry=" + std::to_string(backgroundWidth) + "x" + std::to_string(backgroundHeight) +
                     " cmd=" + cmdLine);
 
                 ctx.backstageHostProcess = LaunchInElevatedDefaultSession(std::string(exePath), cmdLine);
