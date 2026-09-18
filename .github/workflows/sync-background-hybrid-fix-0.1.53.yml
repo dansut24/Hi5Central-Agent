@@ -1,0 +1,46 @@
+name: Sync Background hybrid fix 0.1.53
+
+on:
+  push:
+    branches: [agent-hardening-v2]
+    paths:
+      - ".github/workflows/sync-background-hybrid-fix-0.1.53.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent-hardening-v2
+          fetch-depth: 0
+
+      - name: Download verified source checkpoint
+        run: |
+          wget -q https://downloads.hi5central.com/bootstrap-agent-sync/background-hybrid-fix-0.1.53-f63d739.tar.gz -O /tmp/background-hybrid-fix.tar.gz
+          echo "b101a3aa771229658c5b969bdcf9976852fb7641a99c4669fbfc26de8e90f4b5  /tmp/background-hybrid-fix.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/background-hybrid-fix.tar.gz
+
+      - name: Verify exact source files
+        run: |
+          echo "2bce992828bae7fa6f237e0c61e7252fb570a127793ac735288d9b935cce0c7f  Agent/chatpass_agent/src/backstage/backstage_host.cpp" | sha256sum -c -
+          echo "6e6af89c237e91ed614ec1fb5326f37d1354bcd6e2806f448ffc96f08f94a52f  Agent/chatpass_agent/src/platform/windows/windows_service.cpp" | sha256sum -c -
+          echo "9389d216653e88741a365a78a63e65b17cc3386eae83d278d7ae25e2feac4295  Agent/chatpass_agent/src/ipc/session_launcher.cpp" | sha256sum -c -
+          grep -F 'interacting ? "interaction"' Agent/chatpass_agent/src/backstage/backstage_host.cpp
+          grep -F 'DWORD flags = visibleConsole ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;' Agent/chatpass_agent/src/ipc/session_launcher.cpp
+
+      - name: Commit source checkpoint
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Agent/chatpass_agent/src/backstage/backstage_host.cpp Agent/chatpass_agent/src/platform/windows/windows_service.cpp Agent/chatpass_agent/src/ipc/session_launcher.cpp
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Source already synchronized"
+          else
+            git commit -m "Fix Background hybrid build and console flash [skip ci]"
+            git push origin HEAD:agent-hardening-v2
+          fi
