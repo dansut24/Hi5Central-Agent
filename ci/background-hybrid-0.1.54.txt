@@ -1,0 +1,24 @@
+Hi5Central Background hybrid responsiveness + console-flash fix validation
+
+VPS hybrid source: a96e35d0576636285f8d02cd52a13a6467bcd55e
+VPS console-flash fix: f63d7394d542c34552d51eaf82865729bd944158
+GitHub corrected source: b2448e852d8e9fc79ba336ab1f71a46577ae66a8
+Corrected source archive SHA256: b101a3aa771229658c5b969bdcf9976852fb7641a99c4669fbfc26de8e90f4b5
+
+Exact source file SHA256:
+- backstage_host.cpp: 2bce992828bae7fa6f237e0c61e7252fb570a127793ac735288d9b935cce0c7f
+- windows_service.cpp: 6e6af89c237e91ed614ec1fb5326f37d1354bcd6e2806f448ffc96f08f94a52f
+- session_launcher.cpp: 9389d216653e88741a365a78a63e65b17cc3386eae83d278d7ae25e2feac4295
+
+Purpose:
+- corrected hybrid scheduler compile path
+- remove frame-baked Background cursor
+- pointer-only movement no longer dirties Background video
+- cached native HWND compositor
+- 30 FPS interaction / adaptive idle cadence
+- combined Hi5/native taskbar and z-order
+- Hi5-managed core admin windows
+- richer Task Manager process data
+- Users & Sessions view with NT AUTHORITY\SYSTEM context
+- suppress session-start console flash for Hi5 GUI helpers
+- retain visible private CMD/PowerShell consoles only when explicitly launched
