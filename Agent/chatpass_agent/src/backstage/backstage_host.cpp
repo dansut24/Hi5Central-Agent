@@ -4504,7 +4504,7 @@ namespace hi5 {
                     " frames=" + std::to_string(frames) +
                     " skipped_ticks=" + std::to_string(skippedTicks) +
                     " input_events=" + std::to_string(inputEvents) +
-                    " mode=" + std::string(active ? (dragging ? "motion" : "active") : "idle") +
+                    " mode=" + std::string(active ? (interacting ? "interaction" : "active") : (nativeRefresh ? "native-refresh" : "idle")) +
                     " target_fps=" + std::to_string(targetFps) +
                     " pass=backstage_lowcpu_1");
                 frames = 0;
