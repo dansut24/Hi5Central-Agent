@@ -41,6 +41,7 @@ ComPtr<ICoreWebView2> g_webview;
 constexpr int kToolbarHeight = 52;
 constexpr int kButtonWidth = 72;
 constexpr int kToolbarGap = 6;
+constexpr UINT_PTR kWebViewInitTimerId = 5201;
 
 enum BrowserControlId {
     IDC_BROWSER_BACK = 5101,
@@ -177,7 +178,7 @@ h1{font-size:42px;letter-spacing:-1.4px;margin:0}.sub{color:#65758b;margin:8px 0
     <a class="card" href="https://firewall/"><b>Firewall</b><span>https://firewall/</span></a>
     <a class="card" href="https://example.com"><b>Web test</b><span>Known public test page</span></a>
   </div>
-  <div class="badge">SYSTEM &nbsp;|&nbsp; isolated profile &nbsp;|&nbsp; background desktop</div>
+  <div class="badge">User session &nbsp;|&nbsp; isolated browser &nbsp;|&nbsp; background desktop</div>
 </main>
 <script>
 function go(){
@@ -313,7 +314,7 @@ void CreateBrowserControls(HWND parent) {
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(IDC_BROWSER_GO),
         GetModuleHandleW(nullptr), nullptr);
 
-    g_contextLabel = CreateWindowExW(0, L"STATIC", L"SYSTEM  |  Isolated profile",
+    g_contextLabel = CreateWindowExW(0, L"STATIC", L"User session  |  Isolated browser",
         WS_CHILD | WS_VISIBLE | SS_RIGHT,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(IDC_BROWSER_CONTEXT),
         GetModuleHandleW(nullptr), nullptr);
@@ -389,20 +390,53 @@ void ResizeBrowserUi() {
 }
 
 std::wstring BrowserUserDataFolder() {
-    PWSTR programData = nullptr;
-    std::wstring base = L"C:\\ProgramData";
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramData, KF_FLAG_DEFAULT, nullptr, &programData)) && programData) {
-        base = programData;
-        CoTaskMemFree(programData);
+    PWSTR localAppData = nullptr;
+    std::wstring base;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &localAppData)) && localAppData) {
+        base = localAppData;
+        CoTaskMemFree(localAppData);
     }
-    std::wstring folder = base + L"\\Hi5Central\\Agent\\WebView2\\Backstage";
+    if (base.empty()) {
+        wchar_t tempPath[MAX_PATH]{};
+        const DWORD n = GetTempPathW(MAX_PATH, tempPath);
+        base = (n > 0 && n < MAX_PATH) ? tempPath : L"C:\\Windows\\Temp";
+    }
+
+    std::wstring folder = base + L"\\Hi5Central\\WebView2\\Background";
     std::error_code ec;
     std::filesystem::create_directories(folder, ec);
+    if (ec) {
+        LogWarn("[backstage-browser] failed to create user data folder ec=" + std::to_string(ec.value()));
+    } else {
+        LogInfo("[backstage-browser] user data folder ready");
+    }
     return folder;
 }
 
 void InitWebView2() {
     const std::wstring userData = BrowserUserDataFolder();
+
+    LPWSTR runtimeVersion = nullptr;
+    const HRESULT runtimeHr = GetAvailableCoreWebView2BrowserVersionString(nullptr, &runtimeVersion);
+    if (SUCCEEDED(runtimeHr) && runtimeVersion) {
+        if (g_statusLabel) {
+            const std::wstring status =
+                L"Starting Hi5 Web browser engine...\r\n\r\nWebView2 Runtime " +
+                std::wstring(runtimeVersion);
+            SetWindowTextW(g_statusLabel, status.c_str());
+        }
+        LogInfo("[backstage-browser] WebView2 runtime detected");
+        CoTaskMemFree(runtimeVersion);
+    } else {
+        if (g_statusLabel) {
+            SetWindowTextW(g_statusLabel,
+                L"Microsoft Edge WebView2 Runtime was not detected.\r\n\r\n"
+                L"Install or repair WebView2 Runtime on the target device.");
+        }
+        LogWarn("[backstage-browser] WebView2 runtime lookup failed hr=" +
+            std::to_string(static_cast<long>(runtimeHr)));
+    }
+
     LogInfo("[backstage-browser] creating WebView2 environment");
 
     // Private-desktop capture uses PrintWindow/GDI from the Backstage host.
@@ -428,6 +462,7 @@ void InitWebView2() {
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
                 if (FAILED(result) || !env) {
+                    if (g_hwnd) KillTimer(g_hwnd, kWebViewInitTimerId);
                     if (g_statusLabel) {
                         SetWindowTextW(g_statusLabel,
                             L"Hi5 Web could not start the WebView2 environment.\r\n\r\n"
@@ -442,6 +477,7 @@ void InitWebView2() {
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                         [](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
                             if (FAILED(result) || !controller) {
+                                if (g_hwnd) KillTimer(g_hwnd, kWebViewInitTimerId);
                                 if (g_statusLabel) {
                                     SetWindowTextW(g_statusLabel,
                                         L"Hi5 Web started, but its browser surface could not be created.\r\n\r\n"
@@ -453,6 +489,7 @@ void InitWebView2() {
 
                             g_controller = controller;
                             g_controller->get_CoreWebView2(&g_webview);
+                            if (g_hwnd) KillTimer(g_hwnd, kWebViewInitTimerId);
                             if (g_statusLabel && g_webview) ShowWindow(g_statusLabel, SW_HIDE);
                             ResizeBrowserUi();
 
@@ -505,6 +542,7 @@ void InitWebView2() {
             }).Get());
 
     if (FAILED(hr)) {
+        if (g_hwnd) KillTimer(g_hwnd, kWebViewInitTimerId);
         if (g_statusLabel) {
             SetWindowTextW(g_statusLabel,
                 L"Hi5 Web could not initialise WebView2.\r\n\r\n"
@@ -520,8 +558,23 @@ LRESULT CALLBACK BrowserWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hwnd = hwnd;
         CreateBrowserControls(hwnd);
         ResizeBrowserUi();
+        SetTimer(hwnd, kWebViewInitTimerId, 15000, nullptr);
         InitWebView2();
         return 0;
+
+    case WM_TIMER:
+        if (wp == kWebViewInitTimerId && !g_webview) {
+            KillTimer(hwnd, kWebViewInitTimerId);
+            if (g_statusLabel) {
+                SetWindowTextW(g_statusLabel,
+                    L"Hi5 Web is taking too long to start.\r\n\r\n"
+                    L"The WebView2 Runtime was found, but the browser process did not become ready. "
+                    L"Check Agent diagnostics for [backstage-browser] entries.");
+            }
+            LogWarn("[backstage-browser] startup timeout waiting for WebView2");
+            return 0;
+        }
+        break;
 
     case WM_SIZE:
         ResizeBrowserUi();

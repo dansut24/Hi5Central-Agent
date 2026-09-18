@@ -577,8 +577,8 @@ namespace {
             return RECT{ 0, top, w_, std::max(top + 120, h_ - shellTaskbar) };
         }
 
-        RECT DefaultManagedWindowRect(size_t ordinal) const {
-            const int margin = 14;
+        RECT DefaultManagedWindowRect(size_t ordinal, WindowKind kind) const {
+            const int margin = 18;
             const RECT workspace = ManagedWorkspaceRect();
             const int workLeft = workspace.left + margin;
             const int workTop = workspace.top + margin;
@@ -587,37 +587,37 @@ namespace {
             const int workW = std::max(360, workRight - workLeft);
             const int workH = std::max(280, workBottom - workTop);
 
-            if (workW < 860 || workH < 520) {
-                const int ww = std::min(workW, 820);
-                const int wh = std::min(workH, 540);
-                const int shift = static_cast<int>(ordinal % 5) * 22;
-                int left = workLeft + shift;
-                int top = workTop + shift;
-                if (left + ww > workRight) left = std::max(workLeft, workRight - ww);
-                if (top + wh > workBottom) top = std::max(workTop, workBottom - wh);
-                return RECT{ left, top, left + ww, top + wh };
+            int widthPct = 78;
+            int heightPct = 76;
+            if (kind == WindowKind::Files || kind == WindowKind::Processes ||
+                kind == WindowKind::Services || kind == WindowKind::Events ||
+                kind == WindowKind::Registry || kind == WindowKind::Devices ||
+                kind == WindowKind::Disks || kind == WindowKind::Updates) {
+                widthPct = 84;
+                heightPct = 82;
+            }
+            else if (kind == WindowKind::Terminal || kind == WindowKind::Notepad) {
+                widthPct = 72;
+                heightPct = 70;
             }
 
-            const int slot = static_cast<int>(ordinal % 5);
-            if (slot == 0) {
-                return RECT{ workLeft, workTop,
-                    workLeft + (workW * 52) / 100,
-                    workTop + (workH * 55) / 100 };
-            }
-            if (slot == 1) {
-                return RECT{ workLeft + (workW * 54) / 100, workTop,
-                    workRight, workTop + (workH * 56) / 100 };
-            }
-            if (slot == 2) {
-                return RECT{ workLeft, workTop + (workH * 58) / 100,
-                    workLeft + (workW * 40) / 100, workBottom };
-            }
-            if (slot == 3) {
-                return RECT{ workLeft + (workW * 42) / 100, workTop + (workH * 58) / 100,
-                    workLeft + (workW * 70) / 100, workBottom };
-            }
-            return RECT{ workLeft + (workW * 72) / 100, workTop + (workH * 58) / 100,
-                workRight, workBottom };
+            int ww = std::max(420, (workW * widthPct) / 100);
+            int wh = std::max(300, (workH * heightPct) / 100);
+            ww = std::min(ww, workW);
+            wh = std::min(wh, workH);
+
+            const int cascade = static_cast<int>(ordinal % 6);
+            const int dx = cascade * 22;
+            const int dy = cascade * 18;
+            int left = workLeft + (workW - ww) / 2 + dx;
+            int top = workTop + (workH - wh) / 2 + dy;
+
+            if (left + ww > workRight) left = workRight - ww;
+            if (top + wh > workBottom) top = workBottom - wh;
+            if (left < workLeft) left = workLeft;
+            if (top < workTop) top = workTop;
+
+            return RECT{ left, top, left + ww, top + wh };
         }
 
         int TaskbarRunStartX() const {
@@ -1097,14 +1097,16 @@ namespace {
         }
 
         int WindowRowTop(const BackstageWindow& win, const RECT& c) const {
-            if (win.kind == WindowKind::Services) return c.top + 62;
-            if (win.kind == WindowKind::Files) return c.top + 82;
-            return c.top + 54;
+            if (win.kind == WindowKind::Services) return c.top + 76;
+            if (win.kind == WindowKind::Files) return c.top + 112;
+            if (win.kind == WindowKind::Processes || win.kind == WindowKind::Apps) return c.top + 82;
+            return c.top + 58;
         }
 
         int WindowRowH(const BackstageWindow& win) const {
-            if (win.kind == WindowKind::Services || win.kind == WindowKind::Files) return 30;
-            return 24;
+            if (win.kind == WindowKind::Services || win.kind == WindowKind::Files ||
+                win.kind == WindowKind::Processes || win.kind == WindowKind::Apps) return 32;
+            return 26;
         }
 
         bool HandleScrollbarClick(BackstageWindow& win, int x, int y) {
@@ -1909,7 +1911,7 @@ namespace {
             win.title = spec.title ? spec.title : L"Tool";
             win.subtitle = spec.sub ? spec.sub : L"";
             win.terminalMode = spec.terminalMode ? spec.terminalMode : L"";
-            win.rect = DefaultManagedWindowRect(openOrdinal);
+            win.rect = DefaultManagedWindowRect(openOrdinal, spec.kind);
             win.zOrder = ++zCounter_;
             win.restoreRect = win.rect;
 
@@ -3256,12 +3258,12 @@ namespace {
 
                 const std::wstring currentExe = CurrentExePathW();
                 const bool ok = !currentExe.empty() &&
-                    LaunchNativeElevatedProcess(
+                    LaunchNativeUserProcess(
                         WideToUtf8(currentExe),
                         "--mode backstage-browser --url about:blank");
                 if (ok) nativeSyntheticFocus_ = false;
                 LogInfo("[background-native] launcher app=Hi5 Web group=Network Tools"
-                    " surface=webview2-private-hdesk account=SYSTEM ok=" +
+                    " surface=webview2-private-hdesk account=interactive-user isolated=1 ok=" +
                     std::string(ok ? "1" : "0"));
                 return ok;
             }
@@ -4538,19 +4540,23 @@ namespace {
             RECT c = ContentRect(win);
             if (win.kind == WindowKind::Services) DrawServices(dc, win, c);
             else if (win.kind == WindowKind::Files) DrawFiles(dc, win, c);
-            else if (win.kind == WindowKind::Processes || win.kind == WindowKind::Apps || win.kind == WindowKind::SystemInfo || win.kind == WindowKind::Events || win.kind == WindowKind::Updates || win.kind == WindowKind::Registry || win.kind == WindowKind::Devices || win.kind == WindowKind::Disks) DrawLines(dc, win, c);
+            else if (win.kind == WindowKind::Processes || win.kind == WindowKind::Apps || win.kind == WindowKind::SystemInfo || win.kind == WindowKind::Sessions || win.kind == WindowKind::Events || win.kind == WindowKind::Updates || win.kind == WindowKind::Registry || win.kind == WindowKind::Devices || win.kind == WindowKind::Disks) DrawLines(dc, win, c);
             else if (win.kind == WindowKind::Terminal) DrawTerminal(dc, win, c);
             else if (win.kind == WindowKind::Notepad) DrawNotepad(dc, win, c);
         }
 
         void DrawHeader(HDC dc, const RECT& c, const std::wstring&, const std::wstring& right = L"") {
-            // Compact command strip, closer to current Windows utilities than a
-            // second card-like header inside every managed tool window.
-            FillRectColor(dc, c.left, c.top, c.right - c.left, 42, RGB(252, 253, 255));
-            FillRectColor(dc, c.left, c.top + 41, c.right - c.left, 1, RGB(226, 231, 237));
+            FillRectColor(dc, c.left, c.top, c.right - c.left, c.bottom - c.top, RGB(247, 249, 252));
+            FillRectColor(dc, c.left, c.top, c.right - c.left, 46, RGB(255, 255, 255));
+            FillRectColor(dc, c.left, c.top + 45, c.right - c.left, 1, RGB(223, 229, 237));
+
             if (!right.empty()) {
-                TextClipped(dc, RECT{ c.right - 230, c.top, c.right - 12, c.top + 41 },
-                    right, 11, RGB(92, 103, 118), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                const int pillW = std::min(220, std::max(120, static_cast<int>(right.size()) * 7 + 24));
+                RECT pill{ c.right - pillW - 12, c.top + 9, c.right - 12, c.top + 36 };
+                RoundRectColor(dc, pill.left, pill.top, pill.right - pill.left, pill.bottom - pill.top,
+                    RGB(241, 246, 252), RGB(221, 229, 239), 10);
+                TextClipped(dc, RECT{ pill.left + 10, pill.top, pill.right - 10, pill.bottom },
+                    right, 10, RGB(82, 96, 114), false, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             }
         }
 
@@ -4558,10 +4564,12 @@ namespace {
             RECT r = ActionButtonRect(c, index);
             POINT mouse{ mouseX_, mouseY_ };
             const bool hover = PtInRect(&r, mouse) != 0;
+            const COLORREF fill = hover ? RGB(235, 243, 253) : RGB(255, 255, 255);
+            const COLORREF border = hover ? RGB(154, 190, 229) : RGB(226, 232, 240);
             RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
-                hover ? RGB(235, 242, 251) : RGB(252, 253, 255),
-                hover ? RGB(178, 199, 225) : RGB(221, 228, 237), 7);
-            TextClipped(dc, r, label, 11, RGB(35, 53, 76), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                fill, border, 7);
+            TextClipped(dc, r, label, 11, RGB(36, 55, 78), false,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
 
 
@@ -4586,12 +4594,13 @@ namespace {
         void DrawServices(HDC dc, const BackstageWindow& win, const RECT& c) {
             DrawHeader(dc, c, L"Services", std::to_wstring(win.services.size()) + L" services");
             DrawActionButton(dc, c, 0, L"Start"); DrawActionButton(dc, c, 1, L"Stop"); DrawActionButton(dc, c, 2, L"Restart"); DrawActionButton(dc, c, 3, L"Refresh");
-            const int rowTop = c.top + 62;
-            const int rowH = 30;
-            FillRectColor(dc, c.left, rowTop - 24, c.right - c.left, 22, RGB(238, 244, 252));
-            TextClipped(dc, RECT{ c.left + 14, rowTop - 24, c.right - 340, rowTop - 2 }, L"Display name", 12, RGB(70, 82, 100), true);
-            TextClipped(dc, RECT{ c.right - 318, rowTop - 24, c.right - 210, rowTop - 2 }, L"Startup", 12, RGB(70, 82, 100), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-            TextClipped(dc, RECT{ c.right - 200, rowTop - 24, c.right - 20, rowTop - 2 }, L"State", 12, RGB(70, 82, 100), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            const int rowTop = WindowRowTop(win, c);
+            const int rowH = WindowRowH(win);
+            FillRectColor(dc, c.left, rowTop - 30, c.right - c.left, 30, RGB(241, 245, 250));
+            FillRectColor(dc, c.left, rowTop - 1, c.right - c.left, 1, RGB(222, 229, 238));
+            TextClipped(dc, RECT{ c.left + 16, rowTop - 30, c.right - 350, rowTop }, L"Service", 11, RGB(72, 87, 106), true);
+            TextClipped(dc, RECT{ c.right - 330, rowTop - 30, c.right - 214, rowTop }, L"Startup", 11, RGB(72, 87, 106), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            TextClipped(dc, RECT{ c.right - 200, rowTop - 30, c.right - 20, rowTop }, L"Status", 11, RGB(72, 87, 106), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
             const int visible = VisibleRows(c, rowTop, rowH);
             const int start = std::max(0, win.scroll);
             for (int i = 0; i < visible && i + start < static_cast<int>(win.services.size()); ++i) {
@@ -4613,46 +4622,124 @@ namespace {
         }
 
         void DrawFiles(HDC dc, const BackstageWindow& win, const RECT& c) {
-            DrawHeader(dc, c, L"File Explorer", L"Backstage file actions");
-            DrawActionButton(dc, c, 0, L"Run"); DrawActionButton(dc, c, 1, L"Delete"); DrawActionButton(dc, c, 2, L"New folder"); DrawActionButton(dc, c, 3, L"Refresh");
-            RECT pathBar{ c.left + 12, c.top + 42, c.right - 12, c.top + 70 };
-            RoundRectColor(dc, pathBar.left, pathBar.top, pathBar.right - pathBar.left, pathBar.bottom - pathBar.top, RGB(255, 255, 255), RGB(216, 226, 240), 9);
-            TextClipped(dc, RECT{ pathBar.left + 12, pathBar.top, pathBar.right - 12, pathBar.bottom }, win.path, 12, RGB(55, 70, 90));
-            const int rowTop = c.top + 82;
-            const int rowH = 30;
+            DrawHeader(dc, c, L"File Explorer", std::to_wstring(win.files.size()) + L" items");
+            DrawActionButton(dc, c, 0, L"Open"); DrawActionButton(dc, c, 1, L"Delete"); DrawActionButton(dc, c, 2, L"New folder"); DrawActionButton(dc, c, 3, L"Refresh");
+
+            RECT pathBar{ c.left + 12, c.top + 50, c.right - 12, c.top + 80 };
+            RoundRectColor(dc, pathBar.left, pathBar.top, pathBar.right - pathBar.left, pathBar.bottom - pathBar.top,
+                RGB(255, 255, 255), RGB(214, 224, 237), 8);
+            TextClipped(dc, RECT{ pathBar.left + 12, pathBar.top, pathBar.right - 12, pathBar.bottom },
+                win.path, 11, RGB(54, 70, 91));
+
+            const int rowTop = WindowRowTop(win, c);
+            const int rowH = WindowRowH(win);
+            FillRectColor(dc, c.left, rowTop - 28, c.right - c.left, 28, RGB(241, 245, 250));
+            TextClipped(dc, RECT{ c.left + 16, rowTop - 28, c.right - 300, rowTop }, L"Name", 11, RGB(72, 87, 106), true);
+            TextClipped(dc, RECT{ c.right - 280, rowTop - 28, c.right - 155, rowTop }, L"Type", 11, RGB(72, 87, 106), true);
+            TextClipped(dc, RECT{ c.right - 145, rowTop - 28, c.right - 20, rowTop }, L"Size", 11, RGB(72, 87, 106), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
             const int visible = VisibleRows(c, rowTop, rowH);
             const int start = std::max(0, win.scroll);
             for (int i = 0; i < visible && i + start < static_cast<int>(win.files.size()); ++i) {
                 const int rowIndex = i + start;
                 const int y = rowTop + i * rowH;
                 const FileRow& f = win.files[static_cast<size_t>(rowIndex)];
-                COLORREF fill = (rowIndex == win.selected) ? RGB(219, 236, 255) : ((rowIndex % 2) ? RGB(250, 252, 255) : RGB(255, 255, 255));
+                COLORREF fill = (rowIndex == win.selected) ? RGB(222, 238, 255) : RGB(255, 255, 255);
                 FillRectColor(dc, c.left, y, c.right - c.left, rowH, fill);
-                TextClipped(dc, RECT{ c.left + 14, y, c.left + 42, y + rowH }, f.isDir ? L"[D]" : L"[F]", 12, f.isDir ? RGB(200, 145, 32) : RGB(80, 104, 135), true);
-                TextClipped(dc, RECT{ c.left + 48, y, c.right - 170, y + rowH }, f.name, 13, RGB(28, 38, 52));
-                if (!f.isDir) TextClipped(dc, RECT{ c.right - 150, y, c.right - 18, y + rowH }, FileSizeText(f.size), 12, RGB(90, 102, 116), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                FillRectColor(dc, c.left, y + rowH - 1, c.right - c.left, 1, RGB(235, 239, 244));
+
+                TextClipped(dc, RECT{ c.left + 16, y, c.right - 300, y + rowH }, f.name, 12, RGB(30, 42, 58));
+                TextClipped(dc, RECT{ c.right - 280, y, c.right - 155, y + rowH },
+                    f.isDir ? L"Folder" : L"File", 11, f.isDir ? RGB(157, 103, 18) : RGB(84, 99, 118));
+                if (!f.isDir) {
+                    TextClipped(dc, RECT{ c.right - 145, y, c.right - 20, y + rowH }, FileSizeText(f.size),
+                        11, RGB(84, 99, 118), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                }
             }
             DrawScrollbar(dc, c, static_cast<int>(win.files.size()), visible, win.scroll);
         }
 
         void DrawLines(HDC dc, const BackstageWindow& win, const RECT& c) {
             DrawHeader(dc, c, win.title, std::to_wstring(win.lines.size()) + L" rows");
-            if (win.kind == WindowKind::Processes) { DrawActionButton(dc, c, 0, L"Kill"); DrawActionButton(dc, c, 1, L"Refresh"); }
+            if (win.kind == WindowKind::Processes) { DrawActionButton(dc, c, 0, L"End task"); DrawActionButton(dc, c, 1, L"Refresh"); }
             if (win.kind == WindowKind::Apps) { DrawActionButton(dc, c, 0, L"Uninstall"); DrawActionButton(dc, c, 1, L"Refresh"); }
             if (win.kind == WindowKind::Updates) { DrawActionButton(dc, c, 0, L"Scan"); DrawActionButton(dc, c, 1, L"Install"); DrawActionButton(dc, c, 2, L"Refresh"); DrawActionButton(dc, c, 3, L"History"); }
             if (win.kind == WindowKind::Events) { DrawActionButton(dc, c, 0, L"Home"); DrawActionButton(dc, c, 1, L"Refresh"); }
             if (win.kind == WindowKind::Sessions || win.kind == WindowKind::Devices || win.kind == WindowKind::Disks) { DrawActionButton(dc, c, 0, L"Refresh"); }
             if (win.kind == WindowKind::Registry) { DrawActionButton(dc, c, 0, L"Home"); DrawActionButton(dc, c, 1, L"New Key"); DrawActionButton(dc, c, 2, L"Delete Key"); DrawActionButton(dc, c, 3, L"Refresh"); }
-            const int y0 = c.top + 54;
-            const int lineH = 24;
+
+            const int y0 = WindowRowTop(win, c);
+            const int lineH = WindowRowH(win);
+            const bool processTable = win.kind == WindowKind::Processes;
+            const bool appTable = win.kind == WindowKind::Apps;
+
+            if (processTable || appTable) {
+                FillRectColor(dc, c.left, y0 - 30, c.right - c.left, 30, RGB(241, 245, 250));
+                if (processTable) {
+                    TextClipped(dc, RECT{ c.left + 16, y0 - 30, c.right - 360, y0 }, L"Name", 11, RGB(72, 87, 106), true);
+                    TextClipped(dc, RECT{ c.right - 345, y0 - 30, c.right - 265, y0 }, L"PID", 11, RGB(72, 87, 106), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                    TextClipped(dc, RECT{ c.right - 250, y0 - 30, c.right - 145, y0 }, L"Threads", 11, RGB(72, 87, 106), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                    TextClipped(dc, RECT{ c.right - 130, y0 - 30, c.right - 20, y0 }, L"Memory", 11, RGB(72, 87, 106), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                } else {
+                    TextClipped(dc, RECT{ c.left + 16, y0 - 30, c.right - 450, y0 }, L"Application", 11, RGB(72, 87, 106), true);
+                    TextClipped(dc, RECT{ c.right - 435, y0 - 30, c.right - 315, y0 }, L"Version", 11, RGB(72, 87, 106), true);
+                    TextClipped(dc, RECT{ c.right - 300, y0 - 30, c.right - 130, y0 }, L"Publisher", 11, RGB(72, 87, 106), true);
+                    TextClipped(dc, RECT{ c.right - 115, y0 - 30, c.right - 20, y0 }, L"Removal", 11, RGB(72, 87, 106), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                }
+            }
+
             const int visible = VisibleRows(c, y0, lineH);
-            int start = std::max(0, win.scroll);
+            const int start = std::max(0, win.scroll);
             for (int i = 0; i < visible && i + start < static_cast<int>(win.lines.size()); ++i) {
                 const int rowIndex = i + start;
                 const int y = y0 + i * lineH;
-                COLORREF fill = (rowIndex == win.selected) ? RGB(219, 236, 255) : ((rowIndex % 2) ? RGB(250, 252, 255) : RGB(255, 255, 255));
+                const std::wstring& line = win.lines[static_cast<size_t>(rowIndex)];
+                COLORREF fill = (rowIndex == win.selected) ? RGB(222, 238, 255) : RGB(255, 255, 255);
+
+                if (!processTable && !appTable) {
+                    const bool section = line.rfind(L"===", 0) == 0 ||
+                        (line.size() < 80 && !line.empty() && line.back() == L':');
+                    if (section && rowIndex != win.selected) fill = RGB(241, 245, 250);
+                }
+
                 FillRectColor(dc, c.left, y, c.right - c.left, lineH, fill);
-                TextClipped(dc, RECT{ c.left + 14, y, c.right - 18, y + lineH }, win.lines[static_cast<size_t>(rowIndex)], 12, RGB(38, 50, 67));
+                FillRectColor(dc, c.left, y + lineH - 1, c.right - c.left, 1, RGB(235, 239, 244));
+
+                if (processTable) {
+                    const size_t first = line.find(L"    ");
+                    const size_t marker = line.find(L"    Threads ");
+                    std::wstring pid = first == std::wstring::npos ? L"" : line.substr(0, first);
+                    std::wstring name = (first != std::wstring::npos && marker != std::wstring::npos)
+                        ? line.substr(first + 4, marker - (first + 4)) : line;
+                    std::wstring threads;
+                    std::wstring memory;
+                    if (marker != std::wstring::npos) {
+                        const std::wstring detail = line.substr(marker + 12);
+                        const size_t memSep = detail.find(L"    ");
+                        threads = memSep == std::wstring::npos ? detail : detail.substr(0, memSep);
+                        if (memSep != std::wstring::npos) memory = detail.substr(memSep + 4);
+                    }
+                    TextClipped(dc, RECT{ c.left + 16, y, c.right - 360, y + lineH }, name, 12, RGB(30, 42, 58));
+                    TextClipped(dc, RECT{ c.right - 345, y, c.right - 265, y + lineH }, pid, 11, RGB(80, 94, 112), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                    TextClipped(dc, RECT{ c.right - 250, y, c.right - 145, y + lineH }, threads, 11, RGB(80, 94, 112), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                    TextClipped(dc, RECT{ c.right - 130, y, c.right - 20, y + lineH }, memory, 11, RGB(80, 94, 112), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                }
+                else if (appTable && rowIndex < static_cast<int>(win.apps.size())) {
+                    const AppRow& app = win.apps[static_cast<size_t>(rowIndex)];
+                    TextClipped(dc, RECT{ c.left + 16, y, c.right - 450, y + lineH }, app.name, 12, RGB(30, 42, 58));
+                    TextClipped(dc, RECT{ c.right - 435, y, c.right - 315, y + lineH }, app.version, 11, RGB(80, 94, 112));
+                    TextClipped(dc, RECT{ c.right - 300, y, c.right - 130, y + lineH }, app.publisher, 11, RGB(80, 94, 112));
+                    const std::wstring removal = !app.quietUninstall.empty() ? L"Silent" : (!app.uninstall.empty() ? L"Blocked" : L"None");
+                    TextClipped(dc, RECT{ c.right - 115, y, c.right - 20, y + lineH }, removal, 11,
+                        !app.quietUninstall.empty() ? RGB(32, 120, 72) : RGB(116, 91, 65), false,
+                        DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                }
+                else {
+                    const bool section = line.rfind(L"===", 0) == 0 ||
+                        (line.size() < 80 && !line.empty() && line.back() == L':');
+                    TextClipped(dc, RECT{ c.left + 16, y, c.right - 20, y + lineH }, line,
+                        section ? 11 : 12, section ? RGB(62, 78, 98) : RGB(38, 50, 67), section);
+                }
             }
             DrawScrollbar(dc, c, static_cast<int>(win.lines.size()), visible, win.scroll);
         }
