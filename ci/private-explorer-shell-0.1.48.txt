@@ -1,0 +1,12 @@
+Hi5Central private Explorer shell validation
+
+VPS source: c1301fdebb732ad4ea702f7770de1eb4410b1172
+GitHub source sync: acd8da40a856890f6f963aa36f6932ff73a0fb18
+Source archive SHA256: cea77fc080489a3f42d72cbc360a8cbce2e49c6bd4f7c2c3db9ff564d8a9b777
+
+Purpose:
+- start explorer.exe on the private Background HDESK
+- require a private Shell_TrayWnd before declaring native shell ready
+- open no applications by default
+- close any private startup Explorer folder window before first shell frame
+- retain bounded synthetic fallback if a private Windows shell cannot be created
