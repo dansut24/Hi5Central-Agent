@@ -1,0 +1,16 @@
+Hi5Central Background hybrid responsiveness validation
+
+VPS source: a96e35d0576636285f8d02cd52a13a6467bcd55e
+GitHub source sync: ab509869a81d261d9fa02e3d4e1bc1849d0d1c60
+Source archive SHA256: 359ef1088392e53507fec0a745272f4c7434a284604cd512009059edc867a9dd
+
+Purpose:
+- remove frame-baked Background cursor and use Viewer overlay only
+- pointer-only movement no longer dirties Background video
+- cached PrintWindow compositor for native HWNDs
+- active 30 FPS / idle adaptive render cadence
+- combined Hi5/native taskbar and z-order
+- Hi5-managed core admin windows in native Background mode
+- richer Task Manager process data
+- Users & Sessions view showing interactive sessions and NT AUTHORITY\SYSTEM context
+- preserve private desktop isolation and native app fallback
