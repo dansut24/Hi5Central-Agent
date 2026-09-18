@@ -6470,7 +6470,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " --shmem " + ctx.normalShmemName +
                     " --input-pipe " + ctx.normalInputPipeName +
                     " --stop-event " + ctx.normalStopEventName +
-                    " --fps 15"
+                    " --fps 30"
                     " --width " + std::to_string(backgroundWidth) +
                     " --height " + std::to_string(backgroundHeight);
 

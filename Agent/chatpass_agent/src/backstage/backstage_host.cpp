@@ -12,8 +12,10 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <psapi.h>
 #include <tlhelp32.h>
 #include <winsvc.h>
+#include <wtsapi32.h>
 #include <cstdio>
 #include <shlwapi.h>
 #include <sddl.h>
@@ -23,6 +25,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
@@ -207,6 +210,7 @@ namespace {
         Processes,
         Apps,
         SystemInfo,
+        Sessions,
         Events,
         Terminal,
         Notepad,
@@ -404,6 +408,10 @@ namespace {
 
         bool NativeModeActive() const { return nativeModeActive_; }
 
+        bool HasVisibleNativeWindows() const {
+            return nativeModeActive_ && nativeVisibleWindowCount_ > 0;
+        }
+
         bool HasActiveBackgroundJob() const {
             for (const auto& win : windows_) {
                 if (!win.closed && win.updateJob && !win.updateJob->done.load()) return true;
@@ -435,6 +443,7 @@ namespace {
                 { L"apps",       L"Installed Apps",  L"Software inventory",          L"C:\\Windows\\System32\\appwiz.cpl", WindowKind::Apps,      L"" },
                 { L"events",     L"Event Viewer",    L"Recent system events",        L"C:\\Windows\\System32\\eventvwr.msc", WindowKind::Events,    L"" },
                 { L"system",     L"System Info",     L"System overview",             L"C:\\Windows\\System32\\SystemPropertiesComputerName.exe", WindowKind::SystemInfo, L"" },
+                { L"sessions",   L"Users & Sessions", L"Interactive sessions and SYSTEM context", L"C:\\Windows\\System32\\taskmgr.exe", WindowKind::Sessions, L"" },
                 { L"notepad",    L"Notepad",         L"Backstage notes",             L"C:\\Windows\\System32\\notepad.exe", WindowKind::Notepad,   L"" },
                 { L"updates",    L"Windows Update",  L"Scan/install/reboot status",  L"C:\\Windows\\System32\\UsoClient.exe", WindowKind::Updates,   L"" },
                 { L"registry",   L"Registry",        L"Registry browser",            L"C:\\Windows\\regedit.exe", WindowKind::Registry, L"" },
@@ -482,6 +491,8 @@ namespace {
                 { L"System Settings", L"Resource Monitor", L"C:\\Windows\\System32\\resmon.exe", L"" },
                 { L"System Settings", L"Local Users and Groups", L"C:\\Windows\\System32\\mmc.exe", L"lusrmgr.msc" },
                 { L"System Settings", L"System Configuration", L"C:\\Windows\\System32\\msconfig.exe", L"" },
+                { L"System Settings", L"Windows Update", L"", L"" },
+                { L"System Settings", L"Users & Sessions", L"", L"" },
             };
             return apps;
         }
@@ -949,7 +960,7 @@ namespace {
                 const int idx = win.scroll + visibleIdx;
                 if (visibleIdx >= 0 && idx >= 0 && idx < static_cast<int>(win.services.size())) win.selected = idx;
             }
-            else if (win.kind == WindowKind::Processes || win.kind == WindowKind::Apps || win.kind == WindowKind::SystemInfo || win.kind == WindowKind::Events || win.kind == WindowKind::Updates || win.kind == WindowKind::Registry || win.kind == WindowKind::Devices || win.kind == WindowKind::Disks) {
+            else if (win.kind == WindowKind::Processes || win.kind == WindowKind::Apps || win.kind == WindowKind::SystemInfo || win.kind == WindowKind::Sessions || win.kind == WindowKind::Events || win.kind == WindowKind::Updates || win.kind == WindowKind::Registry || win.kind == WindowKind::Devices || win.kind == WindowKind::Disks) {
                 const int rowTop = WindowRowTop(win, c);
                 const int rowH = WindowRowH(win);
                 const int visibleIdx = (y - rowTop) / rowH;
@@ -1444,6 +1455,9 @@ namespace {
                 if (PtInRect(&ActionButtonRect(c, 2), pt)) { RegistryDeleteSelectedKey(win); return true; }
                 if (PtInRect(&ActionButtonRect(c, 3), pt)) { LoadRegistry(win); return true; }
             }
+            else if (win.kind == WindowKind::Sessions) {
+                if (PtInRect(&ActionButtonRect(c, 0), pt)) { LoadSessions(win); return true; }
+            }
             else if (win.kind == WindowKind::Devices) {
                 if (PtInRect(&ActionButtonRect(c, 0), pt)) { LoadDevices(win); return true; }
             }
@@ -1835,6 +1849,7 @@ namespace {
             else if (win.kind == WindowKind::Processes) LoadProcesses(win);
             else if (win.kind == WindowKind::Apps) LoadApps(win);
             else if (win.kind == WindowKind::SystemInfo) LoadSystemInfo(win);
+            else if (win.kind == WindowKind::Sessions) LoadSessions(win);
             else if (win.kind == WindowKind::Events) { win.noteText = L"EVENTS_ROOT"; LoadEvents(win); }
             else if (win.kind == WindowKind::Updates) LoadUpdates(win);
             else if (win.kind == WindowKind::Registry) { win.noteText = L"REG_ROOT"; LoadRegistry(win); }
@@ -2030,20 +2045,58 @@ namespace {
         }
 
         void LoadProcesses(BackstageWindow& win) {
-            win.lines.clear();
+            struct ProcessDisplayRow {
+                DWORD pid = 0;
+                DWORD threads = 0;
+                SIZE_T workingSet = 0;
+                std::wstring name;
+            };
+
+            std::vector<ProcessDisplayRow> rows;
             HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (snap == INVALID_HANDLE_VALUE) {
-                win.lines.push_back(L"Failed to snapshot processes: " + std::to_wstring(GetLastError()));
+                win.lines = { L"Failed to snapshot processes: " + std::to_wstring(GetLastError()) };
                 return;
             }
+
             PROCESSENTRY32W pe{};
             pe.dwSize = sizeof(pe);
             if (Process32FirstW(snap, &pe)) {
                 do {
-                    win.lines.push_back(std::to_wstring(pe.th32ProcessID) + L"    " + pe.szExeFile);
-                } while (Process32NextW(snap, &pe) && win.lines.size() < 300);
+                    ProcessDisplayRow row;
+                    row.pid = pe.th32ProcessID;
+                    row.threads = pe.cntThreads;
+                    row.name = pe.szExeFile;
+
+                    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, row.pid);
+                    if (process) {
+                        PROCESS_MEMORY_COUNTERS pmc{};
+                        if (GetProcessMemoryInfo(process, &pmc, sizeof(pmc))) row.workingSet = pmc.WorkingSetSize;
+                        CloseHandle(process);
+                    }
+                    rows.push_back(std::move(row));
+                } while (Process32NextW(snap, &pe) && rows.size() < 500);
             }
             CloseHandle(snap);
+
+            std::sort(rows.begin(), rows.end(), [](const ProcessDisplayRow& a, const ProcessDisplayRow& b) {
+                const int cmp = _wcsicmp(a.name.c_str(), b.name.c_str());
+                if (cmp != 0) return cmp < 0;
+                return a.pid < b.pid;
+            });
+
+            win.lines.clear();
+            for (const auto& row : rows) {
+                std::wstring line = std::to_wstring(row.pid) + L"    " + row.name +
+                    L"    Threads " + std::to_wstring(row.threads);
+                if (row.workingSet > 0) {
+                    line += L"    " + std::to_wstring(row.workingSet / (1024ull * 1024ull)) + L" MB";
+                }
+                win.lines.push_back(std::move(line));
+            }
+            win.subtitle = L"Processes · " + std::to_wstring(rows.size()) + L" running · maintenance context SYSTEM";
+            win.selected = -1;
+            win.scroll = 0;
         }
 
         void LoadApps(BackstageWindow& win) {
@@ -2114,6 +2167,73 @@ namespace {
                 L"Memory available: " + std::to_wstring(mem.ullAvailPhys / (1024ull * 1024ull)) + L" MB",
                 L"Session: Backstage SYSTEM maintenance workspace"
             };
+        }
+
+        static std::wstring WtsStateText(WTS_CONNECTSTATE_CLASS state) {
+            switch (state) {
+            case WTSActive: return L"Active";
+            case WTSConnected: return L"Connected";
+            case WTSConnectQuery: return L"ConnectQuery";
+            case WTSShadow: return L"Shadow";
+            case WTSDisconnected: return L"Disconnected";
+            case WTSIdle: return L"Idle";
+            case WTSListen: return L"Listen";
+            case WTSReset: return L"Reset";
+            case WTSDown: return L"Down";
+            case WTSInit: return L"Init";
+            default: return L"Unknown";
+            }
+        }
+
+        static std::wstring QueryWtsString(DWORD sessionId, WTS_INFO_CLASS infoClass) {
+            LPWSTR value = nullptr;
+            DWORD bytes = 0;
+            std::wstring out;
+            if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessionId, infoClass,
+                &value, &bytes) && value && bytes >= sizeof(wchar_t)) {
+                out.assign(value);
+            }
+            if (value) WTSFreeMemory(value);
+            return out;
+        }
+
+        void LoadSessions(BackstageWindow& win) {
+            win.lines.clear();
+            win.lines.push_back(L"Background security context: NT AUTHORITY\\SYSTEM");
+            win.lines.push_back(L"Private desktop: " + privateDesktopFullName_);
+            win.lines.push_back(L"SYSTEM is a security context, not a separate interactive logged-on user.");
+            win.lines.push_back(L"");
+
+            const DWORD consoleSession = WTSGetActiveConsoleSessionId();
+            PWTS_SESSION_INFOW sessions = nullptr;
+            DWORD count = 0;
+            if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count)) {
+                win.lines.push_back(L"Unable to enumerate Windows sessions. Error: " + std::to_wstring(GetLastError()));
+                return;
+            }
+
+            size_t interactiveCount = 0;
+            for (DWORD i = 0; i < count; ++i) {
+                const auto& si = sessions[i];
+                std::wstring user = QueryWtsString(si.SessionId, WTSUserName);
+                std::wstring domain = QueryWtsString(si.SessionId, WTSDomainName);
+                std::wstring station = si.pWinStationName ? si.pWinStationName : L"";
+                if (!user.empty()) ++interactiveCount;
+
+                std::wstring identity = user.empty() ? L"(no interactive user)" :
+                    (domain.empty() ? user : domain + L"\\" + user);
+                std::wstring line = L"Session " + std::to_wstring(si.SessionId);
+                if (si.SessionId == consoleSession) line += L"  [Console]";
+                line += L"  " + WtsStateText(si.State) + L"  " + identity;
+                if (!station.empty()) line += L"  (" + station + L")";
+                win.lines.push_back(std::move(line));
+            }
+            WTSFreeMemory(sessions);
+
+            win.subtitle = L"Windows sessions · " + std::to_wstring(interactiveCount) +
+                L" interactive user" + (interactiveCount == 1 ? L"" : L"s") + L" · Background runs as SYSTEM";
+            win.selected = -1;
+            win.scroll = 0;
         }
 
         void LoadEvents(BackstageWindow& win) {
@@ -2268,6 +2388,15 @@ namespace {
             std::wstring title;
         };
 
+        struct NativeWindowCache {
+            RECT sourceRect{};
+            int width = 0;
+            int height = 0;
+            std::vector<uint8_t> bgra;
+            ULONGLONG lastCaptureTick = 0;
+            bool valid = false;
+        };
+
         struct NativeDesktopEnumCtx {
             std::vector<NativeDesktopWindowInfo>* windows = nullptr;
         };
@@ -2341,18 +2470,23 @@ namespace {
             };
         }
 
-        bool CaptureNativeDesktopWindow(const NativeDesktopWindowInfo& info, HDC targetDc) {
+        static bool NativeRectsEqual(const RECT& a, const RECT& b) {
+            return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+        }
+
+        bool RefreshNativeWindowCache(const NativeDesktopWindowInfo& info, NativeWindowCache& cache) {
             const int fullW = PositiveDim(info.windowRect.right - info.windowRect.left, 32);
             const int fullH = PositiveDim(info.windowRect.bottom - info.windowRect.top, 24);
-            const int cropX = std::max(0, static_cast<int>(info.sourceRect.left - info.windowRect.left));
-            const int cropY = std::max(0, static_cast<int>(info.sourceRect.top - info.windowRect.top));
+            const int cropX = std::max(0, std::min(fullW - 1,
+                static_cast<int>(info.sourceRect.left - info.windowRect.left)));
+            const int cropY = std::max(0, std::min(fullH - 1,
+                static_cast<int>(info.sourceRect.top - info.windowRect.top)));
             const int cropW = std::max(1, std::min(fullW - cropX,
                 static_cast<int>(info.sourceRect.right - info.sourceRect.left)));
             const int cropH = std::max(1, std::min(fullH - cropY,
                 static_cast<int>(info.sourceRect.bottom - info.sourceRect.top)));
-            const RECT dst = NativeViewerRect(info.sourceRect);
 
-            HDC captureDc = CreateCompatibleDC(targetDc);
+            HDC captureDc = CreateCompatibleDC(memDc_);
             if (!captureDc) return false;
             BITMAPINFO bi{};
             bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -2361,6 +2495,7 @@ namespace {
             bi.bmiHeader.biPlanes = 1;
             bi.bmiHeader.biBitCount = 32;
             bi.bmiHeader.biCompression = BI_RGB;
+
             void* captureBits = nullptr;
             HBITMAP bmp = CreateDIBSection(captureDc, &bi, DIB_RGB_COLORS, &captureBits, nullptr, 0);
             if (!bmp || !captureBits) {
@@ -2373,15 +2508,68 @@ namespace {
             FillRectColor(captureDc, 0, 0, fullW, fullH, RGB(0, 0, 0));
             BOOL ok = PrintWindow(info.hwnd, captureDc, 0x00000002);
             if (!ok) ok = PrintWindow(info.hwnd, captureDc, 0);
+
             if (ok) {
-                SetStretchBltMode(targetDc, HALFTONE);
-                StretchBlt(targetDc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
-                    captureDc, cropX, cropY, cropW, cropH, SRCCOPY);
+                cache.width = cropW;
+                cache.height = cropH;
+                cache.sourceRect = info.sourceRect;
+                cache.bgra.resize(static_cast<size_t>(cropW) * static_cast<size_t>(cropH) * 4u);
+
+                const auto* srcBase = static_cast<const uint8_t*>(captureBits);
+                for (int row = 0; row < cropH; ++row) {
+                    const auto* src = srcBase +
+                        (static_cast<size_t>(cropY + row) * static_cast<size_t>(fullW) +
+                         static_cast<size_t>(cropX)) * 4u;
+                    auto* dst = cache.bgra.data() +
+                        static_cast<size_t>(row) * static_cast<size_t>(cropW) * 4u;
+                    std::memcpy(dst, src, static_cast<size_t>(cropW) * 4u);
+                }
+                cache.lastCaptureTick = GetTickCount64();
+                cache.valid = true;
             }
+
             SelectObject(captureDc, old);
             DeleteObject(bmp);
             DeleteDC(captureDc);
             return ok != FALSE;
+        }
+
+        bool CompositeNativeDesktopWindow(const NativeDesktopWindowInfo& info, HDC targetDc) {
+            auto& cache = nativeWindowCache_[info.hwnd];
+            const ULONGLONG now = GetTickCount64();
+            const bool active = !nativeSyntheticFocus_ && info.hwnd == NativeFocusedTopLevel();
+            const ULONGLONG refreshMs = active ? 70ull : 700ull;
+            const bool geometryChanged = !cache.valid || !NativeRectsEqual(cache.sourceRect, info.sourceRect);
+            const bool due = !cache.valid || geometryChanged ||
+                now - cache.lastCaptureTick >= refreshMs;
+
+            if (due) {
+                RefreshNativeWindowCache(info, cache);
+            }
+            if (!cache.valid || cache.bgra.empty()) return false;
+
+            const RECT dst = NativeViewerRect(info.sourceRect);
+            BITMAPINFO bi{};
+            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = cache.width;
+            bi.bmiHeader.biHeight = -cache.height;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+
+            SetStretchBltMode(targetDc, HALFTONE);
+            const int copied = StretchDIBits(targetDc,
+                dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                0, 0, cache.width, cache.height,
+                cache.bgra.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+            return copied != GDI_ERROR;
+        }
+
+        void PruneNativeWindowCache() {
+            for (auto it = nativeWindowCache_.begin(); it != nativeWindowCache_.end();) {
+                if (!it->first || !IsWindow(it->first)) it = nativeWindowCache_.erase(it);
+                else ++it;
+            }
         }
 
         bool LaunchNativeUserProcess(const std::string& exe, const std::string& args) {
@@ -2421,6 +2609,11 @@ namespace {
             }
             nativeDesktopProcesses_.clear();
             nativeFocusHwnd_ = nullptr;
+            nativePreferredHwnd_ = nullptr;
+            nativeSyntheticFocus_ = false;
+            nativeHybridPointerCaptured_ = false;
+            nativeWindowCache_.clear();
+            nativeRestoreRects_.clear();
         }
 
         RECT NativeTaskbarRect() const {
@@ -2475,6 +2668,14 @@ namespace {
             return rows;
         }
 
+        std::vector<BackstageWindow*> NativeTaskbarSyntheticWindows() {
+            std::vector<BackstageWindow*> out;
+            for (auto& win : windows_) {
+                if (!win.closed) out.push_back(&win);
+            }
+            return out;
+        }
+
         void DrawNativeTaskbar(HDC dc, const std::vector<NativeDesktopWindowInfo>& windows) {
             const RECT bar = NativeTaskbarRect();
             FillRectColor(dc, bar.left, bar.top, bar.right - bar.left, bar.bottom - bar.top, RGB(32, 32, 32));
@@ -2490,18 +2691,34 @@ namespace {
             int x = start.right + 8;
             const int maxX = std::max(x, w_ - 150);
             size_t shown = 0;
-            for (const auto& info : windows) {
-                if (!info.hwnd) continue;
-                if (x + 150 > maxX) break;
+
+            for (BackstageWindow* win : NativeTaskbarSyntheticWindows()) {
+                if (!win || x + 150 > maxX || shown >= 8) break;
                 RECT r{ x, bar.top + 5, x + 146, bar.bottom - 5 };
-                const bool active = info.hwnd == NativeFocusedTopLevel();
+                const bool active = nativeSyntheticFocus_ && win->id == activeWindowId_ && !win->minimized;
+                RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                    active ? RGB(58, 80, 108) : RGB(45, 45, 45), RGB(80, 80, 80), 6);
+                const ToolSpec* spec = FindToolSpec(win->toolId);
+                int textLeft = r.left + 10;
+                if (spec && spec->iconPath) {
+                    DrawIconFromFile(dc, spec->iconPath, r.left + 7, r.top + 5, 24);
+                    textLeft = r.left + 38;
+                }
+                TextClipped(dc, RECT{ textLeft, r.top, r.right - 8, r.bottom }, win->title, 12, RGB(238, 238, 238), false);
+                x += 152;
+                ++shown;
+            }
+
+            for (const auto& info : windows) {
+                if (!info.hwnd || x + 150 > maxX || shown >= 8) continue;
+                RECT r{ x, bar.top + 5, x + 146, bar.bottom - 5 };
+                const bool active = !nativeSyntheticFocus_ && info.hwnd == NativeFocusedTopLevel();
                 RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
                     active ? RGB(72, 72, 72) : RGB(45, 45, 45), RGB(80, 80, 80), 6);
                 std::wstring title = info.title.empty() ? info.className : info.title;
                 TextClipped(dc, RECT{ r.left + 10, r.top, r.right - 8, r.bottom }, title, 12, RGB(238, 238, 238), false);
                 x += 152;
                 ++shown;
-                if (shown >= 8) break;
             }
 
             SYSTEMTIME st{};
@@ -2664,13 +2881,51 @@ namespace {
             TextClipped(dc, cancel, L"Cancel", 12, RGB(235, 235, 235), false, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
+        const ToolSpec* HybridToolForMaintenanceTitle(const std::wstring& title) const {
+            struct Map { const wchar_t* title; const wchar_t* toolId; };
+            static const Map maps[] = {
+                { L"Services", L"services" },
+                { L"Event Viewer", L"events" },
+                { L"Device Manager", L"devices" },
+                { L"Disk Management", L"disks" },
+                { L"Registry Editor", L"registry" },
+                { L"Task Manager", L"taskmgr" },
+                { L"Programs and Features", L"apps" },
+                { L"Command Prompt", L"cmd" },
+                { L"PowerShell", L"powershell" },
+                { L"Notepad", L"notepad" },
+                { L"System Information", L"system" },
+                { L"Windows Update", L"updates" },
+                { L"Users & Sessions", L"sessions" },
+            };
+            for (const auto& map : maps) {
+                if (title == map.title) return FindToolSpec(map.toolId);
+            }
+            return nullptr;
+        }
+
         bool LaunchNativeMaintenanceApp(size_t index) {
             const auto& apps = NativeMaintenanceApps();
             if (index >= apps.size()) return false;
             const auto& app = apps[index];
+
+            if (const ToolSpec* hybrid = HybridToolForMaintenanceTitle(app.title)) {
+                const bool ok = LaunchTool(*hybrid);
+                if (ok) {
+                    nativeSyntheticFocus_ = true;
+                    nativeFocusHwnd_ = nullptr;
+                }
+                LogInfo("[background-native] launcher app=" + WideToUtf8(app.title) +
+                    " group=" + WideToUtf8(app.group) +
+                    " surface=hi5-managed account=SYSTEM ok=" + (ok ? std::string("1") : std::string("0")));
+                return ok;
+            }
+
             const bool ok = LaunchNativeElevatedProcess(WideToUtf8(app.exe), WideToUtf8(app.args));
+            if (ok) nativeSyntheticFocus_ = false;
             LogInfo("[background-native] launcher app=" + WideToUtf8(app.title) +
-                " group=" + WideToUtf8(app.group) + " account=SYSTEM ok=" + (ok ? std::string("1") : std::string("0")));
+                " group=" + WideToUtf8(app.group) +
+                " surface=native-hwnd account=SYSTEM ok=" + (ok ? std::string("1") : std::string("0")));
             return ok;
         }
 
@@ -2749,25 +3004,57 @@ namespace {
                 int bx = NativeStartButtonRect().right + 8;
                 const int maxX = std::max(bx, w_ - 150);
                 size_t shown = 0;
+
+                for (BackstageWindow* win : NativeTaskbarSyntheticWindows()) {
+                    if (!win || bx + 150 > maxX || shown >= 8) break;
+                    RECT r{ bx, bar.top + 5, bx + 146, bar.bottom - 5 };
+                    if (PtInRect(&r, pt)) {
+                        if (nativeSyntheticFocus_ && activeWindowId_ == win->id && !win->minimized) {
+                            win->minimized = true;
+                        } else {
+                            BringToFront(win->id);
+                        }
+                        nativeSyntheticFocus_ = true;
+                        nativeFocusHwnd_ = nullptr;
+                        nativePreferredHwnd_ = nullptr;
+                        return true;
+                    }
+                    bx += 152;
+                    ++shown;
+                }
+
                 for (const auto& info : windows) {
-                    if (!info.hwnd) continue;
-                    if (bx + 150 > maxX) break;
+                    if (!info.hwnd || bx + 150 > maxX || shown >= 8) continue;
                     RECT r{ bx, bar.top + 5, bx + 146, bar.bottom - 5 };
                     if (PtInRect(&r, pt)) {
                         NativeActivateTopLevel(info.hwnd);
                         return true;
                     }
                     bx += 152;
-                    if (++shown >= 8) break;
+                    ++shown;
                 }
                 return true;
             }
             return false;
         }
 
+        void DrawHybridSyntheticWindows(HDC dc) {
+            std::vector<const BackstageWindow*> drawOrder;
+            for (const auto& win : windows_) {
+                if (!win.closed && !win.minimized) drawOrder.push_back(&win);
+            }
+            std::sort(drawOrder.begin(), drawOrder.end(),
+                [](const BackstageWindow* a, const BackstageWindow* b) { return a->zOrder < b->zOrder; });
+            for (const BackstageWindow* win : drawOrder) {
+                DrawWindowFrame(dc, *win);
+                DrawWindowContent(dc, *win);
+            }
+        }
+
         bool DrawNativeDesktop() {
             FillRectColor(memDc_, 0, 0, w_, h_, RGB(0, 0, 0));
             auto windows = NativeDesktopWindows();
+            nativeVisibleWindowCount_ = windows.size();
 
             if (!nativeWindowInventoryLogged_ && !windows.empty()) {
                 nativeWindowInventoryLogged_ = true;
@@ -2787,20 +3074,34 @@ namespace {
             }
 
             size_t captured = 0;
+            const bool nativeOnTop = !nativeSyntheticFocus_ && nativePreferredHwnd_ && IsWindow(nativePreferredHwnd_);
+
             for (auto it = windows.rbegin(); it != windows.rend(); ++it) {
                 if (IsIconic(it->hwnd)) continue;
-                if (CaptureNativeDesktopWindow(*it, memDc_)) ++captured;
+                if (nativeOnTop && it->hwnd == nativePreferredHwnd_) continue;
+                if (CompositeNativeDesktopWindow(*it, memDc_)) ++captured;
             }
+
+            DrawHybridSyntheticWindows(memDc_);
+
+            if (nativeOnTop) {
+                for (const auto& info : windows) {
+                    if (info.hwnd == nativePreferredHwnd_ && !IsIconic(info.hwnd)) {
+                        if (CompositeNativeDesktopWindow(info, memDc_)) ++captured;
+                        break;
+                    }
+                }
+            }
+
             if (captured > 0 && !nativeFirstCaptureLogged_) {
                 nativeFirstCaptureLogged_ = true;
                 LogInfo("[background-native] first native capture ok captured=" + std::to_string(captured) +
                     " windows=" + std::to_string(windows.size()));
             }
-
             DrawNativeLauncher(memDc_);
             DrawNativeTaskbar(memDc_, windows);
             DrawNativeRunDialog(memDc_);
-            DrawCursor(memDc_);
+            PruneNativeWindowCache();
             return true;
         }
 
@@ -2862,6 +3163,8 @@ namespace {
             SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
             nativeFocusHwnd_ = hwnd;
+            nativePreferredHwnd_ = hwnd;
+            nativeSyntheticFocus_ = false;
             PostMessageW(hwnd, WM_NCACTIVATE, TRUE, 0);
             PostMessageW(hwnd, WM_SETFOCUS, 0, 0);
         }
@@ -3000,6 +3303,8 @@ namespace {
             else if (cmd.mouseButton.button == 1) { msg = down ? WM_RBUTTONDOWN : WM_RBUTTONUP; wp = down ? MK_RBUTTON : 0; }
             else { msg = down ? WM_MBUTTONDOWN : WM_MBUTTONUP; wp = down ? MK_MBUTTON : 0; }
             if (down) {
+                HWND top = GetAncestor(target, GA_ROOT);
+                if (top && IsWindow(top)) NativeActivateTopLevel(top);
                 nativeFocusHwnd_ = target;
                 PostMessageW(target, WM_SETFOCUS, 0, 0);
             }
@@ -3061,6 +3366,16 @@ namespace {
             for (wchar_t ch : text) PostMessageW(target, WM_CHAR, static_cast<WPARAM>(ch), 1);
         }
 
+        BackstageWindow* HybridSyntheticWindowAt(int x, int y) {
+            POINT pt{ x, y };
+            BackstageWindow* hit = nullptr;
+            for (auto& win : windows_) {
+                if (win.closed || win.minimized || !PtInRect(&win.rect, pt)) continue;
+                if (!hit || win.zOrder > hit->zOrder) hit = &win;
+            }
+            return hit;
+        }
+
         void HandleNativeShortcut(const hi5::InputCmd& cmd) {
             const auto action = static_cast<hi5::ShortcutAction>(cmd.shortcut.action);
             switch (action) {
@@ -3084,23 +3399,35 @@ namespace {
                 break;
             }
             case hi5::ShortcutAction::WinD: {
-                auto windows = NativeDesktopWindows();
-                for (const auto& info : windows) if (info.hwnd) ShowWindow(info.hwnd, SW_MINIMIZE);
+                auto nativeWindows = NativeDesktopWindows();
+                for (const auto& info : nativeWindows) if (info.hwnd) ShowWindow(info.hwnd, SW_MINIMIZE);
+                for (auto& win : windows_) if (!win.closed) win.minimized = true;
                 nativeFocusHwnd_ = nullptr;
+                nativePreferredHwnd_ = nullptr;
+                nativeSyntheticFocus_ = false;
                 nativeLauncherOpen_ = false;
                 nativeLauncherFolder_.clear();
                 break;
             }
             case hi5::ShortcutAction::AltF4: {
-                HWND top = NativeFocusedTopLevel();
-                if (top) PostMessageW(top, WM_CLOSE, 0, 0);
-                nativeFocusHwnd_ = nullptr;
+                if (nativeSyntheticFocus_) {
+                    if (BackstageWindow* win = ActiveWindow()) CloseWindow(win->id);
+                } else {
+                    HWND top = NativeFocusedTopLevel();
+                    if (top) PostMessageW(top, WM_CLOSE, 0, 0);
+                    nativeFocusHwnd_ = nullptr;
+                    nativePreferredHwnd_ = nullptr;
+                }
                 break;
             }
             case hi5::ShortcutAction::AltTab:
             case hi5::ShortcutAction::AltTabBegin:
             case hi5::ShortcutAction::AltTabNext:
             case hi5::ShortcutAction::WinTab: {
+                if (nativeSyntheticFocus_) {
+                    HandleShortcut(cmd);
+                    break;
+                }
                 auto windows = NativeDesktopWindows();
                 if (windows.empty()) break;
                 size_t next = 0;
@@ -3108,12 +3435,7 @@ namespace {
                     if (windows[i].hwnd == NativeFocusedTopLevel()) { next = (i + 1) % windows.size(); break; }
                 }
                 HWND hwnd = windows[next].hwnd;
-                if (hwnd) {
-                    ShowWindow(hwnd, SW_RESTORE);
-                    SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-                    nativeFocusHwnd_ = hwnd;
-                    PostMessageW(hwnd, WM_SETFOCUS, 0, 0);
-                }
+                if (hwnd) NativeActivateTopLevel(hwnd);
                 break;
             }
             case hi5::ShortcutAction::Explorer:
@@ -3129,43 +3451,95 @@ namespace {
             int handled = 0;
             hi5::InputCmd cmd{};
             while (pipe.Read(cmd)) {
-                ++handled;
+                bool visualDirty = true;
+
                 switch (cmd.type) {
                 case hi5::InputCmdType::MouseMove:
                     mouseX_ = std::max(0, std::min(w_ - 1, cmd.mouseMove.x));
                     mouseY_ = std::max(0, std::min(h_ - 1, cmd.mouseMove.y));
-                    NativeMouseMove(mouseX_, mouseY_);
+                    if (nativeHybridPointerCaptured_) {
+                        OnMouseMove(mouseX_, mouseY_);
+                    } else {
+                        const bool movingNativeWindow = nativeNonClientHwnd_ && nativeLeftDown_;
+                        NativeMouseMove(mouseX_, mouseY_);
+                        visualDirty = movingNativeWindow;
+                    }
                     break;
+
                 case hi5::InputCmdType::MouseButton:
                     if (cmd.mouseButton.button == 0) {
                         if (cmd.mouseButton.down) {
                             nativeShellPointerCaptured_ = HandleNativeShellClick(mouseX_, mouseY_);
                             if (nativeShellPointerCaptured_) break;
-                        } else if (nativeShellPointerCaptured_) {
-                            nativeShellPointerCaptured_ = false;
-                            break;
+
+                            BackstageWindow* syntheticHit = HybridSyntheticWindowAt(mouseX_, mouseY_);
+                            const bool preferredNativeHit =
+                                !nativeSyntheticFocus_ && nativePreferredHwnd_ &&
+                                NativeTopLevelAt(mouseX_, mouseY_) == nativePreferredHwnd_;
+                            if (syntheticHit && !preferredNativeHit) {
+                                nativeSyntheticFocus_ = true;
+                                nativeFocusHwnd_ = nullptr;
+                                nativePreferredHwnd_ = nullptr;
+                                nativeHybridPointerCaptured_ = true;
+                                OnMouseDown(mouseX_, mouseY_);
+                                break;
+                            }
+                        } else {
+                            if (nativeShellPointerCaptured_) {
+                                nativeShellPointerCaptured_ = false;
+                                break;
+                            }
+                            if (nativeHybridPointerCaptured_) {
+                                OnMouseUp(mouseX_, mouseY_);
+                                nativeHybridPointerCaptured_ = false;
+                                break;
+                            }
                         }
                     }
                     NativeMouseButton(cmd, mouseX_, mouseY_);
                     break;
-                case hi5::InputCmdType::MouseWheel:
-                    NativeMouseWheel(cmd.mouseWheel.deltaY, mouseX_, mouseY_);
+
+                case hi5::InputCmdType::MouseWheel: {
+                    BackstageWindow* syntheticHit = HybridSyntheticWindowAt(mouseX_, mouseY_);
+                    const bool preferredNativeHit =
+                        !nativeSyntheticFocus_ && nativePreferredHwnd_ &&
+                        NativeTopLevelAt(mouseX_, mouseY_) == nativePreferredHwnd_;
+                    if (syntheticHit && !preferredNativeHit) {
+                        nativeSyntheticFocus_ = true;
+                        nativeFocusHwnd_ = nullptr;
+                        nativePreferredHwnd_ = nullptr;
+                        OnMouseWheel(cmd.mouseWheel.deltaY);
+                    } else {
+                        NativeMouseWheel(cmd.mouseWheel.deltaY, mouseX_, mouseY_);
+                    }
                     break;
+                }
+
                 case hi5::InputCmdType::KeyEvent:
-                    NativeKey(cmd);
+                    if (nativeSyntheticFocus_) OnKey(cmd);
+                    else NativeKey(cmd);
                     break;
+
                 case hi5::InputCmdType::PasteText:
                 case hi5::InputCmdType::ClipboardPaste: {
                     std::string text;
-                    if (pipe.ReadClipboard(cmd.clipboard.offsetInClip, cmd.clipboard.length, text)) NativeText(Utf8ToWide(text));
+                    if (pipe.ReadClipboard(cmd.clipboard.offsetInClip, cmd.clipboard.length, text)) {
+                        if (nativeSyntheticFocus_) OnTextInput(Utf8ToWide(text));
+                        else NativeText(Utf8ToWide(text));
+                    }
                     break;
                 }
+
                 case hi5::InputCmdType::Shortcut:
                     HandleNativeShortcut(cmd);
                     break;
+
                 default:
+                    visualDirty = false;
                     break;
                 }
+
+                if (visualDirty) ++handled;
             }
             return handled;
         }
@@ -3874,7 +4248,7 @@ namespace {
             if (win.kind == WindowKind::Apps) { DrawActionButton(dc, c, 0, L"Uninstall"); DrawActionButton(dc, c, 1, L"Refresh"); }
             if (win.kind == WindowKind::Updates) { DrawActionButton(dc, c, 0, L"Scan"); DrawActionButton(dc, c, 1, L"Install"); DrawActionButton(dc, c, 2, L"Refresh"); DrawActionButton(dc, c, 3, L"History"); }
             if (win.kind == WindowKind::Events) { DrawActionButton(dc, c, 0, L"Home"); DrawActionButton(dc, c, 1, L"Refresh"); }
-            if (win.kind == WindowKind::Devices || win.kind == WindowKind::Disks) { DrawActionButton(dc, c, 0, L"Refresh"); }
+            if (win.kind == WindowKind::Sessions || win.kind == WindowKind::Devices || win.kind == WindowKind::Disks) { DrawActionButton(dc, c, 0, L"Refresh"); }
             if (win.kind == WindowKind::Registry) { DrawActionButton(dc, c, 0, L"Home"); DrawActionButton(dc, c, 1, L"New Key"); DrawActionButton(dc, c, 2, L"Delete Key"); DrawActionButton(dc, c, 3, L"Refresh"); }
             const int y0 = c.top + 54;
             const int lineH = 24;
@@ -3927,7 +4301,6 @@ namespace {
             }
             DrawStartMenu(dc);
             DrawTaskbar(dc);
-            DrawCursor(dc);
         }
 
         void DrawCursor(HDC dc) {
@@ -3957,7 +4330,7 @@ namespace {
         bool mouseDown_ = false;
         bool shiftDown_ = false;
 
-        const int taskbarH_ = 44;
+        const int taskbarH_ = 48;
         const int titleH_ = 46;
 
         std::vector<POINT> iconPositions_;
@@ -3979,6 +4352,7 @@ namespace {
         bool nativeModeActive_ = false;
         bool nativeWindowInventoryLogged_ = false;
         bool nativeFirstCaptureLogged_ = false;
+        size_t nativeVisibleWindowCount_ = 0;
         bool nativeLauncherOpen_ = false;
         bool nativeShellPointerCaptured_ = false;
         std::wstring nativeLauncherFolder_;
@@ -3988,6 +4362,10 @@ namespace {
         const int nativeTaskbarH_ = 48;
         bool nativeLeftDown_ = false;
         HWND nativeFocusHwnd_ = nullptr;
+        HWND nativePreferredHwnd_ = nullptr;
+        bool nativeSyntheticFocus_ = false;
+        bool nativeHybridPointerCaptured_ = false;
+        std::unordered_map<HWND, NativeWindowCache> nativeWindowCache_;
         HWND nativeNonClientHwnd_ = nullptr;
         LRESULT nativeNonClientHit_ = HTNOWHERE;
         POINT nativeNonClientStartScreen_{};
@@ -4043,8 +4421,9 @@ namespace hi5 {
         if (inputPipeOk) renderer.PublishMonitorInfo(inputPipe);
 
         const int idleFps = EnvInt("HI5_BACKSTAGE_IDLE_FPS", 1, 1, 10);
-        const int activeFps = std::max(idleFps, std::min(args.fps, EnvInt("HI5_BACKSTAGE_ACTIVE_FPS", 10, 2, 30)));
-        const int motionFps = std::max(activeFps, std::min(args.fps, EnvInt("HI5_BACKSTAGE_MOTION_FPS", 15, 5, 30)));
+        const int activeFps = std::max(idleFps, std::min(args.fps, EnvInt("HI5_BACKSTAGE_ACTIVE_FPS", 20, 2, 30)));
+        const int motionFps = std::max(activeFps, std::min(args.fps, EnvInt("HI5_BACKSTAGE_MOTION_FPS", 30, 5, 30)));
+        const int nativeRefreshFps = std::max(idleFps, std::min(args.fps, EnvInt("HI5_BACKSTAGE_NATIVE_REFRESH_FPS", 5, 1, 15)));
         const int activeHoldMs = EnvInt("HI5_BACKSTAGE_ACTIVE_HOLD_MS", 900, 100, 5000);
         const int monitorPublishMs = EnvInt("HI5_BACKSTAGE_MONITOR_PUBLISH_MS", 1000, 250, 10000);
 
@@ -4093,15 +4472,19 @@ namespace hi5 {
 
             const auto sinceInputMs = std::chrono::duration_cast<std::chrono::milliseconds>(loopStart - lastInput).count();
             const bool activeJob = renderer.HasActiveBackgroundJob();
+            const bool nativeRefresh = renderer.HasVisibleNativeWindows();
             const bool active = sinceInputMs <= activeHoldMs || activeJob;
-            const bool dragging = active && (handled > 2);
-            const int targetFps = activeJob ? std::max(2, std::min(activeFps, 5)) : (dragging ? motionFps : (active ? activeFps : idleFps));
+            const bool interacting = active && handled > 0;
+            const int targetFps = activeJob
+                ? std::max(2, std::min(activeFps, 5))
+                : (interacting ? motionFps : (active ? activeFps : (nativeRefresh ? nativeRefreshFps : idleFps)));
             const auto frameInterval = IntervalForFps(targetFps);
             const bool dueForFrame = (loopStart - lastRender) >= frameInterval;
 
-            // Background frames are still converted to I420 in this first native-desktop proof.
-            // Keep rendering adaptive while we validate hidden-desktop containment and input.
-            if (dueForFrame && (dirty || !active || activeJob)) {
+            // Pointer-only movement is handled by the Viewer overlay and does not
+            // dirty video. Real native HWNDs still get a bounded idle refresh so
+            // progress/dialog changes remain visible without constant PrintWindow.
+            if (dueForFrame && (dirty || !active || activeJob || nativeRefresh)) {
                 I420Frame frame;
                 if (renderer.Render(frame)) {
                     const uint64_t tsNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
