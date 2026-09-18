@@ -493,6 +493,7 @@ namespace {
                 { L"System Settings", L"System Configuration", L"C:\\Windows\\System32\\msconfig.exe", L"" },
                 { L"System Settings", L"Windows Update", L"", L"" },
                 { L"System Settings", L"Users & Sessions", L"", L"" },
+                { L"Network Tools", L"Hi5 Web", L"", L"" },
             };
             return apps;
         }
@@ -567,8 +568,52 @@ namespace {
         }
 
         RECT ContentRect(const BackstageWindow& win) const {
-            if (win.maximized) return RECT{ win.rect.left + 1, win.rect.top + titleH_, win.rect.right - 1, win.rect.bottom - 1 };
-            return RECT{ win.rect.left + 10, win.rect.top + titleH_ + 8, win.rect.right - 10, win.rect.bottom - 10 };
+            return RECT{ win.rect.left + 1, win.rect.top + titleH_, win.rect.right - 1, win.rect.bottom - 1 };
+        }
+
+        RECT DefaultManagedWindowRect(size_t ordinal) const {
+            const int shellTaskbar = nativeModeActive_ ? nativeTaskbarH_ : taskbarH_;
+            const int margin = 14;
+            const int chromeTop = nativeModeActive_ ? kNativeShellTopH : 0;
+            const int chromeLeft = (nativeModeActive_ && NativeShellSidebarVisible()) ? kNativeShellSideW : 0;
+            const int workLeft = chromeLeft + margin;
+            const int workTop = chromeTop + margin;
+            const int workRight = std::max(workLeft + 360, w_ - margin);
+            const int workBottom = std::max(workTop + 280, h_ - shellTaskbar - margin);
+            const int workW = std::max(360, workRight - workLeft);
+            const int workH = std::max(280, workBottom - workTop);
+
+            if (workW < 860 || workH < 520) {
+                const int ww = std::min(workW, 820);
+                const int wh = std::min(workH, 540);
+                const int shift = static_cast<int>(ordinal % 5) * 22;
+                int left = workLeft + shift;
+                int top = workTop + shift;
+                if (left + ww > workRight) left = std::max(workLeft, workRight - ww);
+                if (top + wh > workBottom) top = std::max(workTop, workBottom - wh);
+                return RECT{ left, top, left + ww, top + wh };
+            }
+
+            const int slot = static_cast<int>(ordinal % 5);
+            if (slot == 0) {
+                return RECT{ workLeft, workTop,
+                    workLeft + (workW * 52) / 100,
+                    workTop + (workH * 55) / 100 };
+            }
+            if (slot == 1) {
+                return RECT{ workLeft + (workW * 54) / 100, workTop,
+                    workRight, workTop + (workH * 56) / 100 };
+            }
+            if (slot == 2) {
+                return RECT{ workLeft, workTop + (workH * 58) / 100,
+                    workLeft + (workW * 40) / 100, workBottom };
+            }
+            if (slot == 3) {
+                return RECT{ workLeft + (workW * 42) / 100, workTop + (workH * 58) / 100,
+                    workLeft + (workW * 70) / 100, workBottom };
+            }
+            return RECT{ workLeft + (workW * 72) / 100, workTop + (workH * 58) / 100,
+                workRight, workBottom };
         }
 
         int TaskbarRunStartX() const {
@@ -1832,6 +1877,9 @@ namespace {
                 return true;
             }
 
+            size_t openOrdinal = 0;
+            for (const auto& item : windows_) if (!item.closed) ++openOrdinal;
+
             BackstageWindow& win = windows_.emplace_back();
             win.id = nextWindowId_++;
             win.kind = spec.kind;
@@ -1839,8 +1887,7 @@ namespace {
             win.title = spec.title ? spec.title : L"Tool";
             win.subtitle = spec.sub ? spec.sub : L"";
             win.terminalMode = spec.terminalMode ? spec.terminalMode : L"";
-            int offset = static_cast<int>(windows_.size() % 5) * 34;
-            win.rect = RECT{ 330 + offset, 78 + offset, std::min(w_ - 34, 1040 + offset), std::min(h_ - taskbarH_ - 16, 610 + offset) };
+            win.rect = DefaultManagedWindowRect(openOrdinal);
             win.zOrder = ++zCounter_;
             win.restoreRect = win.rect;
 
@@ -2658,6 +2705,148 @@ namespace {
             return RECT{ d.right - 104, d.bottom - 52, d.right - 16, d.bottom - 18 };
         }
 
+        static constexpr int kNativeShellTopH = 74;
+        static constexpr int kNativeShellSideW = 252;
+
+        bool NativeShellSidebarVisible() const {
+            return w_ >= 1180 && h_ >= 680;
+        }
+
+        RECT NativeShellWorkspaceRect() const {
+            const int left = NativeShellSidebarVisible() ? kNativeShellSideW : 0;
+            return RECT{ left, kNativeShellTopH, w_, h_ - nativeTaskbarH_ };
+        }
+
+        RECT NativeShellTopActionRect(size_t index) const {
+            const int startX = NativeShellSidebarVisible() ? (kNativeShellSideW + 8) : 170;
+            const int itemW = 88;
+            const int x = startX + static_cast<int>(index) * itemW;
+            return RECT{ x, 7, x + itemW - 4, kNativeShellTopH - 7 };
+        }
+
+        RECT NativeShellSearchRect() const {
+            return RECT{ 14, kNativeShellTopH + 16, kNativeShellSideW - 14, kNativeShellTopH + 52 };
+        }
+
+        RECT NativeShellSideActionRect(size_t index) const {
+            const int y = kNativeShellTopH + 84 + static_cast<int>(index) * 44;
+            return RECT{ 10, y, kNativeShellSideW - 10, y + 40 };
+        }
+
+        const std::vector<std::wstring>& NativeShellTopActions() const {
+            static const std::vector<std::wstring> ids{
+                L"explorer", L"cmd", L"taskmgr", L"services", L"registry",
+                L"events", L"hi5web", L"updates", L"devices", L"more"
+            };
+            return ids;
+        }
+
+        const std::vector<std::wstring>& NativeShellSideActions() const {
+            static const std::vector<std::wstring> ids{
+                L"hi5web", L"cmd", L"powershell", L"explorer", L"taskmgr", L"services",
+                L"events", L"registry", L"devices", L"disks", L"updates", L"system"
+            };
+            return ids;
+        }
+
+        std::wstring NativeShellActionTitle(const std::wstring& id) const {
+            if (id == L"hi5web") return L"Hi5 Web";
+            if (id == L"explorer") return L"File Browser";
+            if (id == L"cmd") return L"Command";
+            if (id == L"taskmgr") return L"Task Manager";
+            if (id == L"services") return L"Services";
+            if (id == L"registry") return L"Registry";
+            if (id == L"events") return L"Event Viewer";
+            if (id == L"updates") return L"Windows Update";
+            if (id == L"devices") return L"Device Manager";
+            if (id == L"powershell") return L"PowerShell";
+            if (id == L"disks") return L"Disk Management";
+            if (id == L"system") return L"System Information";
+            if (id == L"more") return L"More";
+            return id;
+        }
+
+        std::wstring NativeShellActionSubtitle(const std::wstring& id) const {
+            if (id == L"hi5web") return L"Browse the web (isolated)";
+            if (id == L"cmd") return L"Run CMD as SYSTEM";
+            if (id == L"powershell") return L"Run PowerShell as SYSTEM";
+            if (id == L"explorer") return L"Browse and manage files";
+            if (id == L"taskmgr") return L"View and manage processes";
+            if (id == L"services") return L"Manage Windows services";
+            if (id == L"events") return L"View system and application logs";
+            if (id == L"registry") return L"Edit the Windows registry";
+            if (id == L"devices") return L"View and manage hardware";
+            if (id == L"disks") return L"Manage disks and volumes";
+            if (id == L"updates") return L"Check and install updates";
+            if (id == L"system") return L"View detailed system information";
+            return L"";
+        }
+
+        std::wstring NativeShellActionIconPath(const std::wstring& id) const {
+            if (id == L"hi5web" || id == L"more") return CurrentExePathW();
+            if (const ToolSpec* spec = FindToolSpec(id)) {
+                return spec->iconPath ? spec->iconPath : L"";
+            }
+            return L"";
+        }
+
+        bool LaunchNativeShellAction(const std::wstring& id) {
+            if (id == L"more") {
+                nativeLauncherOpen_ = true;
+                nativeLauncherFolder_.clear();
+                return true;
+            }
+            if (id == L"hi5web") {
+                const auto& apps = NativeMaintenanceApps();
+                for (size_t i = 0; i < apps.size(); ++i) {
+                    if (apps[i].title == L"Hi5 Web") return LaunchNativeMaintenanceApp(i);
+                }
+                return false;
+            }
+            if (const ToolSpec* spec = FindToolSpec(id)) {
+                const bool ok = LaunchTool(*spec);
+                if (ok) {
+                    nativeSyntheticFocus_ = true;
+                    nativeFocusHwnd_ = nullptr;
+                    nativePreferredHwnd_ = nullptr;
+                }
+                return ok;
+            }
+            return false;
+        }
+
+        bool HandleNativeShellChromeClick(int x, int y) {
+            POINT pt{ x, y };
+            const auto& top = NativeShellTopActions();
+            const int rightReserve = 230;
+            for (size_t i = 0; i < top.size(); ++i) {
+                RECT r = NativeShellTopActionRect(i);
+                if (r.right > w_ - rightReserve) break;
+                if (PtInRect(&r, pt)) return LaunchNativeShellAction(top[i]);
+            }
+
+            if (NativeShellSidebarVisible()) {
+                RECT search = NativeShellSearchRect();
+                if (PtInRect(&search, pt)) {
+                    nativeLauncherOpen_ = true;
+                    nativeLauncherFolder_.clear();
+                    return true;
+                }
+                const auto& side = NativeShellSideActions();
+                for (size_t i = 0; i < side.size(); ++i) {
+                    RECT r = NativeShellSideActionRect(i);
+                    if (r.bottom > h_ - nativeTaskbarH_ - 10) break;
+                    if (PtInRect(&r, pt)) return LaunchNativeShellAction(side[i]);
+                }
+            }
+
+            if (y < kNativeShellTopH) return true;
+            if (NativeShellSidebarVisible() &&
+                x < kNativeShellSideW &&
+                y < h_ - nativeTaskbarH_) return true;
+            return false;
+        }
+
         std::vector<size_t> NativeLauncherRows() const {
             std::vector<size_t> rows;
             const auto& apps = NativeMaintenanceApps();
@@ -2674,6 +2863,110 @@ namespace {
                 if (!win.closed) out.push_back(&win);
             }
             return out;
+        }
+
+        void DrawNativeShellBackdrop(HDC dc) {
+            FillRectColor(dc, 0, 0, w_, h_, RGB(6, 31, 57));
+            RECT work = NativeShellWorkspaceRect();
+            FillRectColor(dc, work.left, work.top,
+                work.right - work.left, work.bottom - work.top, RGB(18, 76, 132));
+
+            const int workW = std::max(1L, work.right - work.left);
+            const int workH = std::max(1L, work.bottom - work.top);
+            RoundRectColor(dc,
+                work.left + (workW * 42) / 100,
+                work.top + (workH * 10) / 100,
+                (workW * 42) / 100,
+                (workH * 62) / 100,
+                RGB(21, 103, 184), RGB(21, 103, 184), 96);
+            RoundRectColor(dc,
+                work.left + (workW * 18) / 100,
+                work.top + (workH * 48) / 100,
+                (workW * 58) / 100,
+                (workH * 34) / 100,
+                RGB(16, 88, 160), RGB(16, 88, 160), 90);
+        }
+
+        void DrawNativeShellChrome(HDC dc) {
+            FillRectColor(dc, 0, 0, w_, kNativeShellTopH, RGB(5, 27, 50));
+            FillRectColor(dc, 0, kNativeShellTopH - 1, w_, 1, RGB(30, 66, 98));
+
+            Text(dc, 16, 14, L"Hi5", 21, RGB(73, 170, 255), true);
+            Text(dc, 50, 14, L"Central", 21, RGB(247, 250, 255), true);
+            Text(dc, 18, 43, L"Background Tools", 11, RGB(224, 233, 244), false);
+
+            const auto& top = NativeShellTopActions();
+            const int rightReserve = 230;
+            POINT mouse{ mouseX_, mouseY_ };
+            for (size_t i = 0; i < top.size(); ++i) {
+                RECT r = NativeShellTopActionRect(i);
+                if (r.right > w_ - rightReserve) break;
+                const bool hover = PtInRect(&r, mouse) != 0;
+                if (hover) {
+                    RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                        RGB(18, 52, 82), RGB(46, 86, 122), 8);
+                }
+                const std::wstring iconPath = NativeShellActionIconPath(top[i]);
+                if (!iconPath.empty()) {
+                    const int iconX = r.left + ((r.right - r.left) - 24) / 2;
+                    DrawIconFromFile(dc, iconPath, iconX, r.top + 7, 24);
+                }
+                TextClipped(dc, RECT{ r.left + 2, r.top + 35, r.right - 2, r.bottom - 2 },
+                    NativeShellActionTitle(top[i]), 10, RGB(241, 246, 252), false,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
+
+            const int statusX = std::max(0, w_ - 212);
+            RoundRectColor(dc, statusX, 25, 9, 9, RGB(54, 211, 93), RGB(54, 211, 93), 5);
+            TextClipped(dc, RECT{ statusX + 16, 12, w_ - 14, 50 },
+                L"Connected (Background)", 11, RGB(246, 249, 252), false,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            if (!NativeShellSidebarVisible()) return;
+
+            FillRectColor(dc, 0, kNativeShellTopH, kNativeShellSideW,
+                h_ - kNativeShellTopH - nativeTaskbarH_, RGB(18, 39, 62));
+            FillRectColor(dc, kNativeShellSideW - 1, kNativeShellTopH, 1,
+                h_ - kNativeShellTopH - nativeTaskbarH_, RGB(44, 72, 101));
+
+            Text(dc, 18, kNativeShellTopH + 10, L"Hi5 Background", 14, RGB(247, 250, 255), true);
+
+            RECT search = NativeShellSearchRect();
+            RoundRectColor(dc, search.left, search.top, search.right - search.left, search.bottom - search.top,
+                RGB(31, 55, 81), RGB(49, 78, 108), 8);
+            TextClipped(dc, RECT{ search.left + 12, search.top, search.right - 10, search.bottom },
+                L"Search tools and apps...", 11, RGB(178, 195, 214), false,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            Text(dc, 18, kNativeShellTopH + 62, L"System Tools", 11, RGB(220, 230, 241), true);
+
+            const auto& side = NativeShellSideActions();
+            for (size_t i = 0; i < side.size(); ++i) {
+                RECT r = NativeShellSideActionRect(i);
+                if (r.bottom > h_ - nativeTaskbarH_ - 10) break;
+                const bool hover = PtInRect(&r, mouse) != 0;
+                bool active = false;
+                if (side[i] != L"hi5web") {
+                    if (BackstageWindow* open = FindOpenTool(side[i])) {
+                        active = !open->minimized && open->id == activeWindowId_ && nativeSyntheticFocus_;
+                    }
+                }
+
+                if (hover || active) {
+                    RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                        active ? RGB(33, 77, 116) : RGB(27, 58, 88),
+                        active ? RGB(54, 117, 172) : RGB(45, 82, 116), 7);
+                }
+
+                const std::wstring iconPath = NativeShellActionIconPath(side[i]);
+                if (!iconPath.empty()) DrawIconFromFile(dc, iconPath, r.left + 10, r.top + 7, 26);
+                TextClipped(dc, RECT{ r.left + 46, r.top + 3, r.right - 8, r.top + 20 },
+                    NativeShellActionTitle(side[i]), 11, RGB(244, 248, 252), true,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                TextClipped(dc, RECT{ r.left + 46, r.top + 19, r.right - 8, r.bottom - 2 },
+                    NativeShellActionSubtitle(side[i]), 9, RGB(160, 181, 203), false,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
         }
 
         void DrawNativeTaskbar(HDC dc, const std::vector<NativeDesktopWindowInfo>& windows) {
@@ -2737,14 +3030,14 @@ namespace {
                 18, RGB(245, 245, 245), true);
 
             if (nativeLauncherFolder_.empty()) {
-                const std::vector<std::wstring> folders{ L"Windows Tools", L"Windows Accessories", L"System Settings" };
+                const std::vector<std::wstring> folders{ L"Windows Tools", L"Windows Accessories", L"System Settings", L"Network Tools" };
                 for (size_t i = 0; i < folders.size(); ++i) {
                     RECT r = NativeMenuRowRect(i);
                     FillRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, RGB(39, 39, 39));
                     TextClipped(dc, RECT{ r.left + 14, r.top, r.right - 40, r.bottom }, folders[i], 14, RGB(245, 245, 245), true);
                     TextClipped(dc, RECT{ r.right - 34, r.top, r.right - 12, r.bottom }, L">", 15, RGB(210, 210, 210), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 }
-                RECT run = NativeMenuRowRect(3);
+                RECT run = NativeMenuRowRect(4);
                 FillRectColor(dc, run.left, run.top, run.right - run.left, run.bottom - run.top, RGB(39, 39, 39));
                 TextClipped(dc, RECT{ run.left + 14, run.top, run.right - 12, run.bottom }, L"Run...", 14, RGB(245, 245, 245), true);
                 TextClipped(dc, RECT{ m.left + 18, m.bottom - 56, m.right - 18, m.bottom - 20 },
@@ -2762,8 +3055,16 @@ namespace {
                 const auto& app = apps[rows[j]];
                 RECT r = NativeMenuRowRect(j + 1);
                 FillRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, RGB(39, 39, 39));
-                DrawIconFromFile(dc, app.exe, r.left + 10, r.top + 6, 26);
-                TextClipped(dc, RECT{ r.left + 46, r.top, r.right - 12, r.bottom }, app.title, 13, RGB(245, 245, 245), false);
+
+                std::wstring iconPath = app.exe;
+                if (iconPath.empty() && app.title == L"Hi5 Web") iconPath = CurrentExePathW();
+
+                int textLeft = r.left + 14;
+                if (!iconPath.empty()) {
+                    DrawIconFromFile(dc, iconPath, r.left + 10, r.top + 6, 26);
+                    textLeft = r.left + 46;
+                }
+                TextClipped(dc, RECT{ textLeft, r.top, r.right - 12, r.bottom }, app.title, 13, RGB(245, 245, 245), false);
             }
         }
 
@@ -2909,6 +3210,19 @@ namespace {
             if (index >= apps.size()) return false;
             const auto& app = apps[index];
 
+            if (app.title == L"Hi5 Web") {
+                const std::wstring currentExe = CurrentExePathW();
+                const bool ok = !currentExe.empty() &&
+                    LaunchNativeElevatedProcess(
+                        WideToUtf8(currentExe),
+                        "--mode backstage-browser --url about:blank");
+                if (ok) nativeSyntheticFocus_ = false;
+                LogInfo("[background-native] launcher app=Hi5 Web group=Network Tools"
+                    " surface=webview2-private-hdesk account=SYSTEM ok=" +
+                    std::string(ok ? "1" : "0"));
+                return ok;
+            }
+
             if (const ToolSpec* hybrid = HybridToolForMaintenanceTitle(app.title)) {
                 const bool ok = LaunchTool(*hybrid);
                 if (ok) {
@@ -2946,6 +3260,8 @@ namespace {
                 return true;
             }
 
+            if (HandleNativeShellChromeClick(x, y)) return true;
+
             RECT start = NativeStartButtonRect();
             if (PtInRect(&start, pt)) {
                 nativeLauncherOpen_ = !nativeLauncherOpen_;
@@ -2965,10 +3281,12 @@ namespace {
                     RECT toolsRow = NativeMenuRowRect(0);
                     RECT accessoriesRow = NativeMenuRowRect(1);
                     RECT settingsRow = NativeMenuRowRect(2);
-                    RECT runRow = NativeMenuRowRect(3);
+                    RECT networkRow = NativeMenuRowRect(3);
+                    RECT runRow = NativeMenuRowRect(4);
                     if (PtInRect(&toolsRow, pt)) { nativeLauncherFolder_ = L"Windows Tools"; return true; }
                     if (PtInRect(&accessoriesRow, pt)) { nativeLauncherFolder_ = L"Windows Accessories"; return true; }
                     if (PtInRect(&settingsRow, pt)) { nativeLauncherFolder_ = L"System Settings"; return true; }
+                    if (PtInRect(&networkRow, pt)) { nativeLauncherFolder_ = L"Network Tools"; return true; }
                     if (PtInRect(&runRow, pt)) {
                         nativeLauncherOpen_ = false;
                         nativeLauncherFolder_.clear();
@@ -3052,7 +3370,7 @@ namespace {
         }
 
         bool DrawNativeDesktop() {
-            FillRectColor(memDc_, 0, 0, w_, h_, RGB(0, 0, 0));
+            DrawNativeShellBackdrop(memDc_);
             auto windows = NativeDesktopWindows();
             nativeVisibleWindowCount_ = windows.size();
 
@@ -3098,6 +3416,7 @@ namespace {
                 LogInfo("[background-native] first native capture ok captured=" + std::to_string(captured) +
                     " windows=" + std::to_string(windows.size()));
             }
+            DrawNativeShellChrome(memDc_);
             DrawNativeLauncher(memDc_);
             DrawNativeTaskbar(memDc_, windows);
             DrawNativeRunDialog(memDc_);
@@ -4098,52 +4417,65 @@ namespace {
         void DrawWindowFrame(HDC dc, const BackstageWindow& win) {
             if (win.minimized) return;
             const bool active = win.id == activeWindowId_;
-            RoundRectColor(dc, win.rect.left, win.rect.top, win.rect.right - win.rect.left, win.rect.bottom - win.rect.top,
-                RGB(255, 255, 255), active ? RGB(82, 158, 236) : RGB(205, 214, 226), 14);
+            const int ww = win.rect.right - win.rect.left;
+            const int wh = win.rect.bottom - win.rect.top;
+
+            // Reference-style Windows 11 frame: a soft offset shadow, restrained
+            // active border, compact title bar and clean white application surface.
+            if (!win.maximized) {
+                RoundRectColor(dc, win.rect.left + 6, win.rect.top + 7, ww, wh,
+                    RGB(33, 52, 77), RGB(33, 52, 77), 12);
+            }
+            RoundRectColor(dc, win.rect.left, win.rect.top, ww, wh,
+                RGB(252, 253, 255), active ? RGB(147, 181, 219) : RGB(186, 198, 214), 12);
 
             RECT title = TitleBarRect(win);
             FillRectColor(dc, title.left + 1, title.top + 1, title.right - title.left - 2, title.bottom - title.top - 1,
-                active ? RGB(248, 251, 255) : RGB(244, 246, 249));
+                active ? RGB(249, 251, 254) : RGB(246, 248, 251));
+            FillRectColor(dc, title.left + 1, title.bottom - 1, title.right - title.left - 2, 1, RGB(224, 229, 236));
+
             const ToolSpec* spec = FindToolSpec(win.toolId);
-            if (spec) DrawIconFromFile(dc, spec->iconPath ? spec->iconPath : L"", title.left + 14, title.top + 10, 24);
-            TextClipped(dc, RECT{ title.left + 48, title.top + 5, title.right - 150, title.top + 27 }, win.title, 15, RGB(24, 34, 48), true);
-            TextClipped(dc, RECT{ title.left + 48, title.top + 27, title.right - 150, title.bottom }, win.subtitle, 11, RGB(92, 102, 115));
+            if (spec) DrawIconFromFile(dc, spec->iconPath ? spec->iconPath : L"", title.left + 12, title.top + 8, 22);
+            TextClipped(dc, RECT{ title.left + 42, title.top, title.right - 146, title.bottom },
+                win.title, 14, RGB(28, 38, 52), true, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             DrawCaptionButtons(dc, win);
         }
 
         void DrawCaptionButtons(HDC dc, const BackstageWindow& win) {
             RECT minR = MinRect(win), maxR = MaxRect(win), closeR = CloseRect(win);
-            auto drawButton = [&](const RECT& r, COLORREF bg) {
-                FillRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, bg);
-                };
-            drawButton(minR, RGB(248, 251, 255));
-            drawButton(maxR, RGB(248, 251, 255));
-            drawButton(closeR, RGB(255, 242, 242));
+            POINT mouse{ mouseX_, mouseY_ };
+            const bool hoverMin = PtInRect(&minR, mouse) != 0;
+            const bool hoverMax = PtInRect(&maxR, mouse) != 0;
+            const bool hoverClose = PtInRect(&closeR, mouse) != 0;
 
-            HPEN pen = CreatePen(PS_SOLID, 2, RGB(66, 76, 92));
+            FillRectColor(dc, minR.left, minR.top, minR.right - minR.left, minR.bottom - minR.top,
+                hoverMin ? RGB(232, 236, 242) : RGB(249, 251, 254));
+            FillRectColor(dc, maxR.left, maxR.top, maxR.right - maxR.left, maxR.bottom - maxR.top,
+                hoverMax ? RGB(232, 236, 242) : RGB(249, 251, 254));
+            FillRectColor(dc, closeR.left, closeR.top, closeR.right - closeR.left, closeR.bottom - closeR.top,
+                hoverClose ? RGB(196, 43, 28) : RGB(249, 251, 254));
+
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(62, 70, 82));
             HGDIOBJ oldPen = SelectObject(dc, pen);
-            // Minimise: simple horizontal line
-            const int my = (minR.top + minR.bottom) / 2 + 6;
-            MoveToEx(dc, minR.left + 15, my, nullptr);
-            LineTo(dc, minR.right - 15, my);
-            // Maximise / restore: outline square(s)
-            RECT sq{ maxR.left + 15, maxR.top + 10, maxR.right - 15, maxR.bottom - 10 };
+            const int my = (minR.top + minR.bottom) / 2 + 5;
+            MoveToEx(dc, minR.left + 16, my, nullptr);
+            LineTo(dc, minR.right - 16, my);
+            RECT sq{ maxR.left + 16, maxR.top + 11, maxR.right - 16, maxR.bottom - 11 };
             if (win.maximized) {
-                Rectangle(dc, sq.left + 4, sq.top, sq.right, sq.bottom - 4);
-                Rectangle(dc, sq.left, sq.top + 4, sq.right - 4, sq.bottom);
-            }
-            else {
+                Rectangle(dc, sq.left + 3, sq.top, sq.right, sq.bottom - 3);
+                Rectangle(dc, sq.left, sq.top + 3, sq.right - 3, sq.bottom);
+            } else {
                 Rectangle(dc, sq.left, sq.top, sq.right, sq.bottom);
             }
             SelectObject(dc, oldPen);
             DeleteObject(pen);
 
-            HPEN closePen = CreatePen(PS_SOLID, 2, RGB(156, 50, 50));
+            HPEN closePen = CreatePen(PS_SOLID, 1, hoverClose ? RGB(255, 255, 255) : RGB(62, 70, 82));
             oldPen = SelectObject(dc, closePen);
-            MoveToEx(dc, closeR.left + 15, closeR.top + 11, nullptr);
-            LineTo(dc, closeR.right - 15, closeR.bottom - 11);
-            MoveToEx(dc, closeR.right - 15, closeR.top + 11, nullptr);
-            LineTo(dc, closeR.left + 15, closeR.bottom - 11);
+            MoveToEx(dc, closeR.left + 16, closeR.top + 12, nullptr);
+            LineTo(dc, closeR.right - 16, closeR.bottom - 12);
+            MoveToEx(dc, closeR.right - 16, closeR.top + 12, nullptr);
+            LineTo(dc, closeR.left + 16, closeR.bottom - 12);
             SelectObject(dc, oldPen);
             DeleteObject(closePen);
         }
@@ -4159,16 +4491,24 @@ namespace {
         }
 
         void DrawHeader(HDC dc, const RECT& c, const std::wstring&, const std::wstring& right = L"") {
-            // Action/status strip only. The window title is already shown in the title bar.
-            RoundRectColor(dc, c.left, c.top, c.right - c.left, 40, RGB(247, 250, 254), RGB(224, 230, 238), 10);
-            FillRectColor(dc, c.left + 1, c.top + 39, c.right - c.left - 2, 1, RGB(224, 230, 238));
-            if (!right.empty()) TextClipped(dc, RECT{ c.right - 220, c.top, c.right - 12, c.top + 40 }, right, 12, RGB(80, 92, 108), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            // Compact command strip, closer to current Windows utilities than a
+            // second card-like header inside every managed tool window.
+            FillRectColor(dc, c.left, c.top, c.right - c.left, 42, RGB(252, 253, 255));
+            FillRectColor(dc, c.left, c.top + 41, c.right - c.left, 1, RGB(226, 231, 237));
+            if (!right.empty()) {
+                TextClipped(dc, RECT{ c.right - 230, c.top, c.right - 12, c.top + 41 },
+                    right, 11, RGB(92, 103, 118), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            }
         }
 
         void DrawActionButton(HDC dc, const RECT& c, int index, const std::wstring& label) {
             RECT r = ActionButtonRect(c, index);
-            RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, RGB(248, 251, 255), RGB(196, 211, 232), 9);
-            TextClipped(dc, r, label, 12, RGB(25, 43, 66), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            POINT mouse{ mouseX_, mouseY_ };
+            const bool hover = PtInRect(&r, mouse) != 0;
+            RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                hover ? RGB(235, 242, 251) : RGB(252, 253, 255),
+                hover ? RGB(178, 199, 225) : RGB(221, 228, 237), 7);
+            TextClipped(dc, r, label, 11, RGB(35, 53, 76), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
 
@@ -4331,7 +4671,7 @@ namespace {
         bool shiftDown_ = false;
 
         const int taskbarH_ = 48;
-        const int titleH_ = 46;
+        const int titleH_ = 40;
 
         std::vector<POINT> iconPositions_;
         int selectedDesktopIcon_ = -1;
