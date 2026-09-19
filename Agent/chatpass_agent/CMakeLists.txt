@@ -267,6 +267,7 @@ target_link_libraries(native_vp8_stream PRIVATE
   shell32
   shlwapi
   dwmapi
+  uxtheme
   d2d1
   dwrite
 )

@@ -11,6 +11,8 @@
 #endif
 #include <windows.h>
 #include <dwmapi.h>
+#include <uxtheme.h>
+#include <vssym32.h>
 #include <shellapi.h>
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -47,6 +49,11 @@ namespace {
 
     void SignalHandler(int) {
         g_running.store(false);
+    }
+
+    HTHEME WindowThemeHandle() {
+        static HTHEME theme = OpenThemeData(GetDesktopWindow(), L"WINDOW");
+        return theme;
     }
 
     int EnvInt(const char* name, int fallback, int minValue, int maxValue) {
@@ -306,6 +313,8 @@ namespace {
         std::vector<std::wstring> lines;
         std::wstring noteText;
         std::wstring statusText;
+        std::wstring searchText;
+        bool searchFocused = false;
         DWORD lastActionTick = 0;
         std::shared_ptr<BackgroundJob> updateJob;
 
@@ -788,8 +797,7 @@ namespace {
 
             POINT pt{ x, y };
 
-            if (startMenuOpen_) {
-                if (HandleStartMenuClick(x, y)) return;
+            if (startMenuOpen_) {                if (HandleStartMenuClick(x, y)) return;
                 if (!PtInRect(&StartMenuRect(), pt) && !PtInRect(&StartRect(), pt)) {
                     startMenuOpen_ = false;
                     return;
@@ -1002,38 +1010,54 @@ namespace {
 
         void HandleWindowContentClick(BackstageWindow& win, int x, int y) {
             RECT c = ContentRect(win);
-            if (!PtInRect(&c, POINT{ x, y })) return;
+            POINT pt{ x, y };
+            if (!PtInRect(&c, pt)) return;
+
+            if (WindowSupportsSearch(win)) {
+                RECT search = WindowSearchRect(win, c);
+                if (PtInRect(&search, pt)) {
+                    win.searchFocused = true;
+                    win.scroll = 0;
+                    return;
+                }
+                win.searchFocused = false;
+            }
+
             if (HandleScrollbarClick(win, x, y)) return;
             if (HandleActionButtons(win, x, y)) return;
+
+            const std::vector<int> filtered = FilteredRowIndexes(win);
+            const int rowTop = WindowRowTop(win, c);
+            const int rowH = WindowRowH(win);
+            if (y < rowTop) return;
+            const int visibleIdx = (y - rowTop) / rowH;
+            const int filteredIdx = win.scroll + visibleIdx;
+            if (visibleIdx < 0 || filteredIdx < 0 || filteredIdx >= static_cast<int>(filtered.size())) return;
+            const int idx = filtered[static_cast<size_t>(filteredIdx)];
+
             if (win.kind == WindowKind::Files) {
-                const int rowTop = WindowRowTop(win, c);
-                const int rowH = WindowRowH(win);
-                const int visibleIdx = (y - rowTop) / rowH;
-                const int idx = win.scroll + visibleIdx;
-                if (visibleIdx >= 0 && idx >= 0 && idx < static_cast<int>(win.files.size())) {
+                if (idx >= 0 && idx < static_cast<int>(win.files.size())) {
                     win.selected = idx;
                     if (win.files[static_cast<size_t>(idx)].isDir) {
                         win.path = win.files[static_cast<size_t>(idx)].path;
+                        win.searchText.clear();
+                        win.searchFocused = false;
                         win.scroll = 0;
                         LoadFiles(win);
                     }
                 }
             }
             else if (win.kind == WindowKind::Services) {
-                const int rowTop = WindowRowTop(win, c);
-                const int rowH = WindowRowH(win);
-                const int visibleIdx = (y - rowTop) / rowH;
-                const int idx = win.scroll + visibleIdx;
-                if (visibleIdx >= 0 && idx >= 0 && idx < static_cast<int>(win.services.size())) win.selected = idx;
+                if (idx >= 0 && idx < static_cast<int>(win.services.size())) win.selected = idx;
             }
-            else if (win.kind == WindowKind::Processes || win.kind == WindowKind::Apps || win.kind == WindowKind::SystemInfo || win.kind == WindowKind::Sessions || win.kind == WindowKind::Events || win.kind == WindowKind::Updates || win.kind == WindowKind::Registry || win.kind == WindowKind::Devices || win.kind == WindowKind::Disks) {
-                const int rowTop = WindowRowTop(win, c);
-                const int rowH = WindowRowH(win);
-                const int visibleIdx = (y - rowTop) / rowH;
-                const int idx = win.scroll + visibleIdx;
-                if (visibleIdx >= 0 && idx >= 0 && idx < static_cast<int>(win.lines.size())) {
+            else if (win.kind == WindowKind::Processes || win.kind == WindowKind::Apps ||
+                win.kind == WindowKind::SystemInfo || win.kind == WindowKind::Sessions ||
+                win.kind == WindowKind::Events || win.kind == WindowKind::Updates ||
+                win.kind == WindowKind::Registry || win.kind == WindowKind::Devices ||
+                win.kind == WindowKind::Disks) {
+                if (idx >= 0 && idx < static_cast<int>(win.lines.size())) {
                     win.selected = idx;
-                    if (win.kind == WindowKind::Updates && idx >= 0 && idx < static_cast<int>(win.lines.size())) {
+                    if (win.kind == WindowKind::Updates) {
                         std::wstring& line = win.lines[static_cast<size_t>(idx)];
                         if (line.rfind(L"[ ] ", 0) == 0) { line.replace(0, 3, L"[x]"); return; }
                         if (line.rfind(L"[x] ", 0) == 0) { line.replace(0, 3, L"[ ]"); return; }
@@ -1089,10 +1113,73 @@ namespace {
         }
 
 
+        bool WindowSupportsSearch(const BackstageWindow& win) const {
+            return win.kind == WindowKind::Services ||
+                win.kind == WindowKind::Files ||
+                win.kind == WindowKind::Processes ||
+                win.kind == WindowKind::Apps ||
+                win.kind == WindowKind::SystemInfo ||
+                win.kind == WindowKind::Sessions ||
+                win.kind == WindowKind::Events ||
+                win.kind == WindowKind::Updates ||
+                win.kind == WindowKind::Registry ||
+                win.kind == WindowKind::Devices ||
+                win.kind == WindowKind::Disks;
+        }
+
+        RECT WindowSearchRect(const BackstageWindow& win, const RECT& c) const {
+            if (!WindowSupportsSearch(win)) return RECT{ 0, 0, 0, 0 };
+            const int right = c.right - 132;
+            const int left = std::max(c.left + 480, right - 238);
+            return RECT{ left, c.top + 8, right, c.top + 38 };
+        }
+
+        bool SearchContains(const std::wstring& haystack, const std::wstring& query) const {
+            if (query.empty()) return true;
+            return ToLower(haystack).find(ToLower(query)) != std::wstring::npos;
+        }
+
+        std::vector<int> FilteredRowIndexes(const BackstageWindow& win) const {
+            std::vector<int> out;
+            const std::wstring query = win.searchText;
+
+            if (win.kind == WindowKind::Services) {
+                for (size_t i = 0; i < win.services.size(); ++i) {
+                    const auto& row = win.services[i];
+                    const std::wstring blob = row.display + L" " + row.name + L" " +
+                        row.stateText + L" " + row.startTypeText;
+                    if (SearchContains(blob, query)) out.push_back(static_cast<int>(i));
+                }
+                return out;
+            }
+
+            if (win.kind == WindowKind::Files) {
+                for (size_t i = 0; i < win.files.size(); ++i) {
+                    const auto& row = win.files[i];
+                    if (SearchContains(row.name + L" " + row.path, query)) {
+                        out.push_back(static_cast<int>(i));
+                    }
+                }
+                return out;
+            }
+
+            if (win.kind == WindowKind::Apps) {
+                for (size_t i = 0; i < win.apps.size(); ++i) {
+                    const auto& row = win.apps[i];
+                    const std::wstring blob = row.name + L" " + row.publisher + L" " + row.version;
+                    if (SearchContains(blob, query)) out.push_back(static_cast<int>(i));
+                }
+                return out;
+            }
+
+            for (size_t i = 0; i < win.lines.size(); ++i) {
+                if (SearchContains(win.lines[i], query)) out.push_back(static_cast<int>(i));
+            }
+            return out;
+        }
+
         int WindowTotalRows(const BackstageWindow& win) const {
-            if (win.kind == WindowKind::Services) return static_cast<int>(win.services.size());
-            if (win.kind == WindowKind::Files) return static_cast<int>(win.files.size());
-            return static_cast<int>(win.lines.size());
+            return static_cast<int>(FilteredRowIndexes(win).size());
         }
 
         int WindowRowTop(const BackstageWindow& win, const RECT& c) const {
@@ -1509,8 +1596,7 @@ namespace {
                     if (PtInRect(&ActionButtonRect(c, 2), pt)) { SyncBackgroundJobs(); return true; }
                     return true;
                 }
-                if (PtInRect(&ActionButtonRect(c, 0), pt)) { StartWindowsUpdateScan(win); return true; }
-                if (PtInRect(&ActionButtonRect(c, 1), pt)) { StartWindowsUpdateInstall(win); return true; }
+                if (PtInRect(&ActionButtonRect(c, 0), pt)) { StartWindowsUpdateScan(win); return true; }                if (PtInRect(&ActionButtonRect(c, 1), pt)) { StartWindowsUpdateInstall(win); return true; }
                 if (PtInRect(&ActionButtonRect(c, 2), pt)) { RefreshWindowsUpdateView(win); return true; }
                 if (PtInRect(&ActionButtonRect(c, 3), pt)) { LoadWindowsUpdateHistory(win); return true; }
             }
@@ -1725,6 +1811,37 @@ namespace {
 
             BackstageWindow* win = ActiveWindow();
             if (!win || win->minimized) return;
+
+            if (win->searchFocused && WindowSupportsSearch(*win)) {
+                if (vk == VK_BACK) {
+                    if (!win->searchText.empty()) win->searchText.pop_back();
+                    win->scroll = 0;
+                    win->selected = -1;
+                    return;
+                }
+                if (vk == VK_ESCAPE) {
+                    if (!win->searchText.empty()) {
+                        win->searchText.clear();
+                        win->scroll = 0;
+                        win->selected = -1;
+                    } else {
+                        win->searchFocused = false;
+                    }
+                    return;
+                }
+                if (vk == VK_RETURN) {
+                    win->searchFocused = false;
+                    return;
+                }
+                const wchar_t ch = VkToTextChar(vk);
+                if (ch) {
+                    win->searchText.push_back(ch);
+                    win->scroll = 0;
+                    win->selected = -1;
+                }
+                return;
+            }
+
             if (win->kind == WindowKind::Terminal) {
                 if (vk == VK_BACK) {
                     if (!win->terminalInput.empty()) win->terminalInput.pop_back();
@@ -1780,6 +1897,20 @@ namespace {
 
             BackstageWindow* win = ActiveWindow();
             if (!win || win->minimized) return;
+
+            if (win->searchFocused && WindowSupportsSearch(*win)) {
+                for (wchar_t ch : text) {
+                    if (ch == L'\r') continue;
+                    if (ch == L'\n') {
+                        win->searchFocused = false;
+                        continue;
+                    }
+                    if (ch >= 32) win->searchText.push_back(ch);
+                }
+                win->scroll = 0;
+                win->selected = -1;
+                return;
+            }
 
             if (win->kind == WindowKind::Terminal) {
                 for (wchar_t ch : text) {
@@ -2264,8 +2395,7 @@ namespace {
                 out.assign(value);
             }
             if (value) WTSFreeMemory(value);
-            return out;
-        }
+            return out;        }
 
         void LoadSessions(BackstageWindow& win) {
             win.lines.clear();
@@ -3065,7 +3195,6 @@ namespace {
                     L"Maintenance desktop - apps run as SYSTEM", 11, RGB(160, 160, 160));
                 return;
             }
-
             RECT back = NativeMenuRowRect(0);
             FillRectColor(dc, back.left, back.top, back.right - back.left, back.bottom - back.top, RGB(39, 39, 39));
             TextClipped(dc, RECT{ back.left + 14, back.top, back.right - 12, back.bottom }, L"<  Back", 13, RGB(225, 225, 225), true);
@@ -3864,8 +3993,7 @@ namespace {
                                 OnMouseUp(mouseX_, mouseY_);
                                 nativeHybridPointerCaptured_ = false;
                                 break;
-                            }
-                        }
+                            }                        }
                     }
                     NativeMouseButton(cmd, mouseX_, mouseY_);
                     break;
@@ -4481,6 +4609,10 @@ namespace {
                 titleFill, active ? RGB(159, 181, 207) : RGB(196, 205, 217), radius);
 
             RECT title = TitleBarRect(win);
+            if (HTHEME theme = WindowThemeHandle()) {
+                DrawThemeBackground(theme, dc, WP_CAPTION, active ? CS_ACTIVE : CS_INACTIVE,
+                    &title, nullptr);
+            }
             FillRectColor(dc, title.left + 1, title.bottom - 1,
                 title.right - title.left - 2, 1, RGB(225, 230, 237));
 
@@ -4502,10 +4634,28 @@ namespace {
             const bool hoverMin = PtInRect(&minR, mouse) != 0;
             const bool hoverMax = PtInRect(&maxR, mouse) != 0;
             const bool hoverClose = PtInRect(&closeR, mouse) != 0;
-            const bool active = win.id == activeWindowId_;
-            const COLORREF base = active ? RGB(249, 251, 254) : RGB(246, 248, 251);
-            const COLORREF hover = RGB(232, 237, 243);
+            const bool pressedMin = mouseDown_ && hoverMin;
+            const bool pressedMax = mouseDown_ && hoverMax;
+            const bool pressedClose = mouseDown_ && hoverClose;
 
+            if (HTHEME theme = WindowThemeHandle()) {
+                const int minState = pressedMin ? MINBS_PUSHED : (hoverMin ? MINBS_HOT : MINBS_NORMAL);
+                const int maxState = pressedMax
+                    ? (win.maximized ? RBS_PUSHED : MAXBS_PUSHED)
+                    : (hoverMax
+                        ? (win.maximized ? RBS_HOT : MAXBS_HOT)
+                        : (win.maximized ? RBS_NORMAL : MAXBS_NORMAL));
+                const int closeState = pressedClose ? CBS_PUSHED : (hoverClose ? CBS_HOT : CBS_NORMAL);
+
+                DrawThemeBackground(theme, dc, WP_MINBUTTON, minState, &minR, nullptr);
+                DrawThemeBackground(theme, dc, win.maximized ? WP_RESTOREBUTTON : WP_MAXBUTTON,
+                    maxState, &maxR, nullptr);
+                DrawThemeBackground(theme, dc, WP_CLOSEBUTTON, closeState, &closeR, nullptr);
+                return;
+            }
+
+            const COLORREF base = win.id == activeWindowId_ ? RGB(249, 251, 254) : RGB(246, 248, 251);
+            const COLORREF hover = RGB(232, 237, 243);
             FillRectColor(dc, minR.left, minR.top, minR.right - minR.left, minR.bottom - minR.top,
                 hoverMin ? hover : base);
             FillRectColor(dc, maxR.left, maxR.top, maxR.right - maxR.left, maxR.bottom - maxR.top,
@@ -4516,28 +4666,24 @@ namespace {
             const COLORREF glyph = RGB(53, 61, 72);
             HPEN pen = CreatePen(PS_SOLID, 1, glyph);
             HGDIOBJ oldPen = SelectObject(dc, pen);
-
-            const int minY = minR.top + 22;
+            const int minY = (minR.top + minR.bottom) / 2 + 4;
             MoveToEx(dc, minR.left + 16, minY, nullptr);
             LineTo(dc, minR.right - 16, minY);
-
             if (win.maximized) {
-                Rectangle(dc, maxR.left + 18, maxR.top + 11, maxR.right - 14, maxR.bottom - 12);
-                Rectangle(dc, maxR.left + 14, maxR.top + 15, maxR.right - 18, maxR.bottom - 8);
+                Rectangle(dc, maxR.left + 18, maxR.top + 9, maxR.right - 14, maxR.bottom - 10);
+                Rectangle(dc, maxR.left + 14, maxR.top + 13, maxR.right - 18, maxR.bottom - 6);
             } else {
-                Rectangle(dc, maxR.left + 15, maxR.top + 12, maxR.right - 15, maxR.bottom - 11);
+                Rectangle(dc, maxR.left + 15, maxR.top + 10, maxR.right - 15, maxR.bottom - 9);
             }
-
             SelectObject(dc, oldPen);
             DeleteObject(pen);
 
-            HPEN closePen = CreatePen(PS_SOLID, 1,
-                hoverClose ? RGB(255, 255, 255) : glyph);
+            HPEN closePen = CreatePen(PS_SOLID, 1, hoverClose ? RGB(255, 255, 255) : glyph);
             oldPen = SelectObject(dc, closePen);
-            MoveToEx(dc, closeR.left + 16, closeR.top + 12, nullptr);
-            LineTo(dc, closeR.right - 16, closeR.bottom - 11);
-            MoveToEx(dc, closeR.right - 16, closeR.top + 12, nullptr);
-            LineTo(dc, closeR.left + 16, closeR.bottom - 11);
+            MoveToEx(dc, closeR.left + 16, closeR.top + 10, nullptr);
+            LineTo(dc, closeR.right - 16, closeR.bottom - 9);
+            MoveToEx(dc, closeR.right - 16, closeR.top + 10, nullptr);
+            LineTo(dc, closeR.left + 16, closeR.bottom - 9);
             SelectObject(dc, oldPen);
             DeleteObject(closePen);
         }
@@ -4558,13 +4704,176 @@ namespace {
             FillRectColor(dc, c.left, c.top + 45, c.right - c.left, 1, RGB(223, 229, 237));
 
             if (!right.empty()) {
-                const int pillW = std::min(220, std::max(120, static_cast<int>(right.size()) * 7 + 24));
+                const int pillW = 108;
                 RECT pill{ c.right - pillW - 12, c.top + 9, c.right - 12, c.top + 36 };
                 RoundRectColor(dc, pill.left, pill.top, pill.right - pill.left, pill.bottom - pill.top,
                     RGB(241, 246, 252), RGB(221, 229, 239), 10);
-                TextClipped(dc, RECT{ pill.left + 10, pill.top, pill.right - 10, pill.bottom },
+                TextClipped(dc, RECT{ pill.left + 8, pill.top, pill.right - 8, pill.bottom },
                     right, 10, RGB(82, 96, 114), false, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             }
+        }
+
+        void DrawWindowSearchBox(HDC dc, const BackstageWindow& win, const RECT& c) {
+            if (!WindowSupportsSearch(win)) return;
+            RECT r = WindowSearchRect(win, c);
+            if (r.right <= r.left) return;
+
+            const COLORREF border = win.searchFocused ? RGB(66, 139, 214) : RGB(213, 222, 233);
+            RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                RGB(255, 255, 255), border, 9);
+
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(102, 116, 134));
+            HGDIOBJ oldPen = SelectObject(dc, pen);
+            HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+            Ellipse(dc, r.left + 10, r.top + 8, r.left + 22, r.top + 20);
+            MoveToEx(dc, r.left + 20, r.top + 19, nullptr);
+            LineTo(dc, r.left + 25, r.top + 24);
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+            DeleteObject(pen);
+
+            std::wstring value = win.searchText.empty() ? L"Search" : win.searchText;
+            if (win.searchFocused) value += L"|";
+            TextClipped(dc, RECT{ r.left + 31, r.top, r.right - 8, r.bottom },
+                value, 11, win.searchText.empty() ? RGB(132, 143, 157) : RGB(37, 51, 69),
+                false, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+
+        enum class ListGlyph {
+            File, Folder, Process, App
+        };
+
+        void DrawListGlyph(HDC dc, ListGlyph glyph, int x, int cy) {
+            if (glyph == ListGlyph::Folder) {
+                HBRUSH fill = CreateSolidBrush(RGB(244, 191, 61));
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(194, 139, 26));
+                HGDIOBJ oldBrush = SelectObject(dc, fill);
+                HGDIOBJ oldPen = SelectObject(dc, pen);
+                Rectangle(dc, x, cy - 5, x + 17, cy + 7);
+                Rectangle(dc, x + 2, cy - 8, x + 9, cy - 4);
+                SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
+                DeleteObject(fill); DeleteObject(pen);
+                return;
+            }
+
+            if (glyph == ListGlyph::File) {
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(88, 120, 157));
+                HBRUSH fill = CreateSolidBrush(RGB(250, 252, 255));
+                HGDIOBJ oldBrush = SelectObject(dc, fill);
+                HGDIOBJ oldPen = SelectObject(dc, pen);
+                Rectangle(dc, x + 2, cy - 8, x + 15, cy + 8);
+                MoveToEx(dc, x + 10, cy - 8, nullptr); LineTo(dc, x + 15, cy - 3);
+                MoveToEx(dc, x + 10, cy - 8, nullptr); LineTo(dc, x + 10, cy - 3);
+                LineTo(dc, x + 15, cy - 3);
+                SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
+                DeleteObject(fill); DeleteObject(pen);
+                return;
+            }
+
+            const COLORREF fillColor = glyph == ListGlyph::Process ? RGB(70, 151, 222) : RGB(91, 113, 181);
+            HBRUSH fill = CreateSolidBrush(fillColor);
+            HPEN pen = CreatePen(PS_SOLID, 1, fillColor);
+            HGDIOBJ oldBrush = SelectObject(dc, fill);
+            HGDIOBJ oldPen = SelectObject(dc, pen);
+            RoundRect(dc, x, cy - 8, x + 17, cy + 9, 4, 4);
+            SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
+            DeleteObject(fill); DeleteObject(pen);
+
+            HPEN whitePen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+            oldPen = SelectObject(dc, whitePen);
+            if (glyph == ListGlyph::Process) {
+                MoveToEx(dc, x + 4, cy + 3, nullptr); LineTo(dc, x + 7, cy - 1);
+                LineTo(dc, x + 10, cy + 1); LineTo(dc, x + 14, cy - 5);
+            } else {
+                Rectangle(dc, x + 5, cy - 4, x + 12, cy + 4);
+            }
+            SelectObject(dc, oldPen);
+            DeleteObject(whitePen);
+        }
+
+        enum class ActionGlyph {
+            None, Play, Stop, Refresh, Home, Open, Plus, Delete, Search, Download, History        };
+
+        ActionGlyph GlyphForAction(const std::wstring& label) const {
+            if (label == L"Start") return ActionGlyph::Play;
+            if (label == L"Stop") return ActionGlyph::Stop;
+            if (label == L"Restart" || label == L"Refresh") return ActionGlyph::Refresh;
+            if (label == L"Home") return ActionGlyph::Home;
+            if (label == L"Open") return ActionGlyph::Open;
+            if (label == L"New folder" || label == L"New Key") return ActionGlyph::Plus;
+            if (label == L"Delete" || label == L"Delete Key" || label == L"End task" || label == L"Uninstall") return ActionGlyph::Delete;
+            if (label == L"Scan") return ActionGlyph::Search;
+            if (label == L"Install") return ActionGlyph::Download;
+            if (label == L"History") return ActionGlyph::History;
+            return ActionGlyph::None;
+        }
+
+        void DrawActionGlyph(HDC dc, ActionGlyph glyph, int cx, int cy, COLORREF color) {
+            HPEN pen = CreatePen(PS_SOLID, 1, color);
+            HGDIOBJ oldPen = SelectObject(dc, pen);
+            HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+
+            switch (glyph) {
+            case ActionGlyph::Play: {
+                POINT pts[3] = { {cx - 4, cy - 6}, {cx + 5, cy}, {cx - 4, cy + 6} };
+                HBRUSH brush = CreateSolidBrush(color);
+                HGDIOBJ prev = SelectObject(dc, brush);
+                Polygon(dc, pts, 3);
+                SelectObject(dc, prev);
+                DeleteObject(brush);
+                break;
+            }
+            case ActionGlyph::Stop: {
+                HBRUSH brush = CreateSolidBrush(color);
+                HGDIOBJ prev = SelectObject(dc, brush);
+                Rectangle(dc, cx - 5, cy - 5, cx + 5, cy + 5);
+                SelectObject(dc, prev);
+                DeleteObject(brush);
+                break;
+            }
+            case ActionGlyph::Refresh:
+                Arc(dc, cx - 7, cy - 7, cx + 7, cy + 7, cx + 6, cy - 4, cx - 4, cy - 6);
+                MoveToEx(dc, cx + 5, cy - 5, nullptr); LineTo(dc, cx + 7, cy - 1);
+                MoveToEx(dc, cx + 5, cy - 5, nullptr); LineTo(dc, cx + 1, cy - 5);
+                break;
+            case ActionGlyph::Home:
+                MoveToEx(dc, cx - 7, cy, nullptr); LineTo(dc, cx, cy - 7); LineTo(dc, cx + 7, cy);
+                Rectangle(dc, cx - 5, cy, cx + 5, cy + 7);
+                break;
+            case ActionGlyph::Open:
+                Rectangle(dc, cx - 7, cy - 5, cx + 4, cy + 6);
+                MoveToEx(dc, cx, cy - 7, nullptr); LineTo(dc, cx + 7, cy - 7); LineTo(dc, cx + 7, cy);
+                MoveToEx(dc, cx + 7, cy - 7, nullptr); LineTo(dc, cx - 1, cy + 1);
+                break;
+            case ActionGlyph::Plus:
+                MoveToEx(dc, cx - 6, cy, nullptr); LineTo(dc, cx + 6, cy);
+                MoveToEx(dc, cx, cy - 6, nullptr); LineTo(dc, cx, cy + 6);
+                break;
+            case ActionGlyph::Delete:
+                MoveToEx(dc, cx - 5, cy - 5, nullptr); LineTo(dc, cx + 5, cy + 5);
+                MoveToEx(dc, cx + 5, cy - 5, nullptr); LineTo(dc, cx - 5, cy + 5);
+                break;
+            case ActionGlyph::Search:
+                Ellipse(dc, cx - 6, cy - 6, cx + 4, cy + 4);
+                MoveToEx(dc, cx + 2, cy + 2, nullptr); LineTo(dc, cx + 7, cy + 7);
+                break;
+            case ActionGlyph::Download:
+                MoveToEx(dc, cx, cy - 7, nullptr); LineTo(dc, cx, cy + 3);
+                MoveToEx(dc, cx - 4, cy, nullptr); LineTo(dc, cx, cy + 4); LineTo(dc, cx + 4, cy);
+                MoveToEx(dc, cx - 6, cy + 7, nullptr); LineTo(dc, cx + 6, cy + 7);
+                break;
+            case ActionGlyph::History:
+                Ellipse(dc, cx - 7, cy - 7, cx + 7, cy + 7);
+                MoveToEx(dc, cx, cy, nullptr); LineTo(dc, cx, cy - 5);
+                MoveToEx(dc, cx, cy, nullptr); LineTo(dc, cx + 4, cy + 2);
+                break;
+            default:
+                break;
+            }
+
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+            DeleteObject(pen);
         }
 
         void DrawActionButton(HDC dc, const RECT& c, int index, const std::wstring& label) {
@@ -4572,32 +4881,32 @@ namespace {
             POINT mouse{ mouseX_, mouseY_ };
             const bool hover = PtInRect(&r, mouse) != 0;
 
-            std::wstring icon;
             COLORREF fill = RGB(255, 255, 255);
             COLORREF hoverFill = RGB(235, 243, 253);
             COLORREF border = RGB(221, 228, 237);
             COLORREF hoverBorder = RGB(150, 187, 226);
             COLORREF textColor = RGB(38, 57, 80);
 
-            if (label == L"Start") { icon = L"▶"; fill = RGB(245, 252, 247); hoverFill = RGB(228, 247, 235); textColor = RGB(26, 104, 62); }
-            else if (label == L"Stop") { icon = L"■"; fill = RGB(255, 248, 247); hoverFill = RGB(253, 234, 231); textColor = RGB(150, 57, 48); }
-            else if (label == L"Restart" || label == L"Refresh") { icon = L"↻"; }
-            else if (label == L"Home") { icon = L"⌂"; }
-            else if (label == L"Open") { icon = L"↗"; }
-            else if (label == L"New folder" || label == L"New Key") { icon = L"+"; fill = RGB(246, 250, 255); }
-            else if (label == L"Delete" || label == L"Delete Key" || label == L"End task" || label == L"Uninstall") {
-                icon = L"×"; fill = RGB(255, 248, 247); hoverFill = RGB(253, 234, 231); border = RGB(240, 221, 218); hoverBorder = RGB(224, 173, 166); textColor = RGB(151, 55, 46);
+            if (label == L"Start") { fill = RGB(245, 252, 247); hoverFill = RGB(228, 247, 235); textColor = RGB(26, 104, 62); }
+            else if (label == L"Stop" || label == L"Delete" || label == L"Delete Key" ||
+                label == L"End task" || label == L"Uninstall") {
+                fill = RGB(255, 248, 247); hoverFill = RGB(253, 234, 231);
+                border = RGB(240, 221, 218); hoverBorder = RGB(224, 173, 166);
+                textColor = RGB(151, 55, 46);
             }
-            else if (label == L"Scan") { icon = L"⌕"; }
-            else if (label == L"Install") { icon = L"↓"; fill = RGB(246, 250, 255); textColor = RGB(28, 88, 151); }
-            else if (label == L"History") { icon = L"◴"; }
+            else if (label == L"Install" || label == L"New folder" || label == L"New Key") {
+                fill = RGB(246, 250, 255); textColor = RGB(28, 88, 151);
+            }
 
             RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
                 hover ? hoverFill : fill, hover ? hoverBorder : border, 9);
 
-            const std::wstring display = icon.empty() ? label : (icon + L"  " + label);
-            TextClipped(dc, RECT{ r.left + 7, r.top, r.right - 7, r.bottom }, display,
-                11, textColor, false, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            const ActionGlyph glyph = GlyphForAction(label);
+            const bool hasGlyph = glyph != ActionGlyph::None;
+            if (hasGlyph) DrawActionGlyph(dc, glyph, r.left + 17, (r.top + r.bottom) / 2, textColor);
+
+            TextClipped(dc, RECT{ r.left + (hasGlyph ? 31 : 8), r.top, r.right - 8, r.bottom },
+                label, 11, textColor, false, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
 
 
@@ -4620,8 +4929,10 @@ namespace {
         }
 
         void DrawServices(HDC dc, const BackstageWindow& win, const RECT& c) {
-            DrawHeader(dc, c, L"Services", std::to_wstring(win.services.size()) + L" services");
+            const std::vector<int> filtered = FilteredRowIndexes(win);
+            DrawHeader(dc, c, L"Services", std::to_wstring(filtered.size()) + L" services");
             DrawActionButton(dc, c, 0, L"Start"); DrawActionButton(dc, c, 1, L"Stop"); DrawActionButton(dc, c, 2, L"Restart"); DrawActionButton(dc, c, 3, L"Refresh");
+            DrawWindowSearchBox(dc, win, c);
             const int rowTop = WindowRowTop(win, c);
             const int rowH = WindowRowH(win);
             FillRectColor(dc, c.left, rowTop - 30, c.right - c.left, 30, RGB(241, 245, 250));
@@ -4631,8 +4942,8 @@ namespace {
             TextClipped(dc, RECT{ c.right - 200, rowTop - 30, c.right - 20, rowTop }, L"Status", 11, RGB(72, 87, 106), true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
             const int visible = VisibleRows(c, rowTop, rowH);
             const int start = std::max(0, win.scroll);
-            for (int i = 0; i < visible && i + start < static_cast<int>(win.services.size()); ++i) {
-                const int rowIndex = i + start;
+            for (int i = 0; i < visible && i + start < static_cast<int>(filtered.size()); ++i) {
+                const int rowIndex = filtered[static_cast<size_t>(i + start)];
                 const int y = rowTop + i * rowH;
                 const ServiceRow& svc = win.services[static_cast<size_t>(rowIndex)];
                 COLORREF fill = (rowIndex == win.selected) ? RGB(219, 236, 255) : ((rowIndex % 2) ? RGB(250, 252, 255) : RGB(255, 255, 255));
@@ -4646,12 +4957,14 @@ namespace {
                     running ? RGB(144, 220, 176) : RGB(218, 190, 162), 10);
                 TextClipped(dc, pill, svc.stateText, 11, running ? RGB(16, 112, 66) : RGB(126, 75, 42), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
-            DrawScrollbar(dc, c, static_cast<int>(win.services.size()), visible, win.scroll);
+            DrawScrollbar(dc, c, static_cast<int>(filtered.size()), visible, win.scroll);
         }
 
         void DrawFiles(HDC dc, const BackstageWindow& win, const RECT& c) {
-            DrawHeader(dc, c, L"File Explorer", std::to_wstring(win.files.size()) + L" items");
+            const std::vector<int> filtered = FilteredRowIndexes(win);
+            DrawHeader(dc, c, L"File Explorer", std::to_wstring(filtered.size()) + L" items");
             DrawActionButton(dc, c, 0, L"Open"); DrawActionButton(dc, c, 1, L"Delete"); DrawActionButton(dc, c, 2, L"New folder"); DrawActionButton(dc, c, 3, L"Refresh");
+            DrawWindowSearchBox(dc, win, c);
 
             RECT pathBar{ c.left + 12, c.top + 50, c.right - 12, c.top + 80 };
             RoundRectColor(dc, pathBar.left, pathBar.top, pathBar.right - pathBar.left, pathBar.bottom - pathBar.top,
@@ -4668,15 +4981,17 @@ namespace {
 
             const int visible = VisibleRows(c, rowTop, rowH);
             const int start = std::max(0, win.scroll);
-            for (int i = 0; i < visible && i + start < static_cast<int>(win.files.size()); ++i) {
-                const int rowIndex = i + start;
+            for (int i = 0; i < visible && i + start < static_cast<int>(filtered.size()); ++i) {
+                const int rowIndex = filtered[static_cast<size_t>(i + start)];
                 const int y = rowTop + i * rowH;
                 const FileRow& f = win.files[static_cast<size_t>(rowIndex)];
                 COLORREF fill = (rowIndex == win.selected) ? RGB(222, 238, 255) : RGB(255, 255, 255);
                 FillRectColor(dc, c.left, y, c.right - c.left, rowH, fill);
                 FillRectColor(dc, c.left, y + rowH - 1, c.right - c.left, 1, RGB(235, 239, 244));
 
-                TextClipped(dc, RECT{ c.left + 16, y, c.right - 300, y + rowH }, f.name, 12, RGB(30, 42, 58));
+                DrawListGlyph(dc, f.isDir ? ListGlyph::Folder : ListGlyph::File,
+                    c.left + 14, y + rowH / 2);
+                TextClipped(dc, RECT{ c.left + 40, y, c.right - 300, y + rowH }, f.name, 12, RGB(30, 42, 58));
                 TextClipped(dc, RECT{ c.right - 280, y, c.right - 155, y + rowH },
                     f.isDir ? L"Folder" : L"File", 11, f.isDir ? RGB(157, 103, 18) : RGB(84, 99, 118));
                 if (!f.isDir) {
@@ -4684,17 +4999,19 @@ namespace {
                         11, RGB(84, 99, 118), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
                 }
             }
-            DrawScrollbar(dc, c, static_cast<int>(win.files.size()), visible, win.scroll);
+            DrawScrollbar(dc, c, static_cast<int>(filtered.size()), visible, win.scroll);
         }
 
         void DrawLines(HDC dc, const BackstageWindow& win, const RECT& c) {
-            DrawHeader(dc, c, win.title, std::to_wstring(win.lines.size()) + L" rows");
+            const std::vector<int> filtered = FilteredRowIndexes(win);
+            DrawHeader(dc, c, win.title, std::to_wstring(filtered.size()) + L" rows");
             if (win.kind == WindowKind::Processes) { DrawActionButton(dc, c, 0, L"End task"); DrawActionButton(dc, c, 1, L"Refresh"); }
             if (win.kind == WindowKind::Apps) { DrawActionButton(dc, c, 0, L"Uninstall"); DrawActionButton(dc, c, 1, L"Refresh"); }
             if (win.kind == WindowKind::Updates) { DrawActionButton(dc, c, 0, L"Scan"); DrawActionButton(dc, c, 1, L"Install"); DrawActionButton(dc, c, 2, L"Refresh"); DrawActionButton(dc, c, 3, L"History"); }
             if (win.kind == WindowKind::Events) { DrawActionButton(dc, c, 0, L"Home"); DrawActionButton(dc, c, 1, L"Refresh"); }
             if (win.kind == WindowKind::Sessions || win.kind == WindowKind::Devices || win.kind == WindowKind::Disks) { DrawActionButton(dc, c, 0, L"Refresh"); }
             if (win.kind == WindowKind::Registry) { DrawActionButton(dc, c, 0, L"Home"); DrawActionButton(dc, c, 1, L"New Key"); DrawActionButton(dc, c, 2, L"Delete Key"); DrawActionButton(dc, c, 3, L"Refresh"); }
+            DrawWindowSearchBox(dc, win, c);
 
             const int y0 = WindowRowTop(win, c);
             const int lineH = WindowRowH(win);
@@ -4718,8 +5035,8 @@ namespace {
 
             const int visible = VisibleRows(c, y0, lineH);
             const int start = std::max(0, win.scroll);
-            for (int i = 0; i < visible && i + start < static_cast<int>(win.lines.size()); ++i) {
-                const int rowIndex = i + start;
+            for (int i = 0; i < visible && i + start < static_cast<int>(filtered.size()); ++i) {
+                const int rowIndex = filtered[static_cast<size_t>(i + start)];
                 const int y = y0 + i * lineH;
                 const std::wstring& line = win.lines[static_cast<size_t>(rowIndex)];
                 COLORREF fill = (rowIndex == win.selected) ? RGB(222, 238, 255) : RGB(255, 255, 255);
@@ -4747,14 +5064,16 @@ namespace {
                         threads = memSep == std::wstring::npos ? detail : detail.substr(0, memSep);
                         if (memSep != std::wstring::npos) memory = detail.substr(memSep + 4);
                     }
-                    TextClipped(dc, RECT{ c.left + 16, y, c.right - 360, y + lineH }, name, 12, RGB(30, 42, 58));
+                    DrawListGlyph(dc, ListGlyph::Process, c.left + 14, y + lineH / 2);
+                    TextClipped(dc, RECT{ c.left + 40, y, c.right - 360, y + lineH }, name, 12, RGB(30, 42, 58));
                     TextClipped(dc, RECT{ c.right - 345, y, c.right - 265, y + lineH }, pid, 11, RGB(80, 94, 112), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
                     TextClipped(dc, RECT{ c.right - 250, y, c.right - 145, y + lineH }, threads, 11, RGB(80, 94, 112), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
                     TextClipped(dc, RECT{ c.right - 130, y, c.right - 20, y + lineH }, memory, 11, RGB(80, 94, 112), false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
                 }
                 else if (appTable && rowIndex < static_cast<int>(win.apps.size())) {
                     const AppRow& app = win.apps[static_cast<size_t>(rowIndex)];
-                    TextClipped(dc, RECT{ c.left + 16, y, c.right - 450, y + lineH }, app.name, 12, RGB(30, 42, 58));
+                    DrawListGlyph(dc, ListGlyph::App, c.left + 14, y + lineH / 2);
+                    TextClipped(dc, RECT{ c.left + 40, y, c.right - 450, y + lineH }, app.name, 12, RGB(30, 42, 58));
                     TextClipped(dc, RECT{ c.right - 435, y, c.right - 315, y + lineH }, app.version, 11, RGB(80, 94, 112));
                     TextClipped(dc, RECT{ c.right - 300, y, c.right - 130, y + lineH }, app.publisher, 11, RGB(80, 94, 112));
                     const std::wstring removal = !app.quietUninstall.empty() ? L"Silent" : (!app.uninstall.empty() ? L"Blocked" : L"None");
@@ -4769,7 +5088,7 @@ namespace {
                         section ? 11 : 12, section ? RGB(62, 78, 98) : RGB(38, 50, 67), section);
                 }
             }
-            DrawScrollbar(dc, c, static_cast<int>(win.lines.size()), visible, win.scroll);
+            DrawScrollbar(dc, c, static_cast<int>(filtered.size()), visible, win.scroll);
         }
 
         void DrawTerminal(HDC dc, const BackstageWindow& win, const RECT& c) {

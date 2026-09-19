@@ -337,23 +337,36 @@ void DrawBrowserButton(const DRAWITEMSTRUCT* dis) {
     DeleteObject(brush);
     DeleteObject(pen);
 
-    const wchar_t* glyph = L"•";
-    if (dis->CtlID == IDC_BROWSER_BACK) glyph = L"←";
-    else if (dis->CtlID == IDC_BROWSER_FORWARD) glyph = L"→";
-    else if (dis->CtlID == IDC_BROWSER_HOME) glyph = L"⌂";
-    else if (dis->CtlID == IDC_BROWSER_REFRESH) glyph = L"↻";
-    else if (dis->CtlID == IDC_BROWSER_GO) glyph = L"→";
+    const int cx = (rc.left + rc.right) / 2;
+    const int cy = (rc.top + rc.bottom) / 2;
+    HPEN glyphPen = CreatePen(PS_SOLID, 2, textColor);
+    HGDIOBJ oldGlyphPen = SelectObject(dis->hDC, glyphPen);
+    HGDIOBJ oldGlyphBrush = SelectObject(dis->hDC, GetStockObject(HOLLOW_BRUSH));
 
-    HFONT font = CreateFontW(-19, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Symbol");
-    HGDIOBJ oldFont = SelectObject(dis->hDC, font);
-    SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, textColor);
-    RECT textRect = rc;
-    DrawTextW(dis->hDC, glyph, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(dis->hDC, oldFont);
-    DeleteObject(font);
+    if (dis->CtlID == IDC_BROWSER_BACK) {
+        MoveToEx(dis->hDC, cx + 6, cy, nullptr); LineTo(dis->hDC, cx - 6, cy);
+        MoveToEx(dis->hDC, cx - 6, cy, nullptr); LineTo(dis->hDC, cx - 1, cy - 5);
+        MoveToEx(dis->hDC, cx - 6, cy, nullptr); LineTo(dis->hDC, cx - 1, cy + 5);
+    }
+    else if (dis->CtlID == IDC_BROWSER_FORWARD || dis->CtlID == IDC_BROWSER_GO) {
+        MoveToEx(dis->hDC, cx - 6, cy, nullptr); LineTo(dis->hDC, cx + 6, cy);
+        MoveToEx(dis->hDC, cx + 6, cy, nullptr); LineTo(dis->hDC, cx + 1, cy - 5);
+        MoveToEx(dis->hDC, cx + 6, cy, nullptr); LineTo(dis->hDC, cx + 1, cy + 5);
+    }
+    else if (dis->CtlID == IDC_BROWSER_HOME) {
+        MoveToEx(dis->hDC, cx - 7, cy - 1, nullptr); LineTo(dis->hDC, cx, cy - 7); LineTo(dis->hDC, cx + 7, cy - 1);
+        MoveToEx(dis->hDC, cx - 5, cy - 2, nullptr); LineTo(dis->hDC, cx - 5, cy + 6);
+        LineTo(dis->hDC, cx + 5, cy + 6); LineTo(dis->hDC, cx + 5, cy - 2);
+    }
+    else if (dis->CtlID == IDC_BROWSER_REFRESH) {
+        Arc(dis->hDC, cx - 7, cy - 7, cx + 7, cy + 7, cx + 6, cy - 4, cx - 4, cy - 6);
+        MoveToEx(dis->hDC, cx + 5, cy - 5, nullptr); LineTo(dis->hDC, cx + 7, cy - 1);
+        MoveToEx(dis->hDC, cx + 5, cy - 5, nullptr); LineTo(dis->hDC, cx + 1, cy - 5);
+    }
+
+    SelectObject(dis->hDC, oldGlyphBrush);
+    SelectObject(dis->hDC, oldGlyphPen);
+    DeleteObject(glyphPen);
 
     if (focused && !disabled) {
         RECT focus = rc;
@@ -784,8 +797,7 @@ namespace hi5 {
 
 int RunBackstageBrowserMain(int argc, char** argv) {
     LogInfo("[backstage-browser] process start");
-    if (auto url = GetArgValue(argc, argv, "--url")) {
-        g_initialUrl = NormaliseUrl(Utf8ToWide(*url));
+    if (auto url = GetArgValue(argc, argv, "--url")) {        g_initialUrl = NormaliseUrl(Utf8ToWide(*url));
     }
 
     HRESULT ole = OleInitialize(nullptr);
