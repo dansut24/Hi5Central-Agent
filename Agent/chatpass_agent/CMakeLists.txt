@@ -318,7 +318,7 @@ if(WIN32)
     ${WEBVIEW2_LOADER_STATIC}
     nlohmann_json::nlohmann_json Threads::Threads
     d3d11 dxgi windowscodecs advapi32 user32 gdi32 shell32 shlwapi
-    ole32 oleaut32 uuid wtsapi32 userenv psapi dwmapi
+    ole32 oleaut32 uuid wtsapi32 userenv psapi dwmapi uxtheme
   )
   set_target_properties(hi5central_remote_host PROPERTIES OUTPUT_NAME "Hi5CentralRemoteHost")
 
