@@ -998,18 +998,20 @@ function updateDesktopModeButtons() {
   const connected = !!currentSession;
   const pending = !!desktopModePending;
   const backstageActive = activeDesktopMode === "backstage";
+  const lockedMode = normalizeDesktopMode(currentSession?.launchMode || activeDesktopMode);
+  const backstageSession = lockedMode === "backstage";
 
   if (elBtnBackstage) {
+    elBtnBackstage.hidden = connected && !backstageSession;
     elBtnBackstage.classList.toggle("session-toggle-active", backstageActive);
-    elBtnBackstage.disabled = !connected || pending || backstageActive;
-    elBtnBackstage.title = backstageActive ? "Background Desktop active" : "Switch to Background Desktop";
+    elBtnBackstage.disabled = !connected || pending || true;
+    elBtnBackstage.title = backstageSession ? "Background Desktop session" : "Background Desktop is not authorised for this session";
   }
   if (elBtnConsole) {
+    elBtnConsole.hidden = connected && backstageSession;
     elBtnConsole.classList.toggle("session-toggle-active", !backstageActive);
-    elBtnConsole.disabled = !connected || pending || !backstageActive || backgroundModeLocked;
-    elBtnConsole.title = backgroundModeLocked
-      ? "This session was launched in Background Mode"
-      : (!backstageActive ? "Console Desktop active" : "Return to Console Desktop");
+    elBtnConsole.disabled = !connected || pending || true;
+    elBtnConsole.title = backstageSession ? "Console Desktop is not authorised for this session" : "Console Desktop session";
   }
   if (elBtnStartMenu) {
     elBtnStartMenu.disabled = !connected || pending;
@@ -1211,6 +1213,11 @@ function sendBackstageMode(enabled) {
   if (!currentSession) return false;
 
   const targetMode = enabled ? "backstage" : "console";
+  const launchMode = normalizeDesktopMode(currentSession.launchMode || activeDesktopMode);
+  if (targetMode !== launchMode) {
+    console.warn("[viewer] immutable remote session mode rejected switch", { launchMode, targetMode });
+    return false;
+  }
   if (!enabled && backgroundModeLocked) return false;
   if (!desktopModePending && activeDesktopMode === targetMode) return false;
 

@@ -7329,6 +7329,11 @@ exit 1
                     return;
                 }
                 SessionContext& ctx = *it->second;
+                if (ctx.sessionMode == SessionMode::Console) {
+                    LogW("backstage_start rejected for immutable console session=" + sessionId);
+                    SendSessionStateDirect(ctx, "console_ready");
+                    return;
+                }
                 if (ctx.backstageMode && ctx.backstageHostProcess) {
                     SendSessionStateDirect(ctx, "backstage_ready");
                     return;
