@@ -797,8 +797,7 @@ namespace {
                 return;
             }
 
-            if (PtInRect(&StartRect(), pt)) {
-                startMenuOpen_ = true;
+            if (PtInRect(&StartRect(), pt)) {                startMenuOpen_ = true;
                 startSearch_.clear();
                 focusStartSearch_ = true;
                 return;
@@ -1478,7 +1477,8 @@ namespace {
         }
 
         RECT ActionButtonRect(const RECT& c, int index) const {
-            return RECT{ c.left + 12 + index * 92, c.top + 8, c.left + 94 + index * 92, c.top + 36 };
+            const int left = c.left + 12 + index * 114;
+            return RECT{ left, c.top + 8, left + 104, c.top + 38 };
         }
 
         bool HandleActionButtons(BackstageWindow& win, int x, int y) {
@@ -1596,8 +1596,7 @@ namespace {
             const std::wstring child = row.substr(6);
             LONG rc = RegDeleteTreeW(key, child.c_str());
             RegCloseKey(key); LoadRegistry(win);
-            win.lines.insert(win.lines.begin(), rc == ERROR_SUCCESS ? (L"Deleted key: " + child) : (L"Delete failed: " + child + L" error=" + std::to_wstring(rc)));
-        }
+            win.lines.insert(win.lines.begin(), rc == ERROR_SUCCESS ? (L"Deleted key: " + child) : (L"Delete failed: " + child + L" error=" + std::to_wstring(rc)));        }
 
         void ServiceControlSelected(BackstageWindow& win, DWORD control, const std::wstring& action) {
             if (win.selected < 0 || win.selected >= static_cast<int>(win.services.size())) return;
@@ -2396,8 +2395,7 @@ namespace {
         void LoadExperimental(BackstageWindow& win) {
             win.lines = {
                 L"Experimental Native Apps",
-                L"These attempt to launch real Windows tools. Rendering in Backstage may be unreliable without a virtual display backend.",
-                L"",
+                L"These attempt to launch real Windows tools. Rendering in Backstage may be unreliable without a virtual display backend.",                L"",
                 L"1. Services MMC  - services.msc",
                 L"2. Computer Management - compmgmt.msc",
                 L"3. Device Manager - devmgmt.msc",
@@ -3196,7 +3194,6 @@ namespace {
                 TextClipped(dc, RECT{ d.left + 22, d.top + 112, d.right - 220, d.bottom - 16 },
                     nativeRunStatus_, 10, RGB(245, 170, 90), false, DT_LEFT | DT_TOP | DT_WORDBREAK);
             }
-
             RECT ok = NativeRunOkRect();
             RECT cancel = NativeRunCancelRect();
             RoundRectColor(dc, ok.left, ok.top, ok.right - ok.left, ok.bottom - ok.top, RGB(0, 103, 192), RGB(0, 103, 192), 6);
@@ -3996,8 +3993,7 @@ namespace {
                 LogInfo("[backstage] native hwnd detected title=" + WideToUtf8(win.title) +
                     " pid=" + std::to_string(win.nativePid) +
                     " hwnd=0x" + PtrToHex(reinterpret_cast<uintptr_t>(win.nativeHwnd)));
-            }
-        }
+            }        }
 
         void PlaceNativeWindow(BackstageWindow& win, const RECT& content) {
             if (!win.nativeHwnd || !IsWindow(win.nativeHwnd)) return;
@@ -4474,25 +4470,29 @@ namespace {
             const bool active = win.id == activeWindowId_;
             const int ww = win.rect.right - win.rect.left;
             const int wh = win.rect.bottom - win.rect.top;
+            const int radius = win.maximized ? 0 : 8;
 
-            // Reference-style Windows 11 frame: a soft offset shadow, restrained
-            // active border, compact title bar and clean white application surface.
             if (!win.maximized) {
-                RoundRectColor(dc, win.rect.left + 6, win.rect.top + 7, ww, wh,
-                    RGB(33, 52, 77), RGB(33, 52, 77), 12);
+                RoundRectColor(dc, win.rect.left + 5, win.rect.top + 6, ww, wh,
+                    RGB(52, 67, 86), RGB(52, 67, 86), 9);
             }
+            const COLORREF titleFill = active ? RGB(249, 251, 254) : RGB(246, 248, 251);
             RoundRectColor(dc, win.rect.left, win.rect.top, ww, wh,
-                RGB(252, 253, 255), active ? RGB(147, 181, 219) : RGB(186, 198, 214), 12);
+                titleFill, active ? RGB(159, 181, 207) : RGB(196, 205, 217), radius);
 
             RECT title = TitleBarRect(win);
-            FillRectColor(dc, title.left + 1, title.top + 1, title.right - title.left - 2, title.bottom - title.top - 1,
-                active ? RGB(249, 251, 254) : RGB(246, 248, 251));
-            FillRectColor(dc, title.left + 1, title.bottom - 1, title.right - title.left - 2, 1, RGB(224, 229, 236));
+            FillRectColor(dc, title.left + 1, title.bottom - 1,
+                title.right - title.left - 2, 1, RGB(225, 230, 237));
 
             const ToolSpec* spec = FindToolSpec(win.toolId);
-            if (spec) DrawIconFromFile(dc, spec->iconPath ? spec->iconPath : L"", title.left + 12, title.top + 8, 22);
-            TextClipped(dc, RECT{ title.left + 42, title.top, title.right - 146, title.bottom },
-                win.title, 14, RGB(28, 38, 52), true, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            if (spec) {
+                DrawIconFromFile(dc, spec->iconPath ? spec->iconPath : L"",
+                    title.left + 10, title.top + 9, 18);
+            }
+            TextClipped(dc, RECT{ title.left + 35, title.top, title.right - 142, title.bottom },
+                win.title, 12, active ? RGB(31, 40, 53) : RGB(79, 88, 101), false,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
             DrawCaptionButtons(dc, win);
         }
 
@@ -4502,35 +4502,42 @@ namespace {
             const bool hoverMin = PtInRect(&minR, mouse) != 0;
             const bool hoverMax = PtInRect(&maxR, mouse) != 0;
             const bool hoverClose = PtInRect(&closeR, mouse) != 0;
+            const bool active = win.id == activeWindowId_;
+            const COLORREF base = active ? RGB(249, 251, 254) : RGB(246, 248, 251);
+            const COLORREF hover = RGB(232, 237, 243);
 
             FillRectColor(dc, minR.left, minR.top, minR.right - minR.left, minR.bottom - minR.top,
-                hoverMin ? RGB(232, 236, 242) : RGB(249, 251, 254));
+                hoverMin ? hover : base);
             FillRectColor(dc, maxR.left, maxR.top, maxR.right - maxR.left, maxR.bottom - maxR.top,
-                hoverMax ? RGB(232, 236, 242) : RGB(249, 251, 254));
+                hoverMax ? hover : base);
             FillRectColor(dc, closeR.left, closeR.top, closeR.right - closeR.left, closeR.bottom - closeR.top,
-                hoverClose ? RGB(196, 43, 28) : RGB(249, 251, 254));
+                hoverClose ? RGB(196, 43, 28) : base);
 
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(62, 70, 82));
+            const COLORREF glyph = RGB(53, 61, 72);
+            HPEN pen = CreatePen(PS_SOLID, 1, glyph);
             HGDIOBJ oldPen = SelectObject(dc, pen);
-            const int my = (minR.top + minR.bottom) / 2 + 5;
-            MoveToEx(dc, minR.left + 16, my, nullptr);
-            LineTo(dc, minR.right - 16, my);
-            RECT sq{ maxR.left + 16, maxR.top + 11, maxR.right - 16, maxR.bottom - 11 };
+
+            const int minY = minR.top + 22;
+            MoveToEx(dc, minR.left + 16, minY, nullptr);
+            LineTo(dc, minR.right - 16, minY);
+
             if (win.maximized) {
-                Rectangle(dc, sq.left + 3, sq.top, sq.right, sq.bottom - 3);
-                Rectangle(dc, sq.left, sq.top + 3, sq.right - 3, sq.bottom);
+                Rectangle(dc, maxR.left + 18, maxR.top + 11, maxR.right - 14, maxR.bottom - 12);
+                Rectangle(dc, maxR.left + 14, maxR.top + 15, maxR.right - 18, maxR.bottom - 8);
             } else {
-                Rectangle(dc, sq.left, sq.top, sq.right, sq.bottom);
+                Rectangle(dc, maxR.left + 15, maxR.top + 12, maxR.right - 15, maxR.bottom - 11);
             }
+
             SelectObject(dc, oldPen);
             DeleteObject(pen);
 
-            HPEN closePen = CreatePen(PS_SOLID, 1, hoverClose ? RGB(255, 255, 255) : RGB(62, 70, 82));
+            HPEN closePen = CreatePen(PS_SOLID, 1,
+                hoverClose ? RGB(255, 255, 255) : glyph);
             oldPen = SelectObject(dc, closePen);
             MoveToEx(dc, closeR.left + 16, closeR.top + 12, nullptr);
-            LineTo(dc, closeR.right - 16, closeR.bottom - 12);
+            LineTo(dc, closeR.right - 16, closeR.bottom - 11);
             MoveToEx(dc, closeR.right - 16, closeR.top + 12, nullptr);
-            LineTo(dc, closeR.left + 16, closeR.bottom - 12);
+            LineTo(dc, closeR.left + 16, closeR.bottom - 11);
             SelectObject(dc, oldPen);
             DeleteObject(closePen);
         }
@@ -4564,12 +4571,33 @@ namespace {
             RECT r = ActionButtonRect(c, index);
             POINT mouse{ mouseX_, mouseY_ };
             const bool hover = PtInRect(&r, mouse) != 0;
-            const COLORREF fill = hover ? RGB(235, 243, 253) : RGB(255, 255, 255);
-            const COLORREF border = hover ? RGB(154, 190, 229) : RGB(226, 232, 240);
+
+            std::wstring icon;
+            COLORREF fill = RGB(255, 255, 255);
+            COLORREF hoverFill = RGB(235, 243, 253);
+            COLORREF border = RGB(221, 228, 237);
+            COLORREF hoverBorder = RGB(150, 187, 226);
+            COLORREF textColor = RGB(38, 57, 80);
+
+            if (label == L"Start") { icon = L"▶"; fill = RGB(245, 252, 247); hoverFill = RGB(228, 247, 235); textColor = RGB(26, 104, 62); }
+            else if (label == L"Stop") { icon = L"■"; fill = RGB(255, 248, 247); hoverFill = RGB(253, 234, 231); textColor = RGB(150, 57, 48); }
+            else if (label == L"Restart" || label == L"Refresh") { icon = L"↻"; }
+            else if (label == L"Home") { icon = L"⌂"; }
+            else if (label == L"Open") { icon = L"↗"; }
+            else if (label == L"New folder" || label == L"New Key") { icon = L"+"; fill = RGB(246, 250, 255); }
+            else if (label == L"Delete" || label == L"Delete Key" || label == L"End task" || label == L"Uninstall") {
+                icon = L"×"; fill = RGB(255, 248, 247); hoverFill = RGB(253, 234, 231); border = RGB(240, 221, 218); hoverBorder = RGB(224, 173, 166); textColor = RGB(151, 55, 46);
+            }
+            else if (label == L"Scan") { icon = L"⌕"; }
+            else if (label == L"Install") { icon = L"↓"; fill = RGB(246, 250, 255); textColor = RGB(28, 88, 151); }
+            else if (label == L"History") { icon = L"◴"; }
+
             RoundRectColor(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
-                fill, border, 7);
-            TextClipped(dc, r, label, 11, RGB(36, 55, 78), false,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                hover ? hoverFill : fill, hover ? hoverBorder : border, 9);
+
+            const std::wstring display = icon.empty() ? label : (icon + L"  " + label);
+            TextClipped(dc, RECT{ r.left + 7, r.top, r.right - 7, r.bottom }, display,
+                11, textColor, false, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
 
 
@@ -4764,8 +4792,7 @@ namespace {
 
         void DrawNotepad(HDC dc, const BackstageWindow& win, const RECT& c) {
             RoundRectColor(dc, c.left, c.top, c.right - c.left, c.bottom - c.top, RGB(255, 255, 252), RGB(225, 228, 235), 10);
-            RECT text{ c.left + 14, c.top + 12, c.right - 14, c.bottom - 12 };
-            TextClipped(dc, text, win.noteText.empty() ? L"Start typing..." : win.noteText + L"_", 14, win.noteText.empty() ? RGB(120, 126, 135) : RGB(20, 28, 40), false, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            RECT text{ c.left + 14, c.top + 12, c.right - 14, c.bottom - 12 };            TextClipped(dc, text, win.noteText.empty() ? L"Start typing..." : win.noteText + L"_", 14, win.noteText.empty() ? RGB(120, 126, 135) : RGB(20, 28, 40), false, DT_LEFT | DT_TOP | DT_WORDBREAK);
         }
 
         void DrawSynthetic() {
@@ -4811,7 +4838,7 @@ namespace {
         bool shiftDown_ = false;
 
         const int taskbarH_ = 48;
-        const int titleH_ = 40;
+        const int titleH_ = 34;
 
         std::vector<POINT> iconPositions_;
         int selectedDesktopIcon_ = -1;

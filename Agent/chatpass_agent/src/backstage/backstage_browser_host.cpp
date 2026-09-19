@@ -39,8 +39,6 @@ ComPtr<ICoreWebView2Controller> g_controller;
 ComPtr<ICoreWebView2> g_webview;
 
 constexpr int kToolbarHeight = 52;
-constexpr int kButtonWidth = 72;
-constexpr int kToolbarGap = 6;
 constexpr UINT_PTR kWebViewInitTimerId = 5201;
 
 enum BrowserControlId {
@@ -277,40 +275,123 @@ LRESULT CALLBACK AddressWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         : DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+HFONT BrowserUiFont() {
+    static HFONT font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    return font;
+}
+
 void ApplyUiFont(HWND hwnd) {
     if (!hwnd) return;
-    HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(BrowserUiFont()), TRUE);
+}
+
+HBRUSH BrowserToolbarBrush() {
+    static HBRUSH brush = CreateSolidBrush(RGB(248, 250, 253));
+    return brush;
+}
+
+void ApplyRoundedRegion(HWND hwnd, int width, int height, int radius) {
+    if (!hwnd || width <= 0 || height <= 0) return;
+    HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
+    if (!region) return;
+    if (!SetWindowRgn(hwnd, region, TRUE)) DeleteObject(region);
+}
+
+void DrawBrowserButton(const DRAWITEMSTRUCT* dis) {
+    if (!dis || !dis->hDC) return;
+
+    RECT rc = dis->rcItem;
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+    const bool focused = (dis->itemState & ODS_FOCUS) != 0;
+    const bool hot = (dis->itemState & ODS_HOTLIGHT) != 0;
+    const bool primary = dis->CtlID == IDC_BROWSER_GO;
+
+    COLORREF fill = primary ? RGB(27, 126, 214) : RGB(255, 255, 255);
+    COLORREF border = primary ? RGB(27, 126, 214) : RGB(215, 224, 235);
+    COLORREF textColor = primary ? RGB(255, 255, 255) : RGB(45, 59, 78);
+
+    if (hot && !pressed) {
+        fill = primary ? RGB(38, 139, 232) : RGB(241, 246, 252);
+        border = primary ? RGB(38, 139, 232) : RGB(182, 201, 224);
+    }
+    if (pressed) {
+        fill = primary ? RGB(18, 104, 184) : RGB(226, 235, 246);
+        border = primary ? RGB(18, 104, 184) : RGB(163, 187, 216);
+    }
+    if (disabled) {
+        fill = RGB(246, 248, 251);
+        border = RGB(230, 234, 240);
+        textColor = RGB(162, 171, 182);
+    }
+
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HGDIOBJ oldBrush = SelectObject(dis->hDC, brush);
+    HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
+    RoundRect(dis->hDC, rc.left, rc.top, rc.right, rc.bottom, 9, 9);
+    SelectObject(dis->hDC, oldBrush);
+    SelectObject(dis->hDC, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+
+    const wchar_t* glyph = L"•";
+    if (dis->CtlID == IDC_BROWSER_BACK) glyph = L"←";
+    else if (dis->CtlID == IDC_BROWSER_FORWARD) glyph = L"→";
+    else if (dis->CtlID == IDC_BROWSER_HOME) glyph = L"⌂";
+    else if (dis->CtlID == IDC_BROWSER_REFRESH) glyph = L"↻";
+    else if (dis->CtlID == IDC_BROWSER_GO) glyph = L"→";
+
+    HFONT font = CreateFontW(-19, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Symbol");
+    HGDIOBJ oldFont = SelectObject(dis->hDC, font);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, textColor);
+    RECT textRect = rc;
+    DrawTextW(dis->hDC, glyph, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dis->hDC, oldFont);
+    DeleteObject(font);
+
+    if (focused && !disabled) {
+        RECT focus = rc;
+        InflateRect(&focus, -4, -4);
+        DrawFocusRect(dis->hDC, &focus);
+    }
 }
 
 void CreateBrowserControls(HWND parent) {
+    const DWORD iconButtonStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW;
+
     g_backButton = CreateWindowExW(0, L"BUTTON", L"Back",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        iconButtonStyle,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(IDC_BROWSER_BACK),
         GetModuleHandleW(nullptr), nullptr);
 
     g_forwardButton = CreateWindowExW(0, L"BUTTON", L"Forward",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        iconButtonStyle,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(IDC_BROWSER_FORWARD),
         GetModuleHandleW(nullptr), nullptr);
 
     g_homeButton = CreateWindowExW(0, L"BUTTON", L"Home",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        iconButtonStyle,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(IDC_BROWSER_HOME),
         GetModuleHandleW(nullptr), nullptr);
 
     g_refreshButton = CreateWindowExW(0, L"BUTTON", L"Refresh",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        iconButtonStyle,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(IDC_BROWSER_REFRESH),
         GetModuleHandleW(nullptr), nullptr);
 
-    g_addressEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_initialUrl.c_str(),
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+    g_addressEdit = CreateWindowExW(0, L"EDIT", g_initialUrl.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(IDC_BROWSER_ADDRESS),
         GetModuleHandleW(nullptr), nullptr);
 
     g_goButton = CreateWindowExW(0, L"BUTTON", L"Go",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        iconButtonStyle,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(IDC_BROWSER_GO),
         GetModuleHandleW(nullptr), nullptr);
 
@@ -352,30 +433,38 @@ void ResizeBrowserUi() {
     const int width = std::max(1L, client.right - client.left);
     const int height = std::max(1L, client.bottom - client.top);
 
-    int x = kToolbarGap;
-    const int buttonY = 8;
+    int x = 10;
+    const int buttonY = 9;
     const int buttonH = 34;
+    const int iconButtonW = 38;
 
     auto moveButton = [&](HWND hwnd, int w) {
-        if (hwnd) MoveWindow(hwnd, x, buttonY, w, buttonH, TRUE);
-        x += w + kToolbarGap;
+        if (hwnd) {
+            MoveWindow(hwnd, x, buttonY, w, buttonH, TRUE);
+            ApplyRoundedRegion(hwnd, w, buttonH, 9);
+        }
+        x += w + 6;
     };
 
-    moveButton(g_backButton, kButtonWidth);
-    moveButton(g_forwardButton, kButtonWidth);
-    moveButton(g_homeButton, 62);
-    moveButton(g_refreshButton, kButtonWidth);
+    moveButton(g_backButton, iconButtonW);
+    moveButton(g_forwardButton, iconButtonW);
+    moveButton(g_homeButton, iconButtonW);
+    moveButton(g_refreshButton, iconButtonW);
 
-    const int goWidth = 54;
-    const int contextWidth = 156;
-    const int addressWidth = std::max(180, width - x - goWidth - contextWidth - (kToolbarGap * 4));
+    const int goWidth = 42;
+    const int contextWidth = 184;
+    const int addressWidth = std::max(180, width - x - goWidth - contextWidth - 30);
 
-    if (g_addressEdit) MoveWindow(g_addressEdit, x, buttonY, addressWidth, buttonH, TRUE);
-    x += addressWidth + kToolbarGap;
+    if (g_addressEdit) {
+        MoveWindow(g_addressEdit, x, buttonY, addressWidth, buttonH, TRUE);
+        ApplyRoundedRegion(g_addressEdit, addressWidth, buttonH, 9);
+        SendMessageW(g_addressEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
+    }
+    x += addressWidth + 6;
     moveButton(g_goButton, goWidth);
 
     if (g_contextLabel) {
-        MoveWindow(g_contextLabel, x, buttonY + 7, std::max(90, width - x - kToolbarGap), 22, TRUE);
+        MoveWindow(g_contextLabel, x + 4, buttonY + 7, std::max(90, width - x - 12), 22, TRUE);
     }
 
     if (g_statusLabel) {
@@ -580,6 +669,49 @@ LRESULT CALLBACK BrowserWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ResizeBrowserUi();
         return 0;
 
+    case WM_DRAWITEM:
+        if (lp) {
+            const DRAWITEMSTRUCT* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lp);
+            if (dis->CtlType == ODT_BUTTON) {
+                DrawBrowserButton(dis);
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_ERASEBKGND: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        HBRUSH white = GetSysColorBrush(COLOR_WINDOW);
+        FillRect(dc, &client, white);
+        RECT toolbar{ 0, 0, client.right, kToolbarHeight };
+        FillRect(dc, &toolbar, BrowserToolbarBrush());
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(225, 230, 237));
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        MoveToEx(dc, 0, kToolbarHeight - 1, nullptr);
+        LineTo(dc, client.right, kToolbarHeight - 1);
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
+        return 1;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        HWND child = reinterpret_cast<HWND>(lp);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(75, 88, 104));
+        if (child == g_contextLabel) return reinterpret_cast<LRESULT>(BrowserToolbarBrush());
+        return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        SetBkColor(dc, RGB(255, 255, 255));
+        SetTextColor(dc, RGB(32, 45, 62));
+        return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
+    }
+
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDC_BROWSER_BACK:
@@ -665,8 +797,7 @@ int RunBackstageBrowserMain(int argc, char** argv) {
     const wchar_t* cls = L"Hi5CentralBackstageBrowserHostWindow";
 
     WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = BrowserWndProc;
+    wc.cbSize = sizeof(wc);    wc.lpfnWndProc = BrowserWndProc;
     wc.hInstance = hinst;
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
