@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <memory>
 #include <mutex>
@@ -2340,6 +2341,110 @@ class Worker {
             }
 
 
+
+            std::string ActiveInteractiveUserSid() {
+                const DWORD sessionId = WTSGetActiveConsoleSessionId();
+                if (sessionId == 0xFFFFFFFF) return {};
+                HANDLE token = nullptr;
+                if (!WTSQueryUserToken(sessionId, &token)) return {};
+
+                DWORD needed = 0;
+                GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+                if (!needed) {
+                    CloseHandle(token);
+                    return {};
+                }
+                std::vector<BYTE> buffer(needed);
+                if (!GetTokenInformation(token, TokenUser, buffer.data(), needed, &needed)) {
+                    CloseHandle(token);
+                    return {};
+                }
+                CloseHandle(token);
+
+                auto* user = reinterpret_cast<TOKEN_USER*>(buffer.data());
+                LPWSTR sidText = nullptr;
+                if (!ConvertSidToStringSidW(user->User.Sid, &sidText) || !sidText) return {};
+                const std::string sid = WideToUtf8(sidText);
+                LocalFree(sidText);
+                return sid;
+            }
+
+            CommandResult RunPowerShellCommandInteractiveUser(const std::string& actionId, const std::string& command, int timeoutSeconds) {
+                CommandResult result{};
+                if (command.empty()) {
+                    result.error = "Command is empty";
+                    return result;
+                }
+
+                namespace fs = std::filesystem;
+                const auto start = std::chrono::steady_clock::now();
+                fs::path actionDir = fs::path(LR"(C:\ProgramData\Hi5Central\Agent\Actions)");
+                std::error_code ec;
+                fs::create_directories(actionDir, ec);
+
+                std::string safeId = actionId;
+                safeId.erase(std::remove_if(safeId.begin(), safeId.end(), [](unsigned char ch) {
+                    return !(std::isalnum(ch) || ch == '-' || ch == '_');
+                    }), safeId.end());
+                if (safeId.empty()) safeId = "interactive-action";
+                safeId += "-user";
+
+                fs::path scriptPath = actionDir / (ToWidePath(safeId) + L".ps1");
+                fs::path outputDir = fs::path(LR"(C:\Users\Public\Documents)");
+                fs::create_directories(outputDir, ec);
+                fs::path outputPath = outputDir / (std::wstring(L"Hi5Central-") + ToWidePath(safeId) + L".out");
+                {
+                    std::ofstream f(scriptPath, std::ios::binary | std::ios::trunc);
+                    if (!f) {
+                        result.error = "Failed to create interactive PowerShell script file";
+                        return result;
+                    }
+                    f << "$ErrorActionPreference = 'Continue'\r\n";
+                    f << "try {\r\n";
+                    f << command << "\r\n";
+                    f << "} catch { Write-Error $_; exit 1 }\r\n";
+                }
+
+                const std::string cmdExe = R"(C:\Windows\System32\cmd.exe)";
+                const std::string scriptUtf8 = WideToUtf8(scriptPath.wstring());
+                const std::string outputUtf8 = WideToUtf8(outputPath.wstring());
+                const std::string cmdLine =
+                    "/d /s /c \"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \\\"" +
+                    scriptUtf8 + "\\\" > \\\"" + outputUtf8 + "\\\" 2>&1\"";
+
+                HANDLE process = hi5::LaunchInInteractiveSession(cmdExe, cmdLine);
+                if (!process) {
+                    fs::remove(scriptPath, ec);
+                    result.error = "Failed to launch PowerShell in the active interactive user session";
+                    return result;
+                }
+
+                const DWORD timeoutMs = static_cast<DWORD>(std::max(5, timeoutSeconds) * 1000);
+                const DWORD wait = WaitForSingleObject(process, timeoutMs);
+                if (wait == WAIT_TIMEOUT) {
+                    TerminateProcess(process, 124);
+                    result.error = "Interactive user command timed out";
+                }
+
+                DWORD exitCode = 1;
+                if (GetExitCodeProcess(process, &exitCode)) result.exitCode = exitCode;
+                CloseHandle(process);
+
+                std::ifstream output(outputPath, std::ios::binary);
+                if (output) {
+                    constexpr size_t kMaxOutput = 256 * 1024;
+                    std::string contents((std::istreambuf_iterator<char>(output)), std::istreambuf_iterator<char>());
+                    if (contents.size() > kMaxOutput) contents.resize(kMaxOutput);
+                    result.output = std::move(contents);
+                }
+
+                fs::remove(scriptPath, ec);
+                fs::remove(outputPath, ec);
+                const auto end = std::chrono::steady_clock::now();
+                result.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+                return result;
+            }
+
             json ParseJsonObjectFromOutput(const std::string& output) {
                 if (output.empty()) {
                     return json::object();
@@ -3281,6 +3386,592 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 )HI5PS";
             }
 
+            std::string BuildProcessRestartScript(const json& payload) {
+                int pid = 0;
+                try {
+                    if (payload.contains("processId")) pid = payload.value("processId", 0);
+                    if (pid <= 0 && payload.contains("pid")) pid = payload.value("pid", 0);
+                } catch (...) { pid = 0; }
+
+                return PowerShellUtf8Preamble() + std::string(R"HI5PS(
+$ErrorActionPreference = 'Stop'
+$pidToRestart = )HI5PS") + std::to_string(pid) + R"HI5PS(
+if ($pidToRestart -le 4) { throw 'Refusing to restart a protected/system PID' }
+
+$blocked = @('native_vp8_stream','Hi5CentralAgent','services','csrss','wininit','winlogon','lsass','smss','system')
+$process = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $pidToRestart) -ErrorAction Stop
+$name = [string]$process.Name
+if ($blocked -contains ([IO.Path]::GetFileNameWithoutExtension($name))) { throw "Refusing to restart protected process: $name" }
+$commandLine = [string]$process.CommandLine
+$executablePath = [string]$process.ExecutablePath
+if ([string]::IsNullOrWhiteSpace($commandLine)) {
+    if ([string]::IsNullOrWhiteSpace($executablePath)) { throw 'Process command line is unavailable; safe restart is not possible.' }
+    $commandLine = ([char]34) + $executablePath + ([char]34)
+}
+
+Stop-Process -Id $pidToRestart -Force -ErrorAction Stop
+Start-Sleep -Milliseconds 700
+$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine } -ErrorAction Stop
+if ([int]$created.ReturnValue -ne 0) { throw ("Win32_Process.Create failed with code " + $created.ReturnValue) }
+
+[pscustomobject]@{
+    action='process.restart'
+    status='ok'
+    previous_pid=$pidToRestart
+    new_pid=[int]$created.ProcessId
+    name=$name
+    completed_at=(Get-Date).ToUniversalTime().ToString('o')
+} | ConvertTo-Json -Depth 6 -Compress
+)HI5PS";
+            }
+
+            std::string BuildServiceStartupScript(const json& payload) {
+                const std::string serviceName = payload.value("serviceName", payload.value("service_name", std::string()));
+                const std::string requested = payload.value("startType", payload.value("start_type", std::string()));
+                const std::string psServiceName = PsSingleQuote(serviceName);
+                const std::string psRequested = PsSingleQuote(requested);
+
+                return PowerShellUtf8Preamble() + std::string(R"HI5PS(
+$ErrorActionPreference = 'Stop'
+$serviceName = )HI5PS") + psServiceName + R"HI5PS(
+$requested = )HI5PS" + psRequested + R"HI5PS(
+if ([string]::IsNullOrWhiteSpace($serviceName)) { throw 'serviceName is required' }
+
+$map = @{
+    'automatic'='Automatic'
+    'automaticdelayed'='Automatic'
+    'automatic (delayed)'='Automatic'
+    'manual'='Manual'
+    'disabled'='Disabled'
+}
+$key = ([string]$requested).ToLowerInvariant().Replace('-','').Replace('_','')
+if (-not $map.ContainsKey($key)) { throw 'Unsupported service startup type.' }
+Set-Service -Name $serviceName -StartupType $map[$key] -ErrorAction Stop
+
+$regPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\' + $serviceName
+if ($key -eq 'automaticdelayed' -or $key -eq 'automatic (delayed)') {
+    New-ItemProperty -Path $regPath -Name DelayedAutoStart -PropertyType DWord -Value 1 -Force | Out-Null
+} elseif ($map[$key] -eq 'Automatic') {
+    New-ItemProperty -Path $regPath -Name DelayedAutoStart -PropertyType DWord -Value 0 -Force | Out-Null
+}
+
+$svc = Get-CimInstance Win32_Service -Filter ("Name='" + $serviceName.Replace("'","''") + "'") -ErrorAction Stop
+[pscustomobject]@{
+    action='services.set_start_type'
+    status='ok'
+    service_name=$serviceName
+    start_mode=[string]$svc.StartMode
+    delayed_auto_start=$(try { [bool](Get-ItemPropertyValue -Path $regPath -Name DelayedAutoStart -ErrorAction Stop) } catch { $false })
+    completed_at=(Get-Date).ToUniversalTime().ToString('o')
+} | ConvertTo-Json -Depth 6 -Compress
+)HI5PS";
+            }
+
+            std::string BuildRegistryListScript(const json& payload) {
+                const std::string path = payload.value("path", std::string("HKLM:\\"));
+                const std::string psPath = PsSingleQuote(path);
+                return PowerShellUtf8Preamble() + std::string(R"HI5PS(
+$ErrorActionPreference = 'Stop'
+$path = )HI5PS") + psPath + R"HI5PS(
+if ([string]::IsNullOrWhiteSpace($path)) { $path = 'HKLM:\' }
+if (-not (Test-Path -LiteralPath $path)) { throw "Registry path not found: $path" }
+
+$item = Get-Item -LiteralPath $path -ErrorAction Stop
+$subkeys = @(Get-ChildItem -LiteralPath $path -ErrorAction SilentlyContinue | Sort-Object PSChildName | ForEach-Object {
+    [pscustomobject]@{ name=[string]$_.PSChildName; path=[string]$_.PSPath }
+})
+$values = @()
+$properties = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
+foreach ($property in $properties.PSObject.Properties) {
+    if ($property.Name -like 'PS*') { continue }
+    $kind = ''
+    try { $kind = [string]$item.GetValueKind($property.Name) } catch {}
+    $display = ''
+    try {
+        if ($property.Value -is [array]) { $display = ($property.Value -join ', ') }
+        else { $display = [string]$property.Value }
+    } catch {}
+    if ($display.Length -gt 4096) { $display = $display.Substring(0,4096) }
+    $values += [pscustomobject]@{ name=[string]$property.Name; kind=$kind; value=$display }
+}
+[pscustomobject]@{
+    action='registry.list'
+    status='ok'
+    path=[string]$item.PSPath
+    provider_path=$path
+    subkeys=$subkeys
+    values=$values
+    collected_at=(Get-Date).ToUniversalTime().ToString('o')
+} | ConvertTo-Json -Depth 8 -Compress
+)HI5PS";
+            }
+
+            std::string BuildRegistryMutationScript(const std::string& jobType, const json& payload) {
+                const std::string path = payload.value("path", std::string());
+                const std::string name = payload.value("name", std::string());
+                const std::string value = payload.value("value", std::string());
+                const std::string kind = payload.value("kind", std::string("String"));
+                const std::string psPath = PsSingleQuote(path);
+                const std::string psName = PsSingleQuote(name);
+                const std::string psValue = PsSingleQuote(value);
+                const std::string psKind = PsSingleQuote(kind);
+                const std::string psAction = PsSingleQuote(jobType);
+
+                return PowerShellUtf8Preamble() + std::string(R"HI5PS(
+$ErrorActionPreference = 'Stop'
+$path = )HI5PS") + psPath + R"HI5PS(
+$name = )HI5PS" + psName + R"HI5PS(
+$value = )HI5PS" + psValue + R"HI5PS(
+$kind = )HI5PS" + psKind + R"HI5PS(
+$action = )HI5PS" + psAction + R"HI5PS(
+if ([string]::IsNullOrWhiteSpace($path)) { throw 'Registry path is required.' }
+
+if ($action -eq 'registry.create_key') {
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'Key name is required.' }
+    New-Item -Path $path -Name $name -Force -ErrorAction Stop | Out-Null
+} elseif ($action -eq 'registry.delete_key') {
+    Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+} elseif ($action -eq 'registry.delete_value') {
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'Value name is required.' }
+    Remove-ItemProperty -LiteralPath $path -Name $name -Force -ErrorAction Stop
+} elseif ($action -eq 'registry.set_value') {
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'Value name is required.' }
+    $propertyType = switch -Regex ($kind) {
+        'DWord' { 'DWord'; break }
+        'QWord' { 'QWord'; break }
+        'ExpandString' { 'ExpandString'; break }
+        'MultiString' { 'MultiString'; break }
+        'Binary' { 'Binary'; break }
+        default { 'String' }
+    }
+    $converted = $value
+    if ($propertyType -eq 'DWord') { $converted = [uint32]$value }
+    elseif ($propertyType -eq 'QWord') { $converted = [uint64]$value }
+    elseif ($propertyType -eq 'MultiString') { $converted = @($value -split '\r?\n') }
+    elseif ($propertyType -eq 'Binary') {
+        $hex = ($value -replace '[^0-9A-Fa-f]','')
+        if (($hex.Length % 2) -ne 0) { throw 'Binary registry data must contain complete hexadecimal byte pairs.' }
+        $bytes = New-Object byte[] ($hex.Length / 2)
+        for ($i=0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [Convert]::ToByte($hex.Substring($i*2,2),16) }
+        $converted = $bytes
+    }
+    New-ItemProperty -LiteralPath $path -Name $name -PropertyType $propertyType -Value $converted -Force -ErrorAction Stop | Out-Null
+} else {
+    throw 'Unsupported registry action.'
+}
+
+[pscustomobject]@{
+    action=$action
+    status='ok'
+    path=$path
+    name=$name
+    completed_at=(Get-Date).ToUniversalTime().ToString('o')
+} | ConvertTo-Json -Depth 6 -Compress
+)HI5PS";
+            }
+
+            std::string BuildEventLogListScript(const json& payload) {
+                const std::string logName = payload.value("logName", payload.value("log_name", std::string("System")));
+                const std::string level = payload.value("level", std::string("All"));
+                int maxEvents = 200;
+                try { maxEvents = payload.value("maxEvents", payload.value("max_events", 200)); } catch (...) {}
+                maxEvents = std::clamp(maxEvents, 25, 500);
+
+                const std::string psLogName = PsSingleQuote(logName);
+                const std::string psLevel = PsSingleQuote(level);
+
+                return PowerShellUtf8Preamble() + std::string(R"HI5PS(
+$ErrorActionPreference = 'Stop'
+$logName = )HI5PS") + psLogName + R"HI5PS(
+$level = )HI5PS" + psLevel + R"HI5PS(
+$maxEvents = )HI5PS" + std::to_string(maxEvents) + R"HI5PS(
+
+$allowedLogs = @('System','Application','Security')
+if ($allowedLogs -notcontains $logName) { throw 'Unsupported event log.' }
+
+$filter = @{ LogName = $logName }
+switch ($level) {
+    'Critical' { $filter.Level = 1 }
+    'Error' { $filter.Level = 2 }
+    'Warning' { $filter.Level = 3 }
+    'Information' { $filter.Level = 4 }
+    'Verbose' { $filter.Level = 5 }
+    default { }
+}
+
+$items = @(Get-WinEvent -FilterHashtable $filter -MaxEvents $maxEvents -ErrorAction Stop | ForEach-Object {
+    $message = ''
+    try { $message = [string]$_.Message } catch {}
+    if ($message.Length -gt 6000) { $message = $message.Substring(0,6000) }
+    [pscustomobject]@{
+        record_id = [long]$_.RecordId
+        event_id = [int]$_.Id
+        provider = [string]$_.ProviderName
+        level = [string]$_.LevelDisplayName
+        time_created = $(if ($_.TimeCreated) { $_.TimeCreated.ToUniversalTime().ToString('o') } else { $null })
+        computer = [string]$_.MachineName
+        log_name = [string]$_.LogName
+        message = $message
+    }
+})
+
+[pscustomobject]@{
+    action='events.list'
+    status='ok'
+    log_name=$logName
+    level=$level
+    count=$items.Count
+    events=$items
+    collected_at=(Get-Date).ToUniversalTime().ToString('o')
+} | ConvertTo-Json -Depth 8 -Compress
+)HI5PS";
+            }
+
+            std::string BuildSoftwareUninstallScript(const json& payload) {
+                const std::string appName = payload.value("name", std::string());
+                const std::string registryKey = payload.value("registry_key", payload.value("registryKey", std::string()));
+                const std::string scope = payload.value("scope", std::string());
+                const std::string userProfile = payload.value("user_profile", payload.value("userProfile", std::string()));
+                const std::string psName = PsSingleQuote(appName);
+                const std::string psRegistryKey = PsSingleQuote(registryKey);
+                const std::string psScope = PsSingleQuote(scope);
+                const std::string psUserProfile = PsSingleQuote(userProfile);
+
+                return PowerShellUtf8Preamble() + std::string(R"HI5PS(
+$ErrorActionPreference = 'Stop'
+$requestedName = )HI5PS") + psName + R"HI5PS(
+$requestedRegistryKey = )HI5PS" + psRegistryKey + R"HI5PS(
+$requestedScope = )HI5PS" + psScope + R"HI5PS(
+$requestedUserProfile = )HI5PS" + psUserProfile + R"HI5PS(
+
+function ConvertTo-Hi5SafeString($Value) {
+    if ($null -eq $Value) { return '' }
+    $s = [string]$Value
+    return ($s -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', '')
+}
+
+$roots = @(
+    [pscustomobject]@{ scope='machine64'; path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' },
+    [pscustomobject]@{ scope='machine32'; path='HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' }
+)
+$loadedHiveName = ''
+if ($requestedScope -eq 'user') {
+    $roots += [pscustomobject]@{ scope='user'; path='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' }
+} elseif ($requestedScope -like 'user:*') {
+    $requestedSid = $requestedScope.Substring(5)
+    $loadedPath = "Registry::HKEY_USERS\$requestedSid\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    if (Test-Path -LiteralPath ("Registry::HKEY_USERS\$requestedSid")) {
+        $roots += [pscustomobject]@{ scope=$requestedScope; path=$loadedPath }
+    } elseif ($requestedUserProfile) {
+        $ntUser = Join-Path $requestedUserProfile 'NTUSER.DAT'
+        if (Test-Path -LiteralPath $ntUser) {
+            $loadedHiveName = "Hi5CentralUninstall_$PID"
+            & reg.exe load ("HKU\" + $loadedHiveName) $ntUser *> $null
+            if ($LASTEXITCODE -eq 0) {
+                $roots += [pscustomobject]@{
+                    scope=$requestedScope
+                    path=("Registry::HKEY_USERS\" + $loadedHiveName + "\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
+                }
+            } else {
+                $loadedHiveName = ''
+            }
+        }
+    }
+}
+
+function Close-Hi5UserHive {
+    if ($loadedHiveName) {
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        & reg.exe unload ("HKU\" + $loadedHiveName) *> $null
+        $script:loadedHiveName = ''
+    }
+}
+
+function Find-Hi5Target {
+    foreach ($root in $roots) {
+        if ($requestedScope -and $root.scope -ne $requestedScope) { continue }
+        if ($requestedRegistryKey) {
+            $candidatePath = Join-Path $root.path $requestedRegistryKey
+            if (Test-Path -LiteralPath $candidatePath) {
+                $p = Get-ItemProperty -LiteralPath $candidatePath -ErrorAction SilentlyContinue
+                if ($p -and $p.DisplayName) {
+                    return [pscustomobject]@{
+                        path=$candidatePath
+                        scope=$root.scope
+                        registry_key=$requestedRegistryKey
+                        name=[string]$p.DisplayName
+                        publisher=[string]$p.Publisher
+                        version=[string]$p.DisplayVersion
+                        uninstall_string=[string]$p.UninstallString
+                        quiet_uninstall_string=[string]$p.QuietUninstallString
+                    }
+                }
+            }
+        }
+    }
+
+    if ($requestedName) {
+        foreach ($root in $roots) {
+            if ($requestedScope -and $root.scope -ne $requestedScope) { continue }
+            if (-not (Test-Path -LiteralPath $root.path)) { continue }
+            foreach ($child in Get-ChildItem -LiteralPath $root.path -ErrorAction SilentlyContinue) {
+                $p = Get-ItemProperty -LiteralPath $child.PSPath -ErrorAction SilentlyContinue
+                if ($p -and ([string]$p.DisplayName).Trim() -eq $requestedName.Trim()) {
+                    return [pscustomobject]@{
+                        path=$child.PSPath
+                        scope=$root.scope
+                        registry_key=$child.PSChildName
+                        name=[string]$p.DisplayName
+                        publisher=[string]$p.Publisher
+                        version=[string]$p.DisplayVersion
+                        uninstall_string=[string]$p.UninstallString
+                        quiet_uninstall_string=[string]$p.QuietUninstallString
+                    }
+                }
+            }
+        }
+    }
+    return $null
+}
+
+function Test-Hi5ProtectedSoftware($target) {
+    $combined = ("$($target.name) $($target.publisher)").ToLowerInvariant()
+    if ($combined -match 'hi5central|chatpass') {
+        return 'Hi5Central agent/component protection'
+    }
+
+    $knownSecurity = @(
+        'microsoft defender','windows defender','crowdstrike','sentinelone','sophos',
+        'bitdefender','eset','malwarebytes','webroot','cylance','carbon black',
+        'symantec endpoint','trend micro','mcafee','trellix','forticlient','huntress',
+        'cisco secure','cisco amp','cortex xdr','palo alto cortex','avast','avg antivirus',
+        'kaspersky','f-secure','withsecure'
+    )
+    foreach ($term in $knownSecurity) {
+        if ($combined.Contains($term)) { return "Security/AV protection: $term" }
+    }
+
+    try {
+        $avProducts = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntivirusProduct -ErrorAction SilentlyContinue
+        foreach ($av in @($avProducts)) {
+            $avName = ([string]$av.displayName).Trim()
+            if (-not $avName) { continue }
+            $a = $avName.ToLowerInvariant()
+            if ($combined.Contains($a) -or $a.Contains(([string]$target.name).ToLowerInvariant())) {
+                return "Registered antivirus product: $avName"
+            }
+        }
+    } catch {}
+    return ''
+}
+
+function Get-Hi5ProductCode($target) {
+    if ([string]$target.registry_key -match '^\{[0-9A-Fa-f-]{36}\}$') { return [string]$target.registry_key }
+    $match = [regex]::Match([string]$target.uninstall_string, '\{[0-9A-Fa-f-]{36}\}')
+    if ($match.Success) { return $match.Value }
+    return ''
+}
+
+function Test-Hi5StillInstalled {
+    return $null -ne (Find-Hi5Target)
+}
+
+function Get-Hi5RebootRequired {
+    $paths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    foreach ($path in $paths) { try { if (Test-Path -LiteralPath $path) { return $true } } catch {} }
+    try {
+        $pending = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+        if ($pending) { return $true }
+    } catch {}
+    return $false
+}
+
+function Add-Hi5Candidate([System.Collections.ArrayList]$list, [string]$strategy, [string]$command) {
+    if ([string]::IsNullOrWhiteSpace($command)) { return }
+    foreach ($item in $list) { if ($item.command -eq $command) { return } }
+    [void]$list.Add([pscustomobject]@{ strategy=$strategy; command=$command })
+}
+
+function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
+    $root = Join-Path $env:ProgramData 'Hi5Central\Agent\Temp'
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    $cmdFile = Join-Path $root ("uninstall-{0}-{1}.cmd" -f $PID,$index)
+    $outFile = "$cmdFile.out"
+    $errFile = "$cmdFile.err"
+    $nl = [Environment]::NewLine
+    $commandBody = "@echo off" + $nl + $candidate.command + $nl + "exit /b %errorlevel%" + $nl
+    Set-Content -LiteralPath $cmdFile -Value $commandBody -Encoding ASCII -Force
+
+    $started = Get-Date
+    $exitCode = $null
+    $timedOut = $false
+    $output = ''
+    try {
+        $quotedCmd = ([char]34) + $cmdFile + ([char]34)
+        $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d','/s','/c',$quotedCmd) -WindowStyle Hidden -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        if (-not $process.WaitForExit(180000)) {
+            $timedOut = $true
+            try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
+        } else {
+            $exitCode = [int]$process.ExitCode
+        }
+    } catch {
+        $output = $_.Exception.Message
+    }
+
+    try {
+        $stdout = if (Test-Path -LiteralPath $outFile) { Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue } else { '' }
+        $stderr = if (Test-Path -LiteralPath $errFile) { Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue } else { '' }
+        $output = (($output + $nl + $stdout + $nl + $stderr).Trim())
+        if ($output.Length -gt 1600) { $output = $output.Substring($output.Length - 1600) }
+    } catch {}
+    Remove-Item -LiteralPath $cmdFile,$outFile,$errFile -Force -ErrorAction SilentlyContinue
+
+    $stillInstalled = $true
+    for ($probe = 0; $probe -lt 12; $probe++) {
+        Start-Sleep -Seconds $(if ($probe -eq 0) { 2 } else { 3 })
+        $stillInstalled = Test-Hi5StillInstalled
+        if (-not $stillInstalled) { break }
+    }
+
+    return [pscustomobject]@{
+        strategy = $candidate.strategy
+        exit_code = $exitCode
+        timed_out = $timedOut
+        still_installed = $stillInstalled
+        duration_seconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+        output = ConvertTo-Hi5SafeString $output
+    }
+}
+
+$target = Find-Hi5Target
+if (-not $target) {
+    [pscustomobject]@{
+        action='software.uninstall'
+        status='uninstalled'
+        reason='already_not_present'
+        requested_name=$requestedName
+        attempts=@()
+        reboot_required=(Get-Hi5RebootRequired)
+        completed_at=(Get-Date).ToUniversalTime().ToString('o')
+    } | ConvertTo-Json -Depth 10 -Compress
+    Close-Hi5UserHive
+    exit 0
+}
+
+$protectedReason = Test-Hi5ProtectedSoftware $target
+if ($protectedReason) {
+    [pscustomobject]@{
+        action='software.uninstall'
+        status='blocked'
+        reason='protected_security_or_agent'
+        detail=$protectedReason
+        name=$target.name
+        publisher=$target.publisher
+        version=$target.version
+        attempts=@()
+        reboot_required=$false
+        completed_at=(Get-Date).ToUniversalTime().ToString('o')
+    } | ConvertTo-Json -Depth 10 -Compress
+    Close-Hi5UserHive
+    exit 5
+}
+
+$candidates = [System.Collections.ArrayList]::new()
+if ($target.quiet_uninstall_string) {
+    Add-Hi5Candidate $candidates 'vendor_quiet_uninstall' ([string]$target.quiet_uninstall_string)
+}
+
+$productCode = Get-Hi5ProductCode $target
+if ($productCode) {
+    $msiLog = Join-Path $env:ProgramData ("Hi5Central\Agent\Logs\uninstall-{0}.log" -f ($productCode -replace '[{}-]',''))
+    $q = [char]34
+    Add-Hi5Candidate $candidates 'msi_product_code' ("msiexec.exe /x $productCode /qn /norestart REBOOT=ReallySuppress /L*v " + $q + $msiLog + $q)
+}
+
+$uninstall = ([string]$target.uninstall_string).Trim()
+$lower = $uninstall.ToLowerInvariant()
+if ($uninstall) {
+    if ($lower -match 'unins[0-9]*\.exe') {
+        Add-Hi5Candidate $candidates 'inno_silent' ($uninstall + ' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-')
+    }
+    if ($lower -match '(uninstall|uninst)\.exe') {
+        Add-Hi5Candidate $candidates 'nsis_silent' ($uninstall + ' /S')
+    }
+    if ($lower -match 'update\.exe') {
+        Add-Hi5Candidate $candidates 'squirrel_silent' ($uninstall + ' --uninstall -s')
+    }
+    if ($lower -match 'setup\.exe') {
+        Add-Hi5Candidate $candidates 'installshield_silent' ($uninstall + ' /s /v"/qn REBOOT=ReallySuppress"')
+    }
+    if ($lower -match 'uninstall|remove') {
+        Add-Hi5Candidate $candidates 'generic_quiet' ($uninstall + ' /quiet /norestart')
+        Add-Hi5Candidate $candidates 'generic_silent' ($uninstall + ' /silent /norestart')
+        Add-Hi5Candidate $candidates 'generic_capital_s' ($uninstall + ' /S')
+    }
+}
+
+$winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+if ($winget -and $target.name) {
+    $q = [char]34
+    $safeName = ([string]$target.name).Replace([char]34,'')
+    Add-Hi5Candidate $candidates 'winget_exact_name' ("winget.exe uninstall --name " + $q + $safeName + $q + " --exact --silent --disable-interactivity --accept-source-agreements")
+}
+
+$attempts = @()
+$protectionSignal = $false
+$success = $false
+foreach ($candidate in @($candidates)) {
+    $attempt = Invoke-Hi5UninstallAttempt $candidate ($attempts.Count + 1)
+    $attempts += $attempt
+    if (-not $attempt.still_installed) {
+        $success = $true
+        break
+    }
+    $combinedOutput = ([string]$attempt.output).ToLowerInvariant()
+    if ($combinedOutput -match 'password|passphrase|tamper protection|self.?protection|access denied|credential|authorization required') {
+        $protectionSignal = $true
+        break
+    }
+}
+
+if ($success) {
+    [pscustomobject]@{
+        action='software.uninstall'
+        status='uninstalled'
+        reason='verified_removed'
+        name=$target.name
+        publisher=$target.publisher
+        version=$target.version
+        attempts=$attempts
+        reboot_required=(Get-Hi5RebootRequired)
+        completed_at=(Get-Date).ToUniversalTime().ToString('o')
+    } | ConvertTo-Json -Depth 10 -Compress
+    Close-Hi5UserHive
+    exit 0
+}
+
+$reason = if ($protectionSignal) { 'password_or_vendor_protection_required' } elseif ($candidates.Count -eq 0) { 'no_safe_silent_uninstaller_found' } elseif ($requestedScope -like 'user:*') { 'user_context_or_silent_uninstall_failed' } else { 'silent_uninstall_failed' }
+[pscustomobject]@{
+    action='software.uninstall'
+    status='failed'
+    reason=$reason
+    name=$target.name
+    publisher=$target.publisher
+    version=$target.version
+    attempts=$attempts
+    reboot_required=(Get-Hi5RebootRequired)
+    completed_at=(Get-Date).ToUniversalTime().ToString('o')
+} | ConvertTo-Json -Depth 10 -Compress
+Close-Hi5UserHive
+exit 1
+)HI5PS";
+            }
+
             void PostJobResult(const AgentIdentity& ident, const std::string& jobId, bool success, const json& result, const std::string& errorMessage = std::string()) {
                 if (jobId.empty()) return;
 
@@ -3345,6 +4036,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         return;
                     }
 
+                    if (jobType == "process.restart") {
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildProcessRestartScript(payload), 120);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
                     if (jobType == "files.list") {
                         CommandResult cr = RunPowerShellCommand(jobId, BuildFilesListScript(payload), 120);
                         json result = BuildCommandActionResult(std::string(), cr);
@@ -3366,6 +4065,77 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         json result = BuildCommandActionResult(std::string(), cr);
                         const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
                         PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "services.set_start_type") {
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildServiceStartupScript(payload), 120);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "registry.list") {
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildRegistryListScript(payload), 120);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "registry.create_key" || jobType == "registry.delete_key" ||
+                        jobType == "registry.set_value" || jobType == "registry.delete_value") {
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildRegistryMutationScript(jobType, payload), 120);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "events.list") {
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildEventLogListScript(payload), 180);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "software.uninstall") {
+                        const std::string script = BuildSoftwareUninstallScript(payload);
+                        CommandResult cr = RunPowerShellCommand(jobId, script, 900);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        bool ok = cr.error.empty() && result.value("status", std::string()) == "uninstalled";
+
+                        const std::string scope = payload.value("scope", std::string());
+                        if (!ok && scope.rfind("user:", 0) == 0) {
+                            const std::string targetSid = scope.substr(5);
+                            const std::string activeSid = ActiveInteractiveUserSid();
+                            if (!targetSid.empty() && !activeSid.empty() && targetSid == activeSid) {
+                                CommandResult userCr = RunPowerShellCommandInteractiveUser(jobId, script, 900);
+                                json userResult = BuildCommandActionResult(std::string(), userCr);
+                                userResult["execution_context"] = "interactive_user_retry";
+                                userResult["system_attempt"] = {
+                                    {"status", result.value("status", std::string())},
+                                    {"reason", result.value("reason", std::string())},
+                                    {"exit_code", result.value("exit_code", -1)}
+                                };
+                                result = std::move(userResult);
+                                cr = std::move(userCr);
+                                ok = cr.error.empty() && result.value("status", std::string()) == "uninstalled";
+                            }
+                            else {
+                                result["interactive_retry"] = "skipped";
+                                result["interactive_retry_reason"] = activeSid.empty()
+                                    ? "no_active_interactive_user"
+                                    : "target_user_is_not_active";
+                            }
+                        }
+
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        if (ok) {
+                            try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                        }
                         return;
                     }
 
