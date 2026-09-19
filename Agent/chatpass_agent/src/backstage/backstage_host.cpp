@@ -797,8 +797,7 @@ namespace {
 
             POINT pt{ x, y };
 
-            if (startMenuOpen_) {                if (HandleStartMenuClick(x, y)) return;
-                if (!PtInRect(&StartMenuRect(), pt) && !PtInRect(&StartRect(), pt)) {
+            if (startMenuOpen_) {                if (HandleStartMenuClick(x, y)) return;                if (!PtInRect(&StartMenuRect(), pt) && !PtInRect(&StartRect(), pt)) {
                     startMenuOpen_ = false;
                     return;
                 }
@@ -1129,8 +1128,8 @@ namespace {
 
         RECT WindowSearchRect(const BackstageWindow& win, const RECT& c) const {
             if (!WindowSupportsSearch(win)) return RECT{ 0, 0, 0, 0 };
-            const int right = c.right - 132;
-            const int left = std::max(c.left + 480, right - 238);
+            const int right = static_cast<int>(c.right) - 132;
+            const int left = std::max(static_cast<int>(c.left) + 480, right - 238);
             return RECT{ left, c.top + 8, right, c.top + 38 };
         }
 
@@ -1597,8 +1596,7 @@ namespace {
                     return true;
                 }
                 if (PtInRect(&ActionButtonRect(c, 0), pt)) { StartWindowsUpdateScan(win); return true; }                if (PtInRect(&ActionButtonRect(c, 1), pt)) { StartWindowsUpdateInstall(win); return true; }
-                if (PtInRect(&ActionButtonRect(c, 2), pt)) { RefreshWindowsUpdateView(win); return true; }
-                if (PtInRect(&ActionButtonRect(c, 3), pt)) { LoadWindowsUpdateHistory(win); return true; }
+                if (PtInRect(&ActionButtonRect(c, 2), pt)) { RefreshWindowsUpdateView(win); return true; }                if (PtInRect(&ActionButtonRect(c, 3), pt)) { LoadWindowsUpdateHistory(win); return true; }
             }
             else if (win.kind == WindowKind::Events) {
                 if (PtInRect(&ActionButtonRect(c, 0), pt)) { win.noteText = L"EVENTS_ROOT"; LoadEvents(win); return true; }
@@ -2397,8 +2395,7 @@ namespace {
             if (value) WTSFreeMemory(value);
             return out;        }
 
-        void LoadSessions(BackstageWindow& win) {
-            win.lines.clear();
+        void LoadSessions(BackstageWindow& win) {            win.lines.clear();
             win.lines.push_back(L"Background security context: NT AUTHORITY\\SYSTEM");
             win.lines.push_back(L"Private desktop: " + privateDesktopFullName_);
             win.lines.push_back(L"SYSTEM is a security context, not a separate interactive logged-on user.");
@@ -3198,7 +3195,6 @@ namespace {
             RECT back = NativeMenuRowRect(0);
             FillRectColor(dc, back.left, back.top, back.right - back.left, back.bottom - back.top, RGB(39, 39, 39));
             TextClipped(dc, RECT{ back.left + 14, back.top, back.right - 12, back.bottom }, L"<  Back", 13, RGB(225, 225, 225), true);
-
             auto rows = NativeLauncherRows();
             const auto& apps = NativeMaintenanceApps();
             for (size_t j = 0; j < rows.size() && j < 10; ++j) {
@@ -3997,7 +3993,6 @@ namespace {
                     }
                     NativeMouseButton(cmd, mouseX_, mouseY_);
                     break;
-
                 case hi5::InputCmdType::MouseWheel: {
                     BackstageWindow* syntheticHit = HybridSyntheticWindowAt(mouseX_, mouseY_);
                     const bool preferredNativeHit =
@@ -4797,8 +4792,7 @@ namespace {
         ActionGlyph GlyphForAction(const std::wstring& label) const {
             if (label == L"Start") return ActionGlyph::Play;
             if (label == L"Stop") return ActionGlyph::Stop;
-            if (label == L"Restart" || label == L"Refresh") return ActionGlyph::Refresh;
-            if (label == L"Home") return ActionGlyph::Home;
+            if (label == L"Restart" || label == L"Refresh") return ActionGlyph::Refresh;            if (label == L"Home") return ActionGlyph::Home;
             if (label == L"Open") return ActionGlyph::Open;
             if (label == L"New folder" || label == L"New Key") return ActionGlyph::Plus;
             if (label == L"Delete" || label == L"Delete Key" || label == L"End task" || label == L"Uninstall") return ActionGlyph::Delete;
