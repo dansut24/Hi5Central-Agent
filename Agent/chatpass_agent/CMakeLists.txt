@@ -360,4 +360,18 @@ if(WIN32)
     ole32 oleaut32 uuid wtsapi32 userenv psapi dwmapi iphlpapi
   )
   set_target_properties(hi5central_media_host PROPERTIES OUTPUT_NAME "Hi5CentralMediaHost")
+
+  # Short-lived patch worker. The long-lived Agent owns platform
+  # authentication and hands PatchHost only device/job-scoped work.
+  add_executable(hi5central_patch_host
+    src/patching/patch_host_main.cpp
+  )
+  hi5_use_static_msvc_runtime(hi5central_patch_host)
+  target_include_directories(hi5central_patch_host PRIVATE src)
+  target_compile_definitions(hi5central_patch_host PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
+  target_link_libraries(hi5central_patch_host PRIVATE
+    nlohmann_json::nlohmann_json
+    advapi32 user32 shell32
+  )
+  set_target_properties(hi5central_patch_host PROPERTIES OUTPUT_NAME "Hi5CentralPatchHost")
 endif()
