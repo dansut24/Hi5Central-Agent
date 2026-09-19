@@ -1506,6 +1506,162 @@ namespace hi5 {
             return pi.hProcess;
         }
 
+        static std::string PatchSafeId(const std::string& value) {
+            std::string out;
+            out.reserve(value.size());
+            for (const unsigned char ch : value) {
+                if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.') out.push_back(static_cast<char>(ch));
+            }
+            if (out.empty()) out = "patch";
+            if (out.size() > 96) out.resize(96);
+            return out;
+        }
+
+        static bool ApplyPatchFileAcl(const std::filesystem::path& path) {
+            PSECURITY_DESCRIPTOR descriptor = nullptr;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+                SDDL_REVISION_1,
+                &descriptor,
+                nullptr)) {
+                return false;
+            }
+            const BOOL ok = SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, descriptor);
+            LocalFree(descriptor);
+            return ok == TRUE;
+        }
+
+        static bool WriteProtectedPatchManifest(const std::filesystem::path& path, const json& manifest) {
+            const std::string plain = manifest.dump();
+            DATA_BLOB input{};
+            input.pbData = const_cast<BYTE*>(reinterpret_cast<const BYTE*>(plain.data()));
+            input.cbData = static_cast<DWORD>(plain.size());
+
+            DATA_BLOB output{};
+            const DWORD flags = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN;
+            if (!CryptProtectData(&input, L"Hi5Central Patch Manifest", nullptr, nullptr, nullptr, flags, &output)) {
+                return false;
+            }
+
+            bool written = false;
+            try {
+                std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+                if (stream) {
+                    stream.write(reinterpret_cast<const char*>(output.pbData), static_cast<std::streamsize>(output.cbData));
+                    written = stream.good();
+                }
+            } catch (...) {
+                written = false;
+            }
+            LocalFree(output.pbData);
+            if (!written) return false;
+            return ApplyPatchFileAcl(path);
+        }
+
+        static json RunPatchHostSoftwareJob(
+            const AgentIdentity& ident,
+            const std::string& jobId,
+            const json& payload,
+            std::string& errorMessage) {
+
+            const std::string patchHost = PatchHostExePath();
+            if (patchHost.empty()) {
+                errorMessage = "Hi5CentralPatchHost.exe is not installed.";
+                return json::object();
+            }
+
+            namespace fs = std::filesystem;
+            const fs::path root = fs::path(LR"(C:\ProgramData\Hi5Central\Agent\PatchHost)");
+            std::error_code ec;
+            fs::create_directories(root, ec);
+            if (ec) {
+                errorMessage = "Unable to create PatchHost working directory.";
+                return json::object();
+            }
+
+            const std::string safeId = PatchSafeId(jobId);
+            const fs::path manifestPath = root / Utf8ToWide(safeId + ".manifest.dpapi");
+            const fs::path resultPath = root / Utf8ToWide(safeId + ".result.json");
+            fs::remove(manifestPath, ec);
+            ec.clear();
+            fs::remove(resultPath, ec);
+
+            json manifest = payload.is_object() ? payload : json::object();
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            manifest["protocolVersion"] = 1;
+            manifest["action"] = "software.install";
+            manifest["jobId"] = jobId;
+            manifest["deviceId"] = ident.deviceId;
+            manifest["issuedUnixMs"] = nowMs;
+            manifest["expiresUnixMs"] = nowMs + (10LL * 60LL * 1000LL);
+
+            if (!WriteProtectedPatchManifest(manifestPath, manifest)) {
+                errorMessage = "Unable to protect PatchHost manifest.";
+                fs::remove(manifestPath, ec);
+                return json::object();
+            }
+
+            const std::string args =
+                "--execute-manifest " + QuoteArg(manifestPath.string()) +
+                " --output " + QuoteArg(resultPath.string());
+
+            HANDLE process = LaunchServiceChildProcess(patchHost, args);
+            if (!process) {
+                errorMessage = "Unable to launch Hi5CentralPatchHost.exe.";
+                fs::remove(manifestPath, ec);
+                return json::object();
+            }
+
+            const DWORD wait = WaitForSingleObject(process, 35 * 60 * 1000);
+            DWORD exitCode = 1;
+            if (wait == WAIT_TIMEOUT) {
+                TerminateProcess(process, ERROR_TIMEOUT);
+                exitCode = ERROR_TIMEOUT;
+                errorMessage = "PatchHost execution timed out.";
+            } else if (!GetExitCodeProcess(process, &exitCode)) {
+                exitCode = GetLastError();
+                errorMessage = "Unable to read PatchHost exit code.";
+            }
+            CloseHandle(process);
+
+            std::string resultText;
+            try {
+                std::ifstream stream(resultPath, std::ios::binary);
+                if (stream) {
+                    std::ostringstream buffer;
+                    buffer << stream.rdbuf();
+                    resultText = buffer.str();
+                }
+            } catch (...) {}
+
+            fs::remove(manifestPath, ec);
+            ec.clear();
+            fs::remove(resultPath, ec);
+
+            if (resultText.empty()) {
+                if (errorMessage.empty()) errorMessage = "PatchHost did not return a result.";
+                return json{
+                    {"success", false},
+                    {"patchHostExitCode", static_cast<int>(exitCode)}
+                };
+            }
+
+            json result = json::parse(resultText, nullptr, false);
+            if (result.is_discarded() || !result.is_object()) {
+                errorMessage = "PatchHost returned invalid JSON.";
+                return json{
+                    {"success", false},
+                    {"patchHostExitCode", static_cast<int>(exitCode)}
+                };
+            }
+            result["patchHostExitCode"] = static_cast<int>(exitCode);
+            if (!result.value("success", false) && errorMessage.empty()) {
+                errorMessage = result.value("error", std::string("PatchHost reported failure."));
+            }
+            return result;
+        }
+
         static std::string ChatOverlayExePath() {
             return UserHostExePath();
         }
@@ -4528,6 +4684,18 @@ exit 1
                         json result = BuildCommandActionResult(std::string(), cr);
                         const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
                         PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "patch.software") {
+                        std::string patchError;
+                        json result = RunPatchHostSoftwareJob(ident, jobId, payload, patchError);
+                        const bool ok = result.value("success", false);
+                        PostJobResult(ident, jobId, ok, result, patchError);
+                        if (ok) {
+                            try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                            try { SendPatchDiscoverySafe(ident); } catch (...) {}
+                        }
                         return;
                     }
 
