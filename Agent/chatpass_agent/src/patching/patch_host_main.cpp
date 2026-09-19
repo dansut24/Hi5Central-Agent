@@ -26,7 +26,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.0";
+constexpr const char* kPatchHostVersion = "0.2.1";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -249,7 +249,8 @@ std::vector<int> VersionParts(const std::string& value) {
 }
 
 int CompareVersions(const std::string& left, const std::string& right) {
-    const auto a = VersionParts(left);
+    const std::string leftText = Trim(left);
+    const auto a = VersionParts(leftText);
     const auto b = VersionParts(right);
     if (a.empty() || b.empty()) return 0;
     const size_t size = std::max(a.size(), b.size());
@@ -259,6 +260,14 @@ int CompareVersions(const std::string& left, const std::string& right) {
         if (av < bv) return -1;
         if (av > bv) return 1;
     }
+
+    // WinGet can report an installed version as "< X" when it only knows
+    // that the installed package is older than X. Never flatten that to an
+    // exact X during post-install verification, or a failed upgrade could be
+    // reported as successful.
+    if (leftText.rfind("<", 0) == 0 && leftText.rfind("<=", 0) != 0) return -1;
+    if (leftText.rfind(">", 0) == 0 && leftText.rfind(">=", 0) != 0) return 1;
+
     return 0;
 }
 
