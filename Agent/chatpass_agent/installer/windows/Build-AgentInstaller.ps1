@@ -283,7 +283,7 @@ if (-not $SkipBuild) {
     $buildArgs = @(
         "--build", $buildPath,
         "--config", $Configuration,
-        "--target", "native_vp8_stream", "hi5central_user", "hi5central_remote_host", "hi5central_media_host",
+        "--target", "native_vp8_stream", "hi5central_user", "hi5central_remote_host", "hi5central_media_host", "hi5central_patch_host",
         "-j"
     )
 
@@ -309,14 +309,17 @@ if (-not $agentExe -or -not (Test-Path $agentExe)) {
 $userExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralUser.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 $remoteHostExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralRemoteHost.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 $mediaHostExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralMediaHost.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+$patchHostExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralPatchHost.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $userExe) { throw "Hi5CentralUser.exe not found under build directory: $buildPath" }
 if (-not $remoteHostExe) { throw "Hi5CentralRemoteHost.exe not found under build directory: $buildPath" }
 if (-not $mediaHostExe) { throw "Hi5CentralMediaHost.exe not found under build directory: $buildPath" }
+if (-not $patchHostExe) { throw "Hi5CentralPatchHost.exe not found under build directory: $buildPath" }
 
 Assert-NoDynamicVcRuntimeDependency -ExePath $agentExe
 Assert-NoDynamicVcRuntimeDependency -ExePath $userExe.FullName
 Assert-NoDynamicVcRuntimeDependency -ExePath $remoteHostExe.FullName
 Assert-NoDynamicVcRuntimeDependency -ExePath $mediaHostExe.FullName
+Assert-NoDynamicVcRuntimeDependency -ExePath $patchHostExe.FullName
 
 New-Item -ItemType Directory -Force -Path $distPath | Out-Null
 
@@ -353,6 +356,7 @@ $isccArgs = @(
     "/DUserExePath=$($userExe.FullName)",
     "/DRemoteHostExePath=$($remoteHostExe.FullName)",
     "/DMediaHostExePath=$($mediaHostExe.FullName)",
+    "/DPatchHostExePath=$($patchHostExe.FullName)",
     $issPath
 )
 

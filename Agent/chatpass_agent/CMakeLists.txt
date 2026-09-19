@@ -166,7 +166,6 @@ add_executable(native_vp8_stream
   src/webrtc_sender.cpp
   src/codec_policy.cpp
   src/agent_identity.cpp
-  src/patching/patch_worker.cpp
   src/session/session_bridge.cpp
   src/ipc/session_launcher.cpp
   src/ipc/named_pipe.cpp

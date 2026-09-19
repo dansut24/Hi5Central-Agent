@@ -12,7 +12,6 @@
 #include "ui/agent_presence_controller.h"
 #include "ui/chat_controller.h"
 #include "inventory/inventory_snapshot.h"
-#include "patching/patch_worker.h"
 
 #include <nlohmann/json.hpp>
 
@@ -1484,6 +1483,16 @@ namespace hi5 {
             return SiblingExecutablePath("Hi5CentralMediaHost.exe");
         }
 
+        static std::string PatchHostExePath() {
+            const std::string current = CurrentExePath();
+            if (current.empty()) return {};
+            const std::filesystem::path candidate =
+                std::filesystem::path(current).parent_path() / "Hi5CentralPatchHost.exe";
+            std::error_code ec;
+            if (!std::filesystem::exists(candidate, ec)) return {};
+            return candidate.string();
+        }
+
         static HANDLE LaunchServiceChildProcess(const std::string& exePath, const std::string& args) {
             std::wstring command = L"\"" + WideFromUtf8(exePath) + L"\" " + WideFromUtf8(args);
             std::wstring workDir = WideFromUtf8(DirOfPath(exePath));
@@ -2490,30 +2499,9 @@ LogI(
                 signalingConnected_.store(false);
                 signaling_->connect();
                 StartInventoryLoop(ident);
+                StartPatchDiscoveryLoop(ident);
 
-                const std::string enablePatchWorker = ReadConfigValue("HI5_ENABLE_PATCH_WORKER");
-                const bool patchWorkerEnabled =
-                    enablePatchWorker == "1" ||
-                    enablePatchWorker == "true" ||
-                    enablePatchWorker == "TRUE" ||
-                    enablePatchWorker == "yes" ||
-                    enablePatchWorker == "YES";
-
-                if (patchWorkerEnabled) {
-                    PatchWorkerConfig patchConfig;
-                    patchConfig.enabled = true;
-                    patchConfig.apiBaseUrl = ReadConfigValue("HI5_PATCH_API_BASE_URL");
-                    if (patchConfig.apiBaseUrl.empty()) {
-                        patchConfig.apiBaseUrl = "https://api.hi5central.com";
-                    }
-                    patchConfig.apiKey = ReadConfigValue("HI5_PATCH_API_KEY");
-                    patchConfig.deviceId = ident.deviceId;
-                    patchConfig.pollSeconds = ReadConfigInt("HI5_PATCH_POLL_SECONDS", 300, 30, 3600);
-                    LogI("[patch] worker enabled");
-                    patchWorker_.Start(patchConfig);
-                } else {
-                    LogI("[patch] worker disabled by default; set HI5_ENABLE_PATCH_WORKER=1 to enable");
-                }
+                LogI("[patchhost] standalone PatchHost architecture active; legacy in-process patch worker removed");
 
                 auto nextUiCleanupSweep = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                 auto nextSignalingReconnect = std::chrono::steady_clock::now();
@@ -2579,7 +2567,6 @@ LogI(
                     StopSession(nextId);
                 }
 
-                patchWorker_.Stop();
                 StopInventoryLoop();
                 StopTrayLoop();
                 StopChatOverlays();
@@ -6145,6 +6132,104 @@ exit 1
                     });
             }
 
+            void SendPatchDiscoverySafe(const AgentIdentity& ident) {
+                const std::string patchHost = PatchHostExePath();
+                if (patchHost.empty()) {
+                    LogI("[patchhost] executable not installed; discovery skipped");
+                    return;
+                }
+
+                namespace fs = std::filesystem;
+                const fs::path root = fs::path(LR"(C:\ProgramData\Hi5Central\Agent\PatchHost)");
+                std::error_code ec;
+                fs::create_directories(root, ec);
+                const fs::path outputPath = root / L"discovery.json";
+                fs::remove(outputPath, ec);
+
+                const std::string args = "--discover-software --output " + QuoteArg(outputPath.string());
+                HANDLE process = LaunchServiceChildProcess(patchHost, args);
+                if (!process) {
+                    LogW("[patchhost] failed to launch discovery");
+                    return;
+                }
+
+                const DWORD wait = WaitForSingleObject(process, 5 * 60 * 1000);
+                DWORD exitCode = 1;
+                if (wait == WAIT_TIMEOUT) {
+                    TerminateProcess(process, ERROR_TIMEOUT);
+                    exitCode = ERROR_TIMEOUT;
+                    LogW("[patchhost] discovery timed out and was terminated");
+                } else {
+                    GetExitCodeProcess(process, &exitCode);
+                }
+                CloseHandle(process);
+
+                std::ifstream stream(outputPath, std::ios::binary);
+                if (!stream) {
+                    LogW("[patchhost] discovery output missing exit_code=" + std::to_string(exitCode));
+                    return;
+                }
+
+                std::ostringstream buffer;
+                buffer << stream.rdbuf();
+                json result = json::parse(buffer.str(), nullptr, false);
+                fs::remove(outputPath, ec);
+                if (result.is_discarded() || !result.is_object()) {
+                    LogW("[patchhost] discovery output was invalid JSON");
+                    return;
+                }
+
+                json payload = {
+                    {"capabilities", result.value("capabilities", json::object())},
+                    {"packages", result.value("packages", json::array())},
+                    {"winget", result.value("winget", json::object())},
+                    {"success", result.value("success", false)}
+                };
+                if (result.contains("error")) payload["error"] = result["error"];
+                if (result.contains("detail")) payload["detail"] = result["detail"];
+
+                try {
+                    HttpPostJsonWithAgentAuth(
+                        "https://api.hi5central.com/api/v1/agent/devices/patch-discovery",
+                        payload.dump(),
+                        ident
+                    );
+                    LogI("[patchhost] discovery posted packages=" +
+                        std::to_string(payload["packages"].size()) +
+                        " exit_code=" + std::to_string(exitCode));
+                }
+                catch (const std::exception& ex) {
+                    LogW(std::string("[patchhost] discovery post failed: ") + ex.what());
+                }
+            }
+
+            void StartPatchDiscoveryLoop(AgentIdentity ident) {
+                std::thread([this, ident = std::move(ident)]() mutable {
+                    const int intervalSeconds = ReadConfigInt(
+                        "HI5_PATCH_DISCOVERY_SECONDS",
+                        6 * 60 * 60,
+                        15 * 60,
+                        24 * 60 * 60
+                    );
+
+                    for (int i = 0; i < 30 && !stop_.load(); ++i) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
+
+                    while (!stop_.load()) {
+                        if (!HasActiveSessions()) {
+                            SendPatchDiscoverySafe(ident);
+                        } else {
+                            LogI("[patchhost] discovery deferred while remote session is active");
+                        }
+
+                        for (int i = 0; i < intervalSeconds && !stop_.load(); ++i) {
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                        }
+                    }
+                }).detach();
+            }
+
             void StartTelemetryLoop(AgentIdentity ident) {
                 std::thread([this, ident = std::move(ident)]() mutable {
                     CpuSample previousCpu{};
@@ -8773,7 +8858,6 @@ exit 1
             std::unique_ptr<SignalingClient> signaling_;
             std::thread inventoryThread_;
             std::thread trayThread_;
-            PatchWorker patchWorker_;
 
             std::mutex sessionsMu_;
             std::unordered_map<std::string, std::unique_ptr<SessionContext>> sessions_;

@@ -4,6 +4,7 @@
 #define MyUserExeName "Hi5CentralUser.exe"
 #define MyRemoteHostExeName "Hi5CentralRemoteHost.exe"
 #define MyMediaHostExeName "Hi5CentralMediaHost.exe"
+#define MyPatchHostExeName "Hi5CentralPatchHost.exe"
 #define MyServiceName "Hi5CentralAgent"
 #define MyAppVersion GetEnv("HI5_AGENT_VERSION")
 #if MyAppVersion == ""
@@ -29,6 +30,9 @@
 #endif
 #ifndef MediaHostExePath
   #define MediaHostExePath SourceDir + "\" + MyMediaHostExeName
+#endif
+#ifndef PatchHostExePath
+  #define PatchHostExePath SourceDir + "\" + MyPatchHostExeName
 #endif
 
 
@@ -64,6 +68,7 @@ Source: "{#AgentExePath}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags:
 Source: "{#UserExePath}"; DestDir: "{app}"; DestName: "{#MyUserExeName}"; Flags: ignoreversion
 Source: "{#RemoteHostExePath}"; DestDir: "{app}"; DestName: "{#MyRemoteHostExeName}"; Flags: ignoreversion
 Source: "{#MediaHostExePath}"; DestDir: "{app}"; DestName: "{#MyMediaHostExeName}"; Flags: ignoreversion
+Source: "{#PatchHostExePath}"; DestDir: "{app}"; DestName: "{#MyPatchHostExeName}"; Flags: ignoreversion
 
 [InstallDelete]
 Type: files; Name: "{app}\Hi5CentralAgent.exe"
