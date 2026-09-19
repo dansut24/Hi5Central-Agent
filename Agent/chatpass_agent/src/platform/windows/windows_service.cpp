@@ -1531,6 +1531,20 @@ namespace hi5 {
             return ok == TRUE;
         }
 
+        static bool ApplyPatchDirectoryAcl(const std::filesystem::path& path) {
+            PSECURITY_DESCRIPTOR descriptor = nullptr;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+                SDDL_REVISION_1,
+                &descriptor,
+                nullptr)) {
+                return false;
+            }
+            const BOOL ok = SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, descriptor);
+            LocalFree(descriptor);
+            return ok == TRUE;
+        }
+
         static bool WriteProtectedPatchManifest(const std::filesystem::path& path, const json& manifest) {
             const std::string plain = manifest.dump();
             DATA_BLOB input{};
@@ -1576,6 +1590,10 @@ namespace hi5 {
             fs::create_directories(root, ec);
             if (ec) {
                 errorMessage = "Unable to create PatchHost working directory.";
+                return json::object();
+            }
+            if (!ApplyPatchDirectoryAcl(root)) {
+                errorMessage = "Unable to secure PatchHost working directory.";
                 return json::object();
             }
 
@@ -6311,6 +6329,10 @@ exit 1
                 const fs::path root = fs::path(LR"(C:\ProgramData\Hi5Central\Agent\PatchHost)");
                 std::error_code ec;
                 fs::create_directories(root, ec);
+                if (ec || !ApplyPatchDirectoryAcl(root)) {
+                    LogW("[patchhost] unable to secure working directory; discovery skipped");
+                    return;
+                }
                 const fs::path outputPath = root / L"discovery.json";
                 fs::remove(outputPath, ec);
 
