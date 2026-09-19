@@ -19,6 +19,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <wincrypt.h>
+#include <dpapi.h>
 #include <psapi.h>
 #include <sddl.h>
 #include <wtsapi32.h>
