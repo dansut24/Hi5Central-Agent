@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.6";
+constexpr const char* kPatchHostVersion = "0.2.7";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -1154,12 +1154,20 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                                 result["rebootRequired"] = result["rebootRequired"].get<bool>()
                                     || attempt.exitCode == 3010 || attempt.exitCode == 1641;
 
-                                if (verified) break;
-                                if (attempt.timedOut || exitSucceeded) {
-                                    result["error"] = attempt.timedOut
-                                        ? "installer_timeout"
-                                        : "target_version_not_verified_after_successful_installer";
+                                if (verified) {
+                                    result["successfulStrategy"] = strategy.name;
+                                    result.erase("error");
                                     break;
+                                }
+
+                                // An installer exit code is only transport evidence. Some EXE
+                                // installers accept an unknown silent switch, return 0, and do
+                                // nothing. Continue through the approved strategy ladder until
+                                // independent installed-state verification proves the target.
+                                if (attempt.timedOut) {
+                                    result["error"] = "installer_timeout";
+                                } else if (exitSucceeded) {
+                                    result["error"] = "target_version_not_verified_after_successful_installer";
                                 }
                             }
                         }
