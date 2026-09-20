@@ -3791,10 +3791,51 @@ function Get-Hi5RebootRequired {
     return $false
 }
 
+function Resolve-Hi5RegisteredCommand([string]$command) {
+    if ([string]::IsNullOrWhiteSpace($command)) {
+        return [pscustomobject]@{ command=$command; path_rewritten=$false }
+    }
+
+    $trimmed = $command.Trim()
+    $exePath = ''
+    $suffix = ''
+    if ($trimmed -match '^"([^"]+\.exe)"(.*)$') {
+        $exePath = [string]$matches[1]
+        $suffix = [string]$matches[2]
+    } elseif ($trimmed -match '^([^\s"]+\.exe)(.*)$') {
+        $exePath = [string]$matches[1]
+        $suffix = [string]$matches[2]
+    }
+
+    if (-not $exePath -or (Test-Path -LiteralPath $exePath)) {
+        return [pscustomobject]@{ command=$command; path_rewritten=$false }
+    }
+
+    $system32Root = Join-Path $env:WINDIR 'System32\config\systemprofile'
+    $syswow64Root = Join-Path $env:WINDIR 'SysWOW64\config\systemprofile'
+    if ($exePath.StartsWith($system32Root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $alternate = $syswow64Root + $exePath.Substring($system32Root.Length)
+        if (Test-Path -LiteralPath $alternate) {
+            return [pscustomobject]@{
+                command = ([char]34) + $alternate + ([char]34) + $suffix
+                path_rewritten = $true
+            }
+        }
+    }
+
+    return [pscustomobject]@{ command=$command; path_rewritten=$false }
+}
+
 function Add-Hi5Candidate([System.Collections.ArrayList]$list, [string]$strategy, [string]$command) {
     if ([string]::IsNullOrWhiteSpace($command)) { return }
+    $resolved = Resolve-Hi5RegisteredCommand $command
+    $command = [string]$resolved.command
     foreach ($item in $list) { if ($item.command -eq $command) { return } }
-    [void]$list.Add([pscustomobject]@{ strategy=$strategy; command=$command })
+    [void]$list.Add([pscustomobject]@{
+        strategy=$strategy
+        command=$command
+        path_rewritten=[bool]$resolved.path_rewritten
+    })
 }
 
 function Test-Hi5UninstallActivity($candidate) {
@@ -3877,6 +3918,7 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
         still_installed = $stillInstalled
         verification_wait_seconds = $verificationWaitSeconds
         verification_extended = $verificationExtended
+        path_rewritten = [bool]$candidate.path_rewritten
         duration_seconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
         output = ConvertTo-Hi5SafeString $output
     }
@@ -7363,4 +7405,3 @@ exit 1
     }
 
 } // namespace hi5
-
