@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.8";
+constexpr const char* kPatchHostVersion = "0.2.9";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -417,6 +417,50 @@ std::string Sha256File(const std::filesystem::path& path) {
     return output.str();
 }
 
+bool FileContainsInstallerMarker(const std::filesystem::path& path, const std::vector<std::string>& markers) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return false;
+
+    constexpr size_t kChunkSize = 1024 * 1024;
+    constexpr size_t kOverlapSize = 256;
+    std::vector<char> buffer(kChunkSize);
+    std::string overlap;
+
+    while (stream) {
+        stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = stream.gcount();
+        if (count <= 0) break;
+
+        std::string chunk = overlap;
+        chunk.append(buffer.data(), static_cast<size_t>(count));
+        std::transform(chunk.begin(), chunk.end(), chunk.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+        for (const auto& marker : markers) {
+            if (!marker.empty() && chunk.find(marker) != std::string::npos) return true;
+        }
+
+        if (chunk.size() > kOverlapSize) overlap = chunk.substr(chunk.size() - kOverlapSize);
+        else overlap = chunk;
+    }
+    return false;
+}
+
+std::string DetectInstallerTechnology(const std::filesystem::path& path, const std::string& installerType) {
+    const std::string type = Lower(installerType);
+    if (type == "msi") return "msi";
+    if (type != "exe") return "unknown";
+
+    if (FileContainsInstallerMarker(path, { "inno setup setup data", "inno setup" })) return "inno";
+    if (FileContainsInstallerMarker(path, { "nullsoft.nsis", "nullsoft install system", "nsis error" })) return "nsis";
+    if (FileContainsInstallerMarker(path, { "wixbundle", "wixstdba", "burn engine" })) return "burn";
+    if (FileContainsInstallerMarker(path, { "installshield" })) return "installshield";
+    if (FileContainsInstallerMarker(path, { "--squirrel-install", "squirrel aware version", "squirrel" })) return "squirrel";
+    if (FileContainsInstallerMarker(path, { "install4j" })) return "install4j";
+    return "generic";
+}
+
 bool VerifyAuthenticodeTrust(const std::filesystem::path& path, std::string& signerName) {
     signerName.clear();
 
@@ -482,7 +526,8 @@ json Capabilities() {
             { "installerTypes", json::array({ "msi", "exe" }) },
             { "verificationMethods", json::array({ "winget", "uninstall_registry", "file_version" }) },
             { "silentInstallStrategyLadder", true },
-            { "installerTechnologies", json::array({ "msi", "inno", "nullsoft", "nsis", "burn", "installshield", "squirrel", "generic" }) }
+            { "installerTechnologies", json::array({ "msi", "inno", "nullsoft", "nsis", "burn", "installshield", "squirrel", "install4j", "generic" }) },
+            { "artifactTechnologyDetection", true }
         } }
     };
 }
@@ -815,7 +860,8 @@ bool ManifestValid(const json& manifest, std::string& error) {
             && technology != "nsis"
             && technology != "burn"
             && technology != "installshield"
-            && technology != "squirrel") {
+            && technology != "squirrel"
+            && technology != "install4j") {
             error = "unsupported_installer_technology";
             return false;
         }
@@ -966,6 +1012,8 @@ std::vector<VendorInstallStrategy> VendorInstallStrategies(const json& manifest)
         AddInstallStrategy(strategies, "installshield_silent", "/s /v\"/qn /norestart\"");
     } else if (technology == "squirrel") {
         AddInstallStrategy(strategies, "squirrel_silent", "--silent");
+    } else if (technology == "install4j") {
+        AddInstallStrategy(strategies, "install4j_quiet", "-q");
     }
 
     if (technology.empty() || technology == "generic") {
@@ -1024,6 +1072,10 @@ json InspectVendorArtifact(const json& manifest) {
     result["actualSha256"] = actualSha;
     result["sha256Verified"] = !actualSha.empty()
         && (expectedSha.empty() || Lower(actualSha) == Lower(expectedSha));
+
+    const std::string installerTechnology = DetectInstallerTechnology(artifactPath, installerType);
+    result["installerTechnology"] = installerTechnology;
+    result["installerTechnologyRecognized"] = installerTechnology != "generic" && installerTechnology != "unknown";
 
     std::string signer;
     const bool signatureValid = VerifyAuthenticodeTrust(artifactPath, signer);
