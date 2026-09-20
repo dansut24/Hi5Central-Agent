@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.9";
+constexpr const char* kPatchHostVersion = "0.2.10";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -641,13 +641,14 @@ std::string ReadRegistryText(HKEY root, const std::wstring& subkey, const wchar_
 
 void AppendUninstallRegistryMatches(
     HKEY root,
+    const std::wstring& base,
     REGSAM view,
+    const std::string& scope,
+    const std::string& registryView,
     const std::string& productCode,
     const std::string& displayNameContains,
     const std::string& publisherContains,
     json& matches) {
-
-    const std::wstring base = LR"(SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)";
     HKEY uninstall = nullptr;
     if (RegOpenKeyExW(root, base.c_str(), 0, KEY_READ | view, &uninstall) != ERROR_SUCCESS) return;
 
@@ -674,7 +675,8 @@ void AppendUninstallRegistryMatches(
             { "displayName", displayName },
             { "publisher", publisher },
             { "version", version },
-            { "view", view == KEY_WOW64_32KEY ? "32" : "64" }
+            { "scope", scope },
+            { "view", registryView }
         });
     }
     RegCloseKey(uninstall);
@@ -685,8 +687,43 @@ json VerifyUninstallRegistry(const json& verification, const std::string& target
     const std::string displayNameContains = verification.value("displayNameContains", std::string());
     const std::string publisherContains = verification.value("publisherContains", std::string());
     json matches = json::array();
-    AppendUninstallRegistryMatches(HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, productCode, displayNameContains, publisherContains, matches);
-    AppendUninstallRegistryMatches(HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY, productCode, displayNameContains, publisherContains, matches);
+    const std::wstring machineBase = LR"(SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)";
+    AppendUninstallRegistryMatches(
+        HKEY_LOCAL_MACHINE, machineBase, KEY_WOW64_64KEY, "machine", "64",
+        productCode, displayNameContains, publisherContains, matches);
+    AppendUninstallRegistryMatches(
+        HKEY_LOCAL_MACHINE, machineBase, KEY_WOW64_32KEY, "machine", "32",
+        productCode, displayNameContains, publisherContains, matches);
+
+    // User-scoped installers (notably Electron/Squirrel applications) register
+    // under a loaded user's HKU hive. PatchHost runs as SYSTEM, so HKCU alone
+    // would point at LocalSystem and miss other loaded users. Enumerate all
+    // loaded SID hives and verify both native and WOW6432Node uninstall roots.
+    for (DWORD hiveIndex = 0;; ++hiveIndex) {
+        wchar_t hiveName[512]{};
+        DWORD hiveChars = ARRAYSIZE(hiveName);
+        FILETIME lastWrite{};
+        const LONG rc = RegEnumKeyExW(
+            HKEY_USERS, hiveIndex, hiveName, &hiveChars, nullptr, nullptr, nullptr, &lastWrite);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc != ERROR_SUCCESS) continue;
+
+        const std::wstring hive(hiveName, hiveChars);
+        const std::string hiveUtf8 = WideToUtf8(hive);
+        if (hiveUtf8.rfind("S-1-", 0) != 0 || hiveUtf8.find("_Classes") != std::string::npos) continue;
+
+        const std::string scope = "user:" + hiveUtf8;
+        AppendUninstallRegistryMatches(
+            HKEY_USERS,
+            hive + LR"(\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)",
+            0, scope, "user64",
+            productCode, displayNameContains, publisherContains, matches);
+        AppendUninstallRegistryMatches(
+            HKEY_USERS,
+            hive + LR"(\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall)",
+            0, scope, "user32",
+            productCode, displayNameContains, publisherContains, matches);
+    }
 
     bool meetsTarget = !matches.empty();
     std::string lowestVersion;
