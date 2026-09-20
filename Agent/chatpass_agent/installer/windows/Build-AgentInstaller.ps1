@@ -245,6 +245,7 @@ $cmakeArgs += @(
     "-DCMAKE_BUILD_TYPE=$Configuration",
     "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
     "-DHI5_REQUIRE_STATIC_CRT=ON",
+    "-DHI5_AGENT_VERSION=$AgentVersion",
     "-DVCPKG_TARGET_TRIPLET=$VcpkgTriplet"
 )
 

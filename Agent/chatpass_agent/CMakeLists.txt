@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(HI5_REQUIRE_STATIC_CRT "Require static MSVC runtime (/MT) for agent builds" ON)
+set(HI5_AGENT_VERSION "1.0.0" CACHE STRING "Hi5Central Agent runtime version reported to the control plane")
 
 if(MSVC AND HI5_REQUIRE_STATIC_CRT)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -225,6 +226,7 @@ if(HI5_ENABLE_CEF_BROWSER)
 endif()
 
 target_compile_definitions(native_vp8_stream PRIVATE
+  HI5_AGENT_VERSION="${HI5_AGENT_VERSION}"
   RTC_ENABLE_MEDIA=1
   RTC_ENABLE_WEBSOCKET=1
   RTC_STATIC

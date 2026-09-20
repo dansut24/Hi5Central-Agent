@@ -31,7 +31,10 @@ namespace {
 
     constexpr const char* kDefaultApiBase = "https://api.hi5central.com";
     constexpr const char* kDefaultAgentWsBase = "wss://rmm.hi5central.com/agent/ws";
-    constexpr const char* kAgentVersion = "1.0.0";
+#ifndef HI5_AGENT_VERSION
+#define HI5_AGENT_VERSION "1.0.0"
+#endif
+    constexpr const char* kAgentVersion = HI5_AGENT_VERSION;
     constexpr DWORD kDpapiFlags = CRYPTPROTECT_LOCAL_MACHINE;
 
     std::string trim(std::string s) {
