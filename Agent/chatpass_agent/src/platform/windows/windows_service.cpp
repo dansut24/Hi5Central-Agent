@@ -6484,7 +6484,11 @@ exit 1
                         24 * 60 * 60
                     );
 
-                    for (int i = 0; i < 30 && !stop_.load(); ++i) {
+                    // Publish PatchHost capabilities promptly after service start so an
+                    // Agent upgrade cannot leave the control plane showing stale PatchHost
+                    // capabilities for the old build. Full recurring discovery remains on
+                    // the normal long interval below.
+                    for (int i = 0; i < 5 && !stop_.load(); ++i) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                     }
 
