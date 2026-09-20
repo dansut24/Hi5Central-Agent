@@ -76,6 +76,18 @@ jobs:
         run: |
           ./ci/Build-WindowsInstallers.ps1 -Version "0.1.${{ github.run_number }}"
 
+      - name: Verify PatchHost qualification capability
+        shell: pwsh
+        run: |
+          $patchHost = 'Agent/chatpass_agent/build/Release/Hi5CentralPatchHost.exe'
+          if (-not (Test-Path $patchHost)) { throw 'PatchHost build output is missing.' }
+          $version = (& $patchHost --version | Out-String).Trim()
+          $capabilities = (& $patchHost --capabilities | Out-String | ConvertFrom-Json)
+          Write-Host "PatchHost version: $version"
+          if ([version]$version -lt [version]'0.2.9') { throw "PatchHost $version is too old for installer technology qualification." }
+          if (-not $capabilities.vendorDirect.artifactInspection) { throw 'PatchHost artifact inspection capability is missing.' }
+          if (-not $capabilities.vendorDirect.artifactTechnologyDetection) { throw 'PatchHost artifact technology detection capability is missing.' }
+
       - name: Upload Agent installer
         uses: actions/upload-artifact@v4
         with:
@@ -87,6 +99,7 @@ jobs:
             Agent/chatpass_agent/build/Release/Hi5CentralAgentService.exe
             Agent/chatpass_agent/build/Release/Hi5CentralRemoteHost.exe
             Agent/chatpass_agent/build/Release/Hi5CentralMediaHost.exe
+            Agent/chatpass_agent/build/Release/Hi5CentralPatchHost.exe
             Agent/chatpass_agent/build/Release/Hi5CentralUser.exe
 
       - name: Upload Viewer installer
