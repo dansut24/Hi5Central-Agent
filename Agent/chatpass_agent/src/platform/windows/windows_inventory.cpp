@@ -1,4 +1,5 @@
 #include "inventory/inventory_snapshot.h"
+#include "agent_version.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -990,7 +991,7 @@ json AgentInfo(const std::string& collectedAt) {
     std::string state = ServiceState(L"Hi5CentralAgent");
     if (state == "Not installed") state = ServiceState(L"Hi5CentralAgent");
     return {
-        {"version", "1.0.0"},
+        {"version", hi5::kAgentVersion},
         {"service", state},
         {"service_status", state},
         {"install_path", GetModulePath()},

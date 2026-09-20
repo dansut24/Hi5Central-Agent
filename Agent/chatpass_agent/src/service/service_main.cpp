@@ -1,6 +1,7 @@
 ﻿#include "service_main.h"
 
 #include "../agent_identity.h"
+#include "../agent_version.h"
 #include "../signaling_client.h"
 #include "../webrtc_sender.h"
 #include "../codec_capabilities.h"
@@ -1817,7 +1818,7 @@ class Worker {
                 signaling_->onOpen([this, ident]() {
                     LogI("websocket connected");
                     if (signaling_) {
-                        signaling_->send(R"({"type":"hello"})");
+                        signaling_->send(json{{"type", "hello"}, {"agent_version", hi5::kAgentVersion}}.dump());
                         LogI("hello sent");
                         SendInventorySnapshotSafe(ident);
                     }

@@ -1,5 +1,6 @@
 ﻿#include "service/service_main.h"
 #include "agent_identity.h"
+#include "agent_version.h"
 
 #include "signaling_client.h"
 #include "codec_policy.h"
@@ -2362,7 +2363,7 @@ LogI(
                     signalingReconnectRequested_.store(false);
                     LogI("websocket connected");
                     if (signaling_) {
-                        signaling_->send(R"({"type":"hello"})");
+                        signaling_->send(json{{"type", "hello"}, {"agent_version", hi5::kAgentVersion}}.dump());
                         LogI("hello sent");
                         SendInventorySnapshotSafe(ident);
                     }

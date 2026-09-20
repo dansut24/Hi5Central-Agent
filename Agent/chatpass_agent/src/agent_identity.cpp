@@ -1,4 +1,5 @@
 ﻿#include "agent_identity.h"
+#include "agent_version.h"
 #include "platform/platform_identity.h"
 
 #ifdef _WIN32
@@ -31,10 +32,6 @@ namespace {
 
     constexpr const char* kDefaultApiBase = "https://api.hi5central.com";
     constexpr const char* kDefaultAgentWsBase = "wss://rmm.hi5central.com/agent/ws";
-#ifndef HI5_AGENT_VERSION
-#define HI5_AGENT_VERSION "1.0.0"
-#endif
-    constexpr const char* kAgentVersion = HI5_AGENT_VERSION;
     constexpr DWORD kDpapiFlags = CRYPTPROTECT_LOCAL_MACHINE;
 
     std::string trim(std::string s) {
@@ -425,7 +422,7 @@ namespace {
             {"hostname", hostname},
             {"platform", "windows"},
             {"architecture", "x64"},
-            {"agentVersion", kAgentVersion},
+            {"agentVersion", hi5::kAgentVersion},
             {"fingerprint", fingerprint},
             {"device_fingerprint", fingerprint}
         };
