@@ -3799,7 +3799,7 @@ function Add-Hi5Candidate([System.Collections.ArrayList]$list, [string]$strategy
 function Test-Hi5UninstallActivity($candidate) {
     $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $command = [string]$candidate.command
-    foreach ($match in [regex]::Matches($command, '(?i)([A-Za-z0-9_.+-]+)\\.exe')) {
+    foreach ($match in [regex]::Matches($command, '(?i)([A-Za-z0-9_.+-]+)\.exe')) {
         $name = ([string]$match.Groups[1].Value).Trim()
         if ($name -and $name -notin @('cmd','powershell','pwsh')) { [void]$names.Add($name) }
     }
