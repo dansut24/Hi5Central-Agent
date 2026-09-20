@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.4";
+constexpr const char* kPatchHostVersion = "0.2.5";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -479,7 +479,9 @@ json Capabilities() {
             { "sha256Required", true },
             { "authenticodeRequired", true },
             { "installerTypes", json::array({ "msi", "exe" }) },
-            { "verificationMethods", json::array({ "winget", "uninstall_registry", "file_version" }) }
+            { "verificationMethods", json::array({ "winget", "uninstall_registry", "file_version" }) },
+            { "silentInstallStrategyLadder", true },
+            { "installerTechnologies", json::array({ "msi", "inno", "nullsoft", "nsis", "burn", "installshield", "squirrel", "generic" }) }
         } }
     };
 }
@@ -718,6 +720,8 @@ json VerifyFileVersion(const json& verification, const std::string& target) {
     };
 }
 
+bool InstallerArgsSafe(const std::string& value);
+
 bool ManifestValid(const json& manifest, std::string& error) {
     if (!manifest.is_object()) { error = "manifest_not_object"; return false; }
     if (manifest.value("protocolVersion", 0) != 1) { error = "unsupported_protocol"; return false; }
@@ -725,6 +729,8 @@ bool ManifestValid(const json& manifest, std::string& error) {
     if (manifest.value("jobId", std::string()).empty()) { error = "job_id_missing"; return false; }
     if (manifest.value("deviceId", std::string()).empty()) { error = "device_id_missing"; return false; }
     if (manifest.value("targetVersion", std::string()).empty()) { error = "target_version_missing"; return false; }
+    const std::string intent = Lower(manifest.value("intent", std::string("update")));
+    if (intent != "install" && intent != "update") { error = "unsupported_install_intent"; return false; }
 
     const long long expires = manifest.value("expiresUnixMs", 0LL);
     const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -764,6 +770,42 @@ bool ManifestValid(const json& manifest, std::string& error) {
         if (sha.size() != 64) { error = "vendor_sha256_missing"; return false; }
         if (type != "msi" && type != "exe") { error = "unsupported_installer_type"; return false; }
         if (manifest.value("expectedSigner", std::string()).empty()) { error = "expected_signer_missing"; return false; }
+
+        const std::string installArguments = manifest.value("installArguments", std::string());
+        if (!installArguments.empty() && !InstallerArgsSafe(installArguments)) {
+            error = "invalid_install_arguments";
+            return false;
+        }
+
+        if (manifest.contains("installStrategies")) {
+            if (!manifest["installStrategies"].is_array() || manifest["installStrategies"].size() > 12) {
+                error = "invalid_install_strategies";
+                return false;
+            }
+            for (const auto& strategy : manifest["installStrategies"]) {
+                if (!strategy.is_object()) { error = "invalid_install_strategy"; return false; }
+                const std::string name = strategy.value("name", std::string());
+                const std::string args = strategy.value("args", std::string());
+                if (name.empty() || name.size() > 80 || !InstallerArgsSafe(args)) {
+                    error = "invalid_install_strategy";
+                    return false;
+                }
+            }
+        }
+
+        const std::string technology = Lower(manifest.value("installerTechnology", std::string()));
+        if (!technology.empty()
+            && technology != "generic"
+            && technology != "msi"
+            && technology != "inno"
+            && technology != "nullsoft"
+            && technology != "nsis"
+            && technology != "burn"
+            && technology != "installshield"
+            && technology != "squirrel") {
+            error = "unsupported_installer_technology";
+            return false;
+        }
     }
 
     return true;
@@ -824,11 +866,98 @@ json VerifyInstalledVersionWithRetry(const json& manifest, const std::filesystem
     return verification;
 }
 
-CommandResult RunWingetUpgrade(const json& manifest, const std::filesystem::path& root, const std::wstring& suffix = L"winget-install.log") {
+json VerifyInstalledVersionShort(const json& manifest, const std::filesystem::path& root) {
+    const DWORD delaysMs[] = { 0, 1000, 2000 };
+    json verification;
+    int attempts = 0;
+    for (const DWORD delay : delaysMs) {
+        if (delay > 0) Sleep(delay);
+        verification = VerifyInstalledVersion(manifest, root);
+        attempts += 1;
+        if (verification.value("meetsTarget", false)) break;
+    }
+    verification["attempts"] = attempts;
+    return verification;
+}
+
+bool InstallerArgsSafe(const std::string& value) {
+    if (value.empty() || value.size() > 1000) return false;
+    if (value.find('\r') != std::string::npos
+        || value.find('\n') != std::string::npos
+        || value.find('\0') != std::string::npos) return false;
+    return value.find('&') == std::string::npos
+        && value.find('|') == std::string::npos
+        && value.find('<') == std::string::npos
+        && value.find('>') == std::string::npos
+        && value.find('^') == std::string::npos;
+}
+
+struct VendorInstallStrategy {
+    std::string name;
+    std::string args;
+};
+
+void AddInstallStrategy(std::vector<VendorInstallStrategy>& strategies, const std::string& name, const std::string& args) {
+    if (!InstallerArgsSafe(args)) return;
+    for (const auto& current : strategies) {
+        if (Lower(current.args) == Lower(args)) return;
+    }
+    if (strategies.size() >= 12) return;
+    strategies.push_back({ name, args });
+}
+
+std::vector<VendorInstallStrategy> VendorInstallStrategies(const json& manifest) {
+    std::vector<VendorInstallStrategy> strategies;
+    if (manifest.contains("installStrategies") && manifest["installStrategies"].is_array()) {
+        for (const auto& item : manifest["installStrategies"]) {
+            if (!item.is_object()) continue;
+            AddInstallStrategy(
+                strategies,
+                item.value("name", std::string("catalogue")),
+                item.value("args", std::string()));
+        }
+    }
+
+    const std::string explicitArgs = manifest.value("installArguments", std::string());
+    if (!explicitArgs.empty()) AddInstallStrategy(strategies, "configured", explicitArgs);
+
+    const std::string technology = Lower(manifest.value("installerTechnology", std::string("generic")));
+    if (technology == "inno") {
+        AddInstallStrategy(strategies, "inno_verysilent", "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-");
+        AddInstallStrategy(strategies, "inno_silent", "/SILENT /SUPPRESSMSGBOXES /NORESTART /SP-");
+    } else if (technology == "nullsoft" || technology == "nsis") {
+        AddInstallStrategy(strategies, "nsis_silent", "/S");
+    } else if (technology == "burn") {
+        AddInstallStrategy(strategies, "burn_quiet", "/quiet /norestart");
+        AddInstallStrategy(strategies, "burn_passive", "/passive /norestart");
+    } else if (technology == "installshield") {
+        AddInstallStrategy(strategies, "installshield_silent", "/s /v\"/qn /norestart\"");
+    } else if (technology == "squirrel") {
+        AddInstallStrategy(strategies, "squirrel_silent", "--silent");
+    }
+
+    if (technology.empty() || technology == "generic") {
+        AddInstallStrategy(strategies, "generic_quiet", "/quiet /norestart");
+        AddInstallStrategy(strategies, "generic_silent", "/silent /norestart");
+        AddInstallStrategy(strategies, "generic_verysilent", "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-");
+        AddInstallStrategy(strategies, "generic_nsis", "/S");
+        AddInstallStrategy(strategies, "generic_dash_silent", "--silent");
+        AddInstallStrategy(strategies, "generic_dash_quiet", "--quiet");
+    }
+    return strategies;
+}
+
+bool InstallerExitSucceeded(int exitCode) {
+    return exitCode == 0 || exitCode == 3010 || exitCode == 1641;
+}
+
+CommandResult RunWingetInstallOrUpgrade(const json& manifest, const std::filesystem::path& root, const std::wstring& suffix = L"winget-install.log") {
     const std::string packageId = manifest.value("packageId", std::string());
+    const std::string intent = Lower(manifest.value("intent", std::string("update")));
+    const std::wstring verb = intent == "install" ? L" install --id " : L" upgrade --id ";
     const std::wstring winget = ResolveWinget();
     const std::wstring command =
-        Quote(winget) + L" upgrade --id " + Quote(Utf8ToWide(packageId)) +
+        Quote(winget) + verb + Quote(Utf8ToWide(packageId)) +
         L" --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --nowarn";
     return RunHidden(command, root / suffix, 30 * 60 * 1000);
 }
@@ -861,12 +990,14 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
     const std::string installedVersion = manifest.value("installedVersion", std::string());
     const std::string targetVersion = manifest.value("targetVersion", std::string());
     const std::string packageId = manifest.value("packageId", std::string());
+    const std::string intent = Lower(manifest.value("intent", std::string("update")));
 
     json result = {
         { "success", false },
         { "applicationName", applicationName },
         { "packageId", packageId },
         { "provider", provider },
+        { "intent", intent },
         { "installedVersion", installedVersion },
         { "targetVersion", targetVersion },
         { "rebootRequired", false },
@@ -874,12 +1005,15 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         { "fallbackUsed", false },
         { "sha256Verified", false },
         { "signatureVerified", false },
+        { "installAttempts", json::array() },
         { "serializedWaitMs", serializedWaitMs },
         { "jobWorkDir", WideToUtf8(root.wstring()) },
         { "capabilities", Capabilities() }
     };
 
     CommandResult install;
+    json verification = json::object();
+    bool verificationCaptured = false;
     bool directAttempted = false;
 
     if (provider == "vendor_direct") {
@@ -909,18 +1043,63 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                     result["signatureVerified"] = !signer.empty() && ContainsInsensitive(signer, expectedSigner);
                     if (!result["signatureVerified"].get<bool>()) {
                         result["error"] = "unexpected_signer";
+                    } else if (installerType == "msi") {
+                        const std::wstring command = L"msiexec.exe /i " + Quote(installerPath.wstring()) + L" /qn /norestart";
+                        install = RunHidden(command, root / L"vendor-install-msi.log", 30 * 60 * 1000);
+                        result["installAttempts"].push_back({
+                            { "name", "msi_quiet" },
+                            { "exitCode", install.exitCode },
+                            { "timedOut", install.timedOut },
+                            { "output", Truncate(install.output, 2000) }
+                        });
+                        result["exitCode"] = install.exitCode;
+                        result["installerOutput"] = Truncate(install.output, 4000);
+                        result["rebootRequired"] = install.exitCode == 3010 || install.exitCode == 1641;
                     } else {
-                    std::wstring command;
-                    if (installerType == "msi") {
-                        command = L"msiexec.exe /i " + Quote(installerPath.wstring()) + L" /qn /norestart";
-                    } else {
-                        const std::string args = manifest.value("installArguments", std::string("/quiet /norestart"));
-                        command = Quote(installerPath.wstring()) + L" " + Utf8ToWide(args);
-                    }
-                    install = RunHidden(command, root / L"vendor-install.log", 30 * 60 * 1000);
-                    result["exitCode"] = install.exitCode;
-                    result["installerOutput"] = Truncate(install.output, 4000);
-                    result["rebootRequired"] = install.exitCode == 3010 || install.exitCode == 1641;
+                        const auto strategies = VendorInstallStrategies(manifest);
+                        if (strategies.empty()) {
+                            result["error"] = "silent_install_strategy_missing";
+                        } else {
+                            for (size_t index = 0; index < strategies.size(); ++index) {
+                                const auto& strategy = strategies[index];
+                                const std::wstring command =
+                                    Quote(installerPath.wstring()) + L" " + Utf8ToWide(strategy.args);
+                                const std::wstring logName =
+                                    L"vendor-install-" + std::to_wstring(index + 1) + L".log";
+                                const CommandResult attempt = RunHidden(command, root / logName, 30 * 60 * 1000);
+                                const bool exitSucceeded = InstallerExitSucceeded(attempt.exitCode);
+                                const json attemptVerification = exitSucceeded
+                                    ? VerifyInstalledVersionWithRetry(manifest, root, true)
+                                    : VerifyInstalledVersionShort(manifest, root);
+                                const bool verified = attemptVerification.value("meetsTarget", false);
+
+                                result["installAttempts"].push_back({
+                                    { "name", strategy.name },
+                                    { "args", strategy.args },
+                                    { "exitCode", attempt.exitCode },
+                                    { "timedOut", attempt.timedOut },
+                                    { "verified", verified },
+                                    { "verification", attemptVerification },
+                                    { "output", Truncate(attempt.output, 2000) }
+                                });
+
+                                install = attempt;
+                                verification = attemptVerification;
+                                verificationCaptured = true;
+                                result["exitCode"] = attempt.exitCode;
+                                result["installerOutput"] = Truncate(attempt.output, 4000);
+                                result["rebootRequired"] = result["rebootRequired"].get<bool>()
+                                    || attempt.exitCode == 3010 || attempt.exitCode == 1641;
+
+                                if (verified) break;
+                                if (attempt.timedOut || exitSucceeded) {
+                                    result["error"] = attempt.timedOut
+                                        ? "installer_timeout"
+                                        : "target_version_not_verified_after_successful_installer";
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -928,15 +1107,16 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
 
         std::filesystem::remove(installerPath, ec);
     } else {
-        install = RunWingetUpgrade(manifest, root);
+        install = RunWingetInstallOrUpgrade(manifest, root);
         result["exitCode"] = install.exitCode;
         result["installerOutput"] = Truncate(install.output, 4000);
         result["rebootRequired"] = install.exitCode == 3010 || install.exitCode == 1641;
     }
 
-    const bool installerSucceeded =
-        install.exitCode == 0 || install.exitCode == 3010 || install.exitCode == 1641;
-    json verification = VerifyInstalledVersionWithRetry(manifest, root, installerSucceeded);
+    const bool installerSucceeded = InstallerExitSucceeded(install.exitCode);
+    if (!verificationCaptured) {
+        verification = VerifyInstalledVersionWithRetry(manifest, root, installerSucceeded);
+    }
     result["verifiedVersion"] = verification.value("installedVersion", std::string());
     result["verification"] = verification;
     result["verificationPassed"] = verification.value("meetsTarget", false);
@@ -945,11 +1125,11 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         && directAttempted
         && manifest.value("fallbackProvider", std::string()) == "winget") {
         result["fallbackUsed"] = true;
-        const CommandResult fallback = RunWingetUpgrade(manifest, root, L"winget-fallback.log");
+        const CommandResult fallback = RunWingetInstallOrUpgrade(manifest, root, L"winget-fallback.log");
         result["fallbackExitCode"] = fallback.exitCode;
         result["fallbackOutput"] = Truncate(fallback.output, 3000);
         result["rebootRequired"] = result["rebootRequired"].get<bool>() || fallback.exitCode == 3010 || fallback.exitCode == 1641;
-        const bool fallbackSucceeded = fallback.exitCode == 0 || fallback.exitCode == 3010 || fallback.exitCode == 1641;
+        const bool fallbackSucceeded = InstallerExitSucceeded(fallback.exitCode);
         verification = VerifyInstalledVersionWithRetry(manifest, root, fallbackSucceeded);
         result["verifiedVersion"] = verification.value("installedVersion", std::string());
         result["verification"] = verification;
@@ -957,9 +1137,8 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         if (fallbackSucceeded) install = fallback;
     }
 
-    const bool finalInstallerSucceeded =
-        install.exitCode == 0 || install.exitCode == 3010 || install.exitCode == 1641;
-    const bool success = finalInstallerSucceeded && result["verificationPassed"].get<bool>();
+    const bool finalInstallerSucceeded = InstallerExitSucceeded(install.exitCode);
+    const bool success = result["verificationPassed"].get<bool>();
     result["success"] = success;
 
     if (!success) {
