@@ -8,6 +8,7 @@
 #include <Softpub.h>
 #include <bcrypt.h>
 #include <urlmon.h>
+#include <winver.h>
 
 #include <algorithm>
 #include <chrono>
@@ -26,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.3";
+constexpr const char* kPatchHostVersion = "0.2.4";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -477,7 +478,8 @@ json Capabilities() {
             { "httpsOnly", true },
             { "sha256Required", true },
             { "authenticodeRequired", true },
-            { "installerTypes", json::array({ "msi", "exe" }) }
+            { "installerTypes", json::array({ "msi", "exe" }) },
+            { "verificationMethods", json::array({ "winget", "uninstall_registry", "file_version" }) }
         } }
     };
 }
@@ -561,6 +563,161 @@ json DiscoverWinget() {
         } }
     };
 }
+std::string ReadRegistryText(HKEY root, const std::wstring& subkey, const wchar_t* name, REGSAM view) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, subkey.c_str(), 0, KEY_READ | view, &key) != ERROR_SUCCESS) return "";
+    DWORD type = 0;
+    DWORD bytes = 0;
+    LONG rc = RegQueryValueExW(key, name, nullptr, &type, nullptr, &bytes);
+    if (rc != ERROR_SUCCESS || bytes == 0 || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        RegCloseKey(key);
+        return "";
+    }
+    std::vector<wchar_t> buffer((bytes / sizeof(wchar_t)) + 2, L'\0');
+    rc = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<LPBYTE>(buffer.data()), &bytes);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS) return "";
+    std::wstring value(buffer.data());
+    if (type == REG_EXPAND_SZ && !value.empty()) {
+        const DWORD needed = ExpandEnvironmentStringsW(value.c_str(), nullptr, 0);
+        if (needed > 0 && needed < 32768) {
+            std::wstring expanded(needed, L'\0');
+            if (ExpandEnvironmentStringsW(value.c_str(), expanded.data(), needed) > 0) {
+                while (!expanded.empty() && expanded.back() == L'\0') expanded.pop_back();
+                value = expanded;
+            }
+        }
+    }
+    return WideToUtf8(value);
+}
+
+void AppendUninstallRegistryMatches(
+    HKEY root,
+    REGSAM view,
+    const std::string& productCode,
+    const std::string& displayNameContains,
+    const std::string& publisherContains,
+    json& matches) {
+
+    const std::wstring base = LR"(SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)";
+    HKEY uninstall = nullptr;
+    if (RegOpenKeyExW(root, base.c_str(), 0, KEY_READ | view, &uninstall) != ERROR_SUCCESS) return;
+
+    DWORD index = 0;
+    wchar_t name[512]{};
+    DWORD nameChars = ARRAYSIZE(name);
+    FILETIME lastWrite{};
+    while (RegEnumKeyExW(uninstall, index++, name, &nameChars, nullptr, nullptr, nullptr, &lastWrite) == ERROR_SUCCESS) {
+        const std::string keyName = WideToUtf8(name);
+        nameChars = ARRAYSIZE(name);
+
+        if (!productCode.empty() && Lower(keyName) != Lower(productCode)) continue;
+
+        const std::wstring subkey = base + L"\\" + name;
+        const std::string displayName = ReadRegistryText(root, subkey, L"DisplayName", view);
+        const std::string publisher = ReadRegistryText(root, subkey, L"Publisher", view);
+        const std::string version = ReadRegistryText(root, subkey, L"DisplayVersion", view);
+        if (displayName.empty() || version.empty()) continue;
+        if (!displayNameContains.empty() && !ContainsInsensitive(displayName, displayNameContains)) continue;
+        if (!publisherContains.empty() && !ContainsInsensitive(publisher, publisherContains)) continue;
+
+        matches.push_back({
+            { "registryKey", keyName },
+            { "displayName", displayName },
+            { "publisher", publisher },
+            { "version", version },
+            { "view", view == KEY_WOW64_32KEY ? "32" : "64" }
+        });
+    }
+    RegCloseKey(uninstall);
+}
+
+json VerifyUninstallRegistry(const json& verification, const std::string& target) {
+    const std::string productCode = verification.value("productCode", std::string());
+    const std::string displayNameContains = verification.value("displayNameContains", std::string());
+    const std::string publisherContains = verification.value("publisherContains", std::string());
+    json matches = json::array();
+    AppendUninstallRegistryMatches(HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, productCode, displayNameContains, publisherContains, matches);
+    AppendUninstallRegistryMatches(HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY, productCode, displayNameContains, publisherContains, matches);
+
+    bool meetsTarget = !matches.empty();
+    std::string lowestVersion;
+    for (const auto& match : matches) {
+        const std::string version = match.value("version", std::string());
+        if (lowestVersion.empty() || CompareVersions(version, lowestVersion) < 0) lowestVersion = version;
+        if (!VersionMeetsTarget(version, target)) meetsTarget = false;
+    }
+
+    return {
+        { "method", "uninstall_registry" },
+        { "installedVersion", lowestVersion },
+        { "installedVersions", [&]() {
+            json versions = json::array();
+            for (const auto& match : matches) versions.push_back(match.value("version", std::string()));
+            return versions;
+        }() },
+        { "matchingInstances", matches.size() },
+        { "matches", matches },
+        { "meetsTarget", meetsTarget },
+        { "output", matches.empty() ? "No matching uninstall registry entries were found." : "Verified from uninstall registry." }
+    };
+}
+
+bool SafeVerificationFilePath(const std::wstring& path) {
+    if (path.size() < 4 || path.size() > 1024) return false;
+    if (path.rfind(L"\\", 0) == 0) return false;
+    if (!((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) || path[1] != L':' || path[2] != L'\\') return false;
+    const std::filesystem::path fsPath(path);
+    for (const auto& part : fsPath) if (part == L"..") return false;
+    const std::string ext = Lower(WideToUtf8(fsPath.extension().wstring()));
+    return ext == ".exe" || ext == ".dll";
+}
+
+json VerifyFileVersion(const json& verification, const std::string& target) {
+    const std::wstring raw = Utf8ToWide(verification.value("filePath", std::string()));
+    const DWORD needed = ExpandEnvironmentStringsW(raw.c_str(), nullptr, 0);
+    std::wstring path = raw;
+    if (needed > 0 && needed < 32768) {
+        path.assign(needed, L'\0');
+        if (ExpandEnvironmentStringsW(raw.c_str(), path.data(), needed) > 0) {
+            while (!path.empty() && path.back() == L'\0') path.pop_back();
+        }
+    }
+    if (!SafeVerificationFilePath(path)) {
+        return { { "method", "file_version" }, { "installedVersion", "" }, { "matchingInstances", 0 }, { "meetsTarget", false }, { "output", "Verification file path is not allowed." } };
+    }
+
+    DWORD ignored = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &ignored);
+    if (size == 0) {
+        return { { "method", "file_version" }, { "installedVersion", "" }, { "matchingInstances", 0 }, { "meetsTarget", false }, { "output", "File version resource was not found." }, { "filePath", WideToUtf8(path) } };
+    }
+    std::vector<BYTE> buffer(size);
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, buffer.data())) {
+        return { { "method", "file_version" }, { "installedVersion", "" }, { "matchingInstances", 0 }, { "meetsTarget", false }, { "output", "Unable to read file version resource." }, { "filePath", WideToUtf8(path) } };
+    }
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT infoSize = 0;
+    if (!VerQueryValueW(buffer.data(), L"\\", reinterpret_cast<LPVOID*>(&info), &infoSize) || !info || infoSize < sizeof(VS_FIXEDFILEINFO)) {
+        return { { "method", "file_version" }, { "installedVersion", "" }, { "matchingInstances", 0 }, { "meetsTarget", false }, { "output", "File version resource is invalid." }, { "filePath", WideToUtf8(path) } };
+    }
+    const std::string version =
+        std::to_string(HIWORD(info->dwFileVersionMS)) + "." +
+        std::to_string(LOWORD(info->dwFileVersionMS)) + "." +
+        std::to_string(HIWORD(info->dwFileVersionLS)) + "." +
+        std::to_string(LOWORD(info->dwFileVersionLS));
+
+    return {
+        { "method", "file_version" },
+        { "installedVersion", version },
+        { "installedVersions", json::array({ version }) },
+        { "matchingInstances", 1 },
+        { "meetsTarget", VersionMeetsTarget(version, target) },
+        { "output", "Verified from local file version resource." },
+        { "filePath", WideToUtf8(path) }
+    };
+}
+
 bool ManifestValid(const json& manifest, std::string& error) {
     if (!manifest.is_object()) { error = "manifest_not_object"; return false; }
     if (manifest.value("protocolVersion", 0) != 1) { error = "unsupported_protocol"; return false; }
@@ -579,7 +736,25 @@ bool ManifestValid(const json& manifest, std::string& error) {
     if (provider != "winget" && provider != "vendor_direct") { error = "unsupported_provider"; return false; }
 
     const std::string packageId = manifest.value("packageId", std::string());
-    if (packageId.empty()) { error = "package_id_missing"; return false; }
+    const json verification = manifest.value("verification", json::object());
+    const std::string method = Lower(verification.value("method", verification.value("provider", std::string("winget"))));
+    if (method != "winget" && method != "uninstall_registry" && method != "file_version") {
+        error = "unsupported_verification_method";
+        return false;
+    }
+    if ((provider == "winget" || method == "winget") && packageId.empty() && verification.value("packageId", std::string()).empty()) {
+        error = "package_id_missing";
+        return false;
+    }
+    if (method == "uninstall_registry") {
+        const std::string productCode = verification.value("productCode", std::string());
+        const std::string displayNameContains = verification.value("displayNameContains", std::string());
+        if (productCode.empty() && displayNameContains.empty()) { error = "registry_verification_identity_missing"; return false; }
+    }
+    if (method == "file_version" && verification.value("filePath", std::string()).empty()) {
+        error = "file_version_path_missing";
+        return false;
+    }
 
     if (provider == "vendor_direct") {
         const std::string url = manifest.value("downloadUrl", std::string());
@@ -595,7 +770,14 @@ bool ManifestValid(const json& manifest, std::string& error) {
 }
 
 json VerifyInstalledVersion(const json& manifest, const std::filesystem::path& root) {
-    const std::string packageId = manifest.value("packageId", std::string());
+    const json verification = manifest.value("verification", json::object());
+    const std::string method = Lower(verification.value("method", verification.value("provider", std::string("winget"))));
+    const std::string target = manifest.value("targetVersion", std::string());
+
+    if (method == "uninstall_registry") return VerifyUninstallRegistry(verification, target);
+    if (method == "file_version") return VerifyFileVersion(verification, target);
+
+    const std::string packageId = verification.value("packageId", manifest.value("packageId", std::string()));
     const std::wstring winget = ResolveWinget();
     const auto log = root / L"verify.log";
     const std::wstring command =
@@ -604,7 +786,6 @@ json VerifyInstalledVersion(const json& manifest, const std::filesystem::path& r
     const CommandResult verify = RunHidden(command, log, 3 * 60 * 1000);
     const auto rows = FindWingetListRows(verify.output, packageId);
     const WingetListRow row = LowestWingetListRow(rows);
-    const std::string target = manifest.value("targetVersion", std::string());
 
     bool meetsTarget = !rows.empty();
     size_t comparableInstances = 0;
@@ -618,6 +799,7 @@ json VerifyInstalledVersion(const json& manifest, const std::filesystem::path& r
     if (comparableInstances == 0) meetsTarget = false;
 
     return {
+        { "method", "winget" },
         { "exitCode", verify.exitCode },
         { "installedVersion", row.installedVersion },
         { "installedVersions", installedVersions },

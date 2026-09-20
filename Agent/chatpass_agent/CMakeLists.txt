@@ -371,7 +371,7 @@ if(WIN32)
   target_compile_definitions(hi5central_patch_host PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
   target_link_libraries(hi5central_patch_host PRIVATE
     nlohmann_json::nlohmann_json
-    crypt32 bcrypt urlmon wintrust
+    crypt32 bcrypt urlmon wintrust version
     advapi32 user32 shell32
   )
   set_target_properties(hi5central_patch_host PROPERTIES OUTPUT_NAME "Hi5CentralPatchHost")
