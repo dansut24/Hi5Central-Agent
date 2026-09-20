@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.7";
+constexpr const char* kPatchHostVersion = "0.2.8";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -893,6 +893,25 @@ json VerifyInstalledVersionShort(const json& manifest, const std::filesystem::pa
     return verification;
 }
 
+json VerifyInstalledVersionAfterSuccessfulExe(const json& manifest, const std::filesystem::path& root) {
+    // Electron/Squirrel/NSIS-style bootstrap executables can return before a
+    // child process finishes registering the application. Give successful EXE
+    // launches up to ~60 seconds for independently verifiable installed state
+    // before trying another silent strategy.
+    const DWORD delaysMs[] = { 0, 1000, 2000, 4000, 8000, 15000, 30000 };
+    json verification;
+    int attempts = 0;
+    for (const DWORD delay : delaysMs) {
+        if (delay > 0) Sleep(delay);
+        verification = VerifyInstalledVersion(manifest, root);
+        attempts += 1;
+        if (verification.value("meetsTarget", false)) break;
+    }
+    verification["attempts"] = attempts;
+    verification["asyncRegistrationGraceMs"] = 60000;
+    return verification;
+}
+
 bool InstallerArgsSafe(const std::string& value) {
     if (value.empty() || value.size() > 1000) return false;
     if (value.find('\r') != std::string::npos
@@ -1132,7 +1151,7 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                                 const CommandResult attempt = RunHidden(command, root / logName, 30 * 60 * 1000);
                                 const bool exitSucceeded = InstallerExitSucceeded(attempt.exitCode);
                                 const json attemptVerification = exitSucceeded
-                                    ? VerifyInstalledVersionWithRetry(manifest, root, true)
+                                    ? VerifyInstalledVersionAfterSuccessfulExe(manifest, root)
                                     : VerifyInstalledVersionShort(manifest, root);
                                 const bool verified = attemptVerification.value("meetsTarget", false);
 
