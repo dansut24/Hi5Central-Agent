@@ -116,7 +116,7 @@ jobs:
             Viewer/chatpass_viewer/dist/viewer/web/**
 
       - name: Publish latest test installers
-        if: github.event_name == 'push' && github.ref == 'refs/heads/hardening-mobile-viewer'
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/hardening-mobile-viewer' || github.ref == 'refs/heads/agent-hardening-v2')
         shell: pwsh
         run: |
           $publish = Join-Path $env:RUNNER_TEMP 'hi5central-publish'
