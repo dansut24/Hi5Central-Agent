@@ -82,7 +82,9 @@ jobs:
           $patchHost = 'Agent/chatpass_agent/build/Release/Hi5CentralPatchHost.exe'
           if (-not (Test-Path $patchHost)) { throw 'PatchHost build output is missing.' }
           $version = (& $patchHost --version | Out-String).Trim()
-          $capabilities = (& $patchHost --capabilities | Out-String | ConvertFrom-Json)
+          $capabilityResponse = (& $patchHost --capabilities | Out-String | ConvertFrom-Json)
+          $capabilities = $capabilityResponse.capabilities
+          if (-not $capabilities) { throw 'PatchHost capability payload is missing.' }
           Write-Host "PatchHost version: $version"
           if ([version]$version -lt [version]'0.2.9') { throw "PatchHost $version is too old for installer technology qualification." }
           if (-not $capabilities.vendorDirect.artifactInspection) { throw 'PatchHost artifact inspection capability is missing.' }
