@@ -4402,6 +4402,22 @@ function Add-Hi5Candidate([System.Collections.ArrayList]$list, [string]$strategy
     [void]$list.Add([pscustomobject]@{ strategy=$strategy; command=$command })
 }
 
+function Test-Hi5UninstallActivity($candidate) {
+    $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $command = [string]$candidate.command
+    foreach ($match in [regex]::Matches($command, '(?i)([A-Za-z0-9_.+-]+)\\.exe')) {
+        $name = ([string]$match.Groups[1].Value).Trim()
+        if ($name -and $name -notin @('cmd','powershell','pwsh')) { [void]$names.Add($name) }
+    }
+    if ([string]$candidate.strategy -eq 'msi_product_code') { [void]$names.Add('msiexec') }
+    foreach ($name in $names) {
+        try {
+            if (Get-Process -Name $name -ErrorAction SilentlyContinue) { return $true }
+        } catch {}
+    }
+    return $false
+}
+
 function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
     $root = Join-Path $env:ProgramData 'Hi5Central\Agent\Temp'
     New-Item -ItemType Directory -Path $root -Force | Out-Null
@@ -4438,10 +4454,25 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
     Remove-Item -LiteralPath $cmdFile,$outFile,$errFile -Force -ErrorAction SilentlyContinue
 
     $stillInstalled = $true
-    for ($probe = 0; $probe -lt 12; $probe++) {
-        Start-Sleep -Seconds $(if ($probe -eq 0) { 2 } else { 3 })
+    $verificationWaitSeconds = 0
+    $verificationExtended = $false
+    $probeDelays = @(1,2,3)
+    foreach ($delay in $probeDelays) {
+        Start-Sleep -Seconds $delay
+        $verificationWaitSeconds += $delay
         $stillInstalled = Test-Hi5StillInstalled
         if (-not $stillInstalled) { break }
+    }
+
+    if ($stillInstalled -and (Test-Hi5UninstallActivity $candidate)) {
+        $verificationExtended = $true
+        for ($probe = 0; $probe -lt 10; $probe++) {
+            Start-Sleep -Seconds 3
+            $verificationWaitSeconds += 3
+            $stillInstalled = Test-Hi5StillInstalled
+            if (-not $stillInstalled) { break }
+            if (-not (Test-Hi5UninstallActivity $candidate)) { break }
+        }
     }
 
     return [pscustomobject]@{
@@ -4449,6 +4480,8 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
         exit_code = $exitCode
         timed_out = $timedOut
         still_installed = $stillInstalled
+        verification_wait_seconds = $verificationWaitSeconds
+        verification_extended = $verificationExtended
         duration_seconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
         output = ConvertTo-Hi5SafeString $output
     }
