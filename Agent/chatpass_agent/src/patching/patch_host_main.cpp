@@ -26,7 +26,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.2";
+constexpr const char* kPatchHostVersion = "0.2.3";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -103,6 +103,46 @@ std::filesystem::path PatchHostRoot() {
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     return root;
+}
+
+std::wstring SafePathSegment(const std::string& value) {
+    std::wstring output;
+    for (const wchar_t ch : Utf8ToWide(value)) {
+        if ((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z')
+            || (ch >= L'0' && ch <= L'9') || ch == L'-' || ch == L'_') {
+            output.push_back(ch);
+        } else {
+            output.push_back(L'_');
+        }
+    }
+    return output.empty() ? L"unknown-job" : output;
+}
+
+std::filesystem::path PatchJobRoot(const json& manifest) {
+    const auto root = PatchHostRoot() / L"jobs" / SafePathSegment(manifest.value("jobId", std::string()));
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    return root;
+}
+
+struct SoftwareInstallMutex {
+    HANDLE handle = nullptr;
+    bool locked = false;
+
+    ~SoftwareInstallMutex() {
+        if (locked && handle) ReleaseMutex(handle);
+        if (handle) CloseHandle(handle);
+    }
+};
+
+bool AcquireSoftwareInstallMutex(SoftwareInstallMutex& mutex, unsigned long long& waitedMs) {
+    const ULONGLONG started = GetTickCount64();
+    mutex.handle = CreateMutexW(nullptr, FALSE, L"Global\\Hi5CentralPatchHostSoftwareInstall");
+    if (!mutex.handle) return false;
+    const DWORD wait = WaitForSingleObject(mutex.handle, 2 * 60 * 60 * 1000);
+    waitedMs = static_cast<unsigned long long>(GetTickCount64() - started);
+    mutex.locked = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+    return mutex.locked;
 }
 
 std::wstring Quote(const std::wstring& value) {
@@ -588,6 +628,20 @@ json VerifyInstalledVersion(const json& manifest, const std::filesystem::path& r
     };
 }
 
+json VerifyInstalledVersionWithRetry(const json& manifest, const std::filesystem::path& root, bool retry) {
+    const DWORD delaysMs[] = { 0, 1000, 2000, 4000, 8000, 15000 };
+    json verification;
+    int attempts = 0;
+    for (const DWORD delay : delaysMs) {
+        if (delay > 0) Sleep(delay);
+        verification = VerifyInstalledVersion(manifest, root);
+        attempts += 1;
+        if (verification.value("meetsTarget", false) || !retry) break;
+    }
+    verification["attempts"] = attempts;
+    return verification;
+}
+
 CommandResult RunWingetUpgrade(const json& manifest, const std::filesystem::path& root, const std::wstring& suffix = L"winget-install.log") {
     const std::string packageId = manifest.value("packageId", std::string());
     const std::wstring winget = ResolveWinget();
@@ -598,7 +652,6 @@ CommandResult RunWingetUpgrade(const json& manifest, const std::filesystem::path
 }
 
 json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
-    const std::filesystem::path root = PatchHostRoot();
     const std::string plain = DecryptDpapiFile(encryptedManifestPath);
     if (plain.empty()) return { { "success", false }, { "error", "manifest_decrypt_failed" }, { "capabilities", Capabilities() } };
 
@@ -606,6 +659,19 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
     std::string validationError;
     if (manifest.is_discarded() || !ManifestValid(manifest, validationError)) {
         return { { "success", false }, { "error", validationError.empty() ? "manifest_invalid_json" : validationError }, { "capabilities", Capabilities() } };
+    }
+
+    const std::filesystem::path root = PatchJobRoot(manifest);
+    SoftwareInstallMutex installMutex;
+    unsigned long long serializedWaitMs = 0;
+    if (!AcquireSoftwareInstallMutex(installMutex, serializedWaitMs)) {
+        return {
+            { "success", false },
+            { "error", "patch_execution_lock_timeout" },
+            { "detail", "Timed out waiting for another software patch on this endpoint to finish." },
+            { "serializedWaitMs", serializedWaitMs },
+            { "capabilities", Capabilities() }
+        };
     }
 
     const std::string provider = manifest.value("provider", std::string());
@@ -626,6 +692,8 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         { "fallbackUsed", false },
         { "sha256Verified", false },
         { "signatureVerified", false },
+        { "serializedWaitMs", serializedWaitMs },
+        { "jobWorkDir", WideToUtf8(root.wstring()) },
         { "capabilities", Capabilities() }
     };
 
@@ -684,13 +752,12 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         result["rebootRequired"] = install.exitCode == 3010 || install.exitCode == 1641;
     }
 
-    json verification = VerifyInstalledVersion(manifest, root);
+    const bool installerSucceeded =
+        install.exitCode == 0 || install.exitCode == 3010 || install.exitCode == 1641;
+    json verification = VerifyInstalledVersionWithRetry(manifest, root, installerSucceeded);
     result["verifiedVersion"] = verification.value("installedVersion", std::string());
     result["verification"] = verification;
     result["verificationPassed"] = verification.value("meetsTarget", false);
-
-    const bool installerSucceeded =
-        install.exitCode == 0 || install.exitCode == 3010 || install.exitCode == 1641;
 
     if ((!installerSucceeded || !result["verificationPassed"].get<bool>())
         && directAttempted
@@ -700,11 +767,12 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         result["fallbackExitCode"] = fallback.exitCode;
         result["fallbackOutput"] = Truncate(fallback.output, 3000);
         result["rebootRequired"] = result["rebootRequired"].get<bool>() || fallback.exitCode == 3010 || fallback.exitCode == 1641;
-        verification = VerifyInstalledVersion(manifest, root);
+        const bool fallbackSucceeded = fallback.exitCode == 0 || fallback.exitCode == 3010 || fallback.exitCode == 1641;
+        verification = VerifyInstalledVersionWithRetry(manifest, root, fallbackSucceeded);
         result["verifiedVersion"] = verification.value("installedVersion", std::string());
         result["verification"] = verification;
         result["verificationPassed"] = verification.value("meetsTarget", false);
-        if (fallback.exitCode == 0 || fallback.exitCode == 3010 || fallback.exitCode == 1641) install = fallback;
+        if (fallbackSucceeded) install = fallback;
     }
 
     const bool finalInstallerSucceeded =
