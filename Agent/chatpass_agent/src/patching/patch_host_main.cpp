@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.10";
+constexpr const char* kPatchHostVersion = "0.2.11";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -197,6 +197,11 @@ CommandResult RunHidden(const std::wstring& command, const std::filesystem::path
     startup.dwFlags = STARTF_USESHOWWINDOW;
     startup.wShowWindow = SW_HIDE;
 
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) {
+        return { static_cast<int>(GetLastError()), "CreateJobObjectW failed", false };
+    }
+
     PROCESS_INFORMATION process{};
     std::wstring mutableCommand = shell;
     const BOOL created = CreateProcessW(
@@ -205,14 +210,34 @@ CommandResult RunHidden(const std::wstring& command, const std::filesystem::path
         nullptr,
         nullptr,
         FALSE,
-        CREATE_NO_WINDOW,
+        CREATE_NO_WINDOW | CREATE_SUSPENDED,
         nullptr,
         nullptr,
         &startup,
         &process);
 
     if (!created) {
-        return { static_cast<int>(GetLastError()), "CreateProcessW failed", false };
+        const DWORD error = GetLastError();
+        CloseHandle(job);
+        return { static_cast<int>(error), "CreateProcessW failed", false };
+    }
+
+    if (!AssignProcessToJobObject(job, process.hProcess)) {
+        const DWORD error = GetLastError();
+        TerminateProcess(process.hProcess, error);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(job);
+        return { static_cast<int>(error), "AssignProcessToJobObject failed", false };
+    }
+
+    if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+        const DWORD error = GetLastError();
+        TerminateJobObject(job, error);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(job);
+        return { static_cast<int>(error), "ResumeThread failed", false };
     }
 
     const DWORD wait = WaitForSingleObject(process.hProcess, timeoutMs);
@@ -220,7 +245,8 @@ CommandResult RunHidden(const std::wstring& command, const std::filesystem::path
     bool timedOut = false;
     if (wait == WAIT_TIMEOUT) {
         timedOut = true;
-        TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+        TerminateJobObject(job, ERROR_TIMEOUT);
+        WaitForSingleObject(process.hProcess, 5000);
         exitCode = ERROR_TIMEOUT;
     } else if (!GetExitCodeProcess(process.hProcess, &exitCode)) {
         exitCode = GetLastError();
@@ -228,6 +254,7 @@ CommandResult RunHidden(const std::wstring& command, const std::filesystem::path
 
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
+    CloseHandle(job);
     return { static_cast<int>(exitCode), ReadFileUtf8(outputPath), timedOut };
 }
 
@@ -454,7 +481,7 @@ std::string DetectInstallerTechnology(const std::filesystem::path& path, const s
 
     if (FileContainsInstallerMarker(path, { "inno setup setup data", "inno setup" })) return "inno";
     if (FileContainsInstallerMarker(path, { "nullsoft.nsis", "nullsoft install system", "nsis error" })) return "nsis";
-    if (FileContainsInstallerMarker(path, { "wixbundle", "wixstdba", "burn engine" })) return "burn";
+    if (FileContainsInstallerMarker(path, { "wixbundle", "wixstdba", ".wixburn", "\\wix\\src\\burn\\engine", "failed to find burn section", "burn engine" })) return "burn";
     if (FileContainsInstallerMarker(path, { "installshield" })) return "installshield";
     if (FileContainsInstallerMarker(path, { "--squirrel-install", "squirrel aware version", "squirrel" })) return "squirrel";
     if (FileContainsInstallerMarker(path, { "install4j" })) return "install4j";
@@ -1053,7 +1080,8 @@ std::vector<VendorInstallStrategy> VendorInstallStrategies(const json& manifest)
         AddInstallStrategy(strategies, "install4j_quiet", "-q");
     }
 
-    if (technology.empty() || technology == "generic") {
+    if ((technology.empty() || technology == "generic")
+        && manifest.value("allowGenericStrategyFallback", false)) {
         AddInstallStrategy(strategies, "generic_quiet", "/quiet /norestart");
         AddInstallStrategy(strategies, "generic_silent", "/silent /norestart");
         AddInstallStrategy(strategies, "generic_verysilent", "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-");
@@ -1237,7 +1265,7 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                                     Quote(installerPath.wstring()) + L" " + Utf8ToWide(strategy.args);
                                 const std::wstring logName =
                                     L"vendor-install-" + std::to_wstring(index + 1) + L".log";
-                                const CommandResult attempt = RunHidden(command, root / logName, 30 * 60 * 1000);
+                                const CommandResult attempt = RunHidden(command, root / logName, 10 * 60 * 1000);
                                 const bool exitSucceeded = InstallerExitSucceeded(attempt.exitCode);
                                 const json attemptVerification = exitSucceeded
                                     ? VerifyInstalledVersionAfterSuccessfulExe(manifest, root)
@@ -1274,6 +1302,8 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                                 // independent installed-state verification proves the target.
                                 if (attempt.timedOut) {
                                     result["error"] = "installer_timeout";
+                                    result["timeoutKilledProcessTree"] = true;
+                                    break;
                                 } else if (exitSucceeded) {
                                     result["error"] = "target_version_not_verified_after_successful_installer";
                                 }
