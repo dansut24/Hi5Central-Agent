@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.5";
+constexpr const char* kPatchHostVersion = "0.2.6";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -478,6 +478,7 @@ json Capabilities() {
             { "httpsOnly", true },
             { "sha256Required", true },
             { "authenticodeRequired", true },
+            { "artifactInspection", true },
             { "installerTypes", json::array({ "msi", "exe" }) },
             { "verificationMethods", json::array({ "winget", "uninstall_registry", "file_version" }) },
             { "silentInstallStrategyLadder", true },
@@ -725,10 +726,10 @@ bool InstallerArgsSafe(const std::string& value);
 bool ManifestValid(const json& manifest, std::string& error) {
     if (!manifest.is_object()) { error = "manifest_not_object"; return false; }
     if (manifest.value("protocolVersion", 0) != 1) { error = "unsupported_protocol"; return false; }
-    if (manifest.value("action", std::string()) != "software.install") { error = "unsupported_action"; return false; }
+    const std::string action = manifest.value("action", std::string());
+    if (action != "software.install" && action != "software.inspect") { error = "unsupported_action"; return false; }
     if (manifest.value("jobId", std::string()).empty()) { error = "job_id_missing"; return false; }
     if (manifest.value("deviceId", std::string()).empty()) { error = "device_id_missing"; return false; }
-    if (manifest.value("targetVersion", std::string()).empty()) { error = "target_version_missing"; return false; }
     const std::string intent = Lower(manifest.value("intent", std::string("update")));
     if (intent != "install" && intent != "update") { error = "unsupported_install_intent"; return false; }
 
@@ -738,6 +739,18 @@ bool ManifestValid(const json& manifest, std::string& error) {
     if (expires <= now) { error = "manifest_expired"; return false; }
     if (expires > now + 60LL * 60LL * 1000LL) { error = "manifest_expiry_too_far"; return false; }
 
+    if (action == "software.inspect") {
+        if (manifest.value("provider", std::string()) != "vendor_direct") { error = "inspect_provider_invalid"; return false; }
+        const std::string url = manifest.value("downloadUrl", std::string());
+        const std::string type = Lower(manifest.value("installerType", std::string()));
+        const std::string sha = manifest.value("sha256", std::string());
+        if (Lower(url).rfind("https://", 0) != 0) { error = "vendor_url_not_https"; return false; }
+        if (type != "msi" && type != "exe") { error = "unsupported_installer_type"; return false; }
+        if (!sha.empty() && sha.size() != 64) { error = "invalid_optional_sha256"; return false; }
+        return true;
+    }
+
+    if (manifest.value("targetVersion", std::string()).empty()) { error = "target_version_missing"; return false; }
     const std::string provider = manifest.value("provider", std::string());
     if (provider != "winget" && provider != "vendor_direct") { error = "unsupported_provider"; return false; }
 
@@ -962,6 +975,52 @@ CommandResult RunWingetInstallOrUpgrade(const json& manifest, const std::filesys
     return RunHidden(command, root / suffix, 30 * 60 * 1000);
 }
 
+json InspectVendorArtifact(const json& manifest) {
+    const std::filesystem::path root = PatchJobRoot(manifest);
+    const std::string installerType = Lower(manifest.value("installerType", std::string()));
+    const std::filesystem::path artifactPath =
+        root / (std::wstring(L"inspect-artifact.") + Utf8ToWide(installerType));
+    std::error_code ec;
+    std::filesystem::remove(artifactPath, ec);
+
+    json result = {
+        { "success", false },
+        { "action", "software.inspect" },
+        { "applicationName", manifest.value("applicationName", std::string()) },
+        { "downloadUrl", manifest.value("downloadUrl", std::string()) },
+        { "installerType", installerType },
+        { "signatureVerified", false },
+        { "sha256Verified", false },
+        { "capabilities", Capabilities() }
+    };
+
+    if (!DownloadHttps(manifest.value("downloadUrl", std::string()), artifactPath)) {
+        result["error"] = "vendor_download_failed";
+        return result;
+    }
+
+    const std::string actualSha = Sha256File(artifactPath);
+    const std::string expectedSha = manifest.value("sha256", std::string());
+    result["sha256"] = actualSha;
+    result["actualSha256"] = actualSha;
+    result["sha256Verified"] = !actualSha.empty()
+        && (expectedSha.empty() || Lower(actualSha) == Lower(expectedSha));
+
+    std::string signer;
+    const bool signatureValid = VerifyAuthenticodeTrust(artifactPath, signer);
+    result["signer"] = signer;
+    result["signatureVerified"] = signatureValid && !signer.empty();
+
+    std::filesystem::remove(artifactPath, ec);
+
+    if (actualSha.empty()) result["error"] = "sha256_failed";
+    else if (!result["sha256Verified"].get<bool>()) result["error"] = "sha256_mismatch";
+    else if (!signatureValid) result["error"] = "authenticode_invalid";
+    else if (signer.empty()) result["error"] = "authenticode_signer_missing";
+    else result["success"] = true;
+    return result;
+}
+
 json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
     const std::string plain = DecryptDpapiFile(encryptedManifestPath);
     if (plain.empty()) return { { "success", false }, { "error", "manifest_decrypt_failed" }, { "capabilities", Capabilities() } };
@@ -973,6 +1032,10 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
     }
 
     const std::filesystem::path root = PatchJobRoot(manifest);
+    if (manifest.value("action", std::string()) == "software.inspect") {
+        return InspectVendorArtifact(manifest);
+    }
+
     SoftwareInstallMutex installMutex;
     unsigned long long serializedWaitMs = 0;
     if (!AcquireSoftwareInstallMutex(installMutex, serializedWaitMs)) {
