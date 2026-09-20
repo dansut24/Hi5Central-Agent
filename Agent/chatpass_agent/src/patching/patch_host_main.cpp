@@ -26,7 +26,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.1";
+constexpr const char* kPatchHostVersion = "0.2.2";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -205,7 +205,8 @@ struct WingetListRow {
     std::string source;
 };
 
-WingetListRow FindWingetListRow(const std::string& output, const std::string& packageId) {
+std::vector<WingetListRow> FindWingetListRows(const std::string& output, const std::string& packageId) {
+    std::vector<WingetListRow> rows;
     std::istringstream lines(output);
     std::string line;
     const std::string needle = Lower(packageId);
@@ -219,16 +220,34 @@ WingetListRow FindWingetListRow(const std::string& output, const std::string& pa
             if (leftOk && rightOk) {
                 WingetListRow row;
                 row.name = Trim(line.substr(0, pos));
-                const auto tail = Tokens(line.substr(end));
-                if (!tail.empty()) row.installedVersion = tail[0];
-                if (tail.size() >= 2) row.source = tail.back();
-                if (tail.size() >= 3) row.availableVersion = tail[1];
-                return row;
+                auto tail = Tokens(line.substr(end));
+
+                if (!tail.empty()) {
+                    const std::string last = Lower(tail.back());
+                    if (last == "winget" || last == "msstore") {
+                        row.source = tail.back();
+                        tail.pop_back();
+                    }
+                }
+
+                if (!tail.empty()) {
+                    if ((tail[0] == "<" || tail[0] == ">" || tail[0] == "<=" || tail[0] == ">=")
+                        && tail.size() >= 2) {
+                        row.installedVersion = tail[0] + " " + tail[1];
+                        if (tail.size() >= 3) row.availableVersion = tail[2];
+                    } else {
+                        row.installedVersion = tail[0];
+                        if (tail.size() >= 2) row.availableVersion = tail[1];
+                    }
+                }
+
+                rows.push_back(std::move(row));
+                break;
             }
             pos = lowerLine.find(needle, pos + 1);
         }
     }
-    return {};
+    return rows;
 }
 
 std::vector<int> VersionParts(const std::string& value) {
@@ -274,6 +293,20 @@ int CompareVersions(const std::string& left, const std::string& right) {
 bool VersionMeetsTarget(const std::string& installed, const std::string& target) {
     return !installed.empty() && !target.empty() && CompareVersions(installed, target) >= 0;
 }
+
+WingetListRow LowestWingetListRow(const std::vector<WingetListRow>& rows) {
+    WingetListRow selected;
+    bool hasSelected = false;
+    for (const auto& row : rows) {
+        if (row.installedVersion.empty()) continue;
+        if (!hasSelected || CompareVersions(row.installedVersion, selected.installedVersion) < 0) {
+            selected = row;
+            hasSelected = true;
+        }
+    }
+    return selected;
+}
+
 std::string DecryptDpapiFile(const std::filesystem::path& path) {
     const auto encrypted = ReadFileBytes(path);
     if (encrypted.empty()) return "";
@@ -455,13 +488,23 @@ json DiscoverWinget() {
         for (const auto& package : source.value("Packages", json::array())) {
             const std::string packageId = package.value("PackageIdentifier", "");
             if (packageId.empty()) continue;
-            const WingetListRow row = FindWingetListRow(listed.output, packageId);
+            const auto rows = FindWingetListRows(listed.output, packageId);
+            const WingetListRow row = LowestWingetListRow(rows);
+            json installedInstances = json::array();
+            std::string availableVersion;
+            for (const auto& candidate : rows) {
+                if (!candidate.installedVersion.empty()) installedInstances.push_back(candidate.installedVersion);
+                if (availableVersion.empty() && !candidate.availableVersion.empty()) {
+                    availableVersion = candidate.availableVersion;
+                }
+            }
             packages.push_back({
                 { "packageId", packageId },
                 { "name", row.name.empty() ? packageId : row.name },
                 { "publisher", "" },
-                { "installedVersion", package.value("Version", row.installedVersion) },
-                { "availableVersion", row.availableVersion },
+                { "installedVersion", row.installedVersion.empty() ? package.value("Version", "") : row.installedVersion },
+                { "installedInstances", installedInstances },
+                { "availableVersion", availableVersion },
                 { "source", sourceName.empty() ? "winget" : sourceName }
             });
         }
@@ -519,13 +562,28 @@ json VerifyInstalledVersion(const json& manifest, const std::filesystem::path& r
         Quote(winget) + L" list --id " + Quote(Utf8ToWide(packageId)) +
         L" --exact --source winget --accept-source-agreements --disable-interactivity --nowarn";
     const CommandResult verify = RunHidden(command, log, 3 * 60 * 1000);
-    const WingetListRow row = FindWingetListRow(verify.output, packageId);
+    const auto rows = FindWingetListRows(verify.output, packageId);
+    const WingetListRow row = LowestWingetListRow(rows);
     const std::string target = manifest.value("targetVersion", std::string());
+
+    bool meetsTarget = !rows.empty();
+    size_t comparableInstances = 0;
+    json installedVersions = json::array();
+    for (const auto& candidate : rows) {
+        if (candidate.installedVersion.empty()) continue;
+        comparableInstances += 1;
+        installedVersions.push_back(candidate.installedVersion);
+        if (!VersionMeetsTarget(candidate.installedVersion, target)) meetsTarget = false;
+    }
+    if (comparableInstances == 0) meetsTarget = false;
+
     return {
         { "exitCode", verify.exitCode },
         { "installedVersion", row.installedVersion },
+        { "installedVersions", installedVersions },
+        { "matchingInstances", comparableInstances },
         { "availableVersion", row.availableVersion },
-        { "meetsTarget", VersionMeetsTarget(row.installedVersion, target) },
+        { "meetsTarget", meetsTarget },
         { "output", Truncate(verify.output, 2500) }
     };
 }
