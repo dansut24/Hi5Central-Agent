@@ -551,7 +551,8 @@ json Capabilities() {
             { "sha256Required", true },
             { "authenticodeRequired", true },
             { "artifactInspection", true },
-            { "installerTypes", json::array({ "msi", "exe" }) },
+            { "installerTypes", json::array({ "msi", "exe", "msix", "msixbundle", "appx", "appxbundle" }) },
+            { "windowsPackageInspection", true },
             { "verificationMethods", json::array({ "winget", "uninstall_registry", "file_version" }) },
             { "silentInstallStrategyLadder", true },
             { "installerTechnologies", json::array({ "msi", "inno", "nullsoft", "nsis", "burn", "installshield", "squirrel", "install4j", "generic" }) },
@@ -855,7 +856,7 @@ bool ManifestValid(const json& manifest, std::string& error) {
         const std::string type = Lower(manifest.value("installerType", std::string()));
         const std::string sha = manifest.value("sha256", std::string());
         if (Lower(url).rfind("https://", 0) != 0) { error = "vendor_url_not_https"; return false; }
-        if (type != "msi" && type != "exe") { error = "unsupported_installer_type"; return false; }
+        if (type != "msi" && type != "exe" && type != "msix" && type != "msixbundle" && type != "appx" && type != "appxbundle") { error = "unsupported_installer_type"; return false; }
         if (!sha.empty() && sha.size() != 64) { error = "invalid_optional_sha256"; return false; }
         return true;
     }
@@ -891,7 +892,7 @@ bool ManifestValid(const json& manifest, std::string& error) {
         const std::string type = Lower(manifest.value("installerType", std::string()));
         if (Lower(url).rfind("https://", 0) != 0) { error = "vendor_url_not_https"; return false; }
         if (sha.size() != 64) { error = "vendor_sha256_missing"; return false; }
-        if (type != "msi" && type != "exe") { error = "unsupported_installer_type"; return false; }
+        if (type != "msi" && type != "exe" && type != "msix" && type != "msixbundle" && type != "appx" && type != "appxbundle") { error = "unsupported_installer_type"; return false; }
         if (manifest.value("expectedSigner", std::string()).empty()) { error = "expected_signer_missing"; return false; }
 
         const std::string installArguments = manifest.value("installArguments", std::string());
@@ -1144,7 +1145,8 @@ json InspectVendorArtifact(const json& manifest) {
     result["sha256Verified"] = !actualSha.empty()
         && (expectedSha.empty() || Lower(actualSha) == Lower(expectedSha));
 
-    const std::string installerTechnology = DetectInstallerTechnology(artifactPath, installerType);
+    const bool windowsPackage = installerType == "msix" || installerType == "msixbundle" || installerType == "appx" || installerType == "appxbundle";
+    const std::string installerTechnology = windowsPackage ? "msix" : DetectInstallerTechnology(artifactPath, installerType);
     result["installerTechnology"] = installerTechnology;
     result["installerTechnologyRecognized"] = installerTechnology != "generic" && installerTechnology != "unknown";
 
