@@ -540,6 +540,7 @@ json Capabilities() {
         { "protocolVersion", 1 },
         { "softwareDiscovery", true },
         { "softwareInstall", true },
+        { "softwareBulk", true },
         { "windowsUpdateDiscovery", false },
         { "windowsUpdateInstall", false },
         { "providers", json::array({ "winget", "vendor_direct" }) },
