@@ -4783,6 +4783,71 @@ exit 1
                         return;
                     }
 
+                    if (jobType == "patch.software.bulk") {
+                        json items = payload.value("items", json::array());
+                        json results = json::array();
+                        int succeeded = 0;
+                        int failed = 0;
+                        if (!items.is_array() || items.empty() || items.size() > 50) {
+                            PostJobResult(ident, jobId, false, json{
+                                {"success", false},
+                                {"error", "bulk_patch_items_invalid"},
+                                {"attemptedCount", 0}
+                            }, "Bulk software patch requires between 1 and 50 items.");
+                            return;
+                        }
+
+                        size_t index = 0;
+                        for (const auto& item : items) {
+                            index += 1;
+                            if (!item.is_object()) {
+                                failed += 1;
+                                results.push_back(json{
+                                    {"success", false},
+                                    {"error", "bulk_patch_item_invalid"},
+                                    {"index", static_cast<int>(index)}
+                                });
+                                continue;
+                            }
+                            std::string patchError;
+                            json patchPayload = item;
+                            patchPayload["action"] = "software.install";
+                            const std::string childJobId = jobId + "-" + std::to_string(index);
+                            json itemResult = RunPatchHostSoftwareJob(ident, childJobId, patchPayload, patchError);
+                            itemResult["index"] = static_cast<int>(index);
+                            itemResult["catalogueId"] = item.value("catalogueId", std::string());
+                            itemResult["packageId"] = item.value("packageId", std::string());
+                            itemResult["applicationName"] = item.value("applicationName", std::string());
+                            if (itemResult.value("success", false)) succeeded += 1;
+                            else {
+                                failed += 1;
+                                if (!patchError.empty()) itemResult["agentError"] = patchError;
+                            }
+                            results.push_back(std::move(itemResult));
+                        }
+
+                        json capabilities = json::object();
+                        for (const auto& itemResult : results) {
+                            if (itemResult.contains("capabilities") && itemResult["capabilities"].is_object()) {
+                                capabilities = itemResult["capabilities"];
+                                break;
+                            }
+                        }
+                        json result = {
+                            {"success", failed == 0},
+                            {"mode", payload.value("mode", std::string("selected_catalogue"))},
+                            {"attemptedCount", static_cast<int>(items.size())},
+                            {"succeededCount", succeeded},
+                            {"failedCount", failed},
+                            {"items", results},
+                            {"capabilities", capabilities}
+                        };
+                        PostJobResult(ident, jobId, failed == 0, result, failed == 0 ? std::string() : "One or more software updates failed.");
+                        try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                        try { SendPatchDiscoverySafe(ident); } catch (...) {}
+                        return;
+                    }
+
                     if (jobType == "patch.software" || jobType == "patch.vendor_artifact.inspect") {
                         std::string patchError;
                         json patchPayload = payload;
