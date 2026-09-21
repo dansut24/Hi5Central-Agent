@@ -698,4 +698,3 @@ AgentIdentity loadAgentIdentityFromDir(
     ident.agentWsBaseUrl = newState.agentWsBaseUrl;
     return ident;
 }
-
