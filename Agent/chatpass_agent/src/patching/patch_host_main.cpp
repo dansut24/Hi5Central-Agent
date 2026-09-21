@@ -7,7 +7,7 @@
 #include <wintrust.h>
 #include <Softpub.h>
 #include <bcrypt.h>
-#include <urlmon.h>
+#include <winhttp.h>
 #include <winver.h>
 
 #include <algorithm>
@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.12";
+constexpr const char* kPatchHostVersion = "0.2.13";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -125,6 +125,25 @@ std::filesystem::path PatchJobRoot(const json& manifest) {
     std::filesystem::create_directories(root, ec);
     return root;
 }
+
+void PurgeJobDirectory(const std::filesystem::path& path) noexcept {
+    if (path.empty()) return;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+        if (!std::filesystem::exists(path, ec)) return;
+        Sleep(static_cast<DWORD>(250 * (attempt + 1)));
+    }
+}
+
+struct ScopedJobDirectoryCleanup {
+    std::filesystem::path path;
+    explicit ScopedJobDirectoryCleanup(std::filesystem::path value) : path(std::move(value)) {}
+    ~ScopedJobDirectoryCleanup() { PurgeJobDirectory(path); }
+
+    ScopedJobDirectoryCleanup(const ScopedJobDirectoryCleanup&) = delete;
+    ScopedJobDirectoryCleanup& operator=(const ScopedJobDirectoryCleanup&) = delete;
+};
 
 struct SoftwareInstallMutex {
     HANDLE handle = nullptr;
@@ -542,8 +561,111 @@ bool VerifyAuthenticodeTrust(const std::filesystem::path& path, std::string& sig
 
 bool DownloadHttps(const std::string& url, const std::filesystem::path& path) {
     if (Lower(url).rfind("https://", 0) != 0) return false;
-    const HRESULT hr = URLDownloadToFileW(nullptr, Utf8ToWide(url).c_str(), path.c_str(), 0, nullptr);
-    return SUCCEEDED(hr);
+
+    const std::wstring wideUrl = Utf8ToWide(url);
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwSchemeLength = static_cast<DWORD>(-1);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(wideUrl.c_str(), 0, 0, &parts) || parts.nScheme != INTERNET_SCHEME_HTTPS) {
+        return false;
+    }
+
+    const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring requestPath;
+    if (parts.lpszUrlPath && parts.dwUrlPathLength) {
+        requestPath.assign(parts.lpszUrlPath, parts.dwUrlPathLength);
+    }
+    if (parts.lpszExtraInfo && parts.dwExtraInfoLength) {
+        requestPath.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    }
+    if (requestPath.empty()) requestPath = L"/";
+
+    HINTERNET session = WinHttpOpen(
+        L"Hi5Central-PatchHost/0.2.13",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+    if (!session) return false;
+    WinHttpSetTimeouts(session, 120000, 120000, 120000, 120000);
+
+    HINTERNET connect = WinHttpConnect(session, host.c_str(), parts.nPort, 0);
+    if (!connect) {
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    HINTERNET request = WinHttpOpenRequest(
+        connect,
+        L"GET",
+        requestPath.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!request) {
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    const wchar_t headers[] = L"Accept: */*\r\nCache-Control: no-cache\r\n";
+    bool ok = WinHttpSendRequest(
+        request,
+        headers,
+        static_cast<DWORD>(-1L),
+        WINHTTP_NO_REQUEST_DATA,
+        0,
+        0,
+        0) != FALSE;
+    if (ok) ok = WinHttpReceiveResponse(request, nullptr) != FALSE;
+
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (ok) {
+        ok = WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &status,
+            &statusSize,
+            WINHTTP_NO_HEADER_INDEX) != FALSE;
+        ok = ok && status >= 200 && status < 300;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream output;
+    if (ok) {
+        output.open(path, std::ios::binary | std::ios::trunc);
+        ok = output.good();
+    }
+
+    std::vector<char> buffer(1024 * 1024);
+    while (ok) {
+        DWORD read = 0;
+        if (!WinHttpReadData(request, buffer.data(), static_cast<DWORD>(buffer.size()), &read)) {
+            ok = false;
+            break;
+        }
+        if (read == 0) break;
+        output.write(buffer.data(), static_cast<std::streamsize>(read));
+        if (!output.good()) {
+            ok = false;
+            break;
+        }
+    }
+    if (output.is_open()) output.close();
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+
+    if (!ok) std::filesystem::remove(path, ec);
+    return ok;
 }
 json Capabilities() {
     return {
@@ -567,7 +689,10 @@ json Capabilities() {
             { "verificationMethods", json::array({ "winget", "uninstall_registry", "file_version" }) },
             { "silentInstallStrategyLadder", true },
             { "installerTechnologies", json::array({ "msi", "inno", "nullsoft", "nsis", "burn", "installshield", "squirrel", "install4j", "generic" }) },
-            { "artifactTechnologyDetection", true }
+            { "artifactTechnologyDetection", true },
+            { "artifactStorage", "job_scoped" },
+            { "jobDirectoryPurgedOnExit", true },
+            { "winInetCacheUsed", false }
         } }
     };
 }
@@ -1116,6 +1241,7 @@ CommandResult RunWingetInstallOrUpgrade(const json& manifest, const std::filesys
     const std::wstring winget = ResolveWinget();
     const std::string installArguments = manifest.value("installArguments", std::string());
     std::wstring command =
+        L"set \"TEMP=" + root.wstring() + L"\" && set \"TMP=" + root.wstring() + L"\" && " +
         Quote(winget) + verb + Quote(Utf8ToWide(packageId)) +
         L" --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --nowarn";
     // Curated package-specific silent arguments can be supplied by the control
@@ -1189,6 +1315,7 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
     }
 
     const std::filesystem::path root = PatchJobRoot(manifest);
+    ScopedJobDirectoryCleanup jobDirectoryCleanup(root);
     if (manifest.value("action", std::string()) == "software.inspect") {
         return InspectVendorArtifact(manifest);
     }

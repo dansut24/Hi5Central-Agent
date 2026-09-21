@@ -7,7 +7,6 @@
 
 #include <windows.h>
 #include <winhttp.h>
-#include <urlmon.h>
 
 #include <algorithm>
 #include <chrono>
@@ -20,7 +19,6 @@
 #include <vector>
 
 #pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "urlmon.lib")
 
 using json = nlohmann::json;
 
@@ -49,19 +47,44 @@ std::filesystem::path ProgramDataRoot() {
     return std::filesystem::path(LR"(C:\ProgramData\Hi5Central\Agent)");
 }
 
-std::wstring PatchCacheDir() {
-    std::filesystem::path dir = ProgramDataRoot() / L"PatchCache";
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir.wstring();
+std::wstring SafeJobSegment(const std::string& value) {
+    std::wstring output;
+    for (const wchar_t ch : Utf8ToWide(value)) {
+        if ((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z')
+            || (ch >= L'0' && ch <= L'9') || ch == L'-' || ch == L'_') {
+            output.push_back(ch);
+        } else {
+            output.push_back(L'_');
+        }
+    }
+    return output.empty() ? L"unknown-job" : output;
 }
 
-std::filesystem::path PatchActionsDir() {
-    std::filesystem::path dir = ProgramDataRoot() / L"PatchActions";
+std::filesystem::path PatchJobDir(const std::string& taskId) {
+    std::filesystem::path dir = ProgramDataRoot() / L"PatchHost" / L"jobs" / SafeJobSegment(taskId);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     return dir;
 }
+
+void PurgePatchJobDir(const std::filesystem::path& path) noexcept {
+    if (path.empty()) return;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+        if (!std::filesystem::exists(path, ec)) return;
+        Sleep(static_cast<DWORD>(250 * (attempt + 1)));
+    }
+}
+
+struct ScopedPatchJobCleanup {
+    std::filesystem::path path;
+    explicit ScopedPatchJobCleanup(std::filesystem::path value) : path(std::move(value)) {}
+    ~ScopedPatchJobCleanup() { PurgePatchJobDir(path); }
+
+    ScopedPatchJobCleanup(const ScopedPatchJobCleanup&) = delete;
+    ScopedPatchJobCleanup& operator=(const ScopedPatchJobCleanup&) = delete;
+};
 
 std::filesystem::path LogsDir() {
     std::filesystem::path dir = ProgramDataRoot() / L"Logs";
@@ -462,7 +485,7 @@ std::string BuildInstallerCommand(
     const std::string lowerName = Lower(softwareName + " " + localFileName + " " + requestedCommand);
 
     if (EndsWithInsensitive(localPathText, ".msi")) {
-        const std::filesystem::path msiLog = PatchActionsDir() / (SanitizeFilePart(taskId) + L"-msi.log");
+        const std::filesystem::path msiLog = localPath.parent_path() / (SanitizeFilePart(taskId) + L"-msi.log");
         return "msiexec.exe /i " + quotedLocalPath + " /qn /norestart /L*v " + QuoteForCmd(WideToUtf8(msiLog.wstring()));
     }
 
@@ -573,6 +596,9 @@ void PatchWorker::ExecuteTask(const json& task) {
     const std::string targetVersion = task.value("target_version", "");
     if (taskId.empty()) return;
 
+    const std::filesystem::path jobDir = PatchJobDir(taskId);
+    ScopedPatchJobCleanup jobDirectoryCleanup(jobDir);
+
     try {
         WritePatchStatus("[task=" + taskId + "] raw_task=" + TruncateForReport(task.dump(), 4000));
         LogInfo("[patch] executing task=" + taskId + " software=" + softwareName);
@@ -591,7 +617,7 @@ void PatchWorker::ExecuteTask(const json& task) {
         WritePatchStatus("[task=" + taskId + "] wingetId=" + wingetId);
         WritePatchStatus("[task=" + taskId + "] initial installCommand=" + installCommand);
 
-        const std::wstring cacheDir = PatchCacheDir();
+        const std::wstring cacheDir = jobDir.wstring();
         std::filesystem::path localPath;
 
         if (executionType == "download_and_install") {
@@ -626,7 +652,7 @@ void PatchWorker::ExecuteTask(const json& task) {
         // command output/status log. This is where Windows Installer explains
         // the real reason for failures such as exit code 1/1603/1618.
         if (executionType == "download_and_install" && EndsWithInsensitive(WideToUtf8(localPath.wstring()), ".msi")) {
-            const std::filesystem::path msiLog = PatchActionsDir() / (SanitizeFilePart(taskId) + L"-msi.log");
+            const std::filesystem::path msiLog = jobDir / (SanitizeFilePart(taskId) + L"-msi.log");
             const std::string msiText = ReadFileUtf8(msiLog);
             WritePatchStatus("[task=" + taskId + "] msiLogPath=" + WideToUtf8(msiLog.wstring()));
             if (!msiText.empty()) {
@@ -732,13 +758,102 @@ void PatchWorker::ExecuteTask(const json& task) {
 
 bool PatchWorker::DownloadFile(const std::string& url, const std::wstring& outputPath) {
     WritePatchStatus("[download] url=" + url + " output=" + WideToUtf8(outputPath));
-    HRESULT hr = URLDownloadToFileW(nullptr, Utf8ToWide(url).c_str(), outputPath.c_str(), 0, nullptr);
-    if (FAILED(hr)) WritePatchStatus("[download] failed hr=" + std::to_string(static_cast<long>(hr)));
-    return SUCCEEDED(hr);
+    ParsedUrl parsed = ParseUrl(url);
+    if (!parsed.https) {
+        WritePatchStatus("[download] rejected non-HTTPS URL");
+        return false;
+    }
+
+    HINTERNET session = WinHttpOpen(
+        L"Hi5Central-Agent-PatchWorker/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+    if (!session) return false;
+    WinHttpSetTimeouts(session, 120000, 120000, 120000, 120000);
+
+    HINTERNET connect = WinHttpConnect(session, parsed.host.c_str(), parsed.port, 0);
+    if (!connect) {
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    HINTERNET request = WinHttpOpenRequest(
+        connect,
+        L"GET",
+        parsed.path.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!request) {
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return false;
+    }
+
+    const wchar_t headers[] = L"Accept: */*\r\nCache-Control: no-cache\r\n";
+    bool ok = WinHttpSendRequest(
+        request, headers, static_cast<DWORD>(-1L),
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0) != FALSE;
+    if (ok) ok = WinHttpReceiveResponse(request, nullptr) != FALSE;
+
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (ok) {
+        ok = WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &status,
+            &statusSize,
+            WINHTTP_NO_HEADER_INDEX) != FALSE;
+        ok = ok && status >= 200 && status < 300;
+    }
+
+    const std::filesystem::path destination(outputPath);
+    std::error_code ec;
+    std::filesystem::create_directories(destination.parent_path(), ec);
+    std::ofstream output;
+    if (ok) {
+        output.open(destination, std::ios::binary | std::ios::trunc);
+        ok = output.good();
+    }
+
+    std::vector<char> buffer(1024 * 1024);
+    while (ok) {
+        DWORD read = 0;
+        if (!WinHttpReadData(request, buffer.data(), static_cast<DWORD>(buffer.size()), &read)) {
+            ok = false;
+            break;
+        }
+        if (read == 0) break;
+        output.write(buffer.data(), static_cast<std::streamsize>(read));
+        if (!output.good()) {
+            ok = false;
+            break;
+        }
+    }
+    if (output.is_open()) output.close();
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+
+    if (!ok) {
+        std::filesystem::remove(destination, ec);
+        WritePatchStatus("[download] failed");
+    }
+    return ok;
 }
 
 PatchWorker::CommandResult PatchWorker::RunCommand(const std::string& taskId, const std::string& command, const std::wstring& workingDir) {
-    std::filesystem::path actions = PatchActionsDir();
+    std::filesystem::path actions = workingDir.empty()
+        ? (ProgramDataRoot() / L"PatchHost" / L"jobs" / SafeJobSegment(taskId))
+        : std::filesystem::path(workingDir);
+    std::error_code actionsEc;
+    std::filesystem::create_directories(actions, actionsEc);
     std::filesystem::path script = actions / (SanitizeFilePart(taskId) + L".cmd");
     std::filesystem::path output = actions / (SanitizeFilePart(taskId) + L".out.txt");
 
@@ -747,6 +862,8 @@ PatchWorker::CommandResult PatchWorker::RunCommand(const std::string& taskId, co
         out << "@echo off\r\n";
         out << "setlocal EnableExtensions\r\n";
         out << "chcp 65001 >nul\r\n";
+        out << "set \"TEMP=%CD%\"\r\n";
+        out << "set \"TMP=%CD%\"\r\n";
         out << "set PATH=%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0;%ProgramFiles%\\WindowsApps;%LOCALAPPDATA%\\Microsoft\\WindowsApps;%PATH%\r\n";
         out << "echo [Hi5CentralPatch] WorkingDir=%CD%\r\n";
         out << "echo [Hi5CentralPatch] Command=" << command << "\r\n";
