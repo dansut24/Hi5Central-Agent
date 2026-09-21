@@ -488,6 +488,17 @@ std::string DetectInstallerTechnology(const std::filesystem::path& path, const s
     return "generic";
 }
 
+json InspectWindowsPackageIdentity(const std::filesystem::path& path) {
+    const auto log = path.parent_path() / L"package-identity.log";
+    const std::wstring script = L"$ErrorActionPreference=\'Stop\';$p=" + Quote(path.wstring()) + L";Add-Type -AssemblyName System.IO.Compression.FileSystem;$z=[IO.Compression.ZipFile]::OpenRead($p);try{$e=$z.Entries|?{$_.FullName -match \'(^|/)AppxManifest.xml$\'}|select -First 1;if(!$e){throw \'manifest_missing\'};$r=[IO.StreamReader]::new($e.Open());try{$x=[xml]$r.ReadToEnd()}finally{$r.Dispose()};$i=$x.Package.Identity;[pscustomobject]@{name=[string]$i.Name;publisher=[string]$i.Publisher;version=[string]$i.Version;architecture=[string]$i.ProcessorArchitecture}|ConvertTo-Json -Compress}finally{$z.Dispose()}";
+    const CommandResult cr = RunHidden(L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " + Quote(script), log, 60000);
+    if (cr.exitCode != 0) return { { "valid", false }, { "error", "package_manifest_invalid" }, { "output", Truncate(cr.output, 1000) } };
+    const size_t begin = cr.output.find('{'), end = cr.output.rfind('}');
+    if (begin == std::string::npos || end == std::string::npos || end < begin) return { { "valid", false }, { "error", "package_identity_missing" } };
+    const json identity = json::parse(cr.output.substr(begin, end - begin + 1), nullptr, false);
+    if (identity.is_discarded() || identity.value("name", std::string()).empty() || identity.value("publisher", std::string()).empty() || identity.value("version", std::string()).empty()) return { { "valid", false }, { "error", "package_identity_missing" } };
+    return { { "valid", true }, { "identity", identity } };
+}
 bool VerifyAuthenticodeTrust(const std::filesystem::path& path, std::string& signerName) {
     signerName.clear();
 
@@ -1149,6 +1160,7 @@ json InspectVendorArtifact(const json& manifest) {
     const std::string installerTechnology = windowsPackage ? "msix" : DetectInstallerTechnology(artifactPath, installerType);
     result["installerTechnology"] = installerTechnology;
     result["installerTechnologyRecognized"] = installerTechnology != "generic" && installerTechnology != "unknown";
+    if (windowsPackage) { const json package = InspectWindowsPackageIdentity(artifactPath); result["packageInspection"] = package; if (package.value("valid", false)) result["packageIdentity"] = package.value("identity", json::object()); }
 
     std::string signer;
     const bool signatureValid = VerifyAuthenticodeTrust(artifactPath, signer);
@@ -1161,6 +1173,7 @@ json InspectVendorArtifact(const json& manifest) {
     else if (!result["sha256Verified"].get<bool>()) result["error"] = "sha256_mismatch";
     else if (!signatureValid) result["error"] = "authenticode_invalid";
     else if (signer.empty()) result["error"] = "authenticode_signer_missing";
+    else if (windowsPackage && !result.value("packageInspection", json::object()).value("valid", false)) result["error"] = "package_identity_invalid";
     else result["success"] = true;
     return result;
 }
