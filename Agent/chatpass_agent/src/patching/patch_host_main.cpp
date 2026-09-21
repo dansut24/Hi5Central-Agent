@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.11";
+constexpr const char* kPatchHostVersion = "0.2.12";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -1102,9 +1102,14 @@ CommandResult RunWingetInstallOrUpgrade(const json& manifest, const std::filesys
     const std::string intent = Lower(manifest.value("intent", std::string("update")));
     const std::wstring verb = intent == "install" ? L" install --id " : L" upgrade --id ";
     const std::wstring winget = ResolveWinget();
-    const std::wstring command =
+    const std::string installArguments = manifest.value("installArguments", std::string());
+    std::wstring command =
         Quote(winget) + verb + Quote(Utf8ToWide(packageId)) +
         L" --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --nowarn";
+    // Curated package-specific silent arguments can be supplied by the control
+    // plane. Keep them a single quoted WinGet --override value; they never become
+    // shell syntax and the manifest itself is DPAPI job-scoped.
+    if (!installArguments.empty()) command += L" --override " + Quote(Utf8ToWide(installArguments));
     return RunHidden(command, root / suffix, 30 * 60 * 1000);
 }
 
