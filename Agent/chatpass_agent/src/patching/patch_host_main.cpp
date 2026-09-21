@@ -490,7 +490,7 @@ std::string DetectInstallerTechnology(const std::filesystem::path& path, const s
 
 json InspectWindowsPackageIdentity(const std::filesystem::path& path) {
     const auto log = path.parent_path() / L"package-identity.log";
-    const std::wstring script = L"$ErrorActionPreference=\'Stop\';$p=" + Quote(path.wstring()) + L";Add-Type -AssemblyName System.IO.Compression.FileSystem;$z=[IO.Compression.ZipFile]::OpenRead($p);try{$e=$z.Entries|?{$_.FullName -match \'(^|/)AppxManifest.xml$\'}|select -First 1;if(!$e){throw \'manifest_missing\'};$r=[IO.StreamReader]::new($e.Open());try{$x=[xml]$r.ReadToEnd()}finally{$r.Dispose()};$i=$x.Package.Identity;[pscustomobject]@{name=[string]$i.Name;publisher=[string]$i.Publisher;version=[string]$i.Version;architecture=[string]$i.ProcessorArchitecture}|ConvertTo-Json -Compress}finally{$z.Dispose()}";
+    const std::wstring script = L"$ErrorActionPreference=\'Stop\';$p=\'" + path.wstring() + L"\';Add-Type -AssemblyName System.IO.Compression.FileSystem;$z=[IO.Compression.ZipFile]::OpenRead($p);try{$e=$z.Entries|?{$_.FullName -match \'(^|/)AppxManifest.xml$\'}|select -First 1;if(!$e){throw \'manifest_missing\'};$r=[IO.StreamReader]::new($e.Open());try{$x=[xml]$r.ReadToEnd()}finally{$r.Dispose()};$i=$x.Package.Identity;[pscustomobject]@{name=[string]$i.Name;publisher=[string]$i.Publisher;version=[string]$i.Version;architecture=[string]$i.ProcessorArchitecture}|ConvertTo-Json -Compress}finally{$z.Dispose()}";
     const CommandResult cr = RunHidden(L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " + Quote(script), log, 60000);
     if (cr.exitCode != 0) return { { "valid", false }, { "error", "package_manifest_invalid" }, { "output", Truncate(cr.output, 1000) } };
     const size_t begin = cr.output.find('{'), end = cr.output.rfind('}');
@@ -903,7 +903,7 @@ bool ManifestValid(const json& manifest, std::string& error) {
         const std::string type = Lower(manifest.value("installerType", std::string()));
         if (Lower(url).rfind("https://", 0) != 0) { error = "vendor_url_not_https"; return false; }
         if (sha.size() != 64) { error = "vendor_sha256_missing"; return false; }
-        if (type != "msi" && type != "exe" && type != "msix" && type != "msixbundle" && type != "appx" && type != "appxbundle") { error = "unsupported_installer_type"; return false; }
+        if (type != "msi" && type != "exe") { error = "unsupported_installer_type"; return false; }
         if (manifest.value("expectedSigner", std::string()).empty()) { error = "expected_signer_missing"; return false; }
 
         const std::string installArguments = manifest.value("installArguments", std::string());
