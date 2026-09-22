@@ -2310,16 +2310,18 @@ class Worker {
 
                     if (GetTickCount() - started > timeoutMs) {
                         TerminateProcess(pi.hProcess, 124);
+                        WaitForSingleObject(pi.hProcess, 5000);
                         result.error = "Command timed out";
                         break;
                     }
                 }
 
                 for (;;) {
+                    DWORD available = 0;
+                    if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) || available == 0) break;
                     DWORD bytesRead = 0;
-                    if (!ReadFile(readPipe, buffer, static_cast<DWORD>(sizeof(buffer) - 1), &bytesRead, nullptr) || bytesRead == 0) {
-                        break;
-                    }
+                    const DWORD toRead = std::min<DWORD>(available, static_cast<DWORD>(sizeof(buffer) - 1));
+                    if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) break;
                     if (result.output.size() < kMaxOutput) {
                         const size_t remaining = kMaxOutput - result.output.size();
                         result.output.append(buffer, buffer + std::min<size_t>(bytesRead, remaining));
@@ -4161,7 +4163,7 @@ exit 1
 
                     if (jobType == "software.uninstall") {
                         const std::string script = BuildSoftwareUninstallScript(payload);
-                        CommandResult cr = RunPowerShellCommand(jobId, script, 900);
+                        CommandResult cr = RunPowerShellCommand(jobId, script, 480);
                         json result = BuildCommandActionResult(std::string(), cr);
                         bool ok = cr.error.empty() && result.value("status", std::string()) == "uninstalled";
 
@@ -4170,7 +4172,7 @@ exit 1
                             const std::string targetSid = scope.substr(5);
                             const std::string activeSid = ActiveInteractiveUserSid();
                             if (!targetSid.empty() && !activeSid.empty() && targetSid == activeSid) {
-                                CommandResult userCr = RunPowerShellCommandInteractiveUser(jobId, script, 900);
+                                CommandResult userCr = RunPowerShellCommandInteractiveUser(jobId, script, 480);
                                 json userResult = BuildCommandActionResult(std::string(), userCr);
                                 userResult["execution_context"] = "interactive_user_retry";
                                 userResult["system_attempt"] = {
