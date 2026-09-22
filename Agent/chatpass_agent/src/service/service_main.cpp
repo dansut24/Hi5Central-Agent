@@ -3791,8 +3791,7 @@ function Get-Hi5RebootRequired {
     return $false
 }
 
-)HI5PS"
-LR"HI5PS(
+)HI5PS") + std::string(R"HI5PS(
 function Resolve-Hi5RegisteredCommand([string]$command) {
     if ([string]::IsNullOrWhiteSpace($command)) {
         return [pscustomobject]@{ command=$command; path_rewritten=$false }
