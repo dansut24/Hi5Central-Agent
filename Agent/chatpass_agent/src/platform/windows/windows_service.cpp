@@ -4461,7 +4461,16 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
     try {
         $quotedCmd = ([char]34) + $cmdFile + ([char]34)
         $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d','/s','/c',$quotedCmd) -WindowStyle Hidden -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-        if (-not $process.WaitForExit(180000)) {
+        $deadline = (Get-Date).AddSeconds(180)
+        while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
+            if (-not (Test-Hi5StillInstalled)) { break }
+            Start-Sleep -Milliseconds 500
+            try { $process.Refresh() } catch {}
+        }
+        if (-not (Test-Hi5StillInstalled)) {
+            try { if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } } catch {}
+            $exitCode = 0
+        } elseif (-not $process.HasExited) {
             $timedOut = $true
             try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
         } else {
