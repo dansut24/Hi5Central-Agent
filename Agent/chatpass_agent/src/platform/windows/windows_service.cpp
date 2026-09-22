@@ -5319,6 +5319,7 @@ exit 1
             bool StartConPtyProcess(
                 const std::string& sessionId,
                 const std::string& shell,
+                const std::string& runAs,
                 const std::string& arch,
                 short cols,
                 short rows,
@@ -5397,28 +5398,118 @@ exit 1
 
                 PROCESS_INFORMATION pi{};
                 std::wstring cmdLine = TerminalCommandLine(shell, arch);
+                BOOL ok = FALSE;
+                DWORD launchError = ERROR_SUCCESS;
 
-                BOOL ok = CreateProcessW(
-                    nullptr,
-                    cmdLine.data(),
-                    nullptr,
-                    nullptr,
-                    FALSE,
-                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                    nullptr,
-                    nullptr,
-                    &si.StartupInfo,
-                    &pi
-                );
+                if (runAs == "user") {
+                    HANDLE processToken = nullptr;
+                    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &processToken)) {
+                        EnableTokenPrivilege(processToken, L"SeTcbPrivilege");
+                        EnableTokenPrivilege(processToken, L"SeAssignPrimaryTokenPrivilege");
+                        EnableTokenPrivilege(processToken, L"SeIncreaseQuotaPrivilege");
+                        CloseHandle(processToken);
+                    }
+
+                    const DWORD activeSessionId = WTSGetActiveConsoleSessionId();
+                    if (activeSessionId == 0xFFFFFFFF) {
+                        DeleteProcThreadAttributeList(si.lpAttributeList);
+                        ClosePseudoConsole(hpc);
+                        CloseHandle(inputWrite);
+                        CloseHandle(outputRead);
+                        errorOut = "No active signed-in Windows user session is available.";
+                        return false;
+                    }
+
+                    HANDLE userToken = nullptr;
+                    HANDLE primaryToken = nullptr;
+                    if (!WTSQueryUserToken(activeSessionId, &userToken)) {
+                        launchError = GetLastError();
+                        DeleteProcThreadAttributeList(si.lpAttributeList);
+                        ClosePseudoConsole(hpc);
+                        CloseHandle(inputWrite);
+                        CloseHandle(outputRead);
+                        errorOut = "Unable to open the active user token err=" + std::to_string(launchError);
+                        return false;
+                    }
+
+                    if (!DuplicateTokenEx(
+                        userToken,
+                        MAXIMUM_ALLOWED,
+                        nullptr,
+                        SecurityImpersonation,
+                        TokenPrimary,
+                        &primaryToken
+                    )) {
+                        launchError = GetLastError();
+                        CloseHandle(userToken);
+                        DeleteProcThreadAttributeList(si.lpAttributeList);
+                        ClosePseudoConsole(hpc);
+                        CloseHandle(inputWrite);
+                        CloseHandle(outputRead);
+                        errorOut = "Unable to create an active user primary token err=" + std::to_string(launchError);
+                        return false;
+                    }
+
+                    LPVOID environment = nullptr;
+                    if (!CreateEnvironmentBlock(&environment, primaryToken, FALSE)) {
+                        LogW("terminal user environment block unavailable err=" + std::to_string(GetLastError()));
+                        environment = nullptr;
+                    }
+
+                    std::wstring profileDirectory;
+                    DWORD profileChars = 0;
+                    GetUserProfileDirectoryW(primaryToken, nullptr, &profileChars);
+                    if (profileChars > 1) {
+                        std::vector<wchar_t> profileBuffer(profileChars);
+                        if (GetUserProfileDirectoryW(primaryToken, profileBuffer.data(), &profileChars)) {
+                            profileDirectory.assign(profileBuffer.data());
+                        }
+                    }
+
+                    DWORD flags = EXTENDED_STARTUPINFO_PRESENT;
+                    if (environment) flags |= CREATE_UNICODE_ENVIRONMENT;
+                    ok = CreateProcessAsUserW(
+                        primaryToken,
+                        nullptr,
+                        cmdLine.data(),
+                        nullptr,
+                        nullptr,
+                        FALSE,
+                        flags,
+                        environment,
+                        profileDirectory.empty() ? nullptr : profileDirectory.c_str(),
+                        &si.StartupInfo,
+                        &pi
+                    );
+                    launchError = ok ? ERROR_SUCCESS : GetLastError();
+
+                    if (environment) DestroyEnvironmentBlock(environment);
+                    CloseHandle(primaryToken);
+                    CloseHandle(userToken);
+                }
+                else {
+                    ok = CreateProcessW(
+                        nullptr,
+                        cmdLine.data(),
+                        nullptr,
+                        nullptr,
+                        FALSE,
+                        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                        nullptr,
+                        nullptr,
+                        &si.StartupInfo,
+                        &pi
+                    );
+                    launchError = ok ? ERROR_SUCCESS : GetLastError();
+                }
 
                 DeleteProcThreadAttributeList(si.lpAttributeList);
 
                 if (!ok) {
-                    DWORD err = GetLastError();
                     ClosePseudoConsole(hpc);
                     CloseHandle(inputWrite);
                     CloseHandle(outputRead);
-                    errorOut = "CreateProcess terminal failed err=" + std::to_string(err);
+                    errorOut = (runAs == "user" ? "CreateProcessAsUser terminal failed err=" : "CreateProcess terminal failed err=") + std::to_string(launchError);
                     return false;
                 }
 
@@ -5438,7 +5529,8 @@ exit 1
             void StartTerminalSession(const json& msg) {
                 const std::string sessionId = msg.value("sessionId", msg.value("session_id", std::string()));
                 const std::string shell = msg.value("shell", std::string("powershell"));
-                const std::string runAs = msg.value("runAs", msg.value("run_as", std::string("admin")));
+                std::string runAs = msg.value("runAs", msg.value("run_as", std::string("system")));
+                if (runAs == "admin") runAs = "system";
                 const std::string arch = msg.value("arch", std::string("x64"));
                 const short cols = static_cast<short>(msg.value("cols", 120));
                 const short rows = static_cast<short>(msg.value("rows", 32));
@@ -5447,8 +5539,8 @@ exit 1
 
                 if (sessionId.empty()) return;
 
-                if (runAs == "user") {
-                    SendTerminalMessage("terminal_error", sessionId, "Signed-in user terminal mode is coming next. Admin/service mode is available now.");
+                if (runAs != "system" && runAs != "user") {
+                    SendTerminalMessage("terminal_error", sessionId, "Unsupported terminal execution context.");
                     return;
                 }
 
@@ -5457,7 +5549,7 @@ exit 1
                 std::shared_ptr<TerminalSession> session;
                 std::string error;
 
-                if (!StartConPtyProcess(sessionId, shell, arch, cols, rows, session, error)) {
+                if (!StartConPtyProcess(sessionId, shell, runAs, arch, cols, rows, session, error)) {
                     LogW("terminal start failed session=" + sessionId + " error=" + error);
                     SendTerminalMessage("terminal_error", sessionId, error);
                     return;
