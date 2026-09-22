@@ -4443,6 +4443,7 @@ function Test-Hi5UninstallActivity($candidate) {
     }
     return $false
 }
+)HI5PS" + std::string(R"HI5PS(
 
 function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
     $root = Join-Path $env:ProgramData 'Hi5Central\Agent\Temp'
