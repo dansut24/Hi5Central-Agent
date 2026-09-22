@@ -3807,6 +3807,13 @@ function Resolve-Hi5RegisteredCommand([string]$command) {
         $suffix = [string]$matches[2]
     }
 
+    if (-not $exePath -and $trimmed -match '^([A-Za-z]:\\.+?\.exe)(\s+[-/].*)$') {
+        $candidatePath = [string]$matches[1]
+        if (Test-Path -LiteralPath $candidatePath) {
+            return [pscustomobject]@{ command=([char]34)+$candidatePath+([char]34)+[string]$matches[2]; path_rewritten=$true }
+        }
+    }
+
     if (-not $exePath -or (Test-Path -LiteralPath $exePath)) {
         return [pscustomobject]@{ command=$command; path_rewritten=$false }
     }
