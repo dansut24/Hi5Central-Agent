@@ -4405,12 +4405,7 @@ function Resolve-Hi5RegisteredCommand([string]$command) {
     $trimmed = $command.Trim()
     $exePath = ''
     $suffix = ''
-    $wasQuoted = $false
     if ($trimmed -match '^"([^"]+\.exe)"(.*)$') {
-        $exePath = [string]$matches[1]
-        $suffix = [string]$matches[2]
-        $wasQuoted = $true
-    } elseif ($trimmed -match '^([A-Za-z]:\\.+?\.exe)(.*)$') {
         $exePath = [string]$matches[1]
         $suffix = [string]$matches[2]
     } elseif ($trimmed -match '^([^\s"]+\.exe)(.*)$') {
@@ -4418,16 +4413,7 @@ function Resolve-Hi5RegisteredCommand([string]$command) {
         $suffix = [string]$matches[2]
     }
 
-    if (-not $exePath) {
-        return [pscustomobject]@{ command=$command; path_rewritten=$false }
-    }
-    if (Test-Path -LiteralPath $exePath) {
-        if (-not $wasQuoted -and $exePath -match '\s') {
-            return [pscustomobject]@{
-                command = ([char]34) + $exePath + ([char]34) + $suffix
-                path_rewritten = $true
-            }
-        }
+    if (-not $exePath -or (Test-Path -LiteralPath $exePath)) {
         return [pscustomobject]@{ command=$command; path_rewritten=$false }
     }
 
