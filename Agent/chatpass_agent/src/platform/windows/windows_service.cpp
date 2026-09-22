@@ -4464,8 +4464,7 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
         $deadline = (Get-Date).AddSeconds(180)
         while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
             if (-not (Test-Hi5StillInstalled)) { break }
-            Start-Sleep -Milliseconds 500
-            try { $process.Refresh() } catch {}
+            Start-Sleep -Milliseconds 1000
         }
         if (-not (Test-Hi5StillInstalled)) {
             try { if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } } catch {}
