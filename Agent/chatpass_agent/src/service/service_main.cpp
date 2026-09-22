@@ -3792,45 +3792,20 @@ function Get-Hi5RebootRequired {
 }
 
 function Resolve-Hi5RegisteredCommand([string]$command) {
-    if ([string]::IsNullOrWhiteSpace($command)) {
-        return [pscustomobject]@{ command=$command; path_rewritten=$false }
+    if ([string]::IsNullOrWhiteSpace($command)) { return [pscustomobject]@{command=$command;path_rewritten=$false} }
+    $t=$command.Trim(); $p=''; $a=''; $q=$false
+    if ($t -match '^"([^"]+\.exe)"(.*)$') { $p=[string]$matches[1]; $a=[string]$matches[2]; $q=$true }
+    elseif ($t -match '^([^\s"]+\.exe)(.*)$') { $p=[string]$matches[1]; $a=[string]$matches[2] }
+    elseif ($t -match '^([A-Za-z]:\\.+?\.exe)(\s+[-/].*)$') { $p=[string]$matches[1]; $a=[string]$matches[2] }
+    if ($p -and (Test-Path -LiteralPath $p)) {
+        if (-not $q -and $p -match '\s') { return [pscustomobject]@{command=([char]34)+$p+([char]34)+$a;path_rewritten=$true} }
+        return [pscustomobject]@{command=$command;path_rewritten=$false}
     }
-
-    $trimmed = $command.Trim()
-    $exePath = ''
-    $suffix = ''
-    if ($trimmed -match '^"([^"]+\.exe)"(.*)$') {
-        $exePath = [string]$matches[1]
-        $suffix = [string]$matches[2]
-    } elseif ($trimmed -match '^([^\s"]+\.exe)(.*)$') {
-        $exePath = [string]$matches[1]
-        $suffix = [string]$matches[2]
+    if ($p) {
+        $s=Join-Path $env:WINDIR 'System32\config\systemprofile'; $w=Join-Path $env:WINDIR 'SysWOW64\config\systemprofile'
+        if ($p.StartsWith($s,[System.StringComparison]::OrdinalIgnoreCase)) { $x=$w+$p.Substring($s.Length); if(Test-Path -LiteralPath $x){return [pscustomobject]@{command=([char]34)+$x+([char]34)+$a;path_rewritten=$true}} }
     }
-
-    if (-not $exePath -and $trimmed -match '^([A-Za-z]:\\.+?\.exe)(\s+[-/].*)$') {
-        $candidatePath = [string]$matches[1]
-        if (Test-Path -LiteralPath $candidatePath) {
-            return [pscustomobject]@{ command=([char]34)+$candidatePath+([char]34)+[string]$matches[2]; path_rewritten=$true }
-        }
-    }
-
-    if (-not $exePath -or (Test-Path -LiteralPath $exePath)) {
-        return [pscustomobject]@{ command=$command; path_rewritten=$false }
-    }
-
-    $system32Root = Join-Path $env:WINDIR 'System32\config\systemprofile'
-    $syswow64Root = Join-Path $env:WINDIR 'SysWOW64\config\systemprofile'
-    if ($exePath.StartsWith($system32Root, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $alternate = $syswow64Root + $exePath.Substring($system32Root.Length)
-        if (Test-Path -LiteralPath $alternate) {
-            return [pscustomobject]@{
-                command = ([char]34) + $alternate + ([char]34) + $suffix
-                path_rewritten = $true
-            }
-        }
-    }
-
-    return [pscustomobject]@{ command=$command; path_rewritten=$false }
+    return [pscustomobject]@{command=$command;path_rewritten=$false}
 }
 
 function Add-Hi5Candidate([System.Collections.ArrayList]$list, [string]$strategy, [string]$command) {
