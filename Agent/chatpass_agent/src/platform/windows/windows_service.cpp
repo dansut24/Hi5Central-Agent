@@ -4397,7 +4397,7 @@ function Get-Hi5RebootRequired {
     return $false
 }
 
-)HI5PS") + std::string(R"HI5PS_SPLIT(function Resolve-Hi5RegisteredCommand([string]$command) {
+)HI5PS") + std::string(R"H5SPLIT(function Resolve-Hi5RegisteredCommand([string]$command) {
     if ([string]::IsNullOrWhiteSpace($command)) {
         return [pscustomobject]@{ command=$command; path_rewritten=$false }
     }
@@ -4665,7 +4665,7 @@ $reason = if ($protectionSignal) { 'password_or_vendor_protection_required' } el
 } | ConvertTo-Json -Depth 10 -Compress
 Close-Hi5UserHive
 exit 1
-)HI5PS_SPLIT";
+)H5SPLIT";
             }
 
             void PostJobResult(const AgentIdentity& ident, const std::string& jobId, bool success, const json& result, const std::string& errorMessage = std::string()) {
