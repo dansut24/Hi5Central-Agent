@@ -4665,7 +4665,7 @@ $reason = if ($protectionSignal) { 'password_or_vendor_protection_required' } el
 } | ConvertTo-Json -Depth 10 -Compress
 Close-Hi5UserHive
 exit 1
-)HI5PS";
+)HI5PS_SPLIT";
             }
 
             void PostJobResult(const AgentIdentity& ident, const std::string& jobId, bool success, const json& result, const std::string& errorMessage = std::string()) {
