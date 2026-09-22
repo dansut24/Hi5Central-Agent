@@ -3837,7 +3837,7 @@ function Test-Hi5UninstallActivity($candidate) {
     }
     return $false
 }
-)HI5PS") + std::string(R"HI5PS(
+)HI5PS" + R"HI5PS(
 
 function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
     $root = Join-Path $env:ProgramData 'Hi5Central\Agent\Temp'
@@ -4030,7 +4030,7 @@ $reason = if ($protectionSignal) { 'password_or_vendor_protection_required' } el
 } | ConvertTo-Json -Depth 10 -Compress
 Close-Hi5UserHive
 exit 1
-)HI5PS");
+)HI5PS";
             }
 
             void PostJobResult(const AgentIdentity& ident, const std::string& jobId, bool success, const json& result, const std::string& errorMessage = std::string()) {
