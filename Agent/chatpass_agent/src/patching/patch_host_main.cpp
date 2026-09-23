@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.13";
+constexpr const char* kPatchHostVersion = "0.2.14";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -584,7 +584,7 @@ bool DownloadHttps(const std::string& url, const std::filesystem::path& path) {
     if (requestPath.empty()) requestPath = L"/";
 
     HINTERNET session = WinHttpOpen(
-        L"Hi5Central-PatchHost/0.2.13",
+        L"Hi5Central-PatchHost/0.2.14",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -1391,10 +1391,19 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                     if (!result["signatureVerified"].get<bool>()) {
                         result["error"] = "unexpected_signer";
                     } else if (installerType == "msi") {
-                        const std::wstring command = L"msiexec.exe /i " + Quote(installerPath.wstring()) + L" /qn /norestart";
+                        // ManifestValid already rejected unsafe catalogue arguments. MSI packages
+                        // may require vendor properties such as ACCEPTLICENSE=YES.
+                        const std::string configuredArgs = manifest.value("installArguments", std::string());
+                        std::wstring command = L"msiexec.exe /i " + Quote(installerPath.wstring());
+                        if (!configuredArgs.empty()) {
+                            command += L" " + Utf8ToWide(configuredArgs);
+                        } else {
+                            command += L" /qn /norestart";
+                        }
                         install = RunHidden(command, root / L"vendor-install-msi.log", 30 * 60 * 1000);
                         result["installAttempts"].push_back({
-                            { "name", "msi_quiet" },
+                            { "name", configuredArgs.empty() ? "msi_quiet" : "msi_configured_arguments" },
+                            { "args", configuredArgs.empty() ? "/qn /norestart" : configuredArgs },
                             { "exitCode", install.exitCode },
                             { "timedOut", install.timedOut },
                             { "output", Truncate(install.output, 2000) }
