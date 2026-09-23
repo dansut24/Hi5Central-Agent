@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.15";
+constexpr const char* kPatchHostVersion = "0.2.16";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -692,6 +692,8 @@ json Capabilities() {
             { "artifactTechnologyDetection", true },
             { "artifactStorage", "job_scoped" },
             { "jobDirectoryPurgedOnExit", true },
+            { "jobScopedResponseFiles", true },
+            { "responseFileTargetVersionToken", true },
             { "winInetCacheUsed", false }
         } }
     };
@@ -969,6 +971,15 @@ json VerifyFileVersion(const json& verification, const std::string& target) {
 }
 
 bool InstallerArgsSafe(const std::string& value);
+bool VendorResponseFileValid(const json& manifest, std::string& error);
+bool PrepareVendorResponseFile(
+    const json& manifest,
+    const std::filesystem::path& root,
+    std::filesystem::path& responseFilePath,
+    std::string& error);
+std::string ResolveVendorInstallArguments(
+    const std::string& args,
+    const std::filesystem::path& responseFilePath);
 
 bool ManifestValid(const json& manifest, std::string& error) {
     if (!manifest.is_object()) { error = "manifest_not_object"; return false; }
@@ -1036,6 +1047,7 @@ bool ManifestValid(const json& manifest, std::string& error) {
             error = "invalid_install_arguments";
             return false;
         }
+        if (!VendorResponseFileValid(manifest, error)) return false;
 
         if (manifest.contains("installStrategies")) {
             if (!manifest["installStrategies"].is_array() || manifest["installStrategies"].size() > 12) {
@@ -1172,6 +1184,88 @@ bool InstallerArgsSafe(const std::string& value) {
         && value.find('^') == std::string::npos;
 }
 
+bool SafeResponseFileName(const std::string& value) {
+    if (value.empty() || value.size() > 128) return false;
+    if (value == "." || value == "..") return false;
+    for (const unsigned char ch : value) {
+        if (!std::isalnum(ch) && ch != '.' && ch != '_' && ch != '-') return false;
+    }
+    const std::string lower = Lower(value);
+    static const char* kAllowedExtensions[] = { ".xml", ".iss", ".ini", ".txt", ".json", ".config", ".rsp" };
+    for (const char* extension : kAllowedExtensions) {
+        if (EndsWithInsensitive(lower, extension)) return true;
+    }
+    return false;
+}
+
+bool VendorResponseFileValid(const json& manifest, std::string& error) {
+    if (!manifest.contains("responseFile") || manifest["responseFile"].is_null()) return true;
+    if (!manifest["responseFile"].is_object()) {
+        error = "invalid_response_file";
+        return false;
+    }
+    const json response = manifest["responseFile"];
+    const std::string fileName = response.value("fileName", std::string());
+    const std::string content = response.value("content", std::string());
+    const std::string installArguments = manifest.value("installArguments", std::string());
+    if (!SafeResponseFileName(fileName)) {
+        error = "invalid_response_file_name";
+        return false;
+    }
+    if (content.empty() || content.size() > 64 * 1024 || content.find('\0') != std::string::npos) {
+        error = "invalid_response_file_content";
+        return false;
+    }
+    if (installArguments.find("{HI5_RESPONSE_FILE}") == std::string::npos) {
+        error = "response_file_argument_token_missing";
+        return false;
+    }
+    return true;
+}
+
+void ReplaceAll(std::string& value, const std::string& needle, const std::string& replacement) {
+    if (needle.empty()) return;
+    size_t position = 0;
+    while ((position = value.find(needle, position)) != std::string::npos) {
+        value.replace(position, needle.size(), replacement);
+        position += replacement.size();
+    }
+}
+
+bool PrepareVendorResponseFile(
+    const json& manifest,
+    const std::filesystem::path& root,
+    std::filesystem::path& responseFilePath,
+    std::string& error) {
+    responseFilePath.clear();
+    if (!manifest.contains("responseFile") || manifest["responseFile"].is_null()) return true;
+
+    const json response = manifest["responseFile"];
+    const std::string fileName = response.value("fileName", std::string());
+    std::string content = response.value("content", std::string());
+    ReplaceAll(content, "{HI5_TARGET_VERSION}", manifest.value("targetVersion", std::string()));
+
+    responseFilePath = root / Utf8ToWide(fileName);
+    if (!WriteFileUtf8(responseFilePath, content)) {
+        error = "response_file_write_failed";
+        responseFilePath.clear();
+        return false;
+    }
+    return true;
+}
+
+std::string ResolveVendorInstallArguments(
+    const std::string& args,
+    const std::filesystem::path& responseFilePath) {
+    if (responseFilePath.empty()) return args;
+    std::string resolved = args;
+    ReplaceAll(
+        resolved,
+        "{HI5_RESPONSE_FILE}",
+        "\"" + WideToUtf8(responseFilePath.wstring()) + "\"");
+    return resolved;
+}
+
 struct VendorInstallStrategy {
     std::string name;
     std::string args;
@@ -1200,6 +1294,13 @@ std::vector<VendorInstallStrategy> VendorInstallStrategies(const json& manifest)
 
     const std::string explicitArgs = manifest.value("installArguments", std::string());
     if (!explicitArgs.empty()) AddInstallStrategy(strategies, "configured", explicitArgs);
+
+    // A response file represents an explicit vendor-supported installation
+    // recipe. Do not fall through to generic technology strategies that would
+    // omit the response file and silently change the selected components.
+    if (manifest.contains("responseFile") && manifest["responseFile"].is_object()) {
+        return strategies;
+    }
 
     const std::string technology = Lower(manifest.value("installerTechnology", std::string("generic")));
     if (technology == "inno") {
@@ -1362,8 +1463,18 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
     json verification = json::object();
     bool verificationCaptured = false;
     bool directAttempted = false;
+    std::filesystem::path responseFilePath;
 
     if (provider == "vendor_direct") {
+        std::string responseFileError;
+        if (!PrepareVendorResponseFile(manifest, root, responseFilePath, responseFileError)) {
+            result["error"] = responseFileError.empty() ? "response_file_prepare_failed" : responseFileError;
+            return result;
+        }
+        if (!responseFilePath.empty()) {
+            result["responseFileApplied"] = true;
+            result["responseFileName"] = WideToUtf8(responseFilePath.filename().wstring());
+        }
         directAttempted = true;
         const std::string installerType = Lower(manifest.value("installerType", std::string()));
         const std::filesystem::path installerPath = root / (std::wstring(L"installer.") + Utf8ToWide(installerType));
@@ -1393,7 +1504,8 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                     } else if (installerType == "msi") {
                         // ManifestValid already rejected unsafe catalogue arguments. MSI packages
                         // may require vendor properties such as ACCEPTLICENSE=YES.
-                        const std::string configuredArgs = manifest.value("installArguments", std::string());
+                        std::string configuredArgs = manifest.value("installArguments", std::string());
+                        configuredArgs = ResolveVendorInstallArguments(configuredArgs, responseFilePath);
                         std::wstring command = L"msiexec.exe /i " + Quote(installerPath.wstring());
                         if (!configuredArgs.empty()) {
                             command += L" " + Utf8ToWide(configuredArgs);
@@ -1418,8 +1530,11 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                         } else {
                             for (size_t index = 0; index < strategies.size(); ++index) {
                                 const auto& strategy = strategies[index];
+                                const std::string resolvedArgs = ResolveVendorInstallArguments(
+                                    strategy.args,
+                                    responseFilePath);
                                 const std::wstring command =
-                                    Quote(installerPath.wstring()) + L" " + Utf8ToWide(strategy.args);
+                                    Quote(installerPath.wstring()) + L" " + Utf8ToWide(resolvedArgs);
                                 const std::wstring logName =
                                     L"vendor-install-" + std::to_wstring(index + 1) + L".log";
                                 const CommandResult attempt = RunHidden(command, root / logName, 10 * 60 * 1000);
@@ -1431,7 +1546,7 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
 
                                 result["installAttempts"].push_back({
                                     { "name", strategy.name },
-                                    { "args", strategy.args },
+                                    { "args", resolvedArgs },
                                     { "exitCode", attempt.exitCode },
                                     { "timedOut", attempt.timedOut },
                                     { "verified", verified },
