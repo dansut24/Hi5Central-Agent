@@ -4575,6 +4575,7 @@ if ($uninstall) {
         Add-Hi5Candidate $candidates 'inno_silent' ($uninstall + ' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-')
     }
     if ($lower -match '(uninstall|uninst)\.exe') {
+        Add-Hi5Candidate $candidates 'install4j_quiet' ($uninstall + ' -q')
         Add-Hi5Candidate $candidates 'nsis_silent' ($uninstall + ' /S')
     }
     if ($lower -match 'update\.exe') {
