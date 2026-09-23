@@ -27,7 +27,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.14";
+constexpr const char* kPatchHostVersion = "0.2.15";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -584,7 +584,7 @@ bool DownloadHttps(const std::string& url, const std::filesystem::path& path) {
     if (requestPath.empty()) requestPath = L"/";
 
     HINTERNET session = WinHttpOpen(
-        L"Hi5Central-PatchHost/0.2.14",
+        L"Hi5Central-PatchHost/0.2.15",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -1075,7 +1075,7 @@ bool ManifestValid(const json& manifest, std::string& error) {
 json VerifyInstalledVersion(const json& manifest, const std::filesystem::path& root) {
     const json verification = manifest.value("verification", json::object());
     const std::string method = Lower(verification.value("method", verification.value("provider", std::string("winget"))));
-    const std::string target = manifest.value("targetVersion", std::string());
+    const std::string target = verification.value("targetVersion", manifest.value("targetVersion", std::string()));
 
     if (method == "uninstall_registry") return VerifyUninstallRegistry(verification, target);
     if (method == "file_version") return VerifyFileVersion(verification, target);

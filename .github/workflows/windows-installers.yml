@@ -94,6 +94,7 @@ jobs:
           $patchHostSource = Get-Content 'Agent/chatpass_agent/src/patching/patch_host_main.cpp' -Raw
           if ($patchHostSource -notmatch 'msi_configured_arguments') { throw 'PatchHost MSI catalogue argument support is missing.' }
           if ($patchHostSource -notmatch 'configuredArgs = manifest.value') { throw 'PatchHost MSI path no longer reads validated installArguments.' }
+          if ($patchHostSource -notmatch 'verification.value\("targetVersion"') { throw 'PatchHost verification no longer honors transformed verification.targetVersion.' }
 
       - name: Upload Agent installer
         uses: actions/upload-artifact@v4
