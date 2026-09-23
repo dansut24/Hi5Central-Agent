@@ -4523,6 +4523,61 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
     }
 }
 
+function Invoke-Hi5VendorDocumentedCleanup($target) {
+    $name = ([string]$target.name).Trim()
+    $publisher = ([string]$target.publisher).Trim()
+    if ($name -notmatch '^Liquibase(?:\s|$)' -or $publisher -ne 'Liquibase') { return $null }
+
+    $started = Get-Date
+    $uninstall = ([string]$target.uninstall_string).Trim()
+    $exePath = ''
+    if ($uninstall -match '^"([^"]+\\uninstall\.exe)"') { $exePath = [string]$matches[1] }
+    elseif ($uninstall -match '^([A-Za-z]:\\.+?\\uninstall\.exe)(?:\s|$)') { $exePath = [string]$matches[1] }
+
+    $reason = ''
+    $installRoot = if ($exePath) { Split-Path -Parent $exePath } else { '' }
+    $expectedRoot = Join-Path $env:ProgramFiles 'liquibase'
+    if (-not $exePath -or -not (Test-Path -LiteralPath $exePath)) { $reason = 'liquibase_uninstaller_path_missing' }
+    elseif (-not $installRoot.Equals($expectedRoot,[System.StringComparison]::OrdinalIgnoreCase)) { $reason = 'liquibase_install_root_not_allowlisted' }
+    else {
+        $docPath = Join-Path $installRoot 'UNINSTALL.txt'
+        $docText = if (Test-Path -LiteralPath $docPath) { Get-Content -LiteralPath $docPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        if ([string]$docText -notmatch 'To uninstall Liquibase, delete the directory where it was installed\.') {
+            $reason = 'liquibase_vendor_uninstall_documentation_missing'
+        }
+    }
+
+    if (-not $reason) {
+        try {
+            foreach ($p in @(Get-CimInstance Win32_Process -Filter "name='uninstall.exe'" -ErrorAction SilentlyContinue)) {
+                if ([string]$p.ExecutablePath -and ([string]$p.ExecutablePath).Equals($exePath,[System.StringComparison]::OrdinalIgnoreCase)) {
+                    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+                }
+            }
+            Start-Sleep -Milliseconds 500
+            Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $installRoot)) {
+                Remove-Item -LiteralPath ([string]$target.path) -Recurse -Force -ErrorAction Stop
+            }
+        } catch {
+            $reason = 'liquibase_documented_cleanup_failed: ' + $_.Exception.Message
+        }
+    }
+
+    $stillInstalled = Test-Hi5StillInstalled
+    return [pscustomobject]@{
+        strategy = 'vendor_documented_directory_cleanup'
+        exit_code = if ($stillInstalled) { 1 } else { 0 }
+        timed_out = $false
+        still_installed = $stillInstalled
+        verification_wait_seconds = 0
+        verification_extended = $false
+        path_rewritten = $false
+        duration_seconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+        output = ConvertTo-Hi5SafeString $(if ($reason) { $reason } else { 'liquibase_vendor_documented_cleanup_completed' })
+    }
+}
+
 $target = Find-Hi5Target
 if (-not $target) {
     [pscustomobject]@{
@@ -4607,6 +4662,14 @@ foreach ($candidate in @($candidates)) {
     if (-not $attempt.still_installed) {
         $success = $true
         break
+    }
+    if ([string]$candidate.strategy -eq 'install4j_quiet') {
+        $documentedCleanup = Invoke-Hi5VendorDocumentedCleanup $target
+        if ($null -ne $documentedCleanup) {
+            $attempts += $documentedCleanup
+            if (-not $documentedCleanup.still_installed) { $success = $true }
+            break
+        }
     }
     $combinedOutput = ([string]$attempt.output).ToLowerInvariant()
     if ($combinedOutput -match 'password|passphrase|tamper protection|self.?protection|access denied|credential|authorization required') {

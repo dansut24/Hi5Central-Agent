@@ -58,6 +58,7 @@ jobs:
           $service = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
           if ($installer -notmatch 'force_enrollment') { throw 'Installer no longer marks explicit enrollment.' }
           if ($service -notmatch 'install4j_quiet') { throw 'install4j uninstall strategy is missing from the Windows service source.' }
+          if ($service -notmatch 'vendor_documented_directory_cleanup') { throw 'Vendor-documented uninstall cleanup fallback is missing from the Windows service source.' }
           if ($identity -notmatch 'packageAlreadyApplied') { throw 'Enrollment replacement guard is missing.' }
           if ($identity -notmatch 'bootstrapToken') { throw 'Bootstrap enrollment override is missing.' }
           if ($service -notmatch 'signalingReconnectRequested_') { throw 'Signaling reconnect state is missing.' }
