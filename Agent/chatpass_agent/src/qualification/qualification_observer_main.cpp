@@ -357,6 +357,10 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
     }
   }SaveState();
   gProcs=CaptureProcs();PopulateLists();RefreshDetails();AppendLog(L"Observer started. Installed applications are the available test set; removed applications remain in History.",{{"timestamp",NowIso()},{"type","observer_started"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)}});
-  SetTimer(w,kTimerId,kTimerMs,nullptr);ShowWindow(w,show);UpdateWindow(w);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
+  SetTimer(w,kTimerId,kTimerMs,nullptr);
+  ShowWindow(w,SW_SHOW);
+  SetForegroundWindow(w);
+  UpdateWindow(w);
+  MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
   if(singleton)CloseHandle(singleton);if(SUCCEEDED(com))CoUninitialize();return(int)msg.wParam;
 }
