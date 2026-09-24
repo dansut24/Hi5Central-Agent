@@ -377,4 +377,19 @@ if(WIN32)
     advapi32 user32 shell32
   )
   set_target_properties(hi5central_patch_host PROPERTIES OUTPUT_NAME "Hi5CentralPatchHost")
+
+  # Visible qualification-lab companion. This executable never performs
+  # installs/uninstalls itself; it observes process and uninstall-registry
+  # transitions and persists evidence/history for qualification analysis.
+  add_executable(hi5central_qualification_observer WIN32
+    src/qualification/qualification_observer_main.cpp
+  )
+  hi5_use_static_msvc_runtime(hi5central_qualification_observer)
+  target_include_directories(hi5central_qualification_observer PRIVATE src)
+  target_compile_definitions(hi5central_qualification_observer PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
+  target_link_libraries(hi5central_qualification_observer PRIVATE
+    nlohmann_json::nlohmann_json
+    wbemuuid ole32 oleaut32 advapi32 user32 shell32
+  )
+  set_target_properties(hi5central_qualification_observer PROPERTIES OUTPUT_NAME "Hi5CentralQualificationObserver")
 endif()

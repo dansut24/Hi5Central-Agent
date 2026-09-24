@@ -5,6 +5,7 @@
 #define MyRemoteHostExeName "Hi5CentralRemoteHost.exe"
 #define MyMediaHostExeName "Hi5CentralMediaHost.exe"
 #define MyPatchHostExeName "Hi5CentralPatchHost.exe"
+#define MyQualificationObserverExeName "Hi5CentralQualificationObserver.exe"
 #define MyServiceName "Hi5CentralAgent"
 #define MyAppVersion GetEnv("HI5_AGENT_VERSION")
 #if MyAppVersion == ""
@@ -34,6 +35,9 @@
 #ifndef PatchHostExePath
   #define PatchHostExePath SourceDir + "\" + MyPatchHostExeName
 #endif
+#ifndef QualificationObserverExePath
+  #define QualificationObserverExePath SourceDir + "\" + MyQualificationObserverExeName
+#endif
 
 
 [Setup]
@@ -62,6 +66,8 @@ RestartApplications=no
 Name: "{commonappdata}\Hi5Central\Agent"; Permissions: users-readexec admins-full system-full
 Name: "{commonappdata}\Hi5Central\Agent\Logs"; Permissions: users-readexec admins-full system-full
 Name: "{commonappdata}\Hi5Central\Agent\ChatLogs"; Permissions: users-readexec admins-full system-full
+Name: "{commonappdata}\Hi5Central\Agent\Qualification"; Permissions: users-modify admins-full system-full
+Name: "{commonappdata}\Hi5Central\Agent\Qualification\jobs"; Permissions: users-modify admins-full system-full
 
 [Files]
 Source: "{#AgentExePath}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
@@ -69,6 +75,7 @@ Source: "{#UserExePath}"; DestDir: "{app}"; DestName: "{#MyUserExeName}"; Flags:
 Source: "{#RemoteHostExePath}"; DestDir: "{app}"; DestName: "{#MyRemoteHostExeName}"; Flags: ignoreversion
 Source: "{#MediaHostExePath}"; DestDir: "{app}"; DestName: "{#MyMediaHostExeName}"; Flags: ignoreversion
 Source: "{#PatchHostExePath}"; DestDir: "{app}"; DestName: "{#MyPatchHostExeName}"; Flags: ignoreversion
+Source: "{#QualificationObserverExePath}"; DestDir: "{app}"; DestName: "{#MyQualificationObserverExeName}"; Flags: ignoreversion
 
 [InstallDelete]
 Type: files; Name: "{app}\Hi5CentralAgent.exe"
