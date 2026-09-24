@@ -373,6 +373,15 @@ void PopulateLists(){
     }
   }
 }
+void SetDetailsText(const std::wstring& value){
+  if(!gDetails)return;
+  SendMessageW(gDetails,WM_SETREDRAW,FALSE,0);
+  SetWindowTextW(gDetails,value.c_str());
+  SendMessageW(gDetails,EM_SETSEL,0,0);
+  SendMessageW(gDetails,EM_SCROLLCARET,0,0);
+  SendMessageW(gDetails,WM_SETREDRAW,TRUE,0);
+  RedrawWindow(gDetails,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW|RDW_FRAME);
+}
 void ShowInstalledDetails(size_t index){
   if(index>=gInstalledIds.size())return;
   auto it=gApps.find(gInstalledIds[index]);if(it==gApps.end())return;const auto&e=it->second;
@@ -384,7 +393,7 @@ void ShowInstalledDetails(size_t index){
   if(!e.quietUninstallString.empty())s<<L"Registered quiet uninstall: "<<e.quietUninstallString<<L"\r\n";
   const auto candidate=CandidateSilentRecipe(e);if(!candidate.empty())s<<L"Candidate silent recipe: "<<candidate<<L"\r\n";
   s<<L"Recipe status: observed registration; not yet automatically verified\r\n";
-  SetWindowTextW(gDetails,s.str().c_str());
+  SetDetailsText(s.str());
 }
 void ShowHistoryDetails(size_t index){
   if(index>=gHistoryIds.size())return;
@@ -408,7 +417,7 @@ void ShowHistoryDetails(size_t index){
       s<<L"  "<<name;if(!cmd.empty())s<<L" | "<<cmd;s<<L"\r\n";
     }
   }
-  SetWindowTextW(gDetails,s.str().c_str());
+  SetDetailsText(s.str());
 }
 void RefreshDetails(){
   std::wstringstream s;s<<L"CURRENT TARGET / LEARNED IDENTITY\r\n============================================================\r\n";
@@ -424,7 +433,7 @@ void RefreshDetails(){
     if(!e.installLocation.empty())s<<L"InstallLocation: "<<e.installLocation<<L"\r\n";
   }
   if(!any)s<<L"Target is not currently registered as installed.\r\nThe observer will retain it in History after removal and update this pane if it appears again.\r\n";
-  SetWindowTextW(gDetails,s.str().c_str());
+  SetDetailsText(s.str());
 }
 void Tick(bool manual){
   auto apps=CaptureApps();
@@ -496,32 +505,45 @@ void Tick(bool manual){
   }
   for(const auto&[pid,p]:gProcs)if(procs.find(pid)==procs.end())AppendLog(L"PROCESS - "+std::to_wstring(pid)+L" "+p.name,{{"timestamp",NowIso()},{"type","process_exited"},{"pid",pid},{"name",Narrow(p.name)},{"path",Narrow(p.path)},{"commandLine",Narrow(p.commandLine)}});
   gProcs=std::move(procs);
+  const int paneBeforeRefresh=gSelectedPane;
+  const std::string selectedBeforeRefresh=gSelectedId;
   PopulateLists();
 
-  bool restored=false;
+  bool selectionStillPresent=false;
   if(gSelectedPane==1&&!gSelectedId.empty()){
     for(size_t i=0;i<gInstalledIds.size();++i){
-      if(Narrow(gInstalledIds[i])==gSelectedId){ShowInstalledDetails(i);restored=true;break;}
+      if(Narrow(gInstalledIds[i])==gSelectedId){selectionStillPresent=true;break;}
     }
   } else if(gSelectedPane==2&&!gSelectedId.empty()){
     for(size_t i=0;i<gHistoryIds.size();++i){
-      if(gHistoryIds[i]==gSelectedId){ShowHistoryDetails(i);restored=true;break;}
+      if(gHistoryIds[i]==gSelectedId){selectionStillPresent=true;break;}
     }
   }
-  if(!restored)RefreshDetails();
+
+  if(!selectionStillPresent){
+    gSelectedPane=0;
+    gSelectedId.clear();
+    RefreshDetails();
+  } else if(paneBeforeRefresh!=gSelectedPane||selectedBeforeRefresh!=gSelectedId){
+    if(gSelectedPane==1){
+      for(size_t i=0;i<gInstalledIds.size();++i)if(Narrow(gInstalledIds[i])==gSelectedId){ShowInstalledDetails(i);break;}
+    } else if(gSelectedPane==2){
+      for(size_t i=0;i<gHistoryIds.size();++i)if(gHistoryIds[i]==gSelectedId){ShowHistoryDetails(i);break;}
+    }
+  }
 
   std::wstringstream st;st<<L"Installed: "<<SendMessageW(gInstalled,LB_GETCOUNT,0,0)<<L"   Confirmed removals: "<<SendMessageW(gHistory,LB_GETCOUNT,0,0)<<L"   Observed identities: "<<gApps.size()<<L"   Phase: "<<gOpt.phase;
   if(manual)st<<L"   Snapshot saved";SetWindowTextW(gStatus,st.str().c_str());
 }
 void ExportEvidence(){
   json installed=json::array();for(const auto&[_,e]:gApps)installed.push_back(AppJson(e));
-  json out={{"schemaVersion",1},{"observerVersion","0.1.3"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
+  json out={{"schemaVersion",1},{"observerVersion","0.1.4"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
   std::ofstream f(gOpt.root/L"jobs"/gOpt.jobId/L"summary.json",std::ios::binary|std::ios::trunc);f<<out.dump(2);
 }
 void Layout(HWND w){
   RECT r{};GetClientRect(w,&r);
   const int W=r.right,H=r.bottom,m=16,gap=10;
-  const int head=62,bannerH=34,labelH=24,listsH=190,detailH=176,btn=34,status=24;
+  const int head=62,bannerH=34,labelH=24,listsH=180,detailH=210,btn=34,status=24;
 
   MoveWindow(gHeader,m,m,W-2*m,head,TRUE);
   int y=m+head+8;
@@ -611,18 +633,18 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
   std::wstring title=L"Hi5Central Qualification Observer - "+gOpt.application;
   HWND w=CreateWindowExW(0,kClassName,title.c_str(),WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,1220,900,nullptr,nullptr,h,nullptr);if(!w)return 2;
 
-  HFONT titleF=Font(21,true,L"Segoe UI Variable Display");
-  HFONT sectionF=Font(14,true,L"Segoe UI Variable Text");
-  HFONT uiF=Font(15,false,L"Segoe UI Variable Text");
-  HFONT smallF=Font(13,false,L"Segoe UI Variable Text");
-  HFONT mono=Font(14,false,L"Cascadia Mono");
+  HFONT titleF=Font(21,true,L"Segoe UI");
+  HFONT sectionF=Font(14,true,L"Segoe UI");
+  HFONT uiF=Font(15,false,L"Segoe UI");
+  HFONT smallF=Font(13,false,L"Segoe UI");
+  HFONT mono=Font(13,false,L"Consolas");
 
   std::wstringstream head;
-  head<<L"Hi5Central Qualification Observer\r\n"<<gOpt.application<<L"   •   "<<gOpt.phase<<L"   •   "<<gOpt.jobId;
+  head<<L"Hi5Central Qualification Observer\r\n"<<gOpt.application<<L"   |   "<<gOpt.phase<<L"   |   "<<gOpt.jobId;
   gHeader=CreateWindowExW(0,L"STATIC",head.str().c_str(),WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,0,0,w,nullptr,h,nullptr);
   SendMessageW(gHeader,WM_SETFONT,(WPARAM)titleF,TRUE);
 
-  gSafetyBanner=CreateWindowExW(0,L"STATIC",L"  OBSERVER MODE   •   Selecting an application is read-only. This window never uninstalls software on selection.",WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,0,0,0,0,w,(HMENU)1205,h,nullptr);
+  gSafetyBanner=CreateWindowExW(0,L"STATIC",L"  OBSERVER MODE   |   Selecting an application is read-only. This window never uninstalls software on selection.",WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,0,0,0,0,w,(HMENU)1205,h,nullptr);
   SendMessageW(gSafetyBanner,WM_SETFONT,(WPARAM)smallF,TRUE);
 
   gInstalledLabel=CreateWindowExW(0,L"STATIC",L"INSTALLED / AVAILABLE TO TEST",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,0,0,w,(HMENU)1201,h,nullptr);
