@@ -1,5 +1,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
+#include <winevt.h>
+#include <ntsecapi.h>
 #include <wbemidl.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -55,6 +57,14 @@ struct ProcessObservation{
   std::string captureMethod;
 };
 
+struct ProcessAuditRestoreState{
+  bool policyCaptured=false;
+  ULONG previousAuditingInformation=0;
+  bool registryCaptured=false;
+  bool registryValueExisted=false;
+  DWORD previousRegistryValue=0;
+};
+
 Options gOpt;
 HWND gHeader=nullptr,gInstalled=nullptr,gHistory=nullptr,gEvents=nullptr,gDetails=nullptr,gStatus=nullptr;
 HWND gInstalledLabel=nullptr,gHistoryLabel=nullptr,gEventsLabel=nullptr,gDetailsLabel=nullptr,gSafetyBanner=nullptr;
@@ -73,6 +83,12 @@ std::deque<ProcessObservation> gPendingProcessStarts;
 std::mutex gProcessEventMutex;
 std::atomic<bool> gProcessWatcherStop{false};
 std::thread gProcessWatcher;
+EVT_HANDLE gSecuritySubscription=nullptr;
+ProcessAuditRestoreState gAuditRestore;
+bool gProcessAuditActive=false;
+const GUID kAuditProcessCreation={
+  0x0cce922b,0x69ae,0x11d9,{0xbe,0xd3,0x50,0x50,0x54,0x50,0x30,0x30}
+};
 std::deque<std::wstring> gActivityLines;
 bool gActivityDirty=false;
 std::vector<std::wstring> gInstalledIds;
@@ -141,6 +157,236 @@ Options ParseOptions(){
   auto root=Arg(args,L"--root"); o.root=root.empty()?ProgramDataRoot():std::filesystem::path(root);
   return o;
 }
+
+std::filesystem::path AuditRestorePath(const std::filesystem::path& root){
+  return root/L"process-audit-restore.json";
+}
+
+bool EnablePrivilege(const wchar_t* privilege){
+  HANDLE token=nullptr;
+  if(!OpenProcessToken(
+    GetCurrentProcess(),
+    TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY,
+    &token))return false;
+
+  LUID luid{};
+  if(!LookupPrivilegeValueW(nullptr,privilege,&luid)){
+    CloseHandle(token);
+    return false;
+  }
+
+  TOKEN_PRIVILEGES tp{};
+  tp.PrivilegeCount=1;
+  tp.Privileges[0].Luid=luid;
+  tp.Privileges[0].Attributes=SE_PRIVILEGE_ENABLED;
+
+  SetLastError(ERROR_SUCCESS);
+  const BOOL ok=AdjustTokenPrivileges(
+    token,FALSE,&tp,sizeof(tp),nullptr,nullptr);
+  const DWORD err=GetLastError();
+  CloseHandle(token);
+  return ok&&err==ERROR_SUCCESS;
+}
+
+bool SaveAuditRestoreState(
+  const std::filesystem::path& root,
+  const ProcessAuditRestoreState& state){
+  std::error_code ec;
+  std::filesystem::create_directories(root,ec);
+  std::ofstream out(
+    AuditRestorePath(root),
+    std::ios::binary|std::ios::trunc);
+  if(!out)return false;
+  out<<json{
+    {"schemaVersion",1},
+    {"capturedAt",NowIso()},
+    {"policyCaptured",state.policyCaptured},
+    {"previousAuditingInformation",state.previousAuditingInformation},
+    {"registryCaptured",state.registryCaptured},
+    {"registryValueExisted",state.registryValueExisted},
+    {"previousRegistryValue",state.previousRegistryValue}
+  }.dump(2);
+  return (bool)out;
+}
+
+bool LoadAuditRestoreState(
+  const std::filesystem::path& root,
+  ProcessAuditRestoreState& state){
+  std::ifstream in(AuditRestorePath(root),std::ios::binary);
+  if(!in)return false;
+  try{
+    json value;in>>value;
+    state.policyCaptured=value.value("policyCaptured",false);
+    state.previousAuditingInformation=
+      value.value("previousAuditingInformation",0UL);
+    state.registryCaptured=value.value("registryCaptured",false);
+    state.registryValueExisted=value.value("registryValueExisted",false);
+    state.previousRegistryValue=value.value("previousRegistryValue",0UL);
+    return true;
+  }catch(...){
+    return false;
+  }
+}
+
+bool RestoreProcessAuditSettings(
+  const std::filesystem::path& root,
+  const ProcessAuditRestoreState& state,
+  bool removeRecoveryFile=true){
+  bool ok=true;
+
+  if(state.policyCaptured){
+    AUDIT_POLICY_INFORMATION policy{};
+    policy.AuditSubCategoryGuid=kAuditProcessCreation;
+    policy.AuditingInformation=state.previousAuditingInformation;
+    if(!AuditSetSystemPolicy(&policy,1))ok=false;
+  }
+
+  if(state.registryCaptured){
+    constexpr wchar_t keyPath[]=
+      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Audit";
+    constexpr wchar_t valueName[]=
+      L"ProcessCreationIncludeCmdLine_Enabled";
+
+    HKEY key=nullptr;
+    DWORD disposition=0;
+    if(RegCreateKeyExW(
+      HKEY_LOCAL_MACHINE,
+      keyPath,
+      0,
+      nullptr,
+      REG_OPTION_NON_VOLATILE,
+      KEY_QUERY_VALUE|KEY_SET_VALUE,
+      nullptr,
+      &key,
+      &disposition)!=ERROR_SUCCESS){
+      ok=false;
+    }else{
+      if(state.registryValueExisted){
+        const DWORD value=state.previousRegistryValue;
+        if(RegSetValueExW(
+          key,
+          valueName,
+          0,
+          REG_DWORD,
+          reinterpret_cast<const BYTE*>(&value),
+          sizeof(value))!=ERROR_SUCCESS)ok=false;
+      }else{
+        const LONG rc=RegDeleteValueW(key,valueName);
+        if(rc!=ERROR_SUCCESS&&rc!=ERROR_FILE_NOT_FOUND)ok=false;
+      }
+      RegCloseKey(key);
+    }
+  }
+
+  if(ok&&removeRecoveryFile){
+    std::error_code ec;
+    std::filesystem::remove(AuditRestorePath(root),ec);
+  }
+  return ok;
+}
+
+bool RecoverStaleProcessAuditSettings(
+  const std::filesystem::path& root){
+  ProcessAuditRestoreState stale;
+  if(!LoadAuditRestoreState(root,stale))return true;
+  EnablePrivilege(SE_SECURITY_NAME);
+  return RestoreProcessAuditSettings(root,stale,true);
+}
+
+bool EnableQualificationProcessAudit(
+  const std::filesystem::path& root){
+  EnablePrivilege(SE_SECURITY_NAME);
+
+  ProcessAuditRestoreState state;
+  PAUDIT_POLICY_INFORMATION current=nullptr;
+  if(!AuditQuerySystemPolicy(
+    &kAuditProcessCreation,
+    1,
+    &current)||
+    !current){
+    return false;
+  }
+  state.policyCaptured=true;
+  state.previousAuditingInformation=current[0].AuditingInformation;
+  AuditFree(current);
+
+  constexpr wchar_t keyPath[]=
+    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Audit";
+  constexpr wchar_t valueName[]=
+    L"ProcessCreationIncludeCmdLine_Enabled";
+
+  HKEY key=nullptr;
+  DWORD disposition=0;
+  if(RegCreateKeyExW(
+    HKEY_LOCAL_MACHINE,
+    keyPath,
+    0,
+    nullptr,
+    REG_OPTION_NON_VOLATILE,
+    KEY_QUERY_VALUE|KEY_SET_VALUE,
+    nullptr,
+    &key,
+    &disposition)!=ERROR_SUCCESS){
+    return false;
+  }
+
+  state.registryCaptured=true;
+  DWORD type=0,value=0,size=sizeof(value);
+  const LONG query=RegQueryValueExW(
+    key,
+    valueName,
+    nullptr,
+    &type,
+    reinterpret_cast<BYTE*>(&value),
+    &size);
+  if(query==ERROR_SUCCESS&&type==REG_DWORD){
+    state.registryValueExisted=true;
+    state.previousRegistryValue=value;
+  }else if(query!=ERROR_FILE_NOT_FOUND){
+    RegCloseKey(key);
+    return false;
+  }
+
+  if(!SaveAuditRestoreState(root,state)){
+    RegCloseKey(key);
+    return false;
+  }
+
+  AUDIT_POLICY_INFORMATION desired{};
+  desired.AuditSubCategoryGuid=kAuditProcessCreation;
+  desired.AuditingInformation=
+    (state.previousAuditingInformation&~POLICY_AUDIT_EVENT_NONE)|
+    POLICY_AUDIT_EVENT_SUCCESS;
+
+  bool ok=AuditSetSystemPolicy(&desired,1)!=FALSE;
+  const DWORD enabled=1;
+  if(RegSetValueExW(
+    key,
+    valueName,
+    0,
+    REG_DWORD,
+    reinterpret_cast<const BYTE*>(&enabled),
+    sizeof(enabled))!=ERROR_SUCCESS){
+    ok=false;
+  }
+  RegCloseKey(key);
+
+  if(!ok){
+    RestoreProcessAuditSettings(root,state,true);
+    return false;
+  }
+
+  gAuditRestore=state;
+  gProcessAuditActive=true;
+  return true;
+}
+
+void DisableQualificationProcessAudit(){
+  if(!gProcessAuditActive)return;
+  RestoreProcessAuditSettings(gOpt.root,gAuditRestore,true);
+  gProcessAuditActive=false;
+}
+
 std::wstring RegString(HKEY h,const wchar_t* n){
   DWORD t=0,b=0; if(RegQueryValueExW(h,n,nullptr,&t,nullptr,&b)!=ERROR_SUCCESS||(t!=REG_SZ&&t!=REG_EXPAND_SZ)||b<2)return {};
   std::vector<wchar_t> buf(b/2+2,L'\0'); if(RegQueryValueExW(h,n,nullptr,&t,(LPBYTE)buf.data(),&b)!=ERROR_SUCCESS)return {};
@@ -345,6 +591,149 @@ void ProcessStartWatcherLoop(){
   if(services)services->Release();
   if(locator)locator->Release();
   if(SUCCEEDED(com))CoUninitialize();
+}
+
+std::wstring ReplaceAll(
+  std::wstring value,
+  const std::wstring& from,
+  const std::wstring& to){
+  if(from.empty())return value;
+  size_t pos=0;
+  while((pos=value.find(from,pos))!=std::wstring::npos){
+    value.replace(pos,from.size(),to);
+    pos+=to.size();
+  }
+  return value;
+}
+
+std::wstring XmlDecode(std::wstring value){
+  value=ReplaceAll(std::move(value),L"&quot;",L"\"");
+  value=ReplaceAll(std::move(value),L"&apos;",L"'");
+  value=ReplaceAll(std::move(value),L"&lt;",L"<");
+  value=ReplaceAll(std::move(value),L"&gt;",L">");
+  value=ReplaceAll(std::move(value),L"&amp;",L"&");
+  return value;
+}
+
+std::wstring EventDataValue(
+  const std::wstring& xml,
+  const std::wstring& name){
+  const std::wstring doubleMarker=L"<Data Name=\""+name+L"\">";
+  const std::wstring singleMarker=L"<Data Name='"+name+L"'>";
+  size_t start=xml.find(doubleMarker);
+  size_t markerSize=doubleMarker.size();
+  if(start==std::wstring::npos){
+    start=xml.find(singleMarker);
+    markerSize=singleMarker.size();
+  }
+  if(start==std::wstring::npos)return {};
+  start+=markerSize;
+  const size_t end=xml.find(L"</Data>",start);
+  if(end==std::wstring::npos)return {};
+  return XmlDecode(xml.substr(start,end-start));
+}
+
+DWORD ParseEventProcessId(const std::wstring& value){
+  if(value.empty())return 0;
+  wchar_t* end=nullptr;
+  const unsigned long long parsed=wcstoull(value.c_str(),&end,0);
+  if(end==value.c_str())return 0;
+  return (DWORD)parsed;
+}
+
+DWORD WINAPI SecurityProcessEventCallback(
+  EVT_SUBSCRIBE_NOTIFY_ACTION action,
+  PVOID,
+  EVT_HANDLE event){
+  if(action!=EvtSubscribeActionDeliver||!event||gProcessWatcherStop.load())
+    return ERROR_SUCCESS;
+
+  DWORD used=0,count=0;
+  if(!EvtRender(
+    nullptr,
+    event,
+    EvtRenderEventXml,
+    0,
+    nullptr,
+    &used,
+    &count)&&
+    GetLastError()!=ERROR_INSUFFICIENT_BUFFER){
+    return ERROR_SUCCESS;
+  }
+  if(!used)return ERROR_SUCCESS;
+
+  std::vector<wchar_t> buffer(
+    used/sizeof(wchar_t)+2,
+    L'\0');
+  if(!EvtRender(
+    nullptr,
+    event,
+    EvtRenderEventXml,
+    used,
+    buffer.data(),
+    &used,
+    &count)){
+    return ERROR_SUCCESS;
+  }
+
+  const std::wstring xml=buffer.data();
+  const DWORD pid=ParseEventProcessId(
+    EventDataValue(xml,L"NewProcessId"));
+  if(!pid)return ERROR_SUCCESS;
+
+  const DWORD parentPid=ParseEventProcessId(
+    EventDataValue(xml,L"ProcessId"));
+  const std::wstring image=EventDataValue(
+    xml,L"NewProcessName");
+  std::wstring command=EventDataValue(
+    xml,L"CommandLine");
+  if(Trim(command)==L"-")command.clear();
+
+  ProcEntry process;
+  process.pid=pid;
+  process.parentPid=parentPid;
+  process.path=image;
+  process.commandLine=command;
+  if(!image.empty()){
+    try{
+      process.name=std::filesystem::path(image).filename().wstring();
+    }catch(...){
+      process.name=image;
+    }
+  }
+
+  ProcessObservation observation{
+    std::chrono::steady_clock::now(),
+    NowIso(),
+    std::move(process),
+    "Security4688_CommandLineAudit"
+  };
+
+  std::lock_guard<std::mutex> guard(gProcessEventMutex);
+  gPendingProcessStarts.push_back(std::move(observation));
+  while(gPendingProcessStarts.size()>4000)
+    gPendingProcessStarts.pop_front();
+  return ERROR_SUCCESS;
+}
+
+bool StartSecurityProcessSubscription(){
+  if(gSecuritySubscription)return true;
+  gSecuritySubscription=EvtSubscribe(
+    nullptr,
+    nullptr,
+    L"Security",
+    L"*[System[(EventID=4688)]]",
+    nullptr,
+    nullptr,
+    SecurityProcessEventCallback,
+    EvtSubscribeToFutureEvents);
+  return gSecuritySubscription!=nullptr;
+}
+
+void StopSecurityProcessSubscription(){
+  EVT_HANDLE handle=gSecuritySubscription;
+  gSecuritySubscription=nullptr;
+  if(handle)EvtClose(handle);
 }
 
 std::vector<ProcessObservation> DrainProcessStartEvents(){
@@ -854,25 +1243,49 @@ void Tick(bool manual){
   while(!gProcessJournal.empty()&&tickNow-gProcessJournal.front().seen>std::chrono::minutes(5))
     gProcessJournal.pop_front();
 
-  std::set<DWORD> eventPids;
+  auto observationQuality=[](const ProcessObservation& observation){
+    int quality=0;
+    if(!observation.process.commandLine.empty())quality+=100;
+    if(!observation.process.path.empty())quality+=20;
+    if(observation.captureMethod=="Security4688_CommandLineAudit")quality+=60;
+    else if(observation.captureMethod=="Win32_ProcessStartTrace")quality+=30;
+    else if(observation.captureMethod=="snapshot_fallback")quality+=10;
+    return quality;
+  };
+
+  std::map<DWORD,ProcessObservation> mergedStarts;
   auto eventStarts=DrainProcessStartEvents();
   for(auto& observation:eventStarts){
-    eventPids.insert(observation.process.pid);
+    const DWORD pid=observation.process.pid;
+    if(!pid)continue;
+    auto existing=mergedStarts.find(pid);
+    if(existing==mergedStarts.end()||
+       observationQuality(observation)>observationQuality(existing->second)){
+      mergedStarts[pid]=std::move(observation);
+    }
+  }
+
+  std::set<DWORD> eventPids;
+  for(auto&[pid,observation]:mergedStarts){
+    eventPids.insert(pid);
     gProcessJournal.push_back(observation);
     while(gProcessJournal.size()>1500)gProcessJournal.pop_front();
 
     const auto& p=observation.process;
-    std::wstring detail=L"PROCESS START [event] "+std::to_wstring(p.pid)+L" ppid="+std::to_wstring(p.parentPid)+L" "+p.name;
+    std::wstring detail=L"PROCESS START ["+Widen(observation.captureMethod)+L"] "+
+      std::to_wstring(p.pid)+L" ppid="+std::to_wstring(p.parentPid)+L" "+p.name;
     if(!p.commandLine.empty())detail+=L" | "+p.commandLine;
     AppendLog(detail,{
       {"timestamp",observation.timestamp},
       {"type","process_started"},
-      {"captureMethod","Win32_ProcessStartTrace"},
+      {"captureMethod",observation.captureMethod},
       {"pid",p.pid},
       {"parentPid",p.parentPid},
       {"name",Narrow(p.name)},
       {"path",Narrow(p.path)},
-      {"commandLine",Narrow(p.commandLine)}
+      {"commandLine",Narrow(p.commandLine)},
+      {"arguments",CommandArgumentsJson(p.commandLine)},
+      {"switches",CommandSwitchesJson(p.commandLine)}
     });
   }
 
@@ -1002,7 +1415,7 @@ void Tick(bool manual){
 }
 void ExportEvidence(){
   json installed=json::array();for(const auto&[_,e]:gApps)installed.push_back(AppJson(e));
-  json out={{"schemaVersion",1},{"observerVersion","0.1.6"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
+  json out={{"schemaVersion",1},{"observerVersion","0.1.7"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
   std::ofstream f(gOpt.root/L"jobs"/gOpt.jobId/L"summary.json",std::ios::binary|std::ios::trunc);f<<out.dump(2);
 }
 void Layout(HWND w){
@@ -1075,6 +1488,8 @@ LRESULT CALLBACK Proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
   if(msg==WM_CLOSE){
     gStopping=true;
     gProcessWatcherStop.store(true);
+    StopSecurityProcessSubscription();
+    DisableQualificationProcessAudit();
     KillTimer(w,kTimerId);
     Tick(false);
     ExportEvidence();
@@ -1095,8 +1510,14 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
     MessageBoxW(nullptr,L"Hi5Central Qualification Observer is already running in this desktop session.",L"Hi5Central Qualification Observer",MB_OK|MB_ICONINFORMATION);
     CloseHandle(singleton);if(SUCCEEDED(com))CoUninitialize();return 3;
   }
-  gOpt=ParseOptions();std::error_code ec;std::filesystem::create_directories(gOpt.root/L"jobs"/gOpt.jobId,ec);LoadState();BackfillStateRecipes();
-  gLog.open(gOpt.root/L"jobs"/gOpt.jobId/L"observer.log",std::ios::app);gJsonl.open(gOpt.root/L"jobs"/gOpt.jobId/L"events.jsonl",std::ios::binary|std::ios::app);
+  gOpt=ParseOptions();
+  std::error_code ec;
+  std::filesystem::create_directories(gOpt.root/L"jobs"/gOpt.jobId,ec);
+  const bool auditRecoveryOk=RecoverStaleProcessAuditSettings(gOpt.root);
+  LoadState();
+  BackfillStateRecipes();
+  gLog.open(gOpt.root/L"jobs"/gOpt.jobId/L"observer.log",std::ios::app);
+  gJsonl.open(gOpt.root/L"jobs"/gOpt.jobId/L"events.jsonl",std::ios::binary|std::ios::app);
 
   gWindowBrush=CreateSolidBrush(kWindowBg);
   gPanelBrush=CreateSolidBrush(kPanelBg);
@@ -1155,20 +1576,37 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
       s["parentKeyName"]=Narrow(e.parentKeyName);s["testable"]=IsTestableApplication(e);
     }
   }SaveState();
+
+  bool security4688Ready=false;
+  if(auditRecoveryOk&&EnableQualificationProcessAudit(gOpt.root)){
+    security4688Ready=StartSecurityProcessSubscription();
+    if(!security4688Ready)DisableQualificationProcessAudit();
+  }
+
   gProcs=CaptureProcs();
   gProcessWatcherStop.store(false);
   gProcessWatcher=std::thread(ProcessStartWatcherLoop);
   PopulateLists();
   RefreshDetails();
+
+  json captureSources=json::array();
+  if(security4688Ready)captureSources.push_back("Security4688_CommandLineAudit");
+  captureSources.push_back("Win32_ProcessStartTrace");
+  captureSources.push_back("snapshot_fallback");
+
   AppendLog(
-    L"Observer started. Exact process invocation capture is event-driven; removed applications remain in History.",
-    {{"timestamp",NowIso()},{"type","observer_started"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"processCapture","Win32_ProcessStartTrace"}});
+    security4688Ready
+      ? L"Observer started. Exact command-line capture uses Security 4688 with WMI/snapshot fallback."
+      : L"Observer started. Security 4688 command-line capture is unavailable; WMI/snapshot fallback is active.",
+    {{"timestamp",NowIso()},{"type","observer_started"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"processCaptureSources",captureSources},{"auditRecoveryOk",auditRecoveryOk}});
   SetTimer(w,kTimerId,kTimerMs,nullptr);
   ShowWindow(w,SW_SHOW);
   SetForegroundWindow(w);
   UpdateWindow(w);
   MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
   gProcessWatcherStop.store(true);
+  StopSecurityProcessSubscription();
+  DisableQualificationProcessAudit();
   if(gProcessWatcher.joinable())gProcessWatcher.join();
   if(singleton)CloseHandle(singleton);
   if(SUCCEEDED(com))CoUninitialize();
