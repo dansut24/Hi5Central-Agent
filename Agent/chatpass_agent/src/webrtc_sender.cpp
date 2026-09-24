@@ -10,6 +10,8 @@
 #include <rtc/rtc.hpp>
 #include <rtc/av1rtppacketizer.hpp>
 #include <rtc/h265rtppacketizer.hpp>
+#include <rtc/pacinghandler.hpp>
+#include <rtc/plihandler.hpp>
 #include <rtc/rtcpnackresponder.hpp>
 #include <rtc/rtcpsrreporter.hpp>
 #include <nlohmann/json.hpp>
@@ -918,16 +920,49 @@ void WebRtcSender::configureVideoMediaHandler(VideoCodec codec) {
         m_nativeVideoRtpConfig.reset();
     }
 
-    // VP8/VP9/H.264 use Hi5Central's existing manual RTP packetization.
-    if (codec != VideoCodec::AV1 && codec != VideoCodec::H265) {
-        m_track->setMediaHandler(nullptr);
-        return;
-    }
-
     auto cfg = std::make_shared<rtc::RtpPacketizationConfig>(
         m_ssrc, "video-stream", static_cast<uint8_t>(m_payloadType), 90000);
     cfg->sequenceNumber = m_sequence;
     cfg->timestamp = m_externalLastRtpTimestamp != 0 ? m_externalLastRtpTimestamp : randomU32();
+
+    // VP8/VP9/H.264 are packetized by Hi5Central so we can preserve the
+    // existing codec-specific payload descriptors. They still need the RTCP
+    // reliability chain, though. Previously setMediaHandler(nullptr) meant a
+    // lost packet in a large desktop keyframe could never be retransmitted,
+    // leaving the browser connected but permanently waiting for a decodable
+    // first frame. Keep our RTP packets, but add SR/NACK/PLI and pacing.
+    if (codec != VideoCodec::AV1 && codec != VideoCodec::H265) {
+        auto transport = std::make_shared<rtc::MediaHandler>();
+        transport->addToChain(std::make_shared<rtc::RtcpSrReporter>(cfg));
+
+        const int nackCachePackets = readEnvInt("HI5_RTP_NACK_CACHE_PACKETS", 4096, 128, 16384);
+        transport->addToChain(std::make_shared<rtc::RtcpNackResponder>(
+            static_cast<size_t>(nackCachePackets)));
+
+        transport->addToChain(std::make_shared<rtc::PliHandler>([this]() {
+            m_forceKeyframe = true;
+            LogInfo("[video] RTCP PLI/FIR requested keyframe session=" + m_sessionId);
+        }));
+
+        // Do not burst a 150+ packet 1080p keyframe into the socket at once.
+        // A short pacer materially lowers startup loss on Wi-Fi/mobile links
+        // while keeping interactive latency well below a single second.
+        const int defaultPacingKbps = std::max(8000, m_bitrateKbps);
+        const int pacingKbps = readEnvInt("HI5_RTP_PACING_KBPS", defaultPacingKbps, 1000, 50000);
+        const int pacingIntervalMs = readEnvInt("HI5_RTP_PACING_INTERVAL_MS", 5, 1, 50);
+        transport->addToChain(std::make_shared<rtc::PacingHandler>(
+            static_cast<double>(pacingKbps) * 1000.0,
+            std::chrono::milliseconds(pacingIntervalMs)));
+
+        m_track->setMediaHandler(transport);
+        LogInfo("[video] manual RTP recovery chain session=" + m_sessionId +
+            " codec=" + activeVideoCodecName() +
+            " payload=" + std::to_string(m_payloadType) +
+            " nack_cache_packets=" + std::to_string(nackCachePackets) +
+            " pacing_kbps=" + std::to_string(pacingKbps) +
+            " pacing_interval_ms=" + std::to_string(pacingIntervalMs));
+        return;
+    }
 
     std::shared_ptr<rtc::MediaHandler> packetizer;
     if (codec == VideoCodec::AV1) {
@@ -1706,10 +1741,10 @@ void WebRtcSender::createPeerConnection() {
             << " session=" << m_sessionId << "\n";
         if (state == rtc::PeerConnection::State::Connected) {
             LogSupportEvent("Connected - WebRTC");
-            // Force another keyframe at peer-connect as well as track-open.
-            // Some browsers/mobile WebViews complete the media track before
-            // the peer is actually ready to decode the first packet burst.
-            m_forceKeyframe = true;
+            // Track-open/encoder creation already force the startup keyframe.
+            // Do not immediately force a second 1080p intra frame here: two
+            // large keyframes back-to-back amplify startup packet loss. NACK
+            // retransmission and RTCP PLI/FIR now provide targeted recovery.
         }
         if (state == rtc::PeerConnection::State::Disconnected ||
             state == rtc::PeerConnection::State::Failed ||
@@ -2081,11 +2116,13 @@ std::vector<std::vector<uint8_t>> WebRtcSender::packetizeVp9(const Vp9EncodedFra
         payload.reserve(1 + chunk);
 
         /*
-          Minimal VP9 RTP payload descriptor:
-          - I=0, P=0, L=0, F=0, B/E set by packet boundary.
-          - This is enough for a first WebRTC VP9 validation path with one spatial layer.
+          VP9 RTP payload descriptor, single spatial/temporal layer:
+          - I=0, L=0, F=0, V=0, Z=0.
+          - P must be set for inter-picture predicted (delta) frames. The old
+            minimal validation path incorrectly advertised every frame as P=0.
+          - B/E mark the first/last packet of the encoded frame.
         */
-        uint8_t descriptor = 0x00;
+        uint8_t descriptor = frame.keyframe ? 0x00 : 0x40; // P
         if (first) {
             descriptor |= 0x08; // B: beginning of frame
         }
