@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -322,6 +323,179 @@ namespace {
         p.minQuantizer = quality == "near_lossless" ? 0 : 4;
         return p;
     }
+
+    struct NegotiatedVideoFormat {
+        bool found = false;
+        bool compatible = false;
+        WebRtcSender::VideoCodec codec = WebRtcSender::VideoCodec::VP8;
+        int payloadType = -1;
+        std::string codecName;
+        std::string fmtp;
+        std::string h264ProfileLevelId = "42e01f";
+        int h264PacketizationMode = 0;
+        bool h264LevelAsymmetryAllowed = false;
+        int h264MaxWidth = 1280;
+        int h264MaxHeight = 720;
+        std::string rejectionReason;
+    };
+
+    static std::string trimSdpToken(std::string value) {
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t' || value.front() == '\r' || value.front() == '\n')) value.erase(value.begin());
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r' || value.back() == '\n')) value.pop_back();
+        return value;
+    }
+
+    static std::string lowerAscii(std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return value;
+    }
+
+    static std::string sdpAttributeValue(const std::string& fmtp, const std::string& wanted) {
+        std::istringstream ss(fmtp);
+        std::string part;
+        const std::string wantedLower = lowerAscii(wanted);
+        while (std::getline(ss, part, ';')) {
+            part = trimSdpToken(part);
+            const size_t eq = part.find('=');
+            const std::string key = lowerAscii(trimSdpToken(part.substr(0, eq)));
+            if (key != wantedLower) continue;
+            if (eq == std::string::npos) return std::string();
+            return trimSdpToken(part.substr(eq + 1));
+        }
+        return {};
+    }
+
+    static void h264LevelDimensions(const std::string& profileLevelId, int& maxWidth, int& maxHeight) {
+        // Hi5Central's H.264 sender is Baseline/Constrained-Baseline. Keep the
+        // encoded frame inside the negotiated H.264 level. In particular, level
+        // 3.1 (..1f) permits 3600 macroblocks/frame: 1280x720, not 1920x1080.
+        maxWidth = 1280;
+        maxHeight = 720;
+        if (profileLevelId.size() < 6) return;
+        try {
+            const int levelIdc = std::stoi(profileLevelId.substr(profileLevelId.size() - 2), nullptr, 16);
+            if (levelIdc <= 0x0b) { maxWidth = 352; maxHeight = 288; }
+            else if (levelIdc <= 0x15) { maxWidth = 720; maxHeight = 480; }
+            else if (levelIdc <= 0x1e) { maxWidth = 720; maxHeight = 576; }
+            else if (levelIdc == 0x1f) { maxWidth = 1280; maxHeight = 720; }
+            else if (levelIdc == 0x20) { maxWidth = 1280; maxHeight = 1024; }
+            else { maxWidth = 1920; maxHeight = 1080; }
+        } catch (...) {
+            maxWidth = 1280;
+            maxHeight = 720;
+        }
+    }
+
+    static bool parseCodecName(const std::string& codecNameRaw, WebRtcSender::VideoCodec& codec) {
+        const std::string name = lowerAscii(codecNameRaw);
+        if (name == "vp8") { codec = WebRtcSender::VideoCodec::VP8; return true; }
+        if (name == "vp9") { codec = WebRtcSender::VideoCodec::VP9; return true; }
+        if (name == "av1" || name == "av1x") { codec = WebRtcSender::VideoCodec::AV1; return true; }
+        if (name == "h264") { codec = WebRtcSender::VideoCodec::H264; return true; }
+        if (name == "h265" || name == "hevc") { codec = WebRtcSender::VideoCodec::H265; return true; }
+        return false;
+    }
+
+    static NegotiatedVideoFormat parseNegotiatedVideoFormat(const std::string& sdp) {
+        struct RtpMap { int pt = -1; std::string codecName; std::string fmtp; };
+        std::vector<std::string> lines;
+        std::istringstream input(sdp);
+        for (std::string line; std::getline(input, line); ) lines.push_back(trimSdpToken(line));
+
+        size_t videoStart = lines.size();
+        size_t videoEnd = lines.size();
+        std::vector<int> payloadOrder;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            const std::string lower = lowerAscii(lines[i]);
+            if (lower.rfind("m=video ", 0) != 0) continue;
+            videoStart = i;
+            std::istringstream mline(lines[i]);
+            std::string token;
+            mline >> token;
+            mline >> token;
+            mline >> token;
+            int pt = -1;
+            while (mline >> pt) payloadOrder.push_back(pt);
+            for (size_t j = i + 1; j < lines.size(); ++j) {
+                if (lowerAscii(lines[j]).rfind("m=", 0) == 0) { videoEnd = j; break; }
+            }
+            break;
+        }
+        if (videoStart == lines.size()) return {};
+
+        std::vector<RtpMap> maps;
+        auto mapFor = [&](int pt) -> RtpMap* {
+            for (auto& item : maps) if (item.pt == pt) return &item;
+            maps.push_back(RtpMap{});
+            maps.back().pt = pt;
+            return &maps.back();
+        };
+
+        for (size_t i = videoStart + 1; i < videoEnd; ++i) {
+            const std::string lower = lowerAscii(lines[i]);
+            if (lower.rfind("a=rtpmap:", 0) == 0) {
+                const size_t colon = lines[i].find(':');
+                const size_t space = lines[i].find(' ', colon + 1);
+                if (colon == std::string::npos || space == std::string::npos) continue;
+                try {
+                    const int pt = std::stoi(lines[i].substr(colon + 1, space - colon - 1));
+                    std::string encoding = trimSdpToken(lines[i].substr(space + 1));
+                    const size_t slash = encoding.find('/');
+                    if (slash != std::string::npos) encoding.resize(slash);
+                    mapFor(pt)->codecName = encoding;
+                } catch (...) {}
+            } else if (lower.rfind("a=fmtp:", 0) == 0) {
+                const size_t colon = lines[i].find(':');
+                const size_t space = lines[i].find(' ', colon + 1);
+                if (colon == std::string::npos || space == std::string::npos) continue;
+                try {
+                    const int pt = std::stoi(lines[i].substr(colon + 1, space - colon - 1));
+                    mapFor(pt)->fmtp = trimSdpToken(lines[i].substr(space + 1));
+                } catch (...) {}
+            }
+        }
+
+        NegotiatedVideoFormat firstRecognized{};
+        for (int pt : payloadOrder) {
+            RtpMap* map = nullptr;
+            for (auto& item : maps) if (item.pt == pt) { map = &item; break; }
+            if (!map || map->codecName.empty()) continue;
+
+            WebRtcSender::VideoCodec codec;
+            if (!parseCodecName(map->codecName, codec)) continue;
+
+            NegotiatedVideoFormat candidate{};
+            candidate.found = true;
+            candidate.compatible = true;
+            candidate.codec = codec;
+            candidate.payloadType = pt;
+            candidate.codecName = map->codecName;
+            candidate.fmtp = map->fmtp;
+
+            if (codec == WebRtcSender::VideoCodec::H264) {
+                candidate.h264ProfileLevelId = lowerAscii(sdpAttributeValue(map->fmtp, "profile-level-id"));
+                if (candidate.h264ProfileLevelId.empty()) candidate.h264ProfileLevelId = "42e01f";
+                const std::string packetMode = sdpAttributeValue(map->fmtp, "packetization-mode");
+                candidate.h264PacketizationMode = packetMode.empty() ? 0 : std::atoi(packetMode.c_str());
+                candidate.h264LevelAsymmetryAllowed = sdpAttributeValue(map->fmtp, "level-asymmetry-allowed") == "1";
+                h264LevelDimensions(candidate.h264ProfileLevelId, candidate.h264MaxWidth, candidate.h264MaxHeight);
+
+                if (candidate.h264PacketizationMode != 1) {
+                    candidate.compatible = false;
+                    candidate.rejectionReason = "H.264 packetization-mode is not 1";
+                } else if (candidate.h264ProfileLevelId.size() >= 2 && lowerAscii(candidate.h264ProfileLevelId.substr(0, 2)) != "42") {
+                    candidate.compatible = false;
+                    candidate.rejectionReason = "H.264 profile is not Baseline/Constrained-Baseline";
+                }
+            }
+
+            if (!firstRecognized.found) firstRecognized = candidate;
+            if (candidate.compatible) return candidate;
+        }
+        return firstRecognized;
+    }
 }
 
 WebRtcSender::WebRtcSender(std::string sessionId,
@@ -480,17 +654,17 @@ uint32_t WebRtcSender::externalRtpTimestamp(uint64_t captureTimestampNs) {
     return timestamp;
 }
 
-void WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
+bool WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
     std::string upper = sdp;
     std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
         return static_cast<char>(std::toupper(c));
         });
 
-    m_peerAcceptsAv1 = upper.find("A=RTPMAP:100 AV1/90000") != std::string::npos;
-    m_peerAcceptsVp9 = upper.find("A=RTPMAP:98 VP9/90000") != std::string::npos;
-    m_peerAcceptsH265 = upper.find("A=RTPMAP:104 H265/90000") != std::string::npos;
-    m_peerAcceptsH264 = upper.find("A=RTPMAP:102 H264/90000") != std::string::npos;
-    m_peerAcceptsVp8 = upper.find("A=RTPMAP:96 VP8/90000") != std::string::npos;
+    m_peerAcceptsAv1 = upper.find(" AV1/90000") != std::string::npos || upper.find(" AV1X/90000") != std::string::npos;
+    m_peerAcceptsVp9 = upper.find(" VP9/90000") != std::string::npos;
+    m_peerAcceptsH265 = upper.find(" H265/90000") != std::string::npos || upper.find(" HEVC/90000") != std::string::npos;
+    m_peerAcceptsH264 = upper.find(" H264/90000") != std::string::npos;
+    m_peerAcceptsVp8 = upper.find(" VP8/90000") != std::string::npos;
 
     LogInfo("[codec] viewer answer capabilities session=" + m_sessionId +
         " av1=" + std::string(m_peerAcceptsAv1 ? "1" : "0") +
@@ -499,10 +673,52 @@ void WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
         " h264=" + std::string(m_peerAcceptsH264 ? "1" : "0") +
         " vp8=" + std::string(m_peerAcceptsVp8 ? "1" : "0"));
 
-    if (m_autoCodec) selectBestAutoCodec("answer");
+    const NegotiatedVideoFormat selected = parseNegotiatedVideoFormat(sdp);
+    if (!selected.found) {
+        LogWarn("[codec] SDP answer has no supported primary video payload session=" + m_sessionId);
+        return false;
+    }
+    if (!selected.compatible) {
+        LogWarn("[codec] SDP answer first supported payload is unusable session=" + m_sessionId +
+            " payload=" + std::to_string(selected.payloadType) +
+            " codec=" + selected.codecName +
+            " reason=" + selected.rejectionReason);
+        return false;
+    }
+
+    m_negotiatedCodec = selected.codec;
+    m_negotiatedPayloadType = selected.payloadType;
+    if (selected.codec == VideoCodec::H264) {
+        m_negotiatedH264Fmtp = selected.fmtp;
+        m_negotiatedH264ProfileLevelId = selected.h264ProfileLevelId;
+        m_negotiatedH264PacketizationMode = selected.h264PacketizationMode;
+        m_negotiatedH264LevelAsymmetryAllowed = selected.h264LevelAsymmetryAllowed;
+        m_negotiatedH264MaxWidth = selected.h264MaxWidth;
+        m_negotiatedH264MaxHeight = selected.h264MaxHeight;
+    }
+
+    LogInfo("[codec] SDP answer selected session=" + m_sessionId +
+        " payload=" + std::to_string(selected.payloadType) +
+        " codec=" + selected.codecName +
+        (selected.codec == VideoCodec::H264
+            ? " fmtp=\"" + selected.fmtp + "\" profile_level_id=" + m_negotiatedH264ProfileLevelId +
+              " packetization_mode=" + std::to_string(m_negotiatedH264PacketizationMode) +
+              " level_asymmetry_allowed=" + std::string(m_negotiatedH264LevelAsymmetryAllowed ? "1" : "0") +
+              " max_frame=" + std::to_string(m_negotiatedH264MaxWidth) + "x" + std::to_string(m_negotiatedH264MaxHeight)
+            : std::string()));
+
+    return switchVideoCodec(selected.codec, "SDP answer selected payload", selected.payloadType);
 }
 
 bool WebRtcSender::selectBestAutoCodec(const std::string& reasonPrefix) {
+    if (m_negotiationLocked) {
+        LogWarn("[codec] codec change blocked after SDP negotiation session=" + m_sessionId +
+            " active=" + activeVideoCodecName() +
+            " payload=" + std::to_string(m_payloadType) +
+            " requested_reason=" + reasonPrefix +
+            " action=start_new_peer_connection");
+        return false;
+    }
     const std::string quality = imageQualityMode();
     if (quality == "lossless" && m_peerAcceptsVp9 && !m_vp9Failed) {
         m_codecMode = "vp9_sw";
@@ -569,6 +785,11 @@ std::string WebRtcSender::activeVideoCodecName() const {
 }
 
 bool WebRtcSender::applyDevCodecSwitch(const std::string& requestedRaw, std::string& activeCodec, std::string& detail) {
+    if (m_negotiationLocked) {
+        activeCodec = activeVideoCodecName();
+        detail = "Codec is locked by SDP negotiation; start a new remote session to renegotiate codec";
+        return false;
+    }
     std::string requested = requestedRaw;
     std::transform(requested.begin(), requested.end(), requested.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -628,13 +849,26 @@ bool WebRtcSender::applyDevCodecSwitch(const std::string& requestedRaw, std::str
     return reject("Unknown codec request: " + requestedRaw);
 }
 
-bool WebRtcSender::switchVideoCodec(VideoCodec codec, const std::string& reason) {
+bool WebRtcSender::switchVideoCodec(VideoCodec codec, const std::string& reason, int negotiatedPayloadType) {
     int payload = 96;
     const char* name = "VP8";
     if (codec == VideoCodec::VP9) { payload = 98; name = "VP9"; }
     else if (codec == VideoCodec::AV1) { payload = 100; name = "AV1"; }
     else if (codec == VideoCodec::H264) { payload = 102; name = "H.264"; }
     else if (codec == VideoCodec::H265) { payload = 104; name = "H.265"; }
+
+    if (negotiatedPayloadType >= 0) payload = negotiatedPayloadType;
+
+    if (m_negotiationLocked &&
+        (codec != m_negotiatedCodec || payload != m_negotiatedPayloadType)) {
+        LogWarn("[codec] live switch rejected after negotiation session=" + m_sessionId +
+            " active=" + activeVideoCodecName() +
+            " active_payload=" + std::to_string(m_payloadType) +
+            " requested=" + std::string(name) +
+            " requested_payload=" + std::to_string(payload) +
+            " reason=" + reason);
+        return false;
+    }
 
     if (codec == VideoCodec::AV1 && m_autoCodec && !m_peerAcceptsAv1) return false;
     if (codec == VideoCodec::VP9 && m_autoCodec && !m_peerAcceptsVp9) return false;
@@ -754,8 +988,16 @@ void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, do
         " viewer_rtt_ms=" + std::to_string(viewerRttMs) +
         " viewer_jitter_buffer_ms=" + std::to_string(viewerJitterBufferMs));
 
-    // Require two consecutive 5-second health windows before a codec change.
+    // Require two consecutive 5-second health windows before considering a change.
     if (m_codecUnhealthyWindows < 2) return;
+    if (m_negotiationLocked) {
+        LogWarn("[codec] sustained encoder pressure but SDP codec is locked session=" + m_sessionId +
+            " codec=" + activeVideoCodecName() +
+            " payload=" + std::to_string(m_payloadType) +
+            " action=hold_codec_until_renegotiation");
+        m_codecUnhealthyWindows = 0;
+        return;
+    }
 
     if (m_videoCodec == VideoCodec::AV1) m_av1Failed = true;
     else if (m_videoCodec == VideoCodec::VP9) m_vp9Failed = true;
@@ -953,6 +1195,13 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         m_viewerJitterMs = msg.value("jitter_ms", 0.0);
                         m_viewerJitterBufferMs = msg.value("jitter_buffer_ms", 0.0);
                         m_viewerBitrateKbps = msg.value("bitrate_kbps", 0.0);
+                        return;
+                    }
+
+                    if (kind == "request_keyframe") {
+                        m_forceKeyframe = true;
+                        LogInfo("[video] viewer requested keyframe session=" + m_sessionId +
+                            " reason=" + msg.value("reason", std::string("unspecified")));
                         return;
                     }
 
@@ -1433,6 +1682,12 @@ void WebRtcSender::createPeerConnection() {
         std::cout << "[track] open session=" << m_sessionId << "\n";
         m_canSend = true;
 
+        // A newly opened/re-opened video track must start with a decodable
+        // frame. Without this, a viewer can connect successfully after the
+        // encoder has already been running and remain black until a later
+        // periodic keyframe.
+        m_forceKeyframe = true;
+
         if (m_mode == Mode::DirectCapture) {
             startStreamingThread();
         }
@@ -1451,6 +1706,10 @@ void WebRtcSender::createPeerConnection() {
             << " session=" << m_sessionId << "\n";
         if (state == rtc::PeerConnection::State::Connected) {
             LogSupportEvent("Connected - WebRTC");
+            // Force another keyframe at peer-connect as well as track-open.
+            // Some browsers/mobile WebViews complete the media track before
+            // the peer is actually ready to decode the first packet burst.
+            m_forceKeyframe = true;
         }
         if (state == rtc::PeerConnection::State::Disconnected ||
             state == rtc::PeerConnection::State::Failed ||
@@ -1556,8 +1815,14 @@ void WebRtcSender::handleSignalingMessage(const std::string& jsonText) {
                 << " sdp_len=" << sdp.size()
                 << " type=" << sdpType << "\n";
 
-            selectAutoCodecFromAnswer(sdp);
+            const bool videoFormatSelected = selectAutoCodecFromAnswer(sdp);
             m_pc->setRemoteDescription(rtc::Description(sdp, sdpType));
+            if (videoFormatSelected) {
+                m_negotiationLocked = true;
+                LogInfo("[codec] negotiation locked session=" + m_sessionId +
+                    " codec=" + activeVideoCodecName() +
+                    " payload=" + std::to_string(m_payloadType));
+            }
 
             std::cout << "[signal] set remote description ok session=" << m_sessionId << "\n";
         }
@@ -2111,8 +2376,10 @@ bool WebRtcSender::trySendExternalGpuH264(const SharedGpuFrame& frame, uint64_t 
         return false;
     }
 
-    const int h264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 1920, 0, 7680);
-    const int h264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 1080, 0, 4320);
+    const int configuredH264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 1920, 0, 7680);
+    const int configuredH264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 1080, 0, 4320);
+    const int h264MaxW = configuredH264MaxW > 0 ? std::min(configuredH264MaxW, m_negotiatedH264MaxWidth) : m_negotiatedH264MaxWidth;
+    const int h264MaxH = configuredH264MaxH > 0 ? std::min(configuredH264MaxH, m_negotiatedH264MaxHeight) : m_negotiatedH264MaxHeight;
     if ((h264MaxW > 0 && frame.width > h264MaxW) || (h264MaxH > 0 && frame.height > h264MaxH)) {
         return false;
     }
@@ -2452,6 +2719,14 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
     };
 
     auto recoverForcedCodec = [&](VideoCodec failed, const std::string& requested, const std::string& why) {
+        if (m_negotiationLocked) {
+            LogWarn("[codec] encoder failure cannot change negotiated codec session=" + m_sessionId +
+                " codec=" + activeVideoCodecName() +
+                " payload=" + std::to_string(m_payloadType) +
+                " reason=" + why +
+                " action=start_new_peer_connection");
+            return false;
+        }
         if (m_autoCodec) return selectBestAutoCodec("recovery: " + why);
 
         bool recovered = false;
@@ -2786,8 +3061,10 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
 
     if (m_videoCodec == VideoCodec::H264 && !m_h264Failed) {
         bool h264Scaled = false;
-        const int h264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 1920, 0, 7680);
-        const int h264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 1080, 0, 4320);
+        const int configuredH264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 1920, 0, 7680);
+        const int configuredH264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 1080, 0, 4320);
+        const int h264MaxW = configuredH264MaxW > 0 ? std::min(configuredH264MaxW, m_negotiatedH264MaxWidth) : m_negotiatedH264MaxWidth;
+        const int h264MaxH = configuredH264MaxH > 0 ? std::min(configuredH264MaxH, m_negotiatedH264MaxHeight) : m_negotiatedH264MaxHeight;
         const I420Frame& h264Frame = scaleI420ForWebRtc(frame, m_h264ScaleScratch, h264MaxW, h264MaxH, &h264Scaled);
         const int h264Fps = readEnvInt("HI5_H264_ENCODER_FPS", std::min(30, std::max(1, m_fps)), 1, 60);
         const int h264DesktopFloorKbps = h264Frame.width >= 1600 ? 8000 : (h264Frame.width >= 1200 ? 6000 : 4000);

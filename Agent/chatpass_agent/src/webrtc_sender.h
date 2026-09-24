@@ -112,11 +112,11 @@ private:
     bool handleBinaryMousePacket(const rtc::binary& data, const std::string& label);
     void signalLocalOfferIfReady();
     uint32_t externalRtpTimestamp(uint64_t captureTimestampNs);
-    void selectAutoCodecFromAnswer(const std::string& sdp);
+    bool selectAutoCodecFromAnswer(const std::string& sdp);
     bool selectBestAutoCodec(const std::string& reasonPrefix);
     bool applyDevCodecSwitch(const std::string& requested, std::string& activeCodec, std::string& detail);
     std::string activeVideoCodecName() const;
-    bool switchVideoCodec(VideoCodec codec, const std::string& reason);
+    bool switchVideoCodec(VideoCodec codec, const std::string& reason, int negotiatedPayloadType = -1);
     void configureVideoMediaHandler(VideoCodec codec);
     void observeCodecHealth(double encodeAvgMs, double encodeMaxMs, double sendAvgMs);
 #ifdef _WIN32
@@ -200,6 +200,19 @@ private:
     bool m_peerAcceptsH264 = false;
     bool m_peerAcceptsAv1 = false;
     bool m_peerAcceptsH265 = false;
+    // Once the SDP answer has been applied, the selected codec/payload is fixed
+    // for the lifetime of this PeerConnection. Changing codec requires a new
+    // offer/answer exchange; sending a different payload on the existing track
+    // can leave browsers connected with a permanently black video element.
+    bool m_negotiationLocked = false;
+    VideoCodec m_negotiatedCodec = VideoCodec::VP8;
+    int m_negotiatedPayloadType = -1;
+    std::string m_negotiatedH264Fmtp;
+    std::string m_negotiatedH264ProfileLevelId = "42e01f";
+    int m_negotiatedH264PacketizationMode = 1;
+    bool m_negotiatedH264LevelAsymmetryAllowed = false;
+    int m_negotiatedH264MaxWidth = 1280;
+    int m_negotiatedH264MaxHeight = 720;
     bool m_hwAv1Available = false;
     bool m_hwAv1ProbeDone = false;
     bool m_swAv1Available = false;
