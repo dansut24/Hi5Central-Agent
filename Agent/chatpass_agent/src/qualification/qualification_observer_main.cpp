@@ -299,13 +299,13 @@ bool RecoverStaleProcessAuditSettings(
   const std::filesystem::path& root){
   ProcessAuditRestoreState stale;
   if(!LoadAuditRestoreState(root,stale))return true;
-  EnablePrivilege(SE_SECURITY_NAME);
+  EnablePrivilege(L"SeSecurityPrivilege");
   return RestoreProcessAuditSettings(root,stale,true);
 }
 
 bool EnableQualificationProcessAudit(
   const std::filesystem::path& root){
-  EnablePrivilege(SE_SECURITY_NAME);
+  EnablePrivilege(L"SeSecurityPrivilege");
 
   ProcessAuditRestoreState state;
   PAUDIT_POLICY_INFORMATION current=nullptr;
@@ -797,7 +797,7 @@ void StopKernelProcessEtwSession(){
 }
 
 void KernelProcessEtwWatcherLoop(){
-  EnablePrivilege(SE_SYSTEM_PROFILE_NAME);
+  EnablePrivilege(L"SeSystemProfilePrivilege");
 
   // Recover a stale private logger if the previous observer was killed.
   {
