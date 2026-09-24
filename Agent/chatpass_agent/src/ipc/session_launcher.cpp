@@ -471,6 +471,45 @@ namespace hi5 {
         return LaunchInElevatedDefaultSessionForSession(exePath, cmdLine, WTSGetActiveConsoleSessionId());
     }
 
+    HANDLE LaunchInElevatedVisibleDefaultSession(const std::string& exePath,
+        const std::string& cmdLine) {
+        if (!IsRunningAsLocalSystem()) {
+            LogError("[launcher][visible-default-elevated] LocalSystem token required");
+            return nullptr;
+        }
+
+        const DWORD sessionId = WTSGetActiveConsoleSessionId();
+        if (sessionId == 0xFFFFFFFF) {
+            LogError("[launcher][visible-default-elevated] no active console session");
+            return nullptr;
+        }
+
+        EnableLaunchPrivileges();
+
+        HANDLE hPrimary = nullptr;
+        if (!DuplicateCurrentProcessPrimaryTokenForSession(sessionId, hPrimary)) {
+            LogError("[launcher][visible-default-elevated] failed to build session-bound LocalSystem token");
+            return nullptr;
+        }
+
+        const std::wstring wExePath = ToWide(exePath);
+        const std::wstring wCmd = L"\"" + wExePath + L"\" " + ToWide(cmdLine);
+        const std::wstring wDir = DirOf(wExePath);
+
+        HANDLE hProc = LaunchWithToken(
+            hPrimary,
+            wExePath,
+            wCmd,
+            wDir,
+            L"winsta0\\default",
+            "LocalSystem(session-bound-visible)",
+            "[launcher][visible-default-elevated]",
+            true);
+
+        CloseHandle(hPrimary);
+        return hProc;
+    }
+
     HANDLE LaunchOnSecureDesktopForSession(const std::string& exePath,
         const std::string& cmdLine, DWORD sessionId) {
         if (sessionId == 0xFFFFFFFF) {

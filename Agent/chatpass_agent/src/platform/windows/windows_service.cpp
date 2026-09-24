@@ -4792,7 +4792,7 @@ exit 1
                             " --application " + QuoteArg(applicationName) +
                             " --phase " + QuoteArg(phase);
 
-                        HANDLE process = hi5::LaunchInElevatedDefaultSession(observerExe, args);
+                        HANDLE process = hi5::LaunchInElevatedVisibleDefaultSession(observerExe, args);
                         if (!process) {
                             PostJobResult(ident, jobId, false, json{
                                 {"success", false},

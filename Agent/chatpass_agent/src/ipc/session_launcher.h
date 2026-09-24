@@ -31,6 +31,8 @@ namespace hi5 {
     // are present on the normal desktop.
     HANDLE LaunchInElevatedDefaultSession(const std::string& exePath,
         const std::string& cmdLine);
+    HANDLE LaunchInElevatedVisibleDefaultSession(const std::string& exePath,
+        const std::string& cmdLine);
     HANDLE LaunchInElevatedDefaultSessionForSession(const std::string& exePath,
         const std::string& cmdLine, DWORD sessionId);
 
