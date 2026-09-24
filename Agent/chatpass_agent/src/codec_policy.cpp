@@ -41,7 +41,7 @@ namespace hi5 {
         if (requested == "vp8") {
             decision.selectedCodec = "vp8";
             decision.encoder = "libvpx";
-            decision.fps = 20;
+            decision.fps = 30;
             decision.bitrateKbps = 16000;
             decision.hardware = false;
             decision.stable = true;
@@ -112,12 +112,15 @@ namespace hi5 {
         }
 
         decision.selectedCodec = "auto";
-        decision.encoder = "adaptive-webrtc";
-        decision.fps = 20;
-        decision.bitrateKbps = 6000;
+        decision.encoder = "stable-vp8-webrtc";
+        // Production Auto currently negotiates the validated VP8 path only.
+        // Keep the service ceiling interaction-ready; the streamer/encoder still
+        // fall back to 1-2 FPS when idle and use 24 FPS for ordinary activity.
+        decision.fps = 30;
+        decision.bitrateKbps = 8000;
         decision.hardware = false;
         decision.stable = true;
-        decision.reason = "Auto negotiates AV1/VP9/H.265/H.264/VP8 and selects the lowest-cost healthy codec supported by both endpoint and Viewer";
+        decision.reason = "Production Auto uses the validated VP8 path with a 30 FPS interaction ceiling; experimental codecs require explicit opt-in";
 
         return decision;
     }

@@ -5241,7 +5241,7 @@ namespace hi5 {
         if (inputPipeOk) renderer.PublishMonitorInfo(inputPipe);
 
         const int idleFps = EnvInt("HI5_BACKSTAGE_IDLE_FPS", 1, 1, 10);
-        const int activeFps = std::max(idleFps, std::min(args.fps, EnvInt("HI5_BACKSTAGE_ACTIVE_FPS", 20, 2, 30)));
+        const int activeFps = std::max(idleFps, std::min(args.fps, EnvInt("HI5_BACKSTAGE_ACTIVE_FPS", 24, 2, 30)));
         const int motionFps = std::max(activeFps, std::min(args.fps, EnvInt("HI5_BACKSTAGE_MOTION_FPS", 30, 5, 30)));
         const int nativeRefreshFps = std::max(idleFps, std::min(args.fps, EnvInt("HI5_BACKSTAGE_NATIVE_REFRESH_FPS", 5, 1, 15)));
         const int activeHoldMs = EnvInt("HI5_BACKSTAGE_ACTIVE_HOLD_MS", 900, 100, 5000);

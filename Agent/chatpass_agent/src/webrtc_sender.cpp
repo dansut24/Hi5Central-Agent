@@ -230,24 +230,24 @@ namespace {
             }
             else if (mode == 3) {
                 p.name = "software-vp8-backstage-wake";
-                p.fps = readEnvInt("HI5_VP8_BACKSTAGE_WAKE_FPS", 8, 1, 24);
-                p.bitrateKbps = readEnvInt("HI5_VP8_BACKSTAGE_WAKE_KBPS", 1800, 400, 10000);
+                p.fps = readEnvInt("HI5_VP8_BACKSTAGE_WAKE_FPS", 30, 1, 30);
+                p.bitrateKbps = readEnvInt("HI5_VP8_BACKSTAGE_WAKE_KBPS", 5500, 400, 12000);
                 p.cpuUsed = readEnvInt("HI5_VP8_BACKSTAGE_WAKE_CPUUSED", 12, 3, 16);
                 p.maxQuantizer = readEnvInt("HI5_VP8_BACKSTAGE_WAKE_MAX_Q", 40, 24, 54);
                 p.keyframeSeconds = readEnvInt("HI5_VP8_BACKSTAGE_WAKE_KEYFRAME_SECONDS", 12, 2, 60);
             }
             else if (mode == 1) {
                 p.name = "software-vp8-backstage-active";
-                p.fps = readEnvInt("HI5_VP8_BACKSTAGE_ACTIVE_FPS", 10, 1, 30);
-                p.bitrateKbps = readEnvInt("HI5_VP8_BACKSTAGE_ACTIVE_KBPS", 1800, 500, 12000);
+                p.fps = readEnvInt("HI5_VP8_BACKSTAGE_ACTIVE_FPS", 24, 1, 30);
+                p.bitrateKbps = readEnvInt("HI5_VP8_BACKSTAGE_ACTIVE_KBPS", 4500, 500, 12000);
                 p.cpuUsed = readEnvInt("HI5_VP8_BACKSTAGE_ACTIVE_CPUUSED", 12, 3, 16);
                 p.maxQuantizer = readEnvInt("HI5_VP8_BACKSTAGE_ACTIVE_MAX_Q", 42, 24, 54);
                 p.keyframeSeconds = readEnvInt("HI5_VP8_BACKSTAGE_ACTIVE_KEYFRAME_SECONDS", 10, 2, 30);
             }
             else {
                 p.name = "software-vp8-backstage-motion";
-                p.fps = readEnvInt("HI5_VP8_BACKSTAGE_MOTION_FPS", 12, 1, 30);
-                p.bitrateKbps = readEnvInt("HI5_VP8_BACKSTAGE_MOTION_KBPS", 3500, 1000, 16000);
+                p.fps = readEnvInt("HI5_VP8_BACKSTAGE_MOTION_FPS", 30, 1, 30);
+                p.bitrateKbps = readEnvInt("HI5_VP8_BACKSTAGE_MOTION_KBPS", 7000, 1000, 16000);
                 p.cpuUsed = readEnvInt("HI5_VP8_BACKSTAGE_MOTION_CPUUSED", 10, 2, 16);
                 p.maxQuantizer = readEnvInt("HI5_VP8_BACKSTAGE_MOTION_MAX_Q", 40, 20, 52);
                 p.keyframeSeconds = readEnvInt("HI5_VP8_BACKSTAGE_MOTION_KEYFRAME_SECONDS", 10, 1, 30);
@@ -264,24 +264,24 @@ namespace {
             }
             else if (mode == 3) {
                 p.name = secureDesktop ? "software-vp8-secure-wake" : "software-vp8-wake";
-                p.fps = readEnvInt("HI5_VP8_WAKE_FPS", 8, 1, 30);
-                p.bitrateKbps = readEnvInt("HI5_VP8_WAKE_KBPS", 2000, 500, 12000);
+                p.fps = readEnvInt("HI5_VP8_WAKE_FPS", 30, 1, 60);
+                p.bitrateKbps = readEnvInt("HI5_VP8_WAKE_KBPS", 6000, 500, 16000);
                 p.cpuUsed = readEnvInt("HI5_VP8_WAKE_CPUUSED", 13, 3, 16);
                 p.maxQuantizer = readEnvInt("HI5_VP8_WAKE_MAX_Q", 42, 22, 54);
                 p.keyframeSeconds = readEnvInt("HI5_VP8_WAKE_KEYFRAME_SECONDS", 10, 2, 60);
             }
             else if (mode == 1) {
                 p.name = secureDesktop ? "software-vp8-secure-active" : "software-vp8-active";
-                p.fps = readEnvInt("HI5_VP8_ACTIVE_FPS", 15, 1, 30);
-                p.bitrateKbps = readEnvInt("HI5_VP8_ACTIVE_KBPS", 3500, 500, 16000);
+                p.fps = readEnvInt("HI5_VP8_ACTIVE_FPS", 24, 1, 60);
+                p.bitrateKbps = readEnvInt("HI5_VP8_ACTIVE_KBPS", 5000, 500, 16000);
                 p.cpuUsed = readEnvInt("HI5_VP8_ACTIVE_CPUUSED", 11, 3, 16);
                 p.maxQuantizer = readEnvInt("HI5_VP8_ACTIVE_MAX_Q", 38, 20, 50);
                 p.keyframeSeconds = readEnvInt("HI5_VP8_ACTIVE_KEYFRAME_SECONDS", 8, 2, 30);
             }
             else {
                 p.name = secureDesktop ? "software-vp8-secure-motion" : "software-vp8-motion";
-                p.fps = readEnvInt("HI5_VP8_MOTION_FPS", 20, 1, 60);
-                p.bitrateKbps = readEnvInt("HI5_VP8_MOTION_KBPS", 5500, 1000, 20000);
+                p.fps = readEnvInt("HI5_VP8_MOTION_FPS", 30, 1, 60);
+                p.bitrateKbps = readEnvInt("HI5_VP8_MOTION_KBPS", 8000, 1000, 20000);
                 p.cpuUsed = readEnvInt("HI5_VP8_MOTION_CPUUSED", 10, 2, 16);
                 p.maxQuantizer = readEnvInt("HI5_VP8_MOTION_MAX_Q", 38, 18, 50);
                 p.keyframeSeconds = readEnvInt("HI5_VP8_MOTION_KEYFRAME_SECONDS", 8, 1, 30);
@@ -1263,25 +1263,23 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         return;
                     }
 
-                    // Mouse movement is high frequency and best-effort. Keep the
-                    // native cursor path responsive, but do not force the expensive
-                    // full-motion VP8 profile for every single mouse packet. Clicks,
-                    // wheel and keyboard still boost to motion immediately.
-                    if (kind != "mouse_move") {
-                        // Clicks/keys/wheel must wake both the stream mode and the
-                        // cadence immediately. Previously the mode changed to motion
-                        // but the stale idle 2-FPS hint survived until the next 5s
-                        // stats publication, making the picture look frozen even
-                        // though input had already reached the endpoint.
-                        const int wakeFps = readEnvInt("HI5_INPUT_WAKE_FPS",
-                            std::min(20, std::max(8, m_fps)), 4, 60);
-                        m_externalHintMode.store(2, std::memory_order_release);
-                        m_externalHintFps.store(std::max(m_externalHintFps.load(), wakeFps),
-                            std::memory_order_release);
-                        const int wakeHoldMs = readEnvInt("HI5_INPUT_WAKE_HOLD_MS", 1200, 250, 5000);
-                        m_externalInputWakeUntilMs.store(steadyNowMs() + wakeHoldMs,
-                            std::memory_order_release);
-                    }
+                    // Keep pointer transport independent from video, but wake the
+                    // capture/encoder briefly on pointer movement so hover effects,
+                    // menus and window drags follow the cursor instead of waiting on
+                    // the idle 2-FPS cadence. Mouse wake is intentionally shorter
+                    // than click/key/wheel wake to keep idle CPU bounded.
+                    const bool mouseMove = kind == "mouse_move";
+                    const int wakeFps = mouseMove
+                        ? readEnvInt("HI5_MOUSE_MOVE_WAKE_FPS", std::min(30, std::max(18, m_fps)), 8, 60)
+                        : readEnvInt("HI5_INPUT_WAKE_FPS", std::min(30, std::max(12, m_fps)), 4, 60);
+                    const int wakeHoldMs = mouseMove
+                        ? readEnvInt("HI5_MOUSE_MOVE_WAKE_HOLD_MS", 350, 100, 2000)
+                        : readEnvInt("HI5_INPUT_WAKE_HOLD_MS", 1200, 250, 5000);
+                    m_externalHintMode.store(2, std::memory_order_release);
+                    m_externalHintFps.store(std::max(m_externalHintFps.load(), wakeFps),
+                        std::memory_order_release);
+                    m_externalInputWakeUntilMs.store(steadyNowMs() + wakeHoldMs,
+                        std::memory_order_release);
                     if (m_mode == Mode::ExternalFeed && m_inputEventFn) {
                         m_inputEventFn(msg);
                     }
@@ -1368,8 +1366,17 @@ bool WebRtcSender::handleBinaryMousePacket(const rtc::binary& data, const std::s
         }
     }
 
-    // Pointer movement is transported independently from video. Do not wake
-    // the encoder profile for cursor-only motion.
+    // Fast pointer packets are latest-position wins. Wake video for a short
+    // interaction burst so screen content tracks hover/drag state without
+    // permanently coupling cursor movement to the expensive motion profile.
+    const int mouseWakeFps = readEnvInt("HI5_MOUSE_MOVE_WAKE_FPS",
+        std::min(30, std::max(18, m_fps)), 8, 60);
+    const int mouseWakeHoldMs = readEnvInt("HI5_MOUSE_MOVE_WAKE_HOLD_MS", 350, 100, 2000);
+    m_externalHintMode.store(2, std::memory_order_release);
+    m_externalHintFps.store(std::max(m_externalHintFps.load(), mouseWakeFps),
+        std::memory_order_release);
+    m_externalInputWakeUntilMs.store(steadyNowMs() + mouseWakeHoldMs,
+        std::memory_order_release);
 
     const auto receivedAt = std::chrono::steady_clock::now();
     bool injected = false;
@@ -1412,7 +1419,14 @@ bool WebRtcSender::handleBinaryMousePacket(const rtc::binary& data, const std::s
 }
 
 std::shared_ptr<rtc::DataChannel> WebRtcSender::createNamedInputDataChannel(const std::string& label) {
-    auto dc = m_pc->createDataChannel(label);
+    rtc::DataChannelInit init{};
+    if (label == "input-move" || label == "viewer-mouse-move") {
+        // Pointer positions are state, not a command log. Deliver the newest
+        // position immediately and never retransmit an obsolete coordinate.
+        init.reliability.unordered = true;
+        init.reliability.maxRetransmits = 0u;
+    }
+    auto dc = m_pc->createDataChannel(label, init);
     attachInputDataChannelHandlers(dc, label);
     return dc;
 }
@@ -1446,7 +1460,7 @@ void WebRtcSender::setExternalStreamHint(int streamMode, int targetFps, bool bac
     if (inputWakeUntilMs > steadyNowMs()) {
         requestedMode = std::max(requestedMode, 2);
         requestedFps = std::max(requestedFps,
-            readEnvInt("HI5_INPUT_WAKE_FPS", std::min(20, std::max(8, m_fps)), 4, 60));
+            readEnvInt("HI5_INPUT_WAKE_FPS", std::min(30, std::max(12, m_fps)), 4, 60));
     }
     const int idleDelayMs = readEnvInt("HI5_VP8_IDLE_DELAY_MS", 1000, 0, 30000);
     const auto now = std::chrono::steady_clock::now();

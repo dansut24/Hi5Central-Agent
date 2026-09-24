@@ -941,9 +941,9 @@ namespace hi5 {
         auto nextSecurePoll = std::chrono::steady_clock::now() + std::chrono::milliseconds(25);
 
         const int requestedMaxFps = std::max(1, args.fps);
-        const int activeFps = std::min(requestedMaxFps, ReadEnvInt("HI5_STREAM_ACTIVE_FPS", 20, 1, 60));
+        const int activeFps = std::min(requestedMaxFps, ReadEnvInt("HI5_STREAM_ACTIVE_FPS", 24, 1, 60));
         const int idleFps = std::min(activeFps, ReadEnvInt("HI5_STREAM_IDLE_FPS", 2, 1, 15));
-        const int motionFps = std::min(requestedMaxFps, ReadEnvInt("HI5_STREAM_MOTION_FPS", activeFps, 1, 60));
+        const int motionFps = std::min(requestedMaxFps, ReadEnvInt("HI5_STREAM_MOTION_FPS", requestedMaxFps, 1, 60));
         const auto activeHold = std::chrono::milliseconds(ReadEnvInt("HI5_STREAM_ACTIVE_HOLD_MS", 900, 100, 5000));
         const auto statsEvery = std::chrono::seconds(ReadEnvInt("HI5_STREAM_STATS_SECONDS", 5, 1, 60));
         auto nextCaptureAt = std::chrono::steady_clock::now();
@@ -998,9 +998,11 @@ namespace hi5 {
 
                 hadInput = HandleInputPipe(inputPipe, source, currentDisplay, args.sessionId, localInputBlocked);
                 if (hadFastMouse) {
-                    // Fast mouse movement is applied directly in the interactive streamer.
-                    // Do not treat mouse-only movement as video activity: forcing captures
-                    // for cursor motion was the main reason CPU climbed after the cursor experiments.
+                    // The local cursor overlay keeps pointer motion visually immediate, but
+                    // hover effects, menus and dragged windows still need fresh desktop frames.
+                    // Wake capture only while the pointer is actually moving; idle remains cheap.
+                    lastInputAt = std::chrono::steady_clock::now();
+                    nextCaptureAt = lastInputAt;
                 }
 
                 if (hadInput) {
