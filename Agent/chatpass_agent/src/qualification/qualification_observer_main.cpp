@@ -1,5 +1,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
+#include <evntrace.h>
+#include <tdh.h>
 #include <winevt.h>
 #include <ntsecapi.h>
 #include <wbemidl.h>
@@ -83,6 +85,14 @@ std::deque<ProcessObservation> gPendingProcessStarts;
 std::mutex gProcessEventMutex;
 std::atomic<bool> gProcessWatcherStop{false};
 std::thread gProcessWatcher;
+std::thread gEtwProcessWatcher;
+std::atomic<TRACEHANDLE> gEtwSessionHandle{0};
+std::atomic<bool> gEtwProcessReady{false};
+std::atomic<ULONG> gEtwProcessError{ERROR_SUCCESS};
+constexpr wchar_t kEtwProcessSessionName[]=L"Hi5Central Qualification ETW Process";
+const GUID kEtwProcessSessionGuid={
+  0x7a5b69e1,0xc8cb,0x4d02,{0x93,0x2d,0xd8,0xb3,0x26,0x88,0x34,0x51}
+};
 EVT_HANDLE gSecuritySubscription=nullptr;
 ProcessAuditRestoreState gAuditRestore;
 bool gProcessAuditActive=false;
@@ -591,6 +601,287 @@ void ProcessStartWatcherLoop(){
   if(services)services->Release();
   if(locator)locator->Release();
   if(SUCCEEDED(com))CoUninitialize();
+}
+
+std::vector<BYTE> EtwPropertyBytes(
+  PEVENT_RECORD event,
+  const wchar_t* propertyName){
+  std::vector<BYTE> out;
+  if(!event||!propertyName||!*propertyName)return out;
+
+  PROPERTY_DATA_DESCRIPTOR descriptor{};
+  descriptor.PropertyName=
+    reinterpret_cast<ULONGLONG>(propertyName);
+  descriptor.ArrayIndex=ULONG_MAX;
+
+  ULONG size=0;
+  ULONG status=TdhGetPropertySize(
+    event,
+    0,
+    nullptr,
+    1,
+    &descriptor,
+    &size);
+  if(status!=ERROR_SUCCESS||!size)return out;
+
+  out.resize(size);
+  status=TdhGetProperty(
+    event,
+    0,
+    nullptr,
+    1,
+    &descriptor,
+    size,
+    out.data());
+  if(status!=ERROR_SUCCESS)out.clear();
+  return out;
+}
+
+DWORD EtwDwordProperty(
+  PEVENT_RECORD event,
+  const wchar_t* propertyName){
+  const auto bytes=EtwPropertyBytes(event,propertyName);
+  if(bytes.size()<sizeof(DWORD))return 0;
+  DWORD value=0;
+  memcpy(&value,bytes.data(),sizeof(value));
+  return value;
+}
+
+std::wstring EtwWideProperty(
+  PEVENT_RECORD event,
+  const wchar_t* propertyName){
+  const auto bytes=EtwPropertyBytes(event,propertyName);
+  if(bytes.size()<sizeof(wchar_t))return {};
+  const auto* value=
+    reinterpret_cast<const wchar_t*>(bytes.data());
+  size_t count=bytes.size()/sizeof(wchar_t);
+  while(count&&value[count-1]==L'\0')--count;
+  return std::wstring(value,count);
+}
+
+std::wstring EtwAnsiProperty(
+  PEVENT_RECORD event,
+  const wchar_t* propertyName){
+  const auto bytes=EtwPropertyBytes(event,propertyName);
+  if(bytes.empty())return {};
+  size_t count=bytes.size();
+  while(count&&bytes[count-1]==0)--count;
+  if(!count)return {};
+  const char* value=
+    reinterpret_cast<const char*>(bytes.data());
+  const int needed=MultiByteToWideChar(
+    CP_ACP,
+    0,
+    value,
+    static_cast<int>(count),
+    nullptr,
+    0);
+  if(needed<=0)return {};
+  std::wstring out(needed,L'\0');
+  MultiByteToWideChar(
+    CP_ACP,
+    0,
+    value,
+    static_cast<int>(count),
+    out.data(),
+    needed);
+  return out;
+}
+
+void WINAPI KernelProcessEtwCallback(
+  PEVENT_RECORD event){
+  if(!event||gProcessWatcherStop.load())return;
+  if(event->EventHeader.EventDescriptor.Opcode!=
+     EVENT_TRACE_TYPE_START)return;
+
+  const DWORD pid=
+    EtwDwordProperty(event,L"ProcessId");
+  if(!pid)return;
+
+  const DWORD parentPid=
+    EtwDwordProperty(event,L"ParentId");
+  const std::wstring image=
+    EtwAnsiProperty(event,L"ImageFileName");
+  const std::wstring command=
+    EtwWideProperty(event,L"CommandLine");
+
+  ProcEntry process;
+  process.pid=pid;
+  process.parentPid=parentPid;
+  process.path=image;
+  process.commandLine=command;
+
+  if(!image.empty()){
+    try{
+      process.name=
+        std::filesystem::path(image).filename().wstring();
+    }catch(...){
+      process.name=image;
+    }
+  }else if(!command.empty()){
+    std::wstring executable=Trim(command);
+    if(!executable.empty()&&executable.front()==L'"'){
+      const auto end=executable.find(L'"',1);
+      executable=end==std::wstring::npos
+        ? executable.substr(1)
+        : executable.substr(1,end-1);
+    }else{
+      const auto end=executable.find_first_of(L" \t");
+      if(end!=std::wstring::npos)
+        executable=executable.substr(0,end);
+    }
+    process.path=executable;
+    try{
+      process.name=
+        std::filesystem::path(executable).filename().wstring();
+    }catch(...){
+      process.name=executable;
+    }
+  }
+
+  ProcessObservation observation{
+    std::chrono::steady_clock::now(),
+    NowIso(),
+    std::move(process),
+    "KernelETW_ProcessStart"
+  };
+
+  std::lock_guard<std::mutex> guard(gProcessEventMutex);
+  gPendingProcessStarts.push_back(std::move(observation));
+  while(gPendingProcessStarts.size()>4000)
+    gPendingProcessStarts.pop_front();
+}
+
+std::vector<BYTE> KernelEtwPropertiesBuffer(){
+  const size_t nameChars=wcslen(kEtwProcessSessionName)+1;
+  const size_t bytes=
+    sizeof(EVENT_TRACE_PROPERTIES)+
+    nameChars*sizeof(wchar_t);
+  std::vector<BYTE> buffer(bytes,0);
+  auto* properties=
+    reinterpret_cast<EVENT_TRACE_PROPERTIES*>(
+      buffer.data());
+  properties->Wnode.BufferSize=
+    static_cast<ULONG>(bytes);
+  properties->Wnode.Flags=WNODE_FLAG_TRACED_GUID;
+  properties->Wnode.Guid=kEtwProcessSessionGuid;
+  properties->Wnode.ClientContext=1;
+  properties->BufferSize=64;
+  properties->MinimumBuffers=4;
+  properties->MaximumBuffers=32;
+  properties->LogFileMode=
+    EVENT_TRACE_REAL_TIME_MODE|
+    EVENT_TRACE_SYSTEM_LOGGER_MODE;
+  properties->EnableFlags=EVENT_TRACE_FLAG_PROCESS;
+  properties->LoggerNameOffset=
+    sizeof(EVENT_TRACE_PROPERTIES);
+
+  auto* name=reinterpret_cast<wchar_t*>(
+    buffer.data()+properties->LoggerNameOffset);
+  wcscpy_s(name,nameChars,kEtwProcessSessionName);
+  return buffer;
+}
+
+void StopKernelProcessEtwSession(){
+  auto buffer=KernelEtwPropertiesBuffer();
+  auto* properties=
+    reinterpret_cast<EVENT_TRACE_PROPERTIES*>(
+      buffer.data());
+  TRACEHANDLE session=gEtwSessionHandle.exchange(0);
+  ControlTraceW(
+    session,
+    kEtwProcessSessionName,
+    properties,
+    EVENT_TRACE_CONTROL_STOP);
+  gEtwProcessReady.store(false);
+}
+
+void KernelProcessEtwWatcherLoop(){
+  EnablePrivilege(SE_SYSTEM_PROFILE_NAME);
+
+  // Recover a stale private logger if the previous observer was killed.
+  {
+    auto stale=KernelEtwPropertiesBuffer();
+    ControlTraceW(
+      0,
+      kEtwProcessSessionName,
+      reinterpret_cast<EVENT_TRACE_PROPERTIES*>(
+        stale.data()),
+      EVENT_TRACE_CONTROL_STOP);
+  }
+
+  auto buffer=KernelEtwPropertiesBuffer();
+  auto* properties=
+    reinterpret_cast<EVENT_TRACE_PROPERTIES*>(
+      buffer.data());
+
+  TRACEHANDLE session=0;
+  ULONG status=StartTraceW(
+    &session,
+    kEtwProcessSessionName,
+    properties);
+  if(status==ERROR_ALREADY_EXISTS){
+    ControlTraceW(
+      0,
+      kEtwProcessSessionName,
+      properties,
+      EVENT_TRACE_CONTROL_STOP);
+    buffer=KernelEtwPropertiesBuffer();
+    properties=
+      reinterpret_cast<EVENT_TRACE_PROPERTIES*>(
+        buffer.data());
+    status=StartTraceW(
+      &session,
+      kEtwProcessSessionName,
+      properties);
+  }
+  if(status!=ERROR_SUCCESS){
+    gEtwProcessError.store(status);
+    gEtwProcessReady.store(false);
+    return;
+  }
+
+  gEtwSessionHandle.store(session);
+
+  EVENT_TRACE_LOGFILEW logfile{};
+  logfile.LoggerName=
+    const_cast<LPWSTR>(kEtwProcessSessionName);
+  logfile.ProcessTraceMode=
+    PROCESS_TRACE_MODE_REAL_TIME|
+    PROCESS_TRACE_MODE_EVENT_RECORD;
+  logfile.EventRecordCallback=
+    KernelProcessEtwCallback;
+
+  TRACEHANDLE trace=OpenTraceW(&logfile);
+  if(trace==INVALID_PROCESSTRACE_HANDLE){
+    gEtwProcessError.store(GetLastError());
+    StopKernelProcessEtwSession();
+    return;
+  }
+
+  gEtwProcessError.store(ERROR_SUCCESS);
+  gEtwProcessReady.store(true);
+  const ULONG processStatus=
+    ProcessTrace(&trace,1,nullptr,nullptr);
+  gEtwProcessReady.store(false);
+
+  CloseTrace(trace);
+
+  TRACEHANDLE active=
+    gEtwSessionHandle.exchange(0);
+  if(active){
+    auto stopBuffer=KernelEtwPropertiesBuffer();
+    ControlTraceW(
+      active,
+      kEtwProcessSessionName,
+      reinterpret_cast<EVENT_TRACE_PROPERTIES*>(
+        stopBuffer.data()),
+      EVENT_TRACE_CONTROL_STOP);
+  }
+
+  if(processStatus!=ERROR_SUCCESS&&
+     processStatus!=ERROR_CANCELLED)
+    gEtwProcessError.store(processStatus);
 }
 
 std::wstring ReplaceAll(
@@ -1247,7 +1538,8 @@ void Tick(bool manual){
     int quality=0;
     if(!observation.process.commandLine.empty())quality+=100;
     if(!observation.process.path.empty())quality+=20;
-    if(observation.captureMethod=="Security4688_CommandLineAudit")quality+=60;
+    if(observation.captureMethod=="KernelETW_ProcessStart")quality+=80;
+    else if(observation.captureMethod=="Security4688_CommandLineAudit")quality+=60;
     else if(observation.captureMethod=="Win32_ProcessStartTrace")quality+=30;
     else if(observation.captureMethod=="snapshot_fallback")quality+=10;
     return quality;
@@ -1415,7 +1707,7 @@ void Tick(bool manual){
 }
 void ExportEvidence(){
   json installed=json::array();for(const auto&[_,e]:gApps)installed.push_back(AppJson(e));
-  json out={{"schemaVersion",1},{"observerVersion","0.1.7"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
+  json out={{"schemaVersion",1},{"observerVersion","0.1.8"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
   std::ofstream f(gOpt.root/L"jobs"/gOpt.jobId/L"summary.json",std::ios::binary|std::ios::trunc);f<<out.dump(2);
 }
 void Layout(HWND w){
@@ -1488,6 +1780,7 @@ LRESULT CALLBACK Proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
   if(msg==WM_CLOSE){
     gStopping=true;
     gProcessWatcherStop.store(true);
+    StopKernelProcessEtwSession();
     StopSecurityProcessSubscription();
     DisableQualificationProcessAudit();
     KillTimer(w,kTimerId);
@@ -1577,36 +1870,69 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
     }
   }SaveState();
 
+  gProcessWatcherStop.store(false);
+  gEtwProcessReady.store(false);
+  gEtwProcessError.store(ERROR_SUCCESS);
+  gEtwProcessWatcher=std::thread(KernelProcessEtwWatcherLoop);
+
+  for(int i=0;i<40&&!gEtwProcessReady.load()&&
+      gEtwProcessError.load()==ERROR_SUCCESS;++i){
+    Sleep(25);
+  }
+  const bool kernelEtwReady=gEtwProcessReady.load();
+
   bool security4688Ready=false;
-  if(auditRecoveryOk&&EnableQualificationProcessAudit(gOpt.root)){
+  if(!kernelEtwReady&&auditRecoveryOk&&
+     EnableQualificationProcessAudit(gOpt.root)){
     security4688Ready=StartSecurityProcessSubscription();
     if(!security4688Ready)DisableQualificationProcessAudit();
   }
 
   gProcs=CaptureProcs();
-  gProcessWatcherStop.store(false);
   gProcessWatcher=std::thread(ProcessStartWatcherLoop);
   PopulateLists();
   RefreshDetails();
 
   json captureSources=json::array();
+  if(kernelEtwReady)captureSources.push_back("KernelETW_ProcessStart");
   if(security4688Ready)captureSources.push_back("Security4688_CommandLineAudit");
   captureSources.push_back("Win32_ProcessStartTrace");
   captureSources.push_back("snapshot_fallback");
 
+  std::wstring startMessage;
+  if(kernelEtwReady){
+    startMessage=
+      L"Observer started. Exact command-line capture uses kernel ETW with WMI/snapshot fallback.";
+  }else if(security4688Ready){
+    startMessage=
+      L"Observer started. Kernel ETW is unavailable; Security 4688 command-line capture is active with WMI/snapshot fallback.";
+  }else{
+    startMessage=
+      L"Observer started. Kernel ETW and Security 4688 are unavailable; WMI/snapshot fallback is active.";
+  }
+
   AppendLog(
-    security4688Ready
-      ? L"Observer started. Exact command-line capture uses Security 4688 with WMI/snapshot fallback."
-      : L"Observer started. Security 4688 command-line capture is unavailable; WMI/snapshot fallback is active.",
-    {{"timestamp",NowIso()},{"type","observer_started"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"processCaptureSources",captureSources},{"auditRecoveryOk",auditRecoveryOk}});
+    startMessage,
+    {{"timestamp",NowIso()},
+     {"type","observer_started"},
+     {"jobId",Narrow(gOpt.jobId)},
+     {"application",Narrow(gOpt.application)},
+     {"phase",Narrow(gOpt.phase)},
+     {"processCaptureSources",captureSources},
+     {"kernelEtwReady",kernelEtwReady},
+     {"kernelEtwError",gEtwProcessError.load()},
+     {"security4688Ready",security4688Ready},
+     {"auditRecoveryOk",auditRecoveryOk}});
   SetTimer(w,kTimerId,kTimerMs,nullptr);
   ShowWindow(w,SW_SHOW);
   SetForegroundWindow(w);
   UpdateWindow(w);
   MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
   gProcessWatcherStop.store(true);
+  StopKernelProcessEtwSession();
   StopSecurityProcessSubscription();
   DisableQualificationProcessAudit();
+  if(gEtwProcessWatcher.joinable())gEtwProcessWatcher.join();
   if(gProcessWatcher.joinable())gProcessWatcher.join();
   if(singleton)CloseHandle(singleton);
   if(SUCCEEDED(com))CoUninitialize();

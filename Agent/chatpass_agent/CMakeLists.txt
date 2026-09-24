@@ -389,7 +389,7 @@ if(WIN32)
   target_compile_definitions(hi5central_qualification_observer PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
   target_link_libraries(hi5central_qualification_observer PRIVATE
     nlohmann_json::nlohmann_json
-    wbemuuid ole32 oleaut32 advapi32 user32 shell32 wevtapi
+    wbemuuid ole32 oleaut32 advapi32 user32 shell32 wevtapi tdh
   )
   set_target_properties(hi5central_qualification_observer PROPERTIES OUTPUT_NAME "Hi5CentralQualificationObserver")
 endif()
