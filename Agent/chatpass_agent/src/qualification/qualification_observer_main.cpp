@@ -100,7 +100,6 @@ const GUID kAuditProcessCreation={
   0x0cce922b,0x69ae,0x11d9,{0xbe,0xd3,0x50,0x50,0x54,0x50,0x30,0x30}
 };
 std::deque<std::wstring> gActivityLines;
-bool gActivityDirty=false;
 std::vector<std::wstring> gInstalledIds;
 std::vector<std::string> gHistoryIds;
 std::string gSelectedId;
@@ -1045,23 +1044,59 @@ json AppJson(const AppEntry&e){
     {"uninstallString",Narrow(e.uninstallString)},{"quietUninstallString",Narrow(e.quietUninstallString)},{"installLocation",Narrow(e.installLocation)}};
 }
 void RenderActivity(){
-  if(!gEvents||!gActivityDirty)return;
-  std::wstringstream out;
-  for(const auto& line:gActivityLines)out<<line<<L"\r\n";
+  // Live Activity is a row-based LISTBOX. Rows are appended individually in
+  // AppendLog so user scrolling is never replaced by a full-control redraw.
+}
+void AppendActivityRow(const std::wstring& line){
+  if(!gEvents)return;
+
+  const LRESULT countBefore=SendMessageW(gEvents,LB_GETCOUNT,0,0);
+  const LRESULT topBefore=SendMessageW(gEvents,LB_GETTOPINDEX,0,0);
+  const LRESULT itemHeight=SendMessageW(gEvents,LB_GETITEMHEIGHT,0,0);
+  RECT rect{};GetClientRect(gEvents,&rect);
+  const int visibleRows=itemHeight>0?std::max(1,(rect.bottom-rect.top)/(int)itemHeight):10;
+  const bool followTail=countBefore<=0||
+    topBefore+visibleRows>=countBefore-1;
+
   SendMessageW(gEvents,WM_SETREDRAW,FALSE,0);
-  SetWindowTextW(gEvents,out.str().c_str());
-  const int n=GetWindowTextLengthW(gEvents);
-  SendMessageW(gEvents,EM_SETSEL,n,n);
-  SendMessageW(gEvents,EM_SCROLLCARET,0,0);
+  SendMessageW(gEvents,LB_ADDSTRING,0,(LPARAM)line.c_str());
+
+  HDC dc=GetDC(gEvents);
+  if(dc){
+    HFONT font=(HFONT)SendMessageW(gEvents,WM_GETFONT,0,0);
+    HGDIOBJ oldFont=font?SelectObject(dc,font):nullptr;
+    SIZE size{};
+    if(GetTextExtentPoint32W(dc,line.c_str(),(int)line.size(),&size)){
+      const LRESULT currentExtent=SendMessageW(gEvents,LB_GETHORIZONTALEXTENT,0,0);
+      if(size.cx+24>currentExtent)
+        SendMessageW(gEvents,LB_SETHORIZONTALEXTENT,size.cx+24,0);
+    }
+    if(oldFont)SelectObject(dc,oldFont);
+    ReleaseDC(gEvents,dc);
+  }
+
+  LRESULT count=SendMessageW(gEvents,LB_GETCOUNT,0,0);
+  while(count>220){
+    SendMessageW(gEvents,LB_DELETESTRING,0,0);
+    --count;
+  }
+
+  if(followTail){
+    const int newTop=std::max(0,(int)count-visibleRows);
+    SendMessageW(gEvents,LB_SETTOPINDEX,newTop,0);
+  }else{
+    const int adjustedTop=std::max(0,(int)topBefore-(countBefore>=220?1:0));
+    SendMessageW(gEvents,LB_SETTOPINDEX,adjustedTop,0);
+  }
+
   SendMessageW(gEvents,WM_SETREDRAW,TRUE,0);
-  RedrawWindow(gEvents,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW|RDW_FRAME);
-  gActivityDirty=false;
+  InvalidateRect(gEvents,nullptr,TRUE);
 }
 void AppendLog(const std::wstring& text,const json& ev){
   const std::wstring line=L"["+NowLocal()+L"] "+text;
   gActivityLines.push_back(line);
   while(gActivityLines.size()>220)gActivityLines.pop_front();
-  gActivityDirty=true;
+  AppendActivityRow(line);
   if(gLog.is_open()){gLog<<line<<L"\r\n";gLog.flush();}
   if(gJsonl.is_open()){gJsonl<<ev.dump()<<"\n";gJsonl.flush();}
 }
@@ -1095,6 +1130,50 @@ void BackfillStateRecipes(){
     s["registeredQuietUninstallCommand"]=Narrow(e.quietUninstallString);
     s["learnedUninstallCommand"]=Narrow(RegisteredRecipe(e));
     s["candidateSilentUninstallCommand"]=Narrow(CandidateSilentRecipe(e));
+
+    if(!s.contains("observedUninstallActionCommand")&&
+       s.contains("observedUninstallProcesses")&&
+       s["observedUninstallProcesses"].is_array()){
+      const json* bestAction=nullptr;
+      int bestScore=-1;
+      for(const auto& process:s["observedUninstallProcesses"]){
+        if(!process.is_object())continue;
+        const auto command=process.value("commandLine",std::string());
+        if(command.empty())continue;
+        bool hasUninstallSemantics=false;
+        if(process.contains("correlationReasons")&&process["correlationReasons"].is_array()){
+          for(const auto& reason:process["correlationReasons"]){
+            if(reason.is_string()&&reason.get<std::string>()=="uninstall_semantics_in_command"){
+              hasUninstallSemantics=true;
+              break;
+            }
+          }
+        }
+        if(!hasUninstallSemantics)continue;
+        const int score=process.value("correlationScore",0);
+        if(score>bestScore){bestScore=score;bestAction=&process;}
+      }
+      if(bestAction){
+        s["observedUninstallActionCommand"]=bestAction->value("commandLine",std::string());
+        s["observedUninstallActionArguments"]=bestAction->value("arguments",json::array());
+        s["observedUninstallActionSwitches"]=bestAction->value("switches",json::array());
+        s["observedUninstallActionCaptureMethod"]=bestAction->value("captureMethod",std::string());
+        s["observedUninstallActionCorrelationScore"]=bestAction->value("correlationScore",0);
+        s["observedUninstallActionCorrelationReasons"]=bestAction->value("correlationReasons",json::array());
+
+        if(s.contains("patchingEvidence")&&s["patchingEvidence"].is_object()&&
+           s["patchingEvidence"].contains("uninstall")&&s["patchingEvidence"]["uninstall"].is_object()){
+          auto& portal=s["patchingEvidence"]["uninstall"];
+          portal["observedActionCommand"]=s["observedUninstallActionCommand"];
+          portal["observedActionArguments"]=s["observedUninstallActionArguments"];
+          portal["observedActionSwitches"]=s["observedUninstallActionSwitches"];
+          portal["observedActionCaptureMethod"]=s["observedUninstallActionCaptureMethod"];
+          portal["observedActionCorrelationScore"]=s["observedUninstallActionCorrelationScore"];
+          portal["observedActionCorrelationReasons"]=s["observedUninstallActionCorrelationReasons"];
+        }
+      }
+    }
+
     if(!s.value("currentlyInstalled",false)&&!s.contains("lastUninstalledAt")&&s.contains("history")&&s["history"].is_array()){
       for(auto h=s["history"].rbegin();h!=s["history"].rend();++h){
         if(h->value("event",std::string())=="uninstalled"){
@@ -1237,7 +1316,20 @@ void ShowHistoryDetails(size_t index){
   }
 
   const auto captureMethod=Widen(s0.value("observedUninstallCaptureMethod",std::string()));
-  if(!captureMethod.empty())s<<L"Capture method: "<<captureMethod<<L"\r\n";
+  if(!captureMethod.empty())s<<L"Launcher capture method: "<<captureMethod<<L"\r\n";
+
+  const auto action=Widen(s0.value("observedUninstallActionCommand",std::string()));
+  if(!action.empty()){
+    s<<L"Observed downstream uninstall action: "<<action<<L"\r\n";
+    if(s0.contains("observedUninstallActionSwitches")&&s0["observedUninstallActionSwitches"].is_array()){
+      s<<L"Observed action switches:";
+      for(const auto& value:s0["observedUninstallActionSwitches"])s<<L" "<<Widen(value.get<std::string>());
+      s<<L"\r\n";
+    }
+    const auto actionCapture=Widen(s0.value("observedUninstallActionCaptureMethod",std::string()));
+    if(!actionCapture.empty())s<<L"Action capture method: "<<actionCapture<<L"\r\n";
+    s<<L"Action note: observed during confirmed removal; not yet verified as a reusable silent recipe.\r\n";
+  }
 
   const auto observedProcess=Widen(s0.value("observedUninstallProcessCommand",std::string()));
   const int correlationScore=s0.value("observedUninstallCorrelationScore",0);
@@ -1461,6 +1553,39 @@ void CorrelateRemovalWithRecentProcesses(const AppEntry& app,const std::string& 
     state["observedUninstallCorrelationReasons"]=best.reasons;
     state["observedUninstallCorrelationAt"]=NowIso();
 
+    const Candidate* actionCandidate=nullptr;
+    for(const auto& candidate:candidates){
+      if(candidate.observation.process.commandLine.empty())continue;
+      if(std::find(
+        candidate.reasons.begin(),
+        candidate.reasons.end(),
+        "uninstall_semantics_in_command")!=candidate.reasons.end()){
+        actionCandidate=&candidate;
+        break;
+      }
+    }
+    if(actionCandidate){
+      state["observedUninstallActionCommand"]=
+        Narrow(actionCandidate->observation.process.commandLine);
+      state["observedUninstallActionArguments"]=
+        CommandArgumentsJson(actionCandidate->observation.process.commandLine);
+      state["observedUninstallActionSwitches"]=
+        CommandSwitchesJson(actionCandidate->observation.process.commandLine);
+      state["observedUninstallActionCaptureMethod"]=
+        actionCandidate->observation.captureMethod;
+      state["observedUninstallActionCorrelationScore"]=
+        actionCandidate->score;
+      state["observedUninstallActionCorrelationReasons"]=
+        actionCandidate->reasons;
+    }else{
+      state.erase("observedUninstallActionCommand");
+      state.erase("observedUninstallActionArguments");
+      state.erase("observedUninstallActionSwitches");
+      state.erase("observedUninstallActionCaptureMethod");
+      state.erase("observedUninstallActionCorrelationScore");
+      state.erase("observedUninstallActionCorrelationReasons");
+    }
+
     const bool exactIdentity=HasExactIdentityEvidence(best.reasons);
     const bool exactCommand=
       exactIdentity&&best.score>=120&&!best.observation.process.commandLine.empty();
@@ -1514,6 +1639,18 @@ void CorrelateRemovalWithRecentProcesses(const AppEntry& app,const std::string& 
     portalEvidence["observedExactSwitches"]=state["observedUninstallSwitches"];
   if(state.contains("observedUninstallCaptureMethod"))
     portalEvidence["captureMethod"]=state["observedUninstallCaptureMethod"];
+  if(state.contains("observedUninstallActionCommand"))
+    portalEvidence["observedActionCommand"]=state["observedUninstallActionCommand"];
+  if(state.contains("observedUninstallActionArguments"))
+    portalEvidence["observedActionArguments"]=state["observedUninstallActionArguments"];
+  if(state.contains("observedUninstallActionSwitches"))
+    portalEvidence["observedActionSwitches"]=state["observedUninstallActionSwitches"];
+  if(state.contains("observedUninstallActionCaptureMethod"))
+    portalEvidence["observedActionCaptureMethod"]=state["observedUninstallActionCaptureMethod"];
+  if(state.contains("observedUninstallActionCorrelationScore"))
+    portalEvidence["observedActionCorrelationScore"]=state["observedUninstallActionCorrelationScore"];
+  if(state.contains("observedUninstallActionCorrelationReasons"))
+    portalEvidence["observedActionCorrelationReasons"]=state["observedUninstallActionCorrelationReasons"];
   if(state.contains("observedUninstallCorrelationScore"))
     portalEvidence["correlationScore"]=state["observedUninstallCorrelationScore"];
   if(state.contains("observedUninstallCorrelationReasons"))
@@ -1707,7 +1844,7 @@ void Tick(bool manual){
 }
 void ExportEvidence(){
   json installed=json::array();for(const auto&[_,e]:gApps)installed.push_back(AppJson(e));
-  json out={{"schemaVersion",1},{"observerVersion","0.1.8"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
+  json out={{"schemaVersion",1},{"observerVersion","0.1.9"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
   std::ofstream f(gOpt.root/L"jobs"/gOpt.jobId/L"summary.json",std::ios::binary|std::ios::trunc);f<<out.dump(2);
 }
 void Layout(HWND w){
@@ -1844,10 +1981,9 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
   gHistory=CreateWindowExW(WS_EX_STATICEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,0,0,0,0,w,(HMENU)1102,h,nullptr);
   SendMessageW(gInstalled,WM_SETFONT,(WPARAM)uiF,TRUE);SendMessageW(gHistory,WM_SETFONT,(WPARAM)uiF,TRUE);
 
-  gEvents=CreateWindowExW(WS_EX_STATICEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,0,0,0,0,w,nullptr,h,nullptr);
+  gEvents=CreateWindowExW(WS_EX_STATICEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_HSCROLL|LBS_NOINTEGRALHEIGHT|LBS_NOSEL,0,0,0,0,w,nullptr,h,nullptr);
   gDetails=CreateWindowExW(WS_EX_STATICEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,0,0,0,0,w,nullptr,h,nullptr);
   SendMessageW(gEvents,WM_SETFONT,(WPARAM)mono,TRUE);SendMessageW(gDetails,WM_SETFONT,(WPARAM)mono,TRUE);
-  SendMessageW(gEvents,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(10,10));
   SendMessageW(gDetails,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(10,10));
 
   gSnapshot=CreateWindowExW(0,L"BUTTON",L"Capture snapshot",WS_CHILD|WS_VISIBLE|BS_FLAT,0,0,0,0,w,(HMENU)1001,h,nullptr);
