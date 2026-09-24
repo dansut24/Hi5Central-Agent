@@ -1054,7 +1054,9 @@ void AppendActivityRow(const std::wstring& line){
   const LRESULT topBefore=SendMessageW(gEvents,LB_GETTOPINDEX,0,0);
   const LRESULT itemHeight=SendMessageW(gEvents,LB_GETITEMHEIGHT,0,0);
   RECT rect{};GetClientRect(gEvents,&rect);
-  const int visibleRows=itemHeight>0?std::max(1,(rect.bottom-rect.top)/(int)itemHeight):10;
+  const int clientHeight=static_cast<int>(rect.bottom-rect.top);
+  const int rowHeight=static_cast<int>(itemHeight);
+  const int visibleRows=rowHeight>0?std::max(1,clientHeight/rowHeight):10;
   const bool followTail=countBefore<=0||
     topBefore+visibleRows>=countBefore-1;
 
