@@ -29,9 +29,10 @@ struct Options{
 };
 
 struct AppEntry{
-  std::wstring id,scope,key,name,version,publisher,productCode;
+  std::wstring id,scope,key,name,version,publisher,productCode,parentKeyName;
   std::wstring uninstallString,quietUninstallString,installLocation;
   bool windowsInstaller=false;
+  bool systemComponent=false;
 };
 
 struct ProcEntry{
@@ -128,17 +129,47 @@ void ReadUninstallRoot(HKEY hive,const wchar_t* path,REGSAM view,const std::wstr
     HKEY a=nullptr; if(RegOpenKeyExW(root,sub,0,KEY_READ|view,&a)!=ERROR_SUCCESS)continue;
     AppEntry e; e.scope=scope;e.key=sub;e.name=RegString(a,L"DisplayName");e.version=RegString(a,L"DisplayVersion");e.publisher=RegString(a,L"Publisher");
     e.uninstallString=RegString(a,L"UninstallString");e.quietUninstallString=RegString(a,L"QuietUninstallString");e.installLocation=RegString(a,L"InstallLocation");
-    e.windowsInstaller=RegDword(a,L"WindowsInstaller")==1; if(LooksGuid(e.key))e.productCode=e.key; RegCloseKey(a);
+    e.parentKeyName=RegString(a,L"ParentKeyName");
+    e.windowsInstaller=RegDword(a,L"WindowsInstaller")==1;
+    e.systemComponent=RegDword(a,L"SystemComponent")==1;
+    if(LooksGuid(e.key))e.productCode=e.key; RegCloseKey(a);
     if(e.name.empty()&&e.uninstallString.empty()&&e.quietUninstallString.empty())continue;
     e.id=Lower(e.scope+L"|"+e.key+L"|"+e.name); out[e.id]=std::move(e);
   }
   RegCloseKey(root);
 }
+void ReadLoadedUserUninstallRoots(std::map<std::wstring,AppEntry>& out){
+  HKEY users=nullptr;if(RegOpenKeyExW(HKEY_USERS,L"",0,KEY_READ,&users)!=ERROR_SUCCESS)return;
+  for(DWORD i=0;;++i){
+    wchar_t sid[256]{};DWORD len=(DWORD)std::size(sid);LONG rc=RegEnumKeyExW(users,i,sid,&len,nullptr,nullptr,nullptr,nullptr);
+    if(rc==ERROR_NO_MORE_ITEMS)break;if(rc!=ERROR_SUCCESS)continue;
+    std::wstring s=sid;
+    if(s.rfind(L"S-1-5-21-",0)!=0)continue;
+    const std::wstring path=s+L"\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    ReadUninstallRoot(HKEY_USERS,path.c_str(),KEY_WOW64_64KEY,L"user:"+s+L":64",out);
+    ReadUninstallRoot(HKEY_USERS,path.c_str(),KEY_WOW64_32KEY,L"user:"+s+L":32",out);
+  }
+  RegCloseKey(users);
+}
 std::map<std::wstring,AppEntry> CaptureApps(){
   std::map<std::wstring,AppEntry> out; constexpr wchar_t path[]=L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
   ReadUninstallRoot(HKEY_LOCAL_MACHINE,path,KEY_WOW64_64KEY,L"machine64",out);
   ReadUninstallRoot(HKEY_LOCAL_MACHINE,path,KEY_WOW64_32KEY,L"machine32",out);
-  ReadUninstallRoot(HKEY_CURRENT_USER,path,0,L"user",out); return out;
+  ReadLoadedUserUninstallRoots(out);
+  return out;
+}
+bool IsTestableApplication(const AppEntry& e){
+  if(e.name.empty()||e.systemComponent||!e.parentKeyName.empty())return false;
+  if(e.uninstallString.empty()&&e.quietUninstallString.empty())return false;
+  const std::wstring n=Lower(e.name);
+  static const wchar_t* blocked[]={
+    L"application verifier",L"diagnosticshub",L"icecap_",L"intellitrace",L"kits configuration installer",
+    L"microsoft .net host",L"microsoft .net runtime",L"microsoft .net targeting pack",
+    L"microsoft asp.net core",L"windows desktop runtime",L"windows software development kit",
+    L"windows sdk",L"microsoft visual c++",L"vc++ redistributable"
+  };
+  for(const auto* token:blocked)if(n.find(token)!=std::wstring::npos)return false;
+  return true;
 }
 std::wstring VariantString(VARIANT& v){
   if(v.vt==VT_BSTR&&v.bstrVal)return v.bstrVal;
@@ -181,6 +212,7 @@ std::map<DWORD,ProcEntry> CaptureProcs(){
 json AppJson(const AppEntry&e){
   return{{"id",Narrow(e.id)},{"scope",Narrow(e.scope)},{"registryKey",Narrow(e.key)},{"displayName",Narrow(e.name)},{"version",Narrow(e.version)},
     {"publisher",Narrow(e.publisher)},{"productCode",Narrow(e.productCode)},{"windowsInstaller",e.windowsInstaller},
+    {"systemComponent",e.systemComponent},{"parentKeyName",Narrow(e.parentKeyName)},{"testable",IsTestableApplication(e)},
     {"uninstallString",Narrow(e.uninstallString)},{"quietUninstallString",Narrow(e.quietUninstallString)},{"installLocation",Narrow(e.installLocation)}};
 }
 void AppendLog(const std::wstring& text,const json& ev){
@@ -203,17 +235,25 @@ void RecordAppState(const AppEntry&e,bool installed,const char* eventType){
   s["lastSeenAt"]=now;s["currentlyInstalled"]=installed;s["displayName"]=Narrow(e.name);s["version"]=Narrow(e.version);s["publisher"]=Narrow(e.publisher);
   s["scope"]=Narrow(e.scope);s["registryKey"]=Narrow(e.key);s["productCode"]=Narrow(e.productCode);s["uninstallString"]=Narrow(e.uninstallString);
   s["quietUninstallString"]=Narrow(e.quietUninstallString);s["installLocation"]=Narrow(e.installLocation);
+  s["systemComponent"]=e.systemComponent;s["parentKeyName"]=Narrow(e.parentKeyName);s["testable"]=IsTestableApplication(e);
   if(!s.contains("history")||!s["history"].is_array())s["history"]=json::array();
   s["history"].push_back({{"timestamp",now},{"event",eventType},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"snapshot",AppJson(e)}});
   SaveState();
 }
 void PopulateLists(){
   SendMessageW(gInstalled,LB_RESETCONTENT,0,0); SendMessageW(gHistory,LB_RESETCONTENT,0,0);
-  for(const auto&[_,e]:gApps){std::wstring row=e.name+(e.version.empty()?L"":L"  ["+e.version+L"]")+L"  ("+e.scope+L")";SendMessageW(gInstalled,LB_ADDSTRING,0,(LPARAM)row.c_str());}
+  for(const auto&[_,e]:gApps){
+    if(!IsTestableApplication(e))continue;
+    std::wstring row=e.name+(e.version.empty()?L"":L"  ["+e.version+L"]")+L"  ("+e.scope+L")";
+    SendMessageW(gInstalled,LB_ADDSTRING,0,(LPARAM)row.c_str());
+  }
   std::vector<std::wstring> hist;
   for(auto it=gState["apps"].begin();it!=gState["apps"].end();++it){
-    const auto&s=it.value(); if(s.value("currentlyInstalled",false))continue;
-    std::wstring row=Widen(s.value("displayName",std::string()))+L"  ["+Widen(s.value("version",std::string()))+L"]  removed";
+    const auto&s=it.value();
+    if(s.value("currentlyInstalled",false)||!s.value("testable",false))continue;
+    const auto display=Widen(s.value("displayName",std::string()));
+    if(display.empty())continue;
+    std::wstring row=display+L"  ["+Widen(s.value("version",std::string()))+L"]  removed";
     hist.push_back(row);
   }
   std::sort(hist.begin(),hist.end()); for(auto&r:hist)SendMessageW(gHistory,LB_ADDSTRING,0,(LPARAM)r.c_str());
@@ -260,12 +300,12 @@ void Tick(bool manual){
   }
   for(const auto&[pid,p]:gProcs)if(procs.find(pid)==procs.end())AppendLog(L"PROCESS - "+std::to_wstring(pid)+L" "+p.name,{{"timestamp",NowIso()},{"type","process_exited"},{"pid",pid},{"name",Narrow(p.name)},{"path",Narrow(p.path)},{"commandLine",Narrow(p.commandLine)}});
   gProcs=std::move(procs); PopulateLists();RefreshDetails();
-  std::wstringstream st;st<<L"Installed / available to test: "<<gApps.size()<<L"   History: "<<SendMessageW(gHistory,LB_GETCOUNT,0,0)<<L"   Tracking phase: "<<gOpt.phase;
+  std::wstringstream st;st<<L"Installed / available to test: "<<SendMessageW(gInstalled,LB_GETCOUNT,0,0)<<L"   History: "<<SendMessageW(gHistory,LB_GETCOUNT,0,0)<<L"   Observed registry entries: "<<gApps.size()<<L"   Tracking phase: "<<gOpt.phase;
   if(manual)st<<L"   Snapshot saved";SetWindowTextW(gStatus,st.str().c_str());
 }
 void ExportEvidence(){
   json installed=json::array();for(const auto&[_,e]:gApps)installed.push_back(AppJson(e));
-  json out={{"schemaVersion",1},{"observerVersion","0.1.0"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
+  json out={{"schemaVersion",1},{"observerVersion","0.1.1"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
   std::ofstream f(gOpt.root/L"jobs"/gOpt.jobId/L"summary.json",std::ios::binary|std::ios::trunc);f<<out.dump(2);
 }
 void Layout(HWND w){
@@ -306,7 +346,16 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
   gStatus=CreateWindowExW(0,L"STATIC",L"Starting...",WS_CHILD|WS_VISIBLE,0,0,0,0,w,nullptr,h,nullptr);SendMessageW(gStatus,WM_SETFONT,(WPARAM)uiF,TRUE);
   Layout(w);
   for(auto it=gState["apps"].begin();it!=gState["apps"].end();++it)if(it.value().is_object())it.value()["currentlyInstalled"]=false;
-  gApps=CaptureApps();for(const auto&[_,e]:gApps){auto id=Narrow(e.id);auto&s=gState["apps"][id];if(!s.is_object()){RecordAppState(e,true,"baseline_present");}else{s["currentlyInstalled"]=true;s["lastSeenAt"]=NowIso();}}SaveState();
+  gApps=CaptureApps();for(const auto&[_,e]:gApps){
+    auto id=Narrow(e.id);auto&s=gState["apps"][id];
+    if(!s.is_object()){RecordAppState(e,true,"baseline_present");}
+    else{
+      s["currentlyInstalled"]=true;s["lastSeenAt"]=NowIso();s["displayName"]=Narrow(e.name);s["version"]=Narrow(e.version);s["publisher"]=Narrow(e.publisher);
+      s["scope"]=Narrow(e.scope);s["registryKey"]=Narrow(e.key);s["productCode"]=Narrow(e.productCode);s["uninstallString"]=Narrow(e.uninstallString);
+      s["quietUninstallString"]=Narrow(e.quietUninstallString);s["installLocation"]=Narrow(e.installLocation);s["systemComponent"]=e.systemComponent;
+      s["parentKeyName"]=Narrow(e.parentKeyName);s["testable"]=IsTestableApplication(e);
+    }
+  }SaveState();
   gProcs=CaptureProcs();PopulateLists();RefreshDetails();AppendLog(L"Observer started. Installed applications are the available test set; removed applications remain in History.",{{"timestamp",NowIso()},{"type","observer_started"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)}});
   SetTimer(w,kTimerId,kTimerMs,nullptr);ShowWindow(w,show);UpdateWindow(w);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
   if(singleton)CloseHandle(singleton);if(SUCCEEDED(com))CoUninitialize();return(int)msg.wParam;
