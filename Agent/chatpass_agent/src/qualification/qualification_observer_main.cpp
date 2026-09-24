@@ -1,18 +1,22 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <wbemidl.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cwctype>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -48,6 +52,7 @@ struct ProcessObservation{
   std::chrono::steady_clock::time_point seen;
   std::string timestamp;
   ProcEntry process;
+  std::string captureMethod;
 };
 
 Options gOpt;
@@ -64,6 +69,10 @@ constexpr COLORREF kBannerText=RGB(24,87,145);
 std::map<std::wstring,AppEntry> gApps;
 std::map<DWORD,ProcEntry> gProcs;
 std::deque<ProcessObservation> gProcessJournal;
+std::deque<ProcessObservation> gPendingProcessStarts;
+std::mutex gProcessEventMutex;
+std::atomic<bool> gProcessWatcherStop{false};
+std::thread gProcessWatcher;
 std::deque<std::wstring> gActivityLines;
 bool gActivityDirty=false;
 std::vector<std::wstring> gInstalledIds;
@@ -249,6 +258,106 @@ std::map<DWORD,ProcEntry> CaptureProcs(){
   }
   if(rows)rows->Release();services->Release();locator->Release();return out;
 }
+
+ProcEntry CaptureProcessDetails(IWbemServices* services,DWORD pid,DWORD parentPid,const std::wstring& nameHint){
+  ProcEntry p;p.pid=pid;p.parentPid=parentPid;p.name=nameHint;
+  if(!services||!pid)return p;
+
+  wchar_t queryText[160]{};
+  swprintf_s(queryText,L"SELECT Name,ExecutablePath,CommandLine FROM Win32_Process WHERE ProcessId=%lu",pid);
+  BSTR lang=SysAllocString(L"WQL");
+  BSTR query=SysAllocString(queryText);
+  IEnumWbemClassObject* rows=nullptr;
+  HRESULT hr=services->ExecQuery(lang,query,WBEM_FLAG_FORWARD_ONLY|WBEM_FLAG_RETURN_IMMEDIATELY,nullptr,&rows);
+  SysFreeString(lang);SysFreeString(query);
+
+  if(SUCCEEDED(hr)&&rows){
+    IWbemClassObject* obj=nullptr;ULONG count=0;
+    hr=rows->Next(400,1,&obj,&count);
+    if(SUCCEEDED(hr)&&count&&obj){
+      VARIANT a{},b{},c{};VariantInit(&a);VariantInit(&b);VariantInit(&c);
+      obj->Get(L"Name",0,&a,nullptr,nullptr);
+      obj->Get(L"ExecutablePath",0,&b,nullptr,nullptr);
+      obj->Get(L"CommandLine",0,&c,nullptr,nullptr);
+      const auto n=VariantString(a);if(!n.empty())p.name=n;
+      p.path=VariantString(b);p.commandLine=VariantString(c);
+      VariantClear(&a);VariantClear(&b);VariantClear(&c);obj->Release();
+    }
+    rows->Release();
+  }
+
+  if(p.path.empty()){
+    HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
+    if(process){
+      wchar_t path[32768]{};DWORD size=(DWORD)std::size(path);
+      if(QueryFullProcessImageNameW(process,0,path,&size))p.path.assign(path,size);
+      CloseHandle(process);
+    }
+  }
+  return p;
+}
+
+void ProcessStartWatcherLoop(){
+  const HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+  IWbemLocator* locator=nullptr;IWbemServices* services=nullptr;IEnumWbemClassObject* events=nullptr;
+
+  HRESULT hr=CoCreateInstance(CLSID_WbemLocator,nullptr,CLSCTX_INPROC_SERVER,IID_IWbemLocator,(void**)&locator);
+  if(SUCCEEDED(hr)&&locator){
+    BSTR ns=SysAllocString(L"ROOT\\CIMV2");
+    hr=locator->ConnectServer(ns,nullptr,nullptr,nullptr,0,nullptr,nullptr,&services);
+    SysFreeString(ns);
+  }
+  if(SUCCEEDED(hr)&&services){
+    CoSetProxyBlanket(services,RPC_C_AUTHN_WINNT,RPC_C_AUTHZ_NONE,nullptr,RPC_C_AUTHN_LEVEL_CALL,RPC_C_IMP_LEVEL_IMPERSONATE,nullptr,EOAC_NONE);
+    BSTR lang=SysAllocString(L"WQL");
+    BSTR query=SysAllocString(L"SELECT * FROM Win32_ProcessStartTrace");
+    hr=services->ExecNotificationQuery(lang,query,WBEM_FLAG_FORWARD_ONLY|WBEM_FLAG_RETURN_IMMEDIATELY,nullptr,&events);
+    SysFreeString(lang);SysFreeString(query);
+  }
+
+  while(!gProcessWatcherStop.load()&&events){
+    IWbemClassObject* obj=nullptr;ULONG count=0;
+    hr=events->Next(500,1,&obj,&count);
+    if(count&&obj){
+      VARIANT a{},b{},c{};VariantInit(&a);VariantInit(&b);VariantInit(&c);
+      obj->Get(L"ProcessID",0,&a,nullptr,nullptr);
+      obj->Get(L"ParentProcessID",0,&b,nullptr,nullptr);
+      obj->Get(L"ProcessName",0,&c,nullptr,nullptr);
+      const DWORD pid=VariantDword(a),parentPid=VariantDword(b);
+      const std::wstring name=VariantString(c);
+      VariantClear(&a);VariantClear(&b);VariantClear(&c);obj->Release();
+
+      if(pid){
+        ProcessObservation observation{
+          std::chrono::steady_clock::now(),
+          NowIso(),
+          CaptureProcessDetails(services,pid,parentPid,name),
+          "Win32_ProcessStartTrace"
+        };
+        std::lock_guard<std::mutex> guard(gProcessEventMutex);
+        gPendingProcessStarts.push_back(std::move(observation));
+        while(gPendingProcessStarts.size()>4000)gPendingProcessStarts.pop_front();
+      }
+    }
+  }
+
+  if(events)events->Release();
+  if(services)services->Release();
+  if(locator)locator->Release();
+  if(SUCCEEDED(com))CoUninitialize();
+}
+
+std::vector<ProcessObservation> DrainProcessStartEvents(){
+  std::vector<ProcessObservation> out;
+  std::lock_guard<std::mutex> guard(gProcessEventMutex);
+  out.reserve(gPendingProcessStarts.size());
+  while(!gPendingProcessStarts.empty()){
+    out.push_back(std::move(gPendingProcessStarts.front()));
+    gPendingProcessStarts.pop_front();
+  }
+  return out;
+}
+
 json AppJson(const AppEntry&e){
   return{{"id",Narrow(e.id)},{"scope",Narrow(e.scope)},{"registryKey",Narrow(e.key)},{"displayName",Narrow(e.name)},{"version",Narrow(e.version)},
     {"publisher",Narrow(e.publisher)},{"productCode",Narrow(e.productCode)},{"windowsInstaller",e.windowsInstaller},
@@ -433,7 +542,22 @@ void ShowHistoryDetails(size_t index){
   const auto quiet=Widen(s0.value("registeredQuietUninstallCommand",std::string()));if(!quiet.empty())s<<L"Registered quiet uninstall: "<<quiet<<L"\r\n";
   const auto silent=Widen(s0.value("candidateSilentUninstallCommand",std::string()));if(!silent.empty())s<<L"Candidate silent recipe: "<<silent<<L"\r\n";
   const auto observed=Widen(s0.value("observedUninstallCommand",std::string()));
-  if(!observed.empty())s<<L"Observed exact uninstall command: "<<observed<<L"\r\n";
+  if(!observed.empty()){
+    s<<L"Observed exact uninstall command: "<<observed<<L"\r\n";
+    if(s0.contains("observedUninstallSwitches")&&s0["observedUninstallSwitches"].is_array()){
+      s<<L"Observed switches:";
+      for(const auto& value:s0["observedUninstallSwitches"])s<<L" "<<Widen(value.get<std::string>());
+      s<<L"\r\n";
+    }
+    if(s0.contains("observedUninstallArguments")&&s0["observedUninstallArguments"].is_array()){
+      s<<L"Observed arguments:";
+      for(const auto& value:s0["observedUninstallArguments"])s<<L" ["<<Widen(value.get<std::string>())<<L"]";
+      s<<L"\r\n";
+    }
+  }
+
+  const auto captureMethod=Widen(s0.value("observedUninstallCaptureMethod",std::string()));
+  if(!captureMethod.empty())s<<L"Capture method: "<<captureMethod<<L"\r\n";
 
   const auto observedProcess=Widen(s0.value("observedUninstallProcessCommand",std::string()));
   const int correlationScore=s0.value("observedUninstallCorrelationScore",0);
@@ -499,6 +623,43 @@ std::wstring ExecutableNameFromCommand(const std::wstring& command){
   try{return Lower(std::filesystem::path(exe).filename().wstring());}catch(...){return Lower(exe);}
 }
 
+json CommandArgumentsJson(const std::wstring& commandLine){
+  json args=json::array();
+  if(commandLine.empty())return args;
+  int argc=0;
+  LPWSTR* argv=CommandLineToArgvW(commandLine.c_str(),&argc);
+  if(!argv)return args;
+  for(int i=1;i<argc;++i)args.push_back(Narrow(argv[i]));
+  LocalFree(argv);
+  return args;
+}
+
+json CommandSwitchesJson(const std::wstring& commandLine){
+  json switches=json::array();
+  if(commandLine.empty())return switches;
+  int argc=0;
+  LPWSTR* argv=CommandLineToArgvW(commandLine.c_str(),&argc);
+  if(!argv)return switches;
+  for(int i=1;i<argc;++i){
+    const std::wstring token=argv[i]?argv[i]:L"";
+    if(!token.empty()&&(token.front()==L'/'||token.front()==L'-'))
+      switches.push_back(Narrow(token));
+  }
+  LocalFree(argv);
+  return switches;
+}
+
+bool HasExactIdentityEvidence(const std::vector<std::string>& reasons){
+  static const std::set<std::string> strong={
+    "product_code_in_command",
+    "registered_uninstaller_executable",
+    "registered_uninstaller_path",
+    "process_inside_install_location"
+  };
+  for(const auto& reason:reasons)if(strong.count(reason))return true;
+  return false;
+}
+
 std::pair<int,std::vector<std::string>> ScoreUninstallProcess(
   const AppEntry& app,
   const ProcessObservation& observation,
@@ -517,15 +678,23 @@ std::pair<int,std::vector<std::string>> ScoreUninstallProcess(
   if(!product.empty()&&command.find(product)!=std::wstring::npos){
     score+=140;reasons.push_back("product_code_in_command");
   }
+  const bool genericHost=
+    registeredExe==L"msiexec.exe"||registeredExe==L"rundll32.exe"||
+    registeredExe==L"powershell.exe"||registeredExe==L"pwsh.exe"||
+    registeredExe==L"cmd.exe"||registeredExe==L"wscript.exe"||
+    registeredExe==L"cscript.exe";
+
   if(!registeredExe.empty()&&name==registeredExe){
-    score+=100;reasons.push_back("registered_uninstaller_executable");
+    if(genericHost){score+=15;reasons.push_back("generic_registered_host_executable");}
+    else{score+=100;reasons.push_back("registered_uninstaller_executable");}
   }
   if(!registeredExe.empty()&&!path.empty()&&
      Lower(std::filesystem::path(path).filename().wstring())==registeredExe){
-    score+=90;reasons.push_back("registered_uninstaller_path");
+    if(genericHost){score+=10;reasons.push_back("generic_registered_host_path");}
+    else{score+=90;reasons.push_back("registered_uninstaller_path");}
   }
   if(app.windowsInstaller&&name==L"msiexec.exe"){
-    score+=45;reasons.push_back("windows_installer_process");
+    score+=35;reasons.push_back("windows_installer_process");
   }
   if(command.find(L" /x")!=std::wstring::npos||command.find(L"/uninstall")!=std::wstring::npos||
      command.find(L" uninstall")!=std::wstring::npos||command.find(L" remove")!=std::wstring::npos){
@@ -591,6 +760,9 @@ void CorrelateRemovalWithRecentProcesses(const AppEntry& app,const std::string& 
       {"name",Narrow(candidate.observation.process.name)},
       {"path",Narrow(candidate.observation.process.path)},
       {"commandLine",Narrow(candidate.observation.process.commandLine)},
+      {"arguments",CommandArgumentsJson(candidate.observation.process.commandLine)},
+      {"switches",CommandSwitchesJson(candidate.observation.process.commandLine)},
+      {"captureMethod",candidate.observation.captureMethod},
       {"correlationScore",candidate.score},
       {"correlationReasons",reasons}
     });
@@ -600,15 +772,28 @@ void CorrelateRemovalWithRecentProcesses(const AppEntry& app,const std::string& 
   if(!candidates.empty()){
     const auto& best=candidates.front();
     state["observedUninstallProcessName"]=Narrow(best.observation.process.name);
+    state["observedUninstallProcessPath"]=Narrow(best.observation.process.path);
     state["observedUninstallProcessCommand"]=Narrow(best.observation.process.commandLine);
+    state["observedUninstallProcessArguments"]=CommandArgumentsJson(best.observation.process.commandLine);
+    state["observedUninstallProcessSwitches"]=CommandSwitchesJson(best.observation.process.commandLine);
+    state["observedUninstallCaptureMethod"]=best.observation.captureMethod;
     state["observedUninstallCorrelationScore"]=best.score;
+    state["observedUninstallCorrelationReasons"]=best.reasons;
     state["observedUninstallCorrelationAt"]=NowIso();
 
-    if(best.score>=80&&!best.observation.process.commandLine.empty()){
+    const bool exactIdentity=HasExactIdentityEvidence(best.reasons);
+    const bool exactCommand=
+      exactIdentity&&best.score>=120&&!best.observation.process.commandLine.empty();
+
+    if(exactCommand){
       state["observedUninstallCommand"]=Narrow(best.observation.process.commandLine);
-      state["uninstallObservationStatus"]="process_command_observed_removal_confirmed";
+      state["observedUninstallArguments"]=CommandArgumentsJson(best.observation.process.commandLine);
+      state["observedUninstallSwitches"]=CommandSwitchesJson(best.observation.process.commandLine);
+      state["uninstallObservationStatus"]="exact_process_command_observed_removal_confirmed";
     }else{
       state.erase("observedUninstallCommand");
+      state.erase("observedUninstallArguments");
+      state.erase("observedUninstallSwitches");
       state["uninstallObservationStatus"]="process_activity_observed_removal_confirmed";
     }
 
@@ -625,29 +810,86 @@ void CorrelateRemovalWithRecentProcesses(const AppEntry& app,const std::string& 
   }else{
     state["uninstallObservationStatus"]="registered_recipe_observed_removal_confirmed";
   }
+
+  json portalEvidence={
+    {"schemaVersion",1},
+    {"displayName",Narrow(app.name)},
+    {"version",Narrow(app.version)},
+    {"publisher",Narrow(app.publisher)},
+    {"technology",Narrow(UninstallTechnology(app))},
+    {"productCode",Narrow(app.productCode)},
+    {"registeredCommand",Narrow(app.uninstallString)},
+    {"registeredQuietCommand",Narrow(app.quietUninstallString)},
+    {"candidateSilentCommand",Narrow(CandidateSilentRecipe(app))},
+    {"removalConfirmed",true},
+    {"removalConfirmedAt",state.value("lastUninstalledAt",std::string())},
+    {"observationStatus",state.value("uninstallObservationStatus",std::string())},
+    {"observedProcesses",observed}
+  };
+  if(state.contains("observedUninstallCommand"))
+    portalEvidence["observedExactCommand"]=state["observedUninstallCommand"];
+  if(state.contains("observedUninstallArguments"))
+    portalEvidence["observedExactArguments"]=state["observedUninstallArguments"];
+  if(state.contains("observedUninstallSwitches"))
+    portalEvidence["observedExactSwitches"]=state["observedUninstallSwitches"];
+  if(state.contains("observedUninstallCaptureMethod"))
+    portalEvidence["captureMethod"]=state["observedUninstallCaptureMethod"];
+  if(state.contains("observedUninstallCorrelationScore"))
+    portalEvidence["correlationScore"]=state["observedUninstallCorrelationScore"];
+  if(state.contains("observedUninstallCorrelationReasons"))
+    portalEvidence["correlationReasons"]=state["observedUninstallCorrelationReasons"];
+
+  if(!state.contains("patchingEvidence")||!state["patchingEvidence"].is_object())
+    state["patchingEvidence"]=json::object();
+  state["patchingEvidence"]["uninstall"]=std::move(portalEvidence);
   SaveState();
 }
 
 void Tick(bool manual){
   const auto tickNow=std::chrono::steady_clock::now();
 
-  // Capture process starts before inventory changes so an uninstaller that
-  // removes its registry identity within this polling interval is still
-  // available for backward correlation.
-  auto procs=CaptureProcs();
+  // Process creation is event-driven. The 750ms loop only drains the event
+  // queue and takes a fallback snapshot for anything the watcher could not
+  // resolve.
   while(!gProcessJournal.empty()&&tickNow-gProcessJournal.front().seen>std::chrono::minutes(5))
     gProcessJournal.pop_front();
 
-  for(const auto&[pid,p]:procs)if(gProcs.find(pid)==gProcs.end()){
-    const std::string timestamp=NowIso();
-    gProcessJournal.push_back({tickNow,timestamp,p});
+  std::set<DWORD> eventPids;
+  auto eventStarts=DrainProcessStartEvents();
+  for(auto& observation:eventStarts){
+    eventPids.insert(observation.process.pid);
+    gProcessJournal.push_back(observation);
     while(gProcessJournal.size()>1500)gProcessJournal.pop_front();
 
-    std::wstring detail=L"PROCESS + "+std::to_wstring(pid)+L" ppid="+std::to_wstring(p.parentPid)+L" "+p.name;
+    const auto& p=observation.process;
+    std::wstring detail=L"PROCESS START [event] "+std::to_wstring(p.pid)+L" ppid="+std::to_wstring(p.parentPid)+L" "+p.name;
+    if(!p.commandLine.empty())detail+=L" | "+p.commandLine;
+    AppendLog(detail,{
+      {"timestamp",observation.timestamp},
+      {"type","process_started"},
+      {"captureMethod","Win32_ProcessStartTrace"},
+      {"pid",p.pid},
+      {"parentPid",p.parentPid},
+      {"name",Narrow(p.name)},
+      {"path",Narrow(p.path)},
+      {"commandLine",Narrow(p.commandLine)}
+    });
+  }
+
+  auto procs=CaptureProcs();
+  for(const auto&[pid,p]:procs){
+    if(gProcs.find(pid)!=gProcs.end()||eventPids.count(pid))continue;
+    const std::string timestamp=NowIso();
+    ProcessObservation observation{tickNow,timestamp,p,"snapshot_fallback"};
+    gProcessJournal.push_back(observation);
+    while(gProcessJournal.size()>1500)gProcessJournal.pop_front();
+
+    std::wstring detail=L"PROCESS START [snapshot fallback] "+std::to_wstring(pid)+L" ppid="+std::to_wstring(p.parentPid)+L" "+p.name;
     if(!p.commandLine.empty())detail+=L" | "+p.commandLine;
     AppendLog(detail,{
       {"timestamp",timestamp},
       {"type","process_started"},
+      {"captureMethod","snapshot_fallback"},
       {"pid",pid},
       {"parentPid",p.parentPid},
       {"name",Narrow(p.name)},
@@ -655,8 +897,9 @@ void Tick(bool manual){
       {"commandLine",Narrow(p.commandLine)}
     });
   }
+
   for(const auto&[pid,p]:gProcs)if(procs.find(pid)==procs.end()){
-    AppendLog(L"PROCESS - "+std::to_wstring(pid)+L" "+p.name,{
+    AppendLog(L"PROCESS EXIT "+std::to_wstring(pid)+L" "+p.name,{
       {"timestamp",NowIso()},
       {"type","process_exited"},
       {"pid",pid},
@@ -759,7 +1002,7 @@ void Tick(bool manual){
 }
 void ExportEvidence(){
   json installed=json::array();for(const auto&[_,e]:gApps)installed.push_back(AppJson(e));
-  json out={{"schemaVersion",1},{"observerVersion","0.1.5"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
+  json out={{"schemaVersion",1},{"observerVersion","0.1.6"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
   std::ofstream f(gOpt.root/L"jobs"/gOpt.jobId/L"summary.json",std::ios::binary|std::ios::trunc);f<<out.dump(2);
 }
 void Layout(HWND w){
@@ -829,7 +1072,15 @@ LRESULT CALLBACK Proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
   if(msg==WM_CTLCOLOREDIT||msg==WM_CTLCOLORLISTBOX){
     HDC dc=(HDC)wp;SetTextColor(dc,kText);SetBkColor(dc,kPanelBg);return (LRESULT)gPanelBrush;
   }
-  if(msg==WM_CLOSE){gStopping=true;KillTimer(w,kTimerId);Tick(false);ExportEvidence();DestroyWindow(w);return 0;}
+  if(msg==WM_CLOSE){
+    gStopping=true;
+    gProcessWatcherStop.store(true);
+    KillTimer(w,kTimerId);
+    Tick(false);
+    ExportEvidence();
+    DestroyWindow(w);
+    return 0;
+  }
   if(msg==WM_DESTROY){PostQuitMessage(0);return 0;}
   return DefWindowProcW(w,msg,wp,lp);
 }
@@ -904,11 +1155,22 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
       s["parentKeyName"]=Narrow(e.parentKeyName);s["testable"]=IsTestableApplication(e);
     }
   }SaveState();
-  gProcs=CaptureProcs();PopulateLists();RefreshDetails();AppendLog(L"Observer started. Installed applications are the available test set; removed applications remain in History.",{{"timestamp",NowIso()},{"type","observer_started"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)}});
+  gProcs=CaptureProcs();
+  gProcessWatcherStop.store(false);
+  gProcessWatcher=std::thread(ProcessStartWatcherLoop);
+  PopulateLists();
+  RefreshDetails();
+  AppendLog(
+    L"Observer started. Exact process invocation capture is event-driven; removed applications remain in History.",
+    {{"timestamp",NowIso()},{"type","observer_started"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"processCapture","Win32_ProcessStartTrace"}});
   SetTimer(w,kTimerId,kTimerMs,nullptr);
   ShowWindow(w,SW_SHOW);
   SetForegroundWindow(w);
   UpdateWindow(w);
   MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
-  if(singleton)CloseHandle(singleton);if(SUCCEEDED(com))CoUninitialize();return(int)msg.wParam;
+  gProcessWatcherStop.store(true);
+  if(gProcessWatcher.joinable())gProcessWatcher.join();
+  if(singleton)CloseHandle(singleton);
+  if(SUCCEEDED(com))CoUninitialize();
+  return(int)msg.wParam;
 }
