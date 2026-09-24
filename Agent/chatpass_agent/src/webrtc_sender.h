@@ -188,6 +188,7 @@ private:
     std::unique_ptr<Vp9VpxEncoder> m_vp9VpxEncoder;
     std::unique_ptr<Av1MfEncoder> m_av1Encoder;
     std::unique_ptr<H265MfEncoder> m_h265Encoder;
+    I420Frame m_vp8ScaleScratch;
     I420Frame m_vp9ScaleScratch;
     I420Frame m_h264ScaleScratch;
     std::shared_ptr<rtc::RtpPacketizationConfig> m_nativeVideoRtpConfig;
@@ -278,6 +279,9 @@ private:
     std::atomic<double> m_viewerJitterMs{ 0.0 };
     std::atomic<double> m_viewerJitterBufferMs{ 0.0 };
     std::atomic<double> m_viewerBitrateKbps{ 0.0 };
+    std::atomic<int> m_viewerMaxWidth{ 0 };
+    std::atomic<int> m_viewerMaxHeight{ 0 };
+    std::atomic<int> m_viewerTargetFps{ 0 };
 
     int m_externalConfiguredFps = 0;
     int m_externalConfiguredBitrateKbps = 0;

@@ -168,6 +168,45 @@ namespace {
         return out;
     }
 
+    bool SetBackstageClipboardUtf8(const std::string& text) {
+        std::wstring wide;
+        if (!text.empty()) {
+            const int chars = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+            if (chars <= 0) return false;
+            wide.resize(static_cast<size_t>(chars));
+            MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(), chars);
+        }
+        if (!OpenClipboard(nullptr)) return false;
+        EmptyClipboard();
+        const SIZE_T bytes = (wide.size() + 1) * sizeof(wchar_t);
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (!mem) { CloseClipboard(); return false; }
+        void* dst = GlobalLock(mem);
+        if (!dst) { GlobalFree(mem); CloseClipboard(); return false; }
+        std::memcpy(dst, wide.c_str(), bytes);
+        GlobalUnlock(mem);
+        if (!SetClipboardData(CF_UNICODETEXT, mem)) {
+            GlobalFree(mem);
+            CloseClipboard();
+            return false;
+        }
+        CloseClipboard();
+        return true;
+    }
+
+    bool GetBackstageClipboardUtf8(std::string& out) {
+        out.clear();
+        if (!OpenClipboard(nullptr)) return false;
+        HANDLE data = GetClipboardData(CF_UNICODETEXT);
+        if (!data) { CloseClipboard(); return false; }
+        const wchar_t* ptr = static_cast<const wchar_t*>(GlobalLock(data));
+        if (!ptr) { CloseClipboard(); return false; }
+        out = WideToUtf8(std::wstring(ptr));
+        GlobalUnlock(data);
+        CloseClipboard();
+        return true;
+    }
+
     std::wstring BytesToWideOem(const std::string& bytes) {
         if (bytes.empty()) return {};
         int needed = MultiByteToWideChar(CP_OEMCP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
@@ -382,12 +421,20 @@ namespace {
                 case hi5::InputCmdType::KeyEvent:
                     OnKey(cmd);
                     break;
+                case hi5::InputCmdType::ClipboardSet:
                 case hi5::InputCmdType::PasteText:
                 case hi5::InputCmdType::ClipboardPaste: {
                     std::string text;
                     if (pipe.ReadClipboard(cmd.clipboard.offsetInClip, cmd.clipboard.length, text)) {
-                        OnTextInput(Utf8ToWide(text));
+                        if (cmd.type != hi5::InputCmdType::PasteText) SetBackstageClipboardUtf8(text);
+                        if (cmd.type != hi5::InputCmdType::ClipboardSet) OnTextInput(Utf8ToWide(text));
                     }
+                    break;
+                }
+                case hi5::InputCmdType::ClipboardGet: {
+                    std::string text;
+                    const bool ok = GetBackstageClipboardUtf8(text);
+                    pipe.PublishClipboardResponse(text, ok);
                     break;
                 }
                 case hi5::InputCmdType::Shortcut:
@@ -4014,13 +4061,40 @@ namespace {
                     else NativeKey(cmd);
                     break;
 
+                case hi5::InputCmdType::ClipboardSet:
                 case hi5::InputCmdType::PasteText:
                 case hi5::InputCmdType::ClipboardPaste: {
                     std::string text;
                     if (pipe.ReadClipboard(cmd.clipboard.offsetInClip, cmd.clipboard.length, text)) {
-                        if (nativeSyntheticFocus_) OnTextInput(Utf8ToWide(text));
-                        else NativeText(Utf8ToWide(text));
+                        if (cmd.type != hi5::InputCmdType::PasteText) SetBackstageClipboardUtf8(text);
+                        if (cmd.type != hi5::InputCmdType::ClipboardSet) {
+                            if (nativeSyntheticFocus_) OnTextInput(Utf8ToWide(text));
+                            else NativeText(Utf8ToWide(text));
+                        }
                     }
+                    break;
+                }
+
+                case hi5::InputCmdType::ClipboardGet: {
+                    if (!nativeSyntheticFocus_) {
+                        auto sendNativeKey = [&](WORD vk, bool down) {
+                            hi5::InputCmd key{};
+                            key.type = hi5::InputCmdType::KeyEvent;
+                            key.key.vk = vk;
+                            key.key.scanCode = static_cast<uint16_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+                            key.key.down = down ? 1 : 0;
+                            key.key.isExtended = 0;
+                            NativeKey(key);
+                        };
+                        sendNativeKey(VK_CONTROL, true);
+                        sendNativeKey('C', true);
+                        sendNativeKey('C', false);
+                        sendNativeKey(VK_CONTROL, false);
+                        Sleep(80);
+                    }
+                    std::string text;
+                    const bool ok = GetBackstageClipboardUtf8(text);
+                    pipe.PublishClipboardResponse(text, ok);
                     break;
                 }
 

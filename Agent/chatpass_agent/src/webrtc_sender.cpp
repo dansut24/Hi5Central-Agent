@@ -1240,6 +1240,31 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         return;
                     }
 
+                    if (kind == "viewer_stream_profile") {
+                        const int maxW = std::max(0, std::min(7680, msg.value("max_width", 0)));
+                        const int maxH = std::max(0, std::min(4320, msg.value("max_height", 0)));
+                        const int targetFps = std::max(0, std::min(60, msg.value("target_fps", 0)));
+                        m_viewerMaxWidth.store(maxW, std::memory_order_release);
+                        m_viewerMaxHeight.store(maxH, std::memory_order_release);
+                        m_viewerTargetFps.store(targetFps, std::memory_order_release);
+                        m_forceKeyframe = true;
+                        if (auto replyDc = weakDc.lock()) {
+                            try {
+                                replyDc->send(json{
+                                    {"type", "viewer_stream_profile_result"},
+                                    {"status", "accepted"},
+                                    {"max_width", maxW},
+                                    {"max_height", maxH},
+                                    {"target_fps", targetFps}
+                                }.dump());
+                            } catch (...) {}
+                        }
+                        LogInfo("[video] viewer stream profile session=" + m_sessionId +
+                            " max=" + std::to_string(maxW) + "x" + std::to_string(maxH) +
+                            " fps=" + std::to_string(targetFps));
+                        return;
+                    }
+
                     if (kind == "dev_codec_switch") {
                         const std::string requested = msg.value("codec", std::string());
                         {
@@ -2621,7 +2646,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
     if (m_externalInputWakeUntilMs.load(std::memory_order_acquire) > steadyNowMs()) {
         requestedMode = std::max(requestedMode, 2);
         const int wakeFps = readEnvInt("HI5_INPUT_WAKE_FPS",
-            std::min(20, std::max(8, m_fps)), 4, 60);
+            std::min(30, std::max(12, m_fps)), 4, 60);
         m_externalHintFps.store(std::max(m_externalHintFps.load(), wakeFps),
             std::memory_order_release);
     }
@@ -2651,42 +2676,50 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         forceKeyframe = true;
     }
 
+    const int viewerTargetFps = m_viewerTargetFps.load(std::memory_order_acquire);
+    const int sessionMaxFps = viewerTargetFps > 0 ? std::min(std::max(1, m_fps), viewerTargetFps) : std::max(1, m_fps);
     Vp8RuntimeProfile profile = buildVp8RuntimeProfile(
         effectiveMode,
         m_externalHintFps.load(),
         m_externalHintBackstage.load(),
         m_externalHintSecure.load(),
-        std::max(1, m_fps),
+        sessionMaxFps,
         std::max(250, m_bitrateKbps));
 
-    const bool sizeChanged = frame.width != m_externalEncoderWidth || frame.height != m_externalEncoderHeight;
+    const int viewerMaxW = m_viewerMaxWidth.load(std::memory_order_acquire);
+    const int viewerMaxH = m_viewerMaxHeight.load(std::memory_order_acquire);
+    const I420Frame& vp8Frame = (m_videoCodec == VideoCodec::VP8)
+        ? scaleI420ForWebRtc(frame, m_vp8ScaleScratch, viewerMaxW, viewerMaxH)
+        : frame;
+
+    const bool sizeChanged = vp8Frame.width != m_externalEncoderWidth || vp8Frame.height != m_externalEncoderHeight;
     const bool profileChanged = profile.fps != m_externalConfiguredFps ||
         profile.bitrateKbps != m_externalConfiguredBitrateKbps ||
         profile.cpuUsed != m_externalConfiguredCpuUsed ||
         profile.maxQuantizer != m_externalConfiguredMaxQuantizer;
 
     if (m_videoCodec == VideoCodec::VP8 && (!m_encoder || sizeChanged)) {
-        m_externalEncoderWidth = frame.width;
-        m_externalEncoderHeight = frame.height;
+        m_externalEncoderWidth = vp8Frame.width;
+        m_externalEncoderHeight = vp8Frame.height;
         m_externalConfiguredFps = profile.fps;
         m_externalConfiguredBitrateKbps = profile.bitrateKbps;
         m_externalConfiguredCpuUsed = profile.cpuUsed;
         m_externalConfiguredMaxQuantizer = profile.maxQuantizer;
         m_externalProfileName = profile.name;
         m_encoder = std::make_unique<Vp8Encoder>(
-            frame.width,
-            frame.height,
+            vp8Frame.width,
+            vp8Frame.height,
             profile.fps,
             profile.bitrateKbps,
             profile.cpuUsed,
             profile.minQuantizer,
             profile.maxQuantizer,
-            readEnvInt("HI5_VP8_THREADS", frame.width > 1920 ? 2 : 1, 1, 8));
+            readEnvInt("HI5_VP8_THREADS", vp8Frame.width > 1920 ? 2 : 1, 1, 8));
         m_externalFrameCounter = 0;
         forceKeyframe = true;
         m_externalLastProfileChange = nowForProfile;
         std::cout << "[external] service encoder created session=" << m_sessionId
-            << " -> " << frame.width << "x" << frame.height
+            << " -> " << vp8Frame.width << "x" << vp8Frame.height
             << " profile=" << m_externalProfileName
             << " fps=" << profile.fps
             << " bitrate=" << profile.bitrateKbps
@@ -3312,7 +3345,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
 
     try {
         const auto encodeStart = std::chrono::steady_clock::now();
-        EncodedFrame encoded = m_encoder->encode(frame, keyframe);
+        EncodedFrame encoded = m_encoder->encode(vp8Frame, keyframe);
         const auto encodeEnd = std::chrono::steady_clock::now();
 
         const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();

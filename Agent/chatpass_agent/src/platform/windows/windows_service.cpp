@@ -7022,6 +7022,29 @@ exit 1
                     cmd.shortcut.action = static_cast<uint16_t>(action);
                     return pipe.Write(cmd);
                     };
+                if (kind == "clipboard_set" || kind == "clipboard_paste") {
+                    const std::string text = msg.value("text", std::string());
+                    if (text.empty()) return;
+                    uint32_t offset = 0;
+                    if (!pipe.WriteClipboard(text.data(), static_cast<uint32_t>(text.size()), offset)) {
+                        LogW("clipboard command too large or buffer unavailable session=" + ctx.sessionId);
+                        return;
+                    }
+                    InputCmd cmd{};
+                    cmd.type = kind == "clipboard_paste" ? InputCmdType::ClipboardPaste : InputCmdType::ClipboardSet;
+                    cmd.clipboard.offsetInClip = offset;
+                    cmd.clipboard.length = static_cast<uint32_t>(text.size());
+                    pipe.Write(cmd);
+                    return;
+                }
+
+                if (kind == "clipboard_get") {
+                    InputCmd cmd{};
+                    cmd.type = InputCmdType::ClipboardGet;
+                    pipe.Write(cmd);
+                    return;
+                }
+
                 if (kind == "text_input" || kind == "text" || kind == "insert_text" || kind == "key_text") {
                     const std::string text = msg.value("text", msg.value("key", std::string()));
                     writeTextCommand(text);
@@ -7175,15 +7198,39 @@ exit 1
                 if (kind == "mouse_click") {
                     const uint8_t button = readMouseButton();
 
-                    InputCmd down{};
-                    down.type = InputCmdType::MouseButton;
-                    down.mouseButton.button = button;
-                    down.mouseButton.down = 1;
-                    pipe.Write(down);
+                    // Mobile taps carry their normalized target with the click.
+                    // Queue the move and button events through the same input pipe
+                    // so a fast-mouse SCTP packet cannot arrive after the click.
+                    if (msg.contains("x_norm") && msg.contains("y_norm")) {
+                        const int count = pipe.GetMonitorCount();
+                        if (count > 0) {
+                            const int idx = std::max(0, std::min(ctx.displayIndex, count - 1));
+                            const auto mi = pipe.GetMonitorInfo(idx);
+                            const double xn = std::max(0.0, std::min(1.0, msg.value("x_norm", 0.0)));
+                            const double yn = std::max(0.0, std::min(1.0, msg.value("y_norm", 0.0)));
+                            InputCmd move{};
+                            move.type = InputCmdType::MouseMove;
+                            move.mouseMove.x = mi.x + static_cast<int>(xn * static_cast<double>(mi.w));
+                            move.mouseMove.y = mi.y + static_cast<int>(yn * static_cast<double>(mi.h));
+                            move.mouseMove.remoteW = mi.w;
+                            move.mouseMove.remoteH = mi.h;
+                            move.mouseMove.monitorIndex = idx;
+                            pipe.Write(move);
+                        }
+                    }
 
-                    InputCmd up = down;
-                    up.mouseButton.down = 0;
-                    pipe.Write(up);
+                    const int clickCount = std::max(1, std::min(2, msg.value("click_count", 1)));
+                    for (int click = 0; click < clickCount; ++click) {
+                        InputCmd down{};
+                        down.type = InputCmdType::MouseButton;
+                        down.mouseButton.button = button;
+                        down.mouseButton.down = 1;
+                        pipe.Write(down);
+
+                        InputCmd up = down;
+                        up.mouseButton.down = 0;
+                        pipe.Write(up);
+                    }
                     return;
                 }
 
@@ -8476,6 +8523,8 @@ exit 1
                 uint64_t framesForwarded = 0;
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
+                uint64_t lastNormalClipboardSeq = 0;
+                uint64_t lastSecureClipboardSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                 auto nextMemoryDiagnostics = std::chrono::steady_clock::now() + std::chrono::seconds(2);
                 const uint64_t maxFrameAgeNs = static_cast<uint64_t>(ReadConfigInt("HI5_MAX_FRAME_AGE_MS", 250, 50, 2000)) * 1000000ull;
@@ -9219,6 +9268,25 @@ exit 1
                             }
                         }
                     }
+
+                    auto forwardClipboardResponse = [&](InputPipeWriter& inputPipe, uint64_t& lastSeq, const char* source) {
+                        std::string text;
+                        bool ok = false;
+                        uint64_t seq = 0;
+                        if (!inputPipe.ReadClipboardResponse(lastSeq, text, ok, seq)) return;
+                        lastSeq = seq;
+                        SendMediaControl(ctx, json{
+                            {"type", "viewer_control"},
+                            {"payload", {
+                                {"type", "clipboard_result"},
+                                {"ok", ok},
+                                {"text", text},
+                                {"source", source}
+                            }}
+                        });
+                    };
+                    forwardClipboardResponse(ctx.normalInputPipe, lastNormalClipboardSeq, "normal");
+                    forwardClipboardResponse(ctx.secureInputPipe, lastSecureClipboardSeq, "secure");
 
                     if (now >= nextDiagnosticsPoll) {
                         if (staleFramesDropped > 0 && now >= nextStaleFrameLog) {
