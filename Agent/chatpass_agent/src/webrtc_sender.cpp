@@ -1610,14 +1610,27 @@ void WebRtcSender::createPeerConnection() {
 
     rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
     if (m_autoCodec) {
-        // Keep every supported candidate negotiated on the same media section/SSRC.
-        // Auto will only select codecs the Viewer answers and the endpoint can encode.
-        media.addAV1Codec(100);
-        media.addVP9Codec(98);
-        media.addH265Codec(104);
-        media.addH264Codec(102);
-        media.addVP8Codec(96);
-        LogInfo("[codec] SDP adaptive offer AV1=100 VP9=98 H265=104 H264=102 VP8=96 session=" + m_sessionId);
+        // Production Auto must negotiate only a sender path that has passed
+        // end-to-end validation on desktop and mobile. Advertising experimental
+        // codecs lets a browser legitimately select them; once the answer is
+        // applied we must not switch codecs without renegotiation. In 0.1.141
+        // desktop viewers selected AV1 and the Intel MFT then failed ProcessInput,
+        // leaving a connected peer with no video. Keep experimental negotiation
+        // opt-in for qualification/dev sessions only.
+        const bool experimentalAuto = readEnvInt("HI5_AUTO_EXPERIMENTAL_CODECS", 0, 0, 1) == 1;
+        if (experimentalAuto) {
+            media.addVP8Codec(96);
+            media.addH264Codec(102);
+            media.addVP9Codec(98);
+            media.addAV1Codec(100);
+            media.addH265Codec(104);
+            LogInfo("[codec] SDP experimental auto offer VP8=96 H264=102 VP9=98 AV1=100 H265=104 session=" + m_sessionId);
+        } else {
+            m_videoCodec = VideoCodec::VP8;
+            m_payloadType = 96;
+            media.addVP8Codec(m_payloadType);
+            LogInfo("[codec] SDP stable auto offer VP8=96 only session=" + m_sessionId);
+        }
     }
     else if (m_videoCodec == VideoCodec::AV1) {
         try {
