@@ -12,6 +12,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using json=nlohmann::json;
@@ -44,11 +45,21 @@ struct ProcEntry{
 
 Options gOpt;
 HWND gHeader=nullptr,gInstalled=nullptr,gHistory=nullptr,gEvents=nullptr,gDetails=nullptr,gStatus=nullptr;
+HWND gInstalledLabel=nullptr,gHistoryLabel=nullptr,gEventsLabel=nullptr,gDetailsLabel=nullptr,gSafetyBanner=nullptr;
 HWND gSnapshot=nullptr,gExport=nullptr,gStop=nullptr;
+HBRUSH gWindowBrush=nullptr,gPanelBrush=nullptr,gBannerBrush=nullptr;
+constexpr COLORREF kWindowBg=RGB(246,248,251);
+constexpr COLORREF kPanelBg=RGB(255,255,255);
+constexpr COLORREF kText=RGB(28,35,45);
+constexpr COLORREF kMuted=RGB(90,101,116);
+constexpr COLORREF kBannerBg=RGB(235,245,255);
+constexpr COLORREF kBannerText=RGB(24,87,145);
 std::map<std::wstring,AppEntry> gApps;
 std::map<DWORD,ProcEntry> gProcs;
 std::vector<std::wstring> gInstalledIds;
 std::vector<std::string> gHistoryIds;
+std::string gSelectedId;
+int gSelectedPane=0; // 0=none, 1=installed, 2=history
 std::map<std::string,std::chrono::steady_clock::time_point> gRecentlyRemoved;
 json gState={{"schemaVersion",1},{"apps",json::object()}};
 std::ofstream gJsonl;
@@ -306,23 +317,61 @@ void RecordAppState(const AppEntry&e,bool installed,const char* eventType){
 void PopulateLists(){
   SendMessageW(gInstalled,LB_RESETCONTENT,0,0); SendMessageW(gHistory,LB_RESETCONTENT,0,0);
   gInstalledIds.clear();gHistoryIds.clear();
+
+  std::set<std::wstring> shownInstalled;
+  int installedSelection=-1;
   for(const auto&[id,e]:gApps){
     if(!IsTestableApplication(e))continue;
-    std::wstring row=e.name+(e.version.empty()?L"":L"  ["+e.version+L"]")+L"  ("+e.scope+L")";
+    const std::wstring visibleKey=Lower(e.name+L"|"+e.key);
+    if(!shownInstalled.insert(visibleKey).second)continue;
+    std::wstring row=e.name+(e.version.empty()?L"":L"  ["+e.version+L"]");
+    const int index=(int)gInstalledIds.size();
     SendMessageW(gInstalled,LB_ADDSTRING,0,(LPARAM)row.c_str());
     gInstalledIds.push_back(id);
+    if(gSelectedPane==1&&Narrow(id)==gSelectedId)installedSelection=index;
   }
-  std::vector<std::pair<std::wstring,std::string>> hist;
+
+  std::vector<std::tuple<std::wstring,std::string,std::wstring>> hist;
+  std::set<std::wstring> shownHistory;
   for(auto it=gState["apps"].begin();it!=gState["apps"].end();++it){
     const auto&s=it.value();
     if(s.value("currentlyInstalled",false)||!s.value("testable",false))continue;
+
+    const std::string removedAt=s.value("lastUninstalledAt",std::string());
+    const std::string removalStatus=s.value("uninstallObservationStatus",std::string());
+    if(removedAt.empty()&&removalStatus.empty())continue;
+
     const auto display=Widen(s.value("displayName",std::string()));
+    const auto registryKey=Widen(s.value("registryKey",std::string()));
     if(display.empty())continue;
+    const std::wstring visibleKey=Lower(display+L"|"+registryKey);
+    if(!shownHistory.insert(visibleKey).second)continue;
+
     std::wstring row=display+L"  ["+Widen(s.value("version",std::string()))+L"]  removed";
-    hist.push_back({row,it.key()});
+    hist.push_back({row,it.key(),visibleKey});
   }
-  std::sort(hist.begin(),hist.end(),[](const auto&a,const auto&b){return a.first<b.first;});
-  for(auto&item:hist){SendMessageW(gHistory,LB_ADDSTRING,0,(LPARAM)item.first.c_str());gHistoryIds.push_back(item.second);}
+  std::sort(hist.begin(),hist.end(),[](const auto&a,const auto&b){return std::get<0>(a)<std::get<0>(b);});
+
+  int historySelection=-1;
+  for(auto&item:hist){
+    const int index=(int)gHistoryIds.size();
+    SendMessageW(gHistory,LB_ADDSTRING,0,(LPARAM)std::get<0>(item).c_str());
+    gHistoryIds.push_back(std::get<1>(item));
+    if(gSelectedPane==2&&std::get<1>(item)==gSelectedId)historySelection=index;
+  }
+
+  if(installedSelection>=0)SendMessageW(gInstalled,LB_SETCURSEL,installedSelection,0);
+  if(historySelection>=0)SendMessageW(gHistory,LB_SETCURSEL,historySelection,0);
+
+  if(gSelectedPane==1&&installedSelection<0&&!gSelectedId.empty()){
+    for(size_t i=0;i<gHistoryIds.size();++i){
+      if(gHistoryIds[i]==gSelectedId){
+        gSelectedPane=2;
+        SendMessageW(gHistory,LB_SETCURSEL,(WPARAM)i,0);
+        break;
+      }
+    }
+  }
 }
 void ShowInstalledDetails(size_t index){
   if(index>=gInstalledIds.size())return;
@@ -446,32 +495,99 @@ void Tick(bool manual){
     }
   }
   for(const auto&[pid,p]:gProcs)if(procs.find(pid)==procs.end())AppendLog(L"PROCESS - "+std::to_wstring(pid)+L" "+p.name,{{"timestamp",NowIso()},{"type","process_exited"},{"pid",pid},{"name",Narrow(p.name)},{"path",Narrow(p.path)},{"commandLine",Narrow(p.commandLine)}});
-  gProcs=std::move(procs); PopulateLists();RefreshDetails();
-  std::wstringstream st;st<<L"Installed / available to test: "<<SendMessageW(gInstalled,LB_GETCOUNT,0,0)<<L"   History: "<<SendMessageW(gHistory,LB_GETCOUNT,0,0)<<L"   Observed registry entries: "<<gApps.size()<<L"   Tracking phase: "<<gOpt.phase;
+  gProcs=std::move(procs);
+  PopulateLists();
+
+  bool restored=false;
+  if(gSelectedPane==1&&!gSelectedId.empty()){
+    for(size_t i=0;i<gInstalledIds.size();++i){
+      if(Narrow(gInstalledIds[i])==gSelectedId){ShowInstalledDetails(i);restored=true;break;}
+    }
+  } else if(gSelectedPane==2&&!gSelectedId.empty()){
+    for(size_t i=0;i<gHistoryIds.size();++i){
+      if(gHistoryIds[i]==gSelectedId){ShowHistoryDetails(i);restored=true;break;}
+    }
+  }
+  if(!restored)RefreshDetails();
+
+  std::wstringstream st;st<<L"Installed: "<<SendMessageW(gInstalled,LB_GETCOUNT,0,0)<<L"   Confirmed removals: "<<SendMessageW(gHistory,LB_GETCOUNT,0,0)<<L"   Observed identities: "<<gApps.size()<<L"   Phase: "<<gOpt.phase;
   if(manual)st<<L"   Snapshot saved";SetWindowTextW(gStatus,st.str().c_str());
 }
 void ExportEvidence(){
   json installed=json::array();for(const auto&[_,e]:gApps)installed.push_back(AppJson(e));
-  json out={{"schemaVersion",1},{"observerVersion","0.1.2"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
+  json out={{"schemaVersion",1},{"observerVersion","0.1.3"},{"jobId",Narrow(gOpt.jobId)},{"application",Narrow(gOpt.application)},{"phase",Narrow(gOpt.phase)},{"exportedAt",NowIso()},{"installed",installed},{"state",gState}};
   std::ofstream f(gOpt.root/L"jobs"/gOpt.jobId/L"summary.json",std::ios::binary|std::ios::trunc);f<<out.dump(2);
 }
 void Layout(HWND w){
-  RECT r{};GetClientRect(w,&r);int W=r.right,H=r.bottom,m=10,head=70,btn=30,status=24,gap=8,listsH=210,detailH=165;
-  MoveWindow(gHeader,m,m,W-2*m,head,TRUE);int y=m+head+gap;int half=(W-3*m)/2;MoveWindow(gInstalled,m,y,half,listsH,TRUE);MoveWindow(gHistory,m*2+half,y,half,listsH,TRUE);
-  y+=listsH+gap;int eventH=H-y-detailH-btn-status-gap*3-m;MoveWindow(gEvents,m,y,W-2*m,std::max(120,eventH),TRUE);y+=std::max(120,eventH)+gap;
-  MoveWindow(gDetails,m,y,W-2*m,detailH,TRUE);y+=detailH+gap;MoveWindow(gSnapshot,m,y,150,btn,TRUE);MoveWindow(gExport,m+158,y,150,btn,TRUE);MoveWindow(gStop,W-m-150,y,150,btn,TRUE);
-  MoveWindow(gStatus,m,y+btn+2,W-2*m,status,TRUE);
+  RECT r{};GetClientRect(w,&r);
+  const int W=r.right,H=r.bottom,m=16,gap=10;
+  const int head=62,bannerH=34,labelH=24,listsH=190,detailH=176,btn=34,status=24;
+
+  MoveWindow(gHeader,m,m,W-2*m,head,TRUE);
+  int y=m+head+8;
+  MoveWindow(gSafetyBanner,m,y,W-2*m,bannerH,TRUE);
+  y+=bannerH+12;
+
+  const int half=(W-3*m)/2;
+  MoveWindow(gInstalledLabel,m,y,half,labelH,TRUE);
+  MoveWindow(gHistoryLabel,m*2+half,y,half,labelH,TRUE);
+  y+=labelH+4;
+  MoveWindow(gInstalled,m,y,half,listsH,TRUE);
+  MoveWindow(gHistory,m*2+half,y,half,listsH,TRUE);
+  y+=listsH+12;
+
+  MoveWindow(gEventsLabel,m,y,W-2*m,labelH,TRUE);
+  y+=labelH+4;
+  const int eventH=std::max(105,H-y-detailH-labelH-btn-status-gap*4-m);
+  MoveWindow(gEvents,m,y,W-2*m,eventH,TRUE);
+  y+=eventH+12;
+
+  MoveWindow(gDetailsLabel,m,y,W-2*m,labelH,TRUE);
+  y+=labelH+4;
+  MoveWindow(gDetails,m,y,W-2*m,detailH,TRUE);
+  y+=detailH+12;
+
+  MoveWindow(gSnapshot,m,y,156,btn,TRUE);
+  MoveWindow(gExport,m+166,y,156,btn,TRUE);
+  MoveWindow(gStop,W-m-146,y,146,btn,TRUE);
+  MoveWindow(gStatus,m,y+btn+4,W-2*m,status,TRUE);
 }
 LRESULT CALLBACK Proc(HWND w,UINT msg,WPARAM wp,LPARAM lp){
   if(msg==WM_SIZE){Layout(w);return 0;}if(msg==WM_TIMER&&wp==kTimerId&&!gStopping){Tick(false);return 0;}
   if(msg==WM_COMMAND){
-    if(LOWORD(wp)==1101&&HIWORD(wp)==LBN_SELCHANGE){const LRESULT i=SendMessageW(gInstalled,LB_GETCURSEL,0,0);if(i!=LB_ERR)ShowInstalledDetails((size_t)i);return 0;}
-    if(LOWORD(wp)==1102&&HIWORD(wp)==LBN_SELCHANGE){const LRESULT i=SendMessageW(gHistory,LB_GETCURSEL,0,0);if(i!=LB_ERR)ShowHistoryDetails((size_t)i);return 0;}
+    if(LOWORD(wp)==1101&&HIWORD(wp)==LBN_SELCHANGE){
+      const LRESULT i=SendMessageW(gInstalled,LB_GETCURSEL,0,0);
+      if(i!=LB_ERR&&(size_t)i<gInstalledIds.size()){
+        gSelectedPane=1;gSelectedId=Narrow(gInstalledIds[(size_t)i]);
+        SendMessageW(gHistory,LB_SETCURSEL,(WPARAM)-1,0);
+        ShowInstalledDetails((size_t)i);
+      }
+      return 0;
+    }
+    if(LOWORD(wp)==1102&&HIWORD(wp)==LBN_SELCHANGE){
+      const LRESULT i=SendMessageW(gHistory,LB_GETCURSEL,0,0);
+      if(i!=LB_ERR&&(size_t)i<gHistoryIds.size()){
+        gSelectedPane=2;gSelectedId=gHistoryIds[(size_t)i];
+        SendMessageW(gInstalled,LB_SETCURSEL,(WPARAM)-1,0);
+        ShowHistoryDetails((size_t)i);
+      }
+      return 0;
+    }
     if(LOWORD(wp)==1001){Tick(true);ExportEvidence();return 0;}
     if(LOWORD(wp)==1002){ExportEvidence();AppendLog(L"Evidence exported.",{{"timestamp",NowIso()},{"type","export"}});return 0;}
     if(LOWORD(wp)==1003){SendMessageW(w,WM_CLOSE,0,0);return 0;}
   }
-  if(msg==WM_CLOSE){gStopping=true;KillTimer(w,kTimerId);Tick(false);ExportEvidence();DestroyWindow(w);return 0;}if(msg==WM_DESTROY){PostQuitMessage(0);return 0;}return DefWindowProcW(w,msg,wp,lp);
+  if(msg==WM_CTLCOLORSTATIC){
+    HDC dc=(HDC)wp;HWND ctrl=(HWND)lp;SetTextColor(dc,kText);SetBkMode(dc,TRANSPARENT);
+    if(ctrl==gSafetyBanner){SetTextColor(dc,kBannerText);SetBkMode(dc,OPAQUE);SetBkColor(dc,kBannerBg);return (LRESULT)gBannerBrush;}
+    return (LRESULT)gWindowBrush;
+  }
+  if(msg==WM_CTLCOLOREDIT||msg==WM_CTLCOLORLISTBOX){
+    HDC dc=(HDC)wp;SetTextColor(dc,kText);SetBkColor(dc,kPanelBg);return (LRESULT)gPanelBrush;
+  }
+  if(msg==WM_CLOSE){gStopping=true;KillTimer(w,kTimerId);Tick(false);ExportEvidence();DestroyWindow(w);return 0;}
+  if(msg==WM_DESTROY){PostQuitMessage(0);return 0;}
+  return DefWindowProcW(w,msg,wp,lp);
 }
 HFONT Font(int sz,bool bold=false,const wchar_t*face=L"Segoe UI"){return CreateFontW(-sz,0,0,0,bold?FW_SEMIBOLD:FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,face);}
 }
@@ -486,17 +602,52 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,PWSTR,int show){
   }
   gOpt=ParseOptions();std::error_code ec;std::filesystem::create_directories(gOpt.root/L"jobs"/gOpt.jobId,ec);LoadState();BackfillStateRecipes();
   gLog.open(gOpt.root/L"jobs"/gOpt.jobId/L"observer.log",std::ios::app);gJsonl.open(gOpt.root/L"jobs"/gOpt.jobId/L"events.jsonl",std::ios::binary|std::ios::app);
-  WNDCLASSEXW wc{};wc.cbSize=sizeof(wc);wc.hInstance=h;wc.lpfnWndProc=Proc;wc.lpszClassName=kClassName;wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hIcon=LoadIcon(nullptr,IDI_APPLICATION);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);RegisterClassExW(&wc);
-  std::wstring title=L"Hi5Central Qualification Observer - "+gOpt.application;HWND w=CreateWindowExW(0,kClassName,title.c_str(),WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,1180,860,nullptr,nullptr,h,nullptr);if(!w)return 2;
-  HFONT headF=Font(18,true),uiF=Font(15),mono=Font(14,false,L"Consolas");std::wstringstream head;head<<L"Hi5Central Qualification Observer\r\nApplication: "<<gOpt.application<<L"    Phase: "<<gOpt.phase<<L"    Job: "<<gOpt.jobId<<L"\r\nInstalled / available to test (left)                         History / removed (right)";
-  gHeader=CreateWindowExW(0,L"STATIC",head.str().c_str(),WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,0,0,w,nullptr,h,nullptr);SendMessageW(gHeader,WM_SETFONT,(WPARAM)headF,TRUE);
-  gInstalled=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,0,0,0,0,w,(HMENU)1101,h,nullptr);SendMessageW(gInstalled,WM_SETFONT,(WPARAM)uiF,TRUE);
-  gHistory=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,0,0,0,0,w,(HMENU)1102,h,nullptr);SendMessageW(gHistory,WM_SETFONT,(WPARAM)uiF,TRUE);
-  gEvents=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,0,0,0,0,w,nullptr,h,nullptr);SendMessageW(gEvents,WM_SETFONT,(WPARAM)mono,TRUE);
-  gDetails=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,0,0,0,0,w,nullptr,h,nullptr);SendMessageW(gDetails,WM_SETFONT,(WPARAM)mono,TRUE);
-  gSnapshot=CreateWindowExW(0,L"BUTTON",L"Capture snapshot",WS_CHILD|WS_VISIBLE,0,0,0,0,w,(HMENU)1001,h,nullptr);gExport=CreateWindowExW(0,L"BUTTON",L"Export evidence",WS_CHILD|WS_VISIBLE,0,0,0,0,w,(HMENU)1002,h,nullptr);gStop=CreateWindowExW(0,L"BUTTON",L"Stop observer",WS_CHILD|WS_VISIBLE,0,0,0,0,w,(HMENU)1003,h,nullptr);
+
+  gWindowBrush=CreateSolidBrush(kWindowBg);
+  gPanelBrush=CreateSolidBrush(kPanelBg);
+  gBannerBrush=CreateSolidBrush(kBannerBg);
+
+  WNDCLASSEXW wc{};wc.cbSize=sizeof(wc);wc.hInstance=h;wc.lpfnWndProc=Proc;wc.lpszClassName=kClassName;wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hIcon=LoadIcon(nullptr,IDI_APPLICATION);wc.hbrBackground=gWindowBrush;RegisterClassExW(&wc);
+  std::wstring title=L"Hi5Central Qualification Observer - "+gOpt.application;
+  HWND w=CreateWindowExW(0,kClassName,title.c_str(),WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,1220,900,nullptr,nullptr,h,nullptr);if(!w)return 2;
+
+  HFONT titleF=Font(21,true,L"Segoe UI Variable Display");
+  HFONT sectionF=Font(14,true,L"Segoe UI Variable Text");
+  HFONT uiF=Font(15,false,L"Segoe UI Variable Text");
+  HFONT smallF=Font(13,false,L"Segoe UI Variable Text");
+  HFONT mono=Font(14,false,L"Cascadia Mono");
+
+  std::wstringstream head;
+  head<<L"Hi5Central Qualification Observer\r\n"<<gOpt.application<<L"   •   "<<gOpt.phase<<L"   •   "<<gOpt.jobId;
+  gHeader=CreateWindowExW(0,L"STATIC",head.str().c_str(),WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,0,0,w,nullptr,h,nullptr);
+  SendMessageW(gHeader,WM_SETFONT,(WPARAM)titleF,TRUE);
+
+  gSafetyBanner=CreateWindowExW(0,L"STATIC",L"  OBSERVER MODE   •   Selecting an application is read-only. This window never uninstalls software on selection.",WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,0,0,0,0,w,(HMENU)1205,h,nullptr);
+  SendMessageW(gSafetyBanner,WM_SETFONT,(WPARAM)smallF,TRUE);
+
+  gInstalledLabel=CreateWindowExW(0,L"STATIC",L"INSTALLED / AVAILABLE TO TEST",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,0,0,w,(HMENU)1201,h,nullptr);
+  gHistoryLabel=CreateWindowExW(0,L"STATIC",L"CONFIRMED REMOVAL HISTORY",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,0,0,w,(HMENU)1202,h,nullptr);
+  gEventsLabel=CreateWindowExW(0,L"STATIC",L"LIVE ACTIVITY",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,0,0,w,(HMENU)1203,h,nullptr);
+  gDetailsLabel=CreateWindowExW(0,L"STATIC",L"APPLICATION DETAILS / LEARNED RECIPE",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,0,0,w,(HMENU)1204,h,nullptr);
+  for(HWND label:{gInstalledLabel,gHistoryLabel,gEventsLabel,gDetailsLabel})SendMessageW(label,WM_SETFONT,(WPARAM)sectionF,TRUE);
+
+  gInstalled=CreateWindowExW(WS_EX_STATICEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,0,0,0,0,w,(HMENU)1101,h,nullptr);
+  gHistory=CreateWindowExW(WS_EX_STATICEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,0,0,0,0,w,(HMENU)1102,h,nullptr);
+  SendMessageW(gInstalled,WM_SETFONT,(WPARAM)uiF,TRUE);SendMessageW(gHistory,WM_SETFONT,(WPARAM)uiF,TRUE);
+
+  gEvents=CreateWindowExW(WS_EX_STATICEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,0,0,0,0,w,nullptr,h,nullptr);
+  gDetails=CreateWindowExW(WS_EX_STATICEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,0,0,0,0,w,nullptr,h,nullptr);
+  SendMessageW(gEvents,WM_SETFONT,(WPARAM)mono,TRUE);SendMessageW(gDetails,WM_SETFONT,(WPARAM)mono,TRUE);
+  SendMessageW(gEvents,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(10,10));
+  SendMessageW(gDetails,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(10,10));
+
+  gSnapshot=CreateWindowExW(0,L"BUTTON",L"Capture snapshot",WS_CHILD|WS_VISIBLE|BS_FLAT,0,0,0,0,w,(HMENU)1001,h,nullptr);
+  gExport=CreateWindowExW(0,L"BUTTON",L"Export evidence",WS_CHILD|WS_VISIBLE|BS_FLAT,0,0,0,0,w,(HMENU)1002,h,nullptr);
+  gStop=CreateWindowExW(0,L"BUTTON",L"Stop observer",WS_CHILD|WS_VISIBLE|BS_FLAT,0,0,0,0,w,(HMENU)1003,h,nullptr);
   SendMessageW(gSnapshot,WM_SETFONT,(WPARAM)uiF,TRUE);SendMessageW(gExport,WM_SETFONT,(WPARAM)uiF,TRUE);SendMessageW(gStop,WM_SETFONT,(WPARAM)uiF,TRUE);
-  gStatus=CreateWindowExW(0,L"STATIC",L"Starting...",WS_CHILD|WS_VISIBLE,0,0,0,0,w,nullptr,h,nullptr);SendMessageW(gStatus,WM_SETFONT,(WPARAM)uiF,TRUE);
+
+  gStatus=CreateWindowExW(0,L"STATIC",L"Starting observer...",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,0,0,w,nullptr,h,nullptr);
+  SendMessageW(gStatus,WM_SETFONT,(WPARAM)smallF,TRUE);
   Layout(w);
   for(auto it=gState["apps"].begin();it!=gState["apps"].end();++it)if(it.value().is_object())it.value()["currentlyInstalled"]=false;
   gApps=CaptureApps();for(const auto&[_,e]:gApps){
