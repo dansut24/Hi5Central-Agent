@@ -1244,9 +1244,11 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         const int maxW = std::max(0, std::min(7680, msg.value("max_width", 0)));
                         const int maxH = std::max(0, std::min(4320, msg.value("max_height", 0)));
                         const int targetFps = std::max(0, std::min(60, msg.value("target_fps", 0)));
+                        const int targetBitrateKbps = std::max(0, std::min(24000, msg.value("target_bitrate_kbps", 0)));
                         m_viewerMaxWidth.store(maxW, std::memory_order_release);
                         m_viewerMaxHeight.store(maxH, std::memory_order_release);
                         m_viewerTargetFps.store(targetFps, std::memory_order_release);
+                        m_viewerTargetBitrateKbps.store(targetBitrateKbps, std::memory_order_release);
                         m_forceKeyframe = true;
                         if (auto replyDc = weakDc.lock()) {
                             try {
@@ -1255,13 +1257,15 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                                     {"status", "accepted"},
                                     {"max_width", maxW},
                                     {"max_height", maxH},
-                                    {"target_fps", targetFps}
+                                    {"target_fps", targetFps},
+                                    {"target_bitrate_kbps", targetBitrateKbps}
                                 }.dump());
                             } catch (...) {}
                         }
                         LogInfo("[video] viewer stream profile session=" + m_sessionId +
                             " max=" + std::to_string(maxW) + "x" + std::to_string(maxH) +
-                            " fps=" + std::to_string(targetFps));
+                            " fps=" + std::to_string(targetFps) +
+                            " bitrate_kbps=" + std::to_string(targetBitrateKbps));
                         return;
                     }
 
@@ -2685,6 +2689,10 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         m_externalHintSecure.load(),
         sessionMaxFps,
         std::max(250, m_bitrateKbps));
+    const int viewerTargetBitrateKbps = m_viewerTargetBitrateKbps.load(std::memory_order_acquire);
+    if (viewerTargetBitrateKbps > 0) {
+        profile.bitrateKbps = std::max(250, std::min(profile.bitrateKbps, viewerTargetBitrateKbps));
+    }
 
     const int viewerMaxW = m_viewerMaxWidth.load(std::memory_order_acquire);
     const int viewerMaxH = m_viewerMaxHeight.load(std::memory_order_acquire);

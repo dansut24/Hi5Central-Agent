@@ -282,6 +282,7 @@ private:
     std::atomic<int> m_viewerMaxWidth{ 0 };
     std::atomic<int> m_viewerMaxHeight{ 0 };
     std::atomic<int> m_viewerTargetFps{ 0 };
+    std::atomic<int> m_viewerTargetBitrateKbps{ 0 };
 
     int m_externalConfiguredFps = 0;
     int m_externalConfiguredBitrateKbps = 0;

@@ -2604,6 +2604,11 @@ LogI(
                         return;
                     }
 
+                    if (type == "remote_file_upload_cancel") {
+                        HandleRemoteFileUploadCancel(sessionId, msg);
+                        return;
+                    }
+
                     if (type == "remote_file_delete_request") {
                         HandleRemoteFileDeleteRequest(sessionId, msg);
                         return;
@@ -7663,11 +7668,42 @@ exit 1
                 HandleRemoteFileListRequest(sessionId, target.parent_path().string());
             }
 
+            void HandleRemoteFileUploadCancel(const std::string& sessionId, const json& msg) {
+                const std::string transferId = msg.value("transfer_id", std::string());
+                const std::string path = msg.value("path", std::string());
+                if (transferId.empty()) return;
+                std::filesystem::path target;
+                {
+                    std::lock_guard<std::mutex> lock(fileUploadsMu_);
+                    auto it = fileUploads_.find(FileUploadKey(sessionId, transferId));
+                    if (it == fileUploads_.end() || !it->second) return;
+                    target = it->second->target;
+                    if (it->second->stream) it->second->stream->close();
+                    fileUploads_.erase(it);
+                }
+                std::error_code ec;
+                if (!target.empty()) std::filesystem::remove(target, ec);
+                SendFilePayloadToViewer(sessionId, json{{"type","remote_file_upload_cancelled"},{"transfer_id",transferId},{"path",path}});
+            }
+
             void CancelFileUploadsForSession(const std::string& sessionId) {
-                std::lock_guard<std::mutex> lock(fileUploadsMu_);
-                const std::string prefix = sessionId + "|";
-                for (auto it = fileUploads_.begin(); it != fileUploads_.end(); ) {
-                    if (it->first.rfind(prefix, 0) == 0) it = fileUploads_.erase(it); else ++it;
+                std::vector<std::filesystem::path> partials;
+                {
+                    std::lock_guard<std::mutex> lock(fileUploadsMu_);
+                    const std::string prefix = sessionId + "|";
+                    for (auto it = fileUploads_.begin(); it != fileUploads_.end(); ) {
+                        if (it->first.rfind(prefix, 0) == 0) {
+                            if (it->second) {
+                                if (it->second->stream) it->second->stream->close();
+                                if (!it->second->target.empty()) partials.push_back(it->second->target);
+                            }
+                            it = fileUploads_.erase(it);
+                        } else ++it;
+                    }
+                }
+                for (const auto& target : partials) {
+                    std::error_code ec;
+                    std::filesystem::remove(target, ec);
                 }
             }
 
