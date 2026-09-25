@@ -68,6 +68,10 @@ jobs:
         shell: pwsh
         run: ./ci/Verify-RemoteViewerContracts.ps1
 
+      - name: Verify Device Details inventory and live-tool contracts
+        shell: pwsh
+        run: ./ci/Verify-DeviceDetailsContracts.ps1
+
       - name: Ensure Inno Setup is available
         shell: pwsh
         run: |

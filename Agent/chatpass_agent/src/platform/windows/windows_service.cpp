@@ -20,6 +20,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
 #include <wincrypt.h>
 #include <dpapi.h>
 #include <psapi.h>
@@ -30,6 +32,7 @@
 #include <map>
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 #include <algorithm>
 #include <cctype>
@@ -590,6 +593,43 @@ namespace hi5 {
         static std::int64_t NowUnixMs() {
             using namespace std::chrono;
             return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+        }
+
+        static json BuildNetworkStatsResponse(const std::string& requestId) {
+            json adapters = json::array();
+            PMIB_IF_TABLE2 table = nullptr;
+            if (GetIfTable2(&table) == NO_ERROR && table) {
+                for (ULONG i = 0; i < table->NumEntries; ++i) {
+                    const MIB_IF_ROW2& row = table->Table[i];
+                    if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+                    const auto saneSpeed = [](std::uint64_t value) -> std::uint64_t {
+                        return value > 1000000000000ULL ? 0ULL : value;
+                    };
+                    adapters.push_back({
+                        {"name", WideToUtf8(row.Alias)},
+                        {"description", WideToUtf8(row.Description)},
+                        {"interface_index", row.InterfaceIndex},
+                        {"interface_luid", std::to_string(row.InterfaceLuid.Value)},
+                        {"status", row.OperStatus == IfOperStatusUp ? "Up" : "Down"},
+                        {"receive_bytes", static_cast<std::uint64_t>(row.InOctets)},
+                        {"send_bytes", static_cast<std::uint64_t>(row.OutOctets)},
+                        {"receive_link_speed_bps", saneSpeed(static_cast<std::uint64_t>(row.ReceiveLinkSpeed))},
+                        {"transmit_link_speed_bps", saneSpeed(static_cast<std::uint64_t>(row.TransmitLinkSpeed))},
+                        {"receive_errors", static_cast<std::uint64_t>(row.InErrors)},
+                        {"send_errors", static_cast<std::uint64_t>(row.OutErrors)},
+                        {"receive_discards", static_cast<std::uint64_t>(row.InDiscards)},
+                        {"send_discards", static_cast<std::uint64_t>(row.OutDiscards)}
+                    });
+                }
+                FreeMibTable(table);
+            }
+            return {
+                {"type", "network_stats_response"},
+                {"request_id", requestId},
+                {"unix_ms", NowUnixMs()},
+                {"collected_at", NowIsoUtc()},
+                {"adapters", adapters}
+            };
         }
 
         static std::string NowIsoUtc() {
@@ -2484,7 +2524,14 @@ LogI(
                         return;
                     }
 
-                if (type == "refresh_inventory" || type == "inventory_refresh") {
+                    if (type == "network_stats_request") {
+                        const std::string requestId = msg.value("request_id", msg.value("requestId", std::string()));
+                        if (signaling_) signaling_->send(BuildNetworkStatsResponse(requestId).dump());
+                        FlushBridgeOutgoing();
+                        return;
+                    }
+
+                    if (type == "refresh_inventory" || type == "inventory_refresh") {
                         LogI("refresh_inventory requested by control server");
                         SendInventorySnapshotSafe(ident);
                         FlushBridgeOutgoing();

@@ -559,6 +559,8 @@ json NetworkInfo() {
         if (a->IfType == IF_TYPE_IEEE80211) connectionType = "Wi-Fi";
         else if (a->IfType == IF_TYPE_ETHERNET_CSMACD) connectionType = "Ethernet";
 
+        const std::uint64_t rawLinkSpeed = static_cast<std::uint64_t>(a->TransmitLinkSpeed);
+        const std::uint64_t saneLinkSpeed = rawLinkSpeed > 1000000000000ULL ? 0ULL : rawLinkSpeed;
         list.push_back({
             {"name", WideZToUtf8(a->FriendlyName)},
             {"adapter", WideZToUtf8(a->FriendlyName)},
@@ -572,7 +574,7 @@ json NetworkInfo() {
             {"ipv6", ipv6},
             {"dns", dns},
             {"gateway", gateway},
-            {"speed_bps", static_cast<std::uint64_t>(a->TransmitLinkSpeed)}
+            {"speed_bps", saneLinkSpeed}
         });
     }
 
@@ -640,6 +642,57 @@ if (Get-Command Get-LocalGroupMember -ErrorAction SilentlyContinue) {
 }
 [pscustomobject]@{ count = @($items).Count; members = @($items) } | ConvertTo-Json -Depth 5 -Compress
 )PS", { {"count", json(nullptr)}, {"members", json::array()} });
+}
+
+json LocalUsers() {
+    return RunPowerShellJson(R"PS(
+$ErrorActionPreference = 'SilentlyContinue'
+$admins = @{}
+if (Get-Command Get-LocalGroupMember -ErrorAction SilentlyContinue) {
+  Get-LocalGroupMember -Group 'Administrators' | ForEach-Object {
+    $n = [string]$_.Name
+    if ($n) {
+      $admins[$n.ToLowerInvariant()] = $true
+      $leaf = ($n -split '\\')[-1]
+      if ($leaf) { $admins[$leaf.ToLowerInvariant()] = $true }
+    }
+  }
+}
+$users = @()
+if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+  $users = @(Get-LocalUser | ForEach-Object {
+    $name = [string]$_.Name
+    $sid = ''
+    try { $sid = [string]$_.SID.Value } catch { try { $sid = [string]$_.SID } catch {} }
+    [pscustomobject]@{
+      name = $name
+      full_name = [string]$_.FullName
+      enabled = [bool]$_.Enabled
+      description = [string]$_.Description
+      sid = $sid
+      principal_source = [string]$_.PrincipalSource
+      is_admin = [bool]($admins.ContainsKey($name.ToLowerInvariant()))
+      last_logon = $(if ($_.LastLogon) { $_.LastLogon.ToUniversalTime().ToString('o') } else { $null })
+      password_last_set = $(if ($_.PasswordLastSet) { $_.PasswordLastSet.ToUniversalTime().ToString('o') } else { $null })
+      password_expires = $(if ($_.PasswordExpires) { $_.PasswordExpires.ToUniversalTime().ToString('o') } else { $null })
+      account_expires = $(if ($_.AccountExpires) { $_.AccountExpires.ToUniversalTime().ToString('o') } else { $null })
+      user_may_change_password = $(try { [bool]$_.UserMayChangePassword } catch { $null })
+      password_required = $(try { [bool]$_.PasswordRequired } catch { $null })
+    }
+  })
+} else {
+  $users = @(Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" | ForEach-Object {
+    [pscustomobject]@{
+      name=[string]$_.Name; full_name=[string]$_.FullName; enabled=(-not [bool]$_.Disabled);
+      description=[string]$_.Description; sid=[string]$_.SID; principal_source='Local';
+      is_admin=[bool]($admins.ContainsKey(([string]$_.Name).ToLowerInvariant()));
+      last_logon=$null; password_last_set=$null; password_expires=$null; account_expires=$null;
+      user_may_change_password=$null; password_required=[bool]$_.PasswordRequired
+    }
+  })
+}
+[pscustomobject]@{ count=@($users).Count; users=@($users) } | ConvertTo-Json -Depth 6 -Compress
+)PS", { {"count", 0}, {"users", json::array()} });
 }
 
 json TpmInfo() {
@@ -1066,6 +1119,7 @@ json BuildInventorySnapshot(const AgentIdentity& identity) {
     json bitlocker = BitLockerVolumes();
     json tpm = TpmInfo();
     json localAdmins = LocalAdmins();
+    json localUsers = LocalUsers();
     json os = OsInfo();
     json hardware = HardwareInfo();
     json cpu = CpuInfo();
@@ -1108,6 +1162,7 @@ json BuildInventorySnapshot(const AgentIdentity& identity) {
         {"security", security},
         {"network", network},
         {"sessions", sessions},
+        {"local_users", localUsers},
         {"displays", displays},
         {"gpu", gpu},
         {"battery", battery},
