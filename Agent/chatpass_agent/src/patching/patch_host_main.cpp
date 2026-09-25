@@ -878,6 +878,7 @@ json VerifyUninstallRegistry(const json& verification, const std::string& target
         const std::wstring hive(hiveName, hiveChars);
         const std::string hiveUtf8 = WideToUtf8(hive);
         if (hiveUtf8.rfind("S-1-", 0) != 0 || hiveUtf8.find("_Classes") != std::string::npos) continue;
+        if (hiveUtf8 == "S-1-5-18" || hiveUtf8 == "S-1-5-19" || hiveUtf8 == "S-1-5-20") continue;
 
         const std::string scope = "user:" + hiveUtf8;
         AppendUninstallRegistryMatches(

@@ -784,17 +784,28 @@ DWORD RegDwordFromOpenedKey(HKEY key, const wchar_t* name, DWORD fallback = 0) {
 }
 
 json InstalledSoftwareInventory() {
-    struct RootKey { HKEY root; const wchar_t* path; const char* scope; REGSAM view; };
-    const RootKey roots[] = {
-        {HKEY_LOCAL_MACHINE, LR"(SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)", "machine64", KEY_WOW64_64KEY},
-        {HKEY_LOCAL_MACHINE, LR"(SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall)", "machine32", KEY_WOW64_64KEY},
-        {HKEY_CURRENT_USER, LR"(SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)", "user", 0}
+    auto enablePrivilege = [](const wchar_t* privilegeName) {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) return false;
+        LUID luid{};
+        if (!LookupPrivilegeValueW(nullptr, privilegeName, &luid)) {
+            CloseHandle(token);
+            return false;
+        }
+        TOKEN_PRIVILEGES tp{};
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        const BOOL ok = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        const DWORD err = GetLastError();
+        CloseHandle(token);
+        return ok && err == ERROR_SUCCESS;
     };
 
-    json items = json::array();
-    for (const auto& rk : roots) {
+    auto collectRoot = [](HKEY root, const std::wstring& path, const std::string& scope,
+        const std::string& userSid, const std::string& userProfile, REGSAM view, json& items) {
         HKEY rootKey = nullptr;
-        if (RegOpenKeyExW(rk.root, rk.path, 0, KEY_READ | rk.view, &rootKey) != ERROR_SUCCESS) continue;
+        if (RegOpenKeyExW(root, path.c_str(), 0, KEY_READ | view, &rootKey) != ERROR_SUCCESS) return;
 
         for (DWORD index = 0;; ++index) {
             wchar_t subName[512]{};
@@ -804,10 +815,10 @@ json InstalledSoftwareInventory() {
             if (rc != ERROR_SUCCESS) continue;
 
             HKEY appKey = nullptr;
-            if (RegOpenKeyExW(rootKey, subName, 0, KEY_READ | rk.view, &appKey) != ERROR_SUCCESS) continue;
+            if (RegOpenKeyExW(rootKey, subName, 0, KEY_READ | view, &appKey) != ERROR_SUCCESS) continue;
             const std::string name = RegStringFromOpenedKey(appKey, L"DisplayName");
             if (!name.empty() && RegDwordFromOpenedKey(appKey, L"SystemComponent", 0) == 0) {
-                items.push_back({
+                json item = {
                     {"name", name},
                     {"version", RegStringFromOpenedKey(appKey, L"DisplayVersion")},
                     {"publisher", RegStringFromOpenedKey(appKey, L"Publisher")},
@@ -816,17 +827,90 @@ json InstalledSoftwareInventory() {
                     {"uninstall_string", RegStringFromOpenedKey(appKey, L"UninstallString")},
                     {"quiet_uninstall_string", RegStringFromOpenedKey(appKey, L"QuietUninstallString")},
                     {"estimated_size_kb", RegDwordFromOpenedKey(appKey, L"EstimatedSize", 0)},
-                    {"scope", rk.scope},
+                    {"scope", scope},
                     {"registry_key", WideToUtf8(std::wstring(subName, subNameLen))}
-                });
+                };
+                if (!userSid.empty()) item["user_sid"] = userSid;
+                if (!userProfile.empty()) item["user_profile"] = userProfile;
+                items.push_back(std::move(item));
             }
             RegCloseKey(appKey);
         }
         RegCloseKey(rootKey);
+    };
+
+    json items = json::array();
+    collectRoot(HKEY_LOCAL_MACHINE,
+        LR"(SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)",
+        "machine64", "", "", KEY_WOW64_64KEY, items);
+    collectRoot(HKEY_LOCAL_MACHINE,
+        LR"(SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall)",
+        "machine32", "", "", KEY_WOW64_64KEY, items);
+
+    enablePrivilege(SE_BACKUP_NAME);
+    enablePrivilege(SE_RESTORE_NAME);
+
+    HKEY profileList = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        LR"(SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList)",
+        0, KEY_READ | KEY_WOW64_64KEY, &profileList) == ERROR_SUCCESS) {
+        for (DWORD index = 0;; ++index) {
+            wchar_t sidName[256]{};
+            DWORD sidLen = static_cast<DWORD>(sizeof(sidName) / sizeof(sidName[0]));
+            const LONG rc = RegEnumKeyExW(profileList, index, sidName, &sidLen, nullptr, nullptr, nullptr, nullptr);
+            if (rc == ERROR_NO_MORE_ITEMS) break;
+            if (rc != ERROR_SUCCESS) continue;
+
+            const std::wstring sid(sidName, sidLen);
+            if (sid.rfind(L"S-1-5-21-", 0) != 0 && sid.rfind(L"S-1-12-1-", 0) != 0) continue;
+
+            HKEY profileKey = nullptr;
+            if (RegOpenKeyExW(profileList, sid.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &profileKey) != ERROR_SUCCESS) continue;
+            std::string profileUtf8 = RegStringFromOpenedKey(profileKey, L"ProfileImagePath");
+            RegCloseKey(profileKey);
+
+            std::wstring profilePath = Utf8ToWide(profileUtf8);
+            if (!profilePath.empty()) {
+                wchar_t expanded[32768]{};
+                const DWORD n = ExpandEnvironmentStringsW(profilePath.c_str(), expanded,
+                    static_cast<DWORD>(sizeof(expanded) / sizeof(expanded[0])));
+                if (n > 0 && n < static_cast<DWORD>(sizeof(expanded) / sizeof(expanded[0]))) {
+                    profilePath.assign(expanded);
+                    profileUtf8 = WideToUtf8(profilePath);
+                }
+            }
+
+            const std::string sidUtf8 = WideToUtf8(sid);
+            const std::string scope = "user:" + sidUtf8;
+            HKEY loadedHive = nullptr;
+            if (RegOpenKeyExW(HKEY_USERS, sid.c_str(), 0, KEY_READ, &loadedHive) == ERROR_SUCCESS) {
+                RegCloseKey(loadedHive);
+                collectRoot(HKEY_USERS, sid + LR"(\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)",
+                    scope, sidUtf8, profileUtf8, 0, items);
+                continue;
+            }
+
+            if (profilePath.empty()) continue;
+            std::wstring ntUser = profilePath;
+            if (!ntUser.empty() && ntUser.back() != L'\\' && ntUser.back() != L'/') ntUser += L"\\";
+            ntUser += L"NTUSER.DAT";
+            if (GetFileAttributesW(ntUser.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+
+            const std::wstring mountName = L"Hi5CentralTemp_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(index);
+            if (RegLoadKeyW(HKEY_USERS, mountName.c_str(), ntUser.c_str()) == ERROR_SUCCESS) {
+                collectRoot(HKEY_USERS, mountName + LR"(\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)",
+                    scope, sidUtf8, profileUtf8, 0, items);
+                RegUnLoadKeyW(HKEY_USERS, mountName.c_str());
+            }
+        }
+        RegCloseKey(profileList);
     }
 
     std::sort(items.begin(), items.end(), [](const json& a, const json& b) {
-        return a.value("name", "") < b.value("name", "");
+        const std::string an = a.value("name", "");
+        const std::string bn = b.value("name", "");
+        if (an != bn) return an < bn;
+        return a.value("scope", "") < b.value("scope", "");
     });
 
     json recently = json::array();

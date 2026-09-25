@@ -6,12 +6,19 @@ function Require-Literal([string]$Text, [string]$Needle, [string]$Message) {
 
 $inventory = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
 $service = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
+$patchHost = Get-Content 'Agent/chatpass_agent/src/patching/patch_host_main.cpp' -Raw
 
 Require-Literal $inventory 'json LocalUsers()' 'Local-user inventory collector is missing.'
 Require-Literal $inventory '{"local_users", localUsers}' 'Inventory snapshot no longer publishes local_users.'
 Require-Literal $inventory 'Get-LocalGroupMember -Group ''Administrators''' 'Local administrator membership collection is missing.'
 Require-Literal $inventory 'is_admin' 'Local-user administrator annotation is missing.'
 Require-Literal $inventory 'saneLinkSpeed' 'Network inventory must suppress Windows unknown-speed sentinel values.'
+Require-Literal $inventory 'Microsoft\\Windows NT\\CurrentVersion\\ProfileList' 'Software inventory must enumerate real Windows user profiles instead of LocalSystem HKCU.'
+Require-Literal $inventory '"user:" + sidUtf8' 'Per-user software inventory must retain the owning user SID.'
+if ($inventory.Contains('HKEY_CURRENT_USER')) { throw 'Service software inventory must not treat LocalSystem HKCU/systemprofile as an end-user software source.' }
+Require-Literal $patchHost 'hiveUtf8 == "S-1-5-18"' 'Patch verification must reject LocalSystem uninstall registrations.'
+Require-Literal $patchHost 'hiveUtf8 == "S-1-5-19"' 'Patch verification must reject LocalService uninstall registrations.'
+Require-Literal $patchHost 'hiveUtf8 == "S-1-5-20"' 'Patch verification must reject NetworkService uninstall registrations.'
 
 Require-Literal $service 'BuildNetworkStatsResponse' 'Native live network statistics response is missing.'
 Require-Literal $service 'static std::string NowIsoUtc();' 'Network stats UTC helper must be declared before use.'
