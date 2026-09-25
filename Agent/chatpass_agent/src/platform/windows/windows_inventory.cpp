@@ -847,8 +847,8 @@ json InstalledSoftwareInventory() {
         LR"(SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall)",
         "machine32", "", "", KEY_WOW64_64KEY, items);
 
-    enablePrivilege(SE_BACKUP_NAME);
-    enablePrivilege(SE_RESTORE_NAME);
+    enablePrivilege(L"SeBackupPrivilege");
+    enablePrivilege(L"SeRestorePrivilege");
 
     HKEY profileList = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
