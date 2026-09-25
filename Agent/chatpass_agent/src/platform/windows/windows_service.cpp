@@ -4813,15 +4813,19 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
     $exitCode = $null
     $timedOut = $false
     $output = ''
+    $isMsi = [string]$candidate.strategy -like 'msi_*'
     try {
         $quotedCmd = ([char]34) + $cmdFile + ([char]34)
         $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d','/s','/c',$quotedCmd) -WindowStyle Hidden -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
         $deadline = (Get-Date).AddSeconds(180)
         while (-not $process.HasExited -and (Get-Date) -lt $deadline) {
-            if (-not (Test-Hi5StillInstalled)) { break }
+            # MSI registration can disappear temporarily before InstallFinalize and
+            # then return during rollback. Never terminate an in-flight MSI merely
+            # because inventory no longer sees the product mid-transaction.
+            if (-not $isMsi -and -not (Test-Hi5StillInstalled)) { break }
             Start-Sleep -Milliseconds 1000
         }
-        if (-not (Test-Hi5StillInstalled)) {
+        if (-not $isMsi -and -not (Test-Hi5StillInstalled)) {
             try { if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } } catch {}
             $exitCode = 0
         } elseif (-not $process.HasExited) {
@@ -4841,14 +4845,20 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
         if ([string]$candidate.strategy -like 'msi_*' -and
             $script:hi5MsiLog -and
             (Test-Path -LiteralPath $script:hi5MsiLog)) {
-            $msiTail = @(Get-Content -LiteralPath $script:hi5MsiLog -Tail 60 -ErrorAction SilentlyContinue)
-            if ($msiTail.Count -gt 0) {
+            $msiLines = @(Get-Content -LiteralPath $script:hi5MsiLog -ErrorAction SilentlyContinue)
+            $msiContext = @($msiLines | Where-Object {
+                $_ -match 'Return value 3|CustomAction|Error 17[0-9]{2}|Removal failed|MainEngineThread is returning (1603|1618)'
+            } | Select-Object -Last 24)
+            $msiTail = @($msiLines | Select-Object -Last 30)
+            if ($msiContext.Count -gt 0) {
+                $output = (($output + $nl + '[MSI failure context]' + $nl + ($msiContext -join $nl)).Trim())
+            } elseif ($msiTail.Count -gt 0) {
                 $output = (($output + $nl + '[MSI log tail]' + $nl + ($msiTail -join $nl)).Trim())
             }
             Remove-Item -LiteralPath $script:hi5MsiLog -Force -ErrorAction SilentlyContinue
             $script:hi5MsiLog = ''
         }
-        if ($output.Length -gt 1600) { $output = $output.Substring($output.Length - 1600) }
+        if ($output.Length -gt 4000) { $output = $output.Substring($output.Length - 4000) }
     } catch {}
     Remove-Item -LiteralPath $cmdFile,$outFile,$errFile -Force -ErrorAction SilentlyContinue
 

@@ -55,7 +55,9 @@ Require-Literal $service 'PatchHost" / L"jobs", 6' 'Abandoned PatchHost job payl
 Require-Literal $service 'remove_all(qualificationRoot' 'Production Agent housekeeping must remove legacy qualification-observer evidence.'
 Require-Literal $service 'remove_all(legacyUpgrade' 'Retired Hi5CentralUpgrade storage must be removed completely.'
 Require-Literal $service 'Hi5Central\Agent\Temp' 'Temporary uninstall diagnostics must use Agent Temp instead of permanent Logs.'
-Require-Literal $service '[MSI log tail]' 'Failed MSI uninstall diagnostics must be condensed into the job result.'
+Require-Literal $service '[MSI failure context]' 'Failed MSI uninstall diagnostics must retain the meaningful failure context in the job result.'
+Require-Literal $service '$isMsi = [string]$candidate.strategy -like ''msi_*''' 'MSI uninstall attempts must be identified explicitly.'
+Require-Literal $service 'if (-not $isMsi -and -not (Test-Hi5StillInstalled))' 'MSI uninstall must not be terminated merely because registration disappears mid-transaction.'
 Require-Literal $service 'Remove-Item -LiteralPath $script:hi5MsiLog' 'Temporary MSI uninstall logs must be removed after the attempt.'
 if ($service.Contains('CadStatusPath()')) { throw 'CAD state must not maintain a duplicate unbounded CadStatus.txt log.' }
 if ($service.Contains('Hi5Central\Agent\Logs\uninstall-')) { throw 'Verbose MSI uninstall logs must not be written to permanent Agent Logs.' }
