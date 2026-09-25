@@ -133,7 +133,7 @@ std::filesystem::path PatchJobRoot(const json& manifest) {
 
 std::string ReadMsiProperty(const std::filesystem::path& packagePath, const wchar_t* propertyName) {
     MSIHANDLE database = 0;
-    if (MsiOpenDatabaseW(packagePath.c_str(), MSIDBOPEN_READONLY, &database) != ERROR_SUCCESS || !database) {
+    if (MsiOpenDatabaseW(packagePath.c_str(), nullptr, &database) != ERROR_SUCCESS || !database) {
         return "";
     }
 
