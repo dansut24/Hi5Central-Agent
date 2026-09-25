@@ -273,6 +273,40 @@ bool RegisterManagedMsiSource(const std::string& productCode, const std::filesys
     return result == ERROR_SUCCESS;
 }
 
+bool MachineMsiProductRegistered(const std::wstring& productCode) {
+    if (productCode.empty()) return false;
+    DWORD chars = 0;
+    const UINT result = MsiGetProductInfoExW(
+        productCode.c_str(),
+        nullptr,
+        MSIINSTALLCONTEXT_MACHINE,
+        INSTALLPROPERTY_VERSIONSTRING,
+        nullptr,
+        &chars);
+    return result == ERROR_SUCCESS || result == ERROR_MORE_DATA;
+}
+
+void PurgeOrphanedManagedMsiSources() noexcept {
+    const auto root = ManagedMsiCacheRoot();
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec)) return;
+
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) break;
+        if (!entry.is_directory(ec)) {
+            ec.clear();
+            continue;
+        }
+
+        const std::wstring key = entry.path().filename().wstring();
+        std::wstring productCode = L"{" + key + L"}";
+        if (key.size() != 36 || !MachineMsiProductRegistered(productCode)) {
+            std::filesystem::remove_all(entry.path(), ec);
+            ec.clear();
+        }
+    }
+}
+
 void PurgeJobDirectory(const std::filesystem::path& path) noexcept {
     if (path.empty()) return;
     for (int attempt = 0; attempt < 8; ++attempt) {
@@ -1582,6 +1616,10 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
             { "capabilities", Capabilities() }
         };
     }
+
+    // Product-scoped MSI sources intentionally outlive the job directory, but
+    // never keep packages for products that Windows Installer no longer knows.
+    PurgeOrphanedManagedMsiSources();
 
     const std::string provider = manifest.value("provider", std::string());
     const std::string applicationName = manifest.value("applicationName", std::string());

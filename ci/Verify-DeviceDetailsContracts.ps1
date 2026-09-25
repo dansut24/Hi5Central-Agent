@@ -31,6 +31,7 @@ Require-Literal $patchHost 'VendorInstallStrategies(executionManifest)' 'PatchHo
 Require-Literal $patchHost 'msiManagedSourceCache' 'PatchHost must advertise managed MSI source caching.'
 Require-Literal $patchHost 'ReadMsiProperty(installerPath, L"ProductCode")' 'PatchHost must identify MSI ProductCode before promotion into persistent source cache.'
 Require-Literal $patchHost 'InstallerCache\Msi' 'Verified MSI packages must use the managed product-scoped source cache.'
+Require-Literal $patchHost 'PurgeOrphanedManagedMsiSources();' 'PatchHost must remove managed MSI sources after their products are no longer registered.'
 Require-Literal $service "'msi_cached_source'" 'Software uninstall must prefer a retained managed MSI source when available.'
 Require-Literal $service 'Remove-Hi5MsiCache $productCode' 'Verified MSI uninstall must purge its managed source cache.'
 
