@@ -4723,6 +4723,19 @@ function Get-Hi5ProductCode($target) {
     return ''
 }
 
+function Get-Hi5MsiCacheDir([string]$productCode) {
+    if ($productCode -notmatch '^\{?[0-9A-Fa-f-]{36}\}?$') { return '' }
+    $cacheKey = ($productCode -replace '[{}]','').ToUpperInvariant()
+    return Join-Path $env:ProgramData ("Hi5Central\Agent\InstallerCache\Msi\" + $cacheKey)
+}
+
+function Remove-Hi5MsiCache([string]$productCode) {
+    $cacheDir = Get-Hi5MsiCacheDir $productCode
+    if ($cacheDir -and (Test-Path -LiteralPath $cacheDir)) {
+        Remove-Item -LiteralPath $cacheDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-Hi5StillInstalled {
     return $null -ne (Find-Hi5Target)
 }
@@ -4776,7 +4789,7 @@ function Test-Hi5UninstallActivity($candidate) {
         $name = ([string]$match.Groups[1].Value).Trim()
         if ($name -and $name -notin @('cmd','powershell','pwsh')) { [void]$names.Add($name) }
     }
-    if ([string]$candidate.strategy -eq 'msi_product_code') { [void]$names.Add('msiexec') }
+    if ([string]$candidate.strategy -like 'msi_*') { [void]$names.Add('msiexec') }
     foreach ($name in $names) {
         try {
             if (Get-Process -Name $name -ErrorAction SilentlyContinue) { return $true }
@@ -4825,7 +4838,7 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
         $stdout = if (Test-Path -LiteralPath $outFile) { Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue } else { '' }
         $stderr = if (Test-Path -LiteralPath $errFile) { Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue } else { '' }
         $output = (($output + $nl + $stdout + $nl + $stderr).Trim())
-        if ([string]$candidate.strategy -eq 'msi_product_code' -and
+        if ([string]$candidate.strategy -like 'msi_*' -and
             $script:hi5MsiLog -and
             (Test-Path -LiteralPath $script:hi5MsiLog)) {
             $msiTail = @(Get-Content -LiteralPath $script:hi5MsiLog -Tail 60 -ErrorAction SilentlyContinue)
@@ -4931,6 +4944,9 @@ function Invoke-Hi5VendorDocumentedCleanup($target) {
 
 $target = Find-Hi5Target
 if (-not $target) {
+    if ($requestedRegistryKey -match '^\{[0-9A-Fa-f-]{36}\}$') {
+        Remove-Hi5MsiCache $requestedRegistryKey
+    }
     [pscustomobject]@{
         action='software.uninstall'
         status='uninstalled'
@@ -4968,12 +4984,19 @@ if ($target.quiet_uninstall_string) {
 }
 
 $script:hi5MsiLog = ''
+$script:hi5MsiCacheDir = ''
 $productCode = Get-Hi5ProductCode $target
 if ($productCode) {
     $msiLogRoot = Join-Path $env:ProgramData 'Hi5Central\Agent\Temp'
     New-Item -ItemType Directory -Path $msiLogRoot -Force | Out-Null
     $script:hi5MsiLog = Join-Path $msiLogRoot ("uninstall-{0}-{1}.log" -f ($productCode -replace '[{}-]',''),$PID)
     $q = [char]34
+    $cacheKey = ($productCode -replace '[{}]','').ToUpperInvariant()
+    $script:hi5MsiCacheDir = Join-Path $env:ProgramData ("Hi5Central\Agent\InstallerCache\Msi\" + $cacheKey)
+    $cachedMsi = Join-Path $script:hi5MsiCacheDir 'installer.msi'
+    if (Test-Path -LiteralPath $cachedMsi) {
+        Add-Hi5Candidate $candidates 'msi_cached_source' ("msiexec.exe /x " + $q + $cachedMsi + $q + " /qn /norestart REBOOT=ReallySuppress /L*v " + $q + $script:hi5MsiLog + $q)
+    }
     Add-Hi5Candidate $candidates 'msi_product_code' ("msiexec.exe /x $productCode /qn /norestart REBOOT=ReallySuppress /L*v " + $q + $script:hi5MsiLog + $q)
 }
 
@@ -5033,6 +5056,9 @@ foreach ($candidate in @($candidates)) {
 }
 
 if ($success) {
+    if ($productCode) {
+        Remove-Hi5MsiCache $productCode
+    }
     [pscustomobject]@{
         action='software.uninstall'
         status='uninstalled'

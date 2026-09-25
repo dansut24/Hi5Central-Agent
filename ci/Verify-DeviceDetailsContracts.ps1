@@ -28,6 +28,11 @@ Require-Literal $patchHost 'hiveUtf8 == "S-1-5-20"' 'Patch verification must rej
 Require-Literal $patchHost 'DetectInstallerTechnology(' 'PatchHost must inspect downloaded EXE installer technology before choosing silent arguments.'
 Require-Literal $patchHost 'installerTechnologyAutoSelected' 'PatchHost must record when runtime installer-technology detection overrides a generic catalogue hint.'
 Require-Literal $patchHost 'VendorInstallStrategies(executionManifest)' 'PatchHost must execute silent strategies from the runtime-detected installer technology.'
+Require-Literal $patchHost 'msiManagedSourceCache' 'PatchHost must advertise managed MSI source caching.'
+Require-Literal $patchHost 'ReadMsiProperty(installerPath, L"ProductCode")' 'PatchHost must identify MSI ProductCode before promotion into persistent source cache.'
+Require-Literal $patchHost 'InstallerCache\Msi' 'Verified MSI packages must use the managed product-scoped source cache.'
+Require-Literal $service "'msi_cached_source'" 'Software uninstall must prefer a retained managed MSI source when available.'
+Require-Literal $service 'Remove-Hi5MsiCache $productCode' 'Verified MSI uninstall must purge its managed source cache.'
 
 Require-Literal $service 'BuildNetworkStatsResponse' 'Native live network statistics response is missing.'
 Require-Literal $service 'static std::string NowIsoUtc();' 'Network stats UTC helper must be declared before use.'

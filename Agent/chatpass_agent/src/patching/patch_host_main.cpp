@@ -9,6 +9,7 @@
 #include <bcrypt.h>
 #include <winhttp.h>
 #include <winver.h>
+#include <msi.h>
 
 #include <algorithm>
 #include <chrono>
@@ -27,7 +28,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.16";
+constexpr const char* kPatchHostVersion = "0.2.17";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -119,11 +120,157 @@ std::wstring SafePathSegment(const std::string& value) {
     return output.empty() ? L"unknown-job" : output;
 }
 
+std::string Sha256File(const std::filesystem::path& path);
+
 std::filesystem::path PatchJobRoot(const json& manifest) {
     const auto root = PatchHostRoot() / L"jobs" / SafePathSegment(manifest.value("jobId", std::string()));
     std::error_code ec;
     std::filesystem::create_directories(root, ec);
     return root;
+}
+
+
+std::string ReadMsiProperty(const std::filesystem::path& packagePath, const wchar_t* propertyName) {
+    MSIHANDLE database = 0;
+    if (MsiOpenDatabaseW(packagePath.c_str(), MSIDBOPEN_READONLY, &database) != ERROR_SUCCESS || !database) {
+        return "";
+    }
+
+    const std::wstring query =
+        L"SELECT `Value` FROM `Property` WHERE `Property`='" + std::wstring(propertyName) + L"'";
+    MSIHANDLE view = 0;
+    MSIHANDLE record = 0;
+    std::string value;
+
+    if (MsiDatabaseOpenViewW(database, query.c_str(), &view) == ERROR_SUCCESS
+        && view
+        && MsiViewExecute(view, 0) == ERROR_SUCCESS
+        && MsiViewFetch(view, &record) == ERROR_SUCCESS
+        && record) {
+        wchar_t probe[1] = { L'\0' };
+        DWORD chars = 0;
+        const UINT probeResult = MsiRecordGetStringW(record, 1, probe, &chars);
+        if (probeResult == ERROR_MORE_DATA || probeResult == ERROR_SUCCESS) {
+            std::vector<wchar_t> buffer(static_cast<size_t>(chars) + 1, L'\0');
+            DWORD capacity = static_cast<DWORD>(buffer.size());
+            if (MsiRecordGetStringW(record, 1, buffer.data(), &capacity) == ERROR_SUCCESS) {
+                value = WideToUtf8(std::wstring(buffer.data(), capacity));
+            }
+        }
+    }
+
+    if (record) MsiCloseHandle(record);
+    if (view) MsiCloseHandle(view);
+    MsiCloseHandle(database);
+    return Trim(value);
+}
+
+std::wstring MsiProductCodeCacheKey(const std::string& productCode) {
+    std::wstring key;
+    for (const wchar_t ch : Utf8ToWide(productCode)) {
+        if ((ch >= L'0' && ch <= L'9')
+            || (ch >= L'a' && ch <= L'f')
+            || (ch >= L'A' && ch <= L'F')
+            || ch == L'-') {
+            key.push_back((ch >= L'a' && ch <= L'f') ? static_cast<wchar_t>(ch - L'a' + L'A') : ch);
+        }
+    }
+    return key;
+}
+
+std::filesystem::path ManagedMsiCacheRoot() {
+    std::filesystem::path root = LR"(C:\ProgramData\Hi5Central\Agent\InstallerCache\Msi)";
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    return root;
+}
+
+std::filesystem::path ManagedMsiCacheDirectory(const std::string& productCode) {
+    const std::wstring key = MsiProductCodeCacheKey(productCode);
+    if (key.empty()) return {};
+    return ManagedMsiCacheRoot() / key;
+}
+
+bool PrepareManagedMsiSource(
+    const std::filesystem::path& verifiedPackage,
+    const json& manifest,
+    const std::string& productCode,
+    const std::string& expectedSha256,
+    std::filesystem::path& cachedPackage,
+    std::string& error) {
+    const auto cacheDirectory = ManagedMsiCacheDirectory(productCode);
+    if (cacheDirectory.empty()) {
+        error = "msi_product_code_invalid";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(cacheDirectory, ec);
+    if (ec) {
+        error = "msi_source_cache_directory_failed";
+        return false;
+    }
+
+    const auto temporary = cacheDirectory / L"installer.msi.tmp";
+    cachedPackage = cacheDirectory / L"installer.msi";
+    std::filesystem::remove(temporary, ec);
+    ec.clear();
+
+    std::filesystem::copy_file(
+        verifiedPackage,
+        temporary,
+        std::filesystem::copy_options::overwrite_existing,
+        ec);
+    if (ec) {
+        std::filesystem::remove(temporary, ec);
+        error = "msi_source_cache_copy_failed";
+        return false;
+    }
+
+    const std::string copiedSha256 = Sha256File(temporary);
+    if (copiedSha256.empty() || Lower(copiedSha256) != Lower(expectedSha256)) {
+        std::filesystem::remove(temporary, ec);
+        error = "msi_source_cache_hash_mismatch";
+        return false;
+    }
+
+    std::filesystem::remove(cachedPackage, ec);
+    ec.clear();
+    std::filesystem::rename(temporary, cachedPackage, ec);
+    if (ec) {
+        std::filesystem::remove(temporary, ec);
+        error = "msi_source_cache_promote_failed";
+        return false;
+    }
+
+    const json metadata = {
+        { "productCode", productCode },
+        { "packageId", manifest.value("packageId", std::string()) },
+        { "applicationName", manifest.value("applicationName", std::string()) },
+        { "targetVersion", manifest.value("targetVersion", std::string()) },
+        { "downloadUrl", manifest.value("downloadUrl", std::string()) },
+        { "sha256", expectedSha256 }
+    };
+    // Metadata is diagnostic convenience only. The verified MSI itself is
+    // the maintenance-critical artifact and must not be discarded because a
+    // sidecar write failed.
+    WriteFileUtf8(cacheDirectory / L"metadata.json", metadata.dump(2));
+    return true;
+}
+
+bool RegisterManagedMsiSource(const std::string& productCode, const std::filesystem::path& cacheDirectory) {
+    const std::wstring product = Utf8ToWide(productCode);
+    std::wstring source = cacheDirectory.wstring();
+    if (product.empty() || source.empty()) return false;
+    if (source.back() != L'\\') source.push_back(L'\\');
+    const UINT result = MsiSourceListAddSourceExW(
+        product.c_str(),
+        nullptr,
+        MSIINSTALLCONTEXT_MACHINE,
+        MSICODE_PRODUCT,
+        source.c_str(),
+        1);
+    return result == ERROR_SUCCESS;
 }
 
 void PurgeJobDirectory(const std::filesystem::path& path) noexcept {
@@ -692,6 +839,8 @@ json Capabilities() {
             { "artifactTechnologyDetection", true },
             { "artifactStorage", "job_scoped" },
             { "jobDirectoryPurgedOnExit", true },
+            { "msiManagedSourceCache", true },
+            { "msiSourceCacheScope", "product_code" },
             { "jobScopedResponseFiles", true },
             { "responseFileTargetVersionToken", true },
             { "winInetCacheUsed", false }
@@ -1503,27 +1652,60 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                     if (!result["signatureVerified"].get<bool>()) {
                         result["error"] = "unexpected_signer";
                     } else if (installerType == "msi") {
-                        // ManifestValid already rejected unsafe catalogue arguments. MSI packages
-                        // may require vendor properties such as ACCEPTLICENSE=YES.
-                        std::string configuredArgs = manifest.value("installArguments", std::string());
-                        configuredArgs = ResolveVendorInstallArguments(configuredArgs, responseFilePath);
-                        std::wstring command = L"msiexec.exe /i " + Quote(installerPath.wstring());
-                        if (!configuredArgs.empty()) {
-                            command += L" " + Utf8ToWide(configuredArgs);
+                        // Some MSI packages require their original source for later
+                        // repair/uninstall. Never install an MSI from the disposable
+                        // PatchHost job directory. Promote the already verified package
+                        // into a product-scoped managed source cache first.
+                        const std::string productCode = ReadMsiProperty(installerPath, L"ProductCode");
+                        result["msiProductCode"] = productCode;
+                        if (productCode.empty()) {
+                            result["error"] = "msi_product_code_missing";
                         } else {
-                            command += L" /qn /norestart";
+                            std::filesystem::path managedMsiPath;
+                            std::string cacheError;
+                            if (!PrepareManagedMsiSource(
+                                    installerPath,
+                                    manifest,
+                                    productCode,
+                                    actualSha,
+                                    managedMsiPath,
+                                    cacheError)) {
+                                result["error"] = cacheError.empty()
+                                    ? "msi_source_cache_prepare_failed"
+                                    : cacheError;
+                            } else {
+                                result["msiSourceCachePath"] = WideToUtf8(managedMsiPath.wstring());
+                                result["msiSourceCacheRetained"] = true;
+
+                                // ManifestValid already rejected unsafe catalogue arguments.
+                                // MSI packages may require vendor properties such as
+                                // ACCEPTLICENSE=YES.
+                                std::string configuredArgs = manifest.value("installArguments", std::string());
+                                configuredArgs = ResolveVendorInstallArguments(configuredArgs, responseFilePath);
+                                std::wstring command = L"msiexec.exe /i " + Quote(managedMsiPath.wstring());
+                                if (!configuredArgs.empty()) {
+                                    command += L" " + Utf8ToWide(configuredArgs);
+                                } else {
+                                    command += L" /qn /norestart";
+                                }
+                                install = RunHidden(command, root / L"vendor-install-msi.log", 30 * 60 * 1000);
+                                result["installAttempts"].push_back({
+                                    { "name", configuredArgs.empty() ? "msi_quiet" : "msi_configured_arguments" },
+                                    { "args", configuredArgs.empty() ? "/qn /norestart" : configuredArgs },
+                                    { "exitCode", install.exitCode },
+                                    { "timedOut", install.timedOut },
+                                    { "output", Truncate(install.output, 2000) }
+                                });
+                                result["exitCode"] = install.exitCode;
+                                result["installerOutput"] = Truncate(install.output, 4000);
+                                result["rebootRequired"] = install.exitCode == 3010 || install.exitCode == 1641;
+                                if (InstallerExitSucceeded(install.exitCode)) {
+                                    result["msiSourceRegistered"] = RegisterManagedMsiSource(
+                                        productCode,
+                                        managedMsiPath.parent_path());
+                                }
+                            }
                         }
-                        install = RunHidden(command, root / L"vendor-install-msi.log", 30 * 60 * 1000);
-                        result["installAttempts"].push_back({
-                            { "name", configuredArgs.empty() ? "msi_quiet" : "msi_configured_arguments" },
-                            { "args", configuredArgs.empty() ? "/qn /norestart" : configuredArgs },
-                            { "exitCode", install.exitCode },
-                            { "timedOut", install.timedOut },
-                            { "output", Truncate(install.output, 2000) }
-                        });
-                        result["exitCode"] = install.exitCode;
-                        result["installerOutput"] = Truncate(install.output, 4000);
-                        result["rebootRequired"] = install.exitCode == 3010 || install.exitCode == 1641;
                     } else {
                         json executionManifest = manifest;
                         const std::string configuredTechnology = Lower(
