@@ -572,7 +572,7 @@ namespace hi5 {
             return std::filesystem::path(LR"(C:\ProgramData\Hi5Central\Agent\ChatLogs)");
         }
 
-        static void PurgeOldChatLogs(int maxAgeDays = 90) {
+        static void PurgeOldChatLogs(int maxAgeDays = 30) {
             namespace fs = std::filesystem;
             const auto dir = ChatLogDir();
             std::error_code ec;
@@ -586,6 +586,213 @@ namespace hi5 {
                 if (!ec && t < cutoff) {
                     fs::remove(item.path(), ec);
                 }
+            }
+        }
+
+
+        struct HousekeepingStats {
+            uint64_t bytes = 0;
+            size_t files = 0;
+            size_t directories = 0;
+        };
+
+        static bool HousekeepingOlderThan(const std::filesystem::path& path, int maxAgeHours) {
+            std::error_code ec;
+            const auto modified = std::filesystem::last_write_time(path, ec);
+            if (ec) return false;
+            return modified < (std::filesystem::file_time_type::clock::now() - std::chrono::hours(maxAgeHours));
+        }
+
+        static void HousekeepingRemoveFile(const std::filesystem::path& path, HousekeepingStats& stats) {
+            std::error_code ec;
+            const uintmax_t size = std::filesystem::is_regular_file(path, ec)
+                ? std::filesystem::file_size(path, ec)
+                : 0;
+            ec.clear();
+            if (std::filesystem::remove(path, ec) && !ec) {
+                stats.bytes += static_cast<uint64_t>(size);
+                ++stats.files;
+            }
+        }
+
+        static uint64_t HousekeepingTreeSize(const std::filesystem::path& root) {
+            std::error_code ec;
+            uint64_t total = 0;
+            for (std::filesystem::recursive_directory_iterator it(
+                     root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+                 it != end && !ec; it.increment(ec)) {
+                if (!it->is_regular_file(ec)) continue;
+                const auto size = it->file_size(ec);
+                if (!ec) total += static_cast<uint64_t>(size);
+                ec.clear();
+            }
+            return total;
+        }
+
+        static std::filesystem::file_time_type HousekeepingNewestWrite(const std::filesystem::path& root) {
+            std::error_code ec;
+            auto newest = std::filesystem::last_write_time(root, ec);
+            if (ec) newest = std::filesystem::file_time_type::min();
+            ec.clear();
+            for (std::filesystem::recursive_directory_iterator it(
+                     root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+                 it != end && !ec; it.increment(ec)) {
+                const auto modified = it->last_write_time(ec);
+                if (!ec && modified > newest) newest = modified;
+                ec.clear();
+            }
+            return newest;
+        }
+
+        static void PurgeOldChildDirectories(
+            const std::filesystem::path& root,
+            int maxAgeHours,
+            HousekeepingStats& stats) {
+            std::error_code ec;
+            if (!std::filesystem::exists(root, ec)) return;
+            const auto cutoff =
+                std::filesystem::file_time_type::clock::now() - std::chrono::hours(maxAgeHours);
+            for (std::filesystem::directory_iterator it(
+                     root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+                 it != end && !ec; it.increment(ec)) {
+                if (!it->is_directory(ec)) continue;
+                const auto child = it->path();
+                if (HousekeepingNewestWrite(child) >= cutoff) continue;
+                const uint64_t size = HousekeepingTreeSize(child);
+                ec.clear();
+                const auto removed = std::filesystem::remove_all(child, ec);
+                if (!ec && removed > 0) {
+                    stats.bytes += size;
+                    ++stats.directories;
+                }
+                ec.clear();
+            }
+        }
+
+        static void PurgeOldFiles(
+            const std::filesystem::path& root,
+            int maxAgeHours,
+            bool recursive,
+            HousekeepingStats& stats) {
+            std::error_code ec;
+            if (!std::filesystem::exists(root, ec)) return;
+            if (recursive) {
+                for (std::filesystem::recursive_directory_iterator it(
+                         root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+                     it != end && !ec; it.increment(ec)) {
+                    if (!it->is_regular_file(ec)) continue;
+                    if (HousekeepingOlderThan(it->path(), maxAgeHours)) {
+                        HousekeepingRemoveFile(it->path(), stats);
+                    }
+                    ec.clear();
+                }
+            } else {
+                for (std::filesystem::directory_iterator it(
+                         root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+                     it != end && !ec; it.increment(ec)) {
+                    if (!it->is_regular_file(ec)) continue;
+                    if (HousekeepingOlderThan(it->path(), maxAgeHours)) {
+                        HousekeepingRemoveFile(it->path(), stats);
+                    }
+                    ec.clear();
+                }
+            }
+        }
+
+        static void PurgeOldMatchingFiles(
+            const std::filesystem::path& root,
+            const std::string& prefix,
+            const std::string& suffix,
+            int maxAgeHours,
+            HousekeepingStats& stats) {
+            std::error_code ec;
+            if (!std::filesystem::exists(root, ec)) return;
+            for (std::filesystem::directory_iterator it(
+                     root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+                 it != end && !ec; it.increment(ec)) {
+                if (!it->is_regular_file(ec)) continue;
+                const std::string name = it->path().filename().string();
+                if (!prefix.empty() && name.rfind(prefix, 0) != 0) continue;
+                if (!suffix.empty() &&
+                    (name.size() < suffix.size() ||
+                     name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)) continue;
+                if (HousekeepingOlderThan(it->path(), maxAgeHours)) {
+                    HousekeepingRemoveFile(it->path(), stats);
+                }
+                ec.clear();
+            }
+        }
+
+        static void RemoveEmptyDirectories(const std::filesystem::path& root) {
+            std::error_code ec;
+            if (!std::filesystem::exists(root, ec)) return;
+            std::vector<std::filesystem::path> directories;
+            for (std::filesystem::recursive_directory_iterator it(
+                     root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+                 it != end && !ec; it.increment(ec)) {
+                if (it->is_directory(ec)) directories.push_back(it->path());
+                ec.clear();
+            }
+            std::sort(directories.rbegin(), directories.rend());
+            for (const auto& dir : directories) {
+                ec.clear();
+                std::filesystem::remove(dir, ec);
+            }
+            ec.clear();
+            std::filesystem::remove(root, ec);
+        }
+
+        static void PurgeProgramDataHousekeeping() {
+            namespace fs = std::filesystem;
+            HousekeepingStats stats{};
+            const fs::path agentRoot = LR"(C:\ProgramData\Hi5Central\Agent)";
+            const fs::path logs = agentRoot / L"Logs";
+            const fs::path upgrade = agentRoot / L"Upgrade";
+
+            // Core logs are rotated separately. Remove only redundant/legacy
+            // diagnostics and stale verbose installer traces.
+            HousekeepingRemoveFile(logs / L"CadStatus.txt", stats);
+            HousekeepingRemoveFile(logs / L"diagnostics.log.txt", stats);
+            PurgeOldMatchingFiles(logs, "uninstall-", ".log", 6, stats);
+            PurgeOldMatchingFiles(logs, "hi5-h264-dump", ".h264", 6, stats);
+            for (int index = 3; index <= 9; ++index) {
+                HousekeepingRemoveFile(logs / (L"agent.log." + std::to_wstring(index)), stats);
+                HousekeepingRemoveFile(logs / (L"diagnostics.log." + std::to_wstring(index)), stats);
+            }
+
+            // Job-local payloads are disposable once a job has finished. Six
+            // hours is far beyond the longest installer timeout and avoids
+            // racing an active PatchHost/action.
+            PurgeOldChildDirectories(agentRoot / L"PatchHost" / L"jobs", 6, stats);
+            PurgeOldFiles(agentRoot / L"Temp", 6, true, stats);
+            PurgeOldFiles(agentRoot / L"Actions", 6, true, stats);
+
+            // Qualification evidence is useful briefly for troubleshooting but
+            // should not become a permanent endpoint-side archive.
+            PurgeOldChildDirectories(agentRoot / L"Qualification" / L"jobs", 24 * 7, stats);
+
+            // Agent-upgrade installers are transient. Keep recent logs/results
+            // long enough for the diagnostics UI, not every historical build.
+            PurgeOldMatchingFiles(upgrade, "Hi5CentralAgentSetup-", ".exe", 6, stats);
+            PurgeOldMatchingFiles(upgrade, "run-upgrade-", ".ps1", 24, stats);
+            PurgeOldMatchingFiles(upgrade, "installer-", ".log", 24 * 7, stats);
+            PurgeOldMatchingFiles(upgrade, "result-", ".json", 24 * 7, stats);
+
+            // Pre-current updater builds used a separate ProgramData root.
+            // Current source/history has no dependency on it. Retain the most
+            // recent 24 hours defensively, then scavenge legacy content.
+            const fs::path legacyUpgrade = LR"(C:\ProgramData\Hi5CentralUpgrade)";
+            PurgeOldFiles(legacyUpgrade, 24, true, stats);
+            RemoveEmptyDirectories(legacyUpgrade);
+
+            PurgeOldChatLogs(30);
+            RemoveEmptyDirectories(agentRoot / L"Temp");
+            RemoveEmptyDirectories(agentRoot / L"Actions");
+
+            if (stats.files || stats.directories) {
+                LogI("[housekeeping] reclaimed_bytes=" + std::to_string(stats.bytes) +
+                    " files=" + std::to_string(stats.files) +
+                    " directories=" + std::to_string(stats.directories));
             }
         }
 
@@ -1010,21 +1217,9 @@ namespace hi5 {
             return EnableTokenPrivilege(token, wide.c_str());
         }
 
-        static std::filesystem::path CadStatusPath() {
-            return std::filesystem::path(LR"(C:\ProgramData\Hi5Central\Agent\Logs\CadStatus.txt)");
-        }
-
         static void CadLog(const std::string& line) {
-            try {
-                std::error_code ec;
-                std::filesystem::create_directories(CadStatusPath().parent_path(), ec);
-                std::ofstream out(CadStatusPath(), std::ios::binary | std::ios::app);
-                if (out.good()) {
-                    out << NowIsoUtc() << " " << line << "\n";
-                }
-            }
-            catch (...) {
-            }
+            // CAD/UAC state is already part of the bounded diagnostics stream.
+            // Do not maintain a second unbounded CadStatus.txt copy.
             LogI("[cad] " + line);
         }
 
@@ -2429,7 +2624,9 @@ class Worker {
 
             void Run() {
                 LogI("worker start");
-                PurgeOldChatLogs(90);
+                std::thread([]() {
+                    PurgeProgramDataHousekeeping();
+                }).detach();
 
                 constexpr int width = 0;
                 constexpr int height = 0;
@@ -4629,6 +4826,16 @@ function Invoke-Hi5UninstallAttempt($candidate, [int]$index) {
         $stdout = if (Test-Path -LiteralPath $outFile) { Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue } else { '' }
         $stderr = if (Test-Path -LiteralPath $errFile) { Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue } else { '' }
         $output = (($output + $nl + $stdout + $nl + $stderr).Trim())
+        if ([string]$candidate.strategy -eq 'msi_product_code' -and
+            $script:hi5MsiLog -and
+            (Test-Path -LiteralPath $script:hi5MsiLog)) {
+            $msiTail = @(Get-Content -LiteralPath $script:hi5MsiLog -Tail 60 -ErrorAction SilentlyContinue)
+            if ($msiTail.Count -gt 0) {
+                $output = (($output + $nl + '[MSI log tail]' + $nl + ($msiTail -join $nl)).Trim())
+            }
+            Remove-Item -LiteralPath $script:hi5MsiLog -Force -ErrorAction SilentlyContinue
+            $script:hi5MsiLog = ''
+        }
         if ($output.Length -gt 1600) { $output = $output.Substring($output.Length - 1600) }
     } catch {}
     Remove-Item -LiteralPath $cmdFile,$outFile,$errFile -Force -ErrorAction SilentlyContinue
@@ -4761,11 +4968,14 @@ if ($target.quiet_uninstall_string) {
     Add-Hi5Candidate $candidates 'vendor_quiet_uninstall' ([string]$target.quiet_uninstall_string)
 }
 
+$script:hi5MsiLog = ''
 $productCode = Get-Hi5ProductCode $target
 if ($productCode) {
-    $msiLog = Join-Path $env:ProgramData ("Hi5Central\Agent\Logs\uninstall-{0}.log" -f ($productCode -replace '[{}-]',''))
+    $msiLogRoot = Join-Path $env:ProgramData 'Hi5Central\Agent\Temp'
+    New-Item -ItemType Directory -Path $msiLogRoot -Force | Out-Null
+    $script:hi5MsiLog = Join-Path $msiLogRoot ("uninstall-{0}-{1}.log" -f ($productCode -replace '[{}-]',''),$PID)
     $q = [char]34
-    Add-Hi5Candidate $candidates 'msi_product_code' ("msiexec.exe /x $productCode /qn /norestart REBOOT=ReallySuppress /L*v " + $q + $msiLog + $q)
+    Add-Hi5Candidate $candidates 'msi_product_code' ("msiexec.exe /x $productCode /qn /norestart REBOOT=ReallySuppress /L*v " + $q + $script:hi5MsiLog + $q)
 }
 
 $uninstall = ([string]$target.uninstall_string).Trim()
@@ -6847,6 +7057,7 @@ exit 1
                     // First snapshot is sent immediately from the WebSocket open callback.
                     // This loop sends follow-up live inventory every 60 seconds so
                     // the RMM portal stays up-to-date without waiting five minutes.
+                    int housekeepingCycles = 0;
                     while (!stop_.load()) {
                         for (int i = 0; i < 60 && !stop_.load(); ++i) {
                             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -6857,6 +7068,10 @@ exit 1
                             continue;
                         }
                         SendInventorySnapshotSafe(ident);
+                        if (++housekeepingCycles >= 360) {
+                            PurgeProgramDataHousekeeping();
+                            housekeepingCycles = 0;
+                        }
                     }
                     });
             }

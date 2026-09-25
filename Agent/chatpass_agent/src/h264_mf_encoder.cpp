@@ -101,14 +101,14 @@ namespace {
         if (!enabled || data.empty() || frames >= 180) return;
         CreateDirectoryA("C:\\ProgramData\\Hi5Central", nullptr);
         CreateDirectoryA("C:\\ProgramData\\Hi5Central\\Agent", nullptr);
-        CreateDirectoryA("C:\\ProgramData\\Hi5Central\\Agent\\Logs", nullptr);
-        std::ofstream f("C:\\ProgramData\\Hi5Central\\Agent\\Logs\\hi5-h264-dump.h264", std::ios::binary | std::ios::app);
+        CreateDirectoryA("C:\\ProgramData\\Hi5Central\\Agent\\Temp", nullptr);
+        std::ofstream f("C:\\ProgramData\\Hi5Central\\Agent\\Temp\\hi5-h264-dump.h264", std::ios::binary | std::ios::app);
         if (f) {
             f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
             ++frames;
             if (frames == 1 || frames == 30 || frames == 180) {
                 std::cout << "[h264] dump wrote frame_count=" << frames
-                    << " path=C:\\ProgramData\\Hi5Central\\Agent\\Logs\\hi5-h264-dump.h264"
+                    << " path=C:\\ProgramData\\Hi5Central\\Agent\\Temp\\hi5-h264-dump.h264"
                     << " bytes=" << data.size() << "\n";
             }
         }

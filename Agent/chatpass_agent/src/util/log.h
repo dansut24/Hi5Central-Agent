@@ -130,8 +130,8 @@ inline void Hi5WriteLogLine(const char* level, const std::string& msg) {
     if (std::string(level) == "ERROR") std::cerr << s << std::endl;
     else std::cout << s << std::endl;
 
-    constexpr uintmax_t kDiagnosticMaxBytes = 5ull * 1024ull * 1024ull;
-    constexpr int kDiagnosticBackups = 3;
+    constexpr uintmax_t kDiagnosticMaxBytes = 4ull * 1024ull * 1024ull;
+    constexpr int kDiagnosticBackups = 2;
     Hi5AppendLogLine(Hi5DiagnosticLogPath(), s, kDiagnosticMaxBytes, kDiagnosticBackups);
 }
 
@@ -144,12 +144,12 @@ inline void LogSupportEvent(const std::string& msg) {
 
     const std::string s = Hi5NowString(false) + " - " + safe;
     constexpr uintmax_t kSupportMaxBytes = 2ull * 1024ull * 1024ull;
-    constexpr int kSupportBackups = 4;
+    constexpr int kSupportBackups = 2;
     Hi5AppendLogLine(Hi5SupportLogPath(), s, kSupportMaxBytes, kSupportBackups);
     // Keep the same event in diagnostics for correlation without making the
     // end-user log carry packet/frame/debug noise.
     Hi5AppendLogLine(Hi5DiagnosticLogPath(), Hi5NowString(true) + " [EVENT] " + safe,
-        5ull * 1024ull * 1024ull, 3);
+        4ull * 1024ull * 1024ull, 2);
 }
 
 inline void LogInfo(const std::string& msg) { Hi5WriteLogLine("INFO", msg); }
