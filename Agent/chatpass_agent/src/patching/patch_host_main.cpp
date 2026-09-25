@@ -21,6 +21,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -29,7 +30,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.17";
+constexpr const char* kPatchHostVersion = "0.2.18";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -868,9 +869,10 @@ json Capabilities() {
             { "artifactInspection", true },
             { "installerTypes", json::array({ "msi", "exe", "msix", "msixbundle", "appx", "appxbundle" }) },
             { "windowsPackageInspection", true },
-            { "verificationMethods", json::array({ "winget", "uninstall_registry", "file_version" }) },
+            { "verificationMethods", json::array({ "winget", "uninstall_registry", "file_version", "office_c2r_registry" }) },
             { "silentInstallStrategyLadder", true },
-            { "installerTechnologies", json::array({ "msi", "inno", "nullsoft", "nsis", "burn", "installshield", "squirrel", "install4j", "generic" }) },
+            { "installerTechnologies", json::array({ "msi", "inno", "nullsoft", "nsis", "burn", "installshield", "squirrel", "install4j", "office_odt_sfx", "generic" }) },
+            { "officeClickToRun", true },
             { "artifactTechnologyDetection", true },
             { "artifactStorage", "job_scoped" },
             { "jobDirectoryPurgedOnExit", true },
@@ -1100,6 +1102,63 @@ json VerifyUninstallRegistry(const json& verification, const std::string& target
     };
 }
 
+json VerifyOfficeClickToRun(const json& verification, const std::string& target) {
+    const std::wstring configKey = LR"(SOFTWARE\Microsoft\Office\ClickToRun\Configuration)";
+    const std::string requiredProductId = verification.value("productId", std::string());
+
+    std::string installedVersion;
+    std::string productReleaseIds;
+    std::string updateChannel;
+    std::string cdnBaseUrl;
+    std::string registryView;
+
+    for (const auto& candidate : std::vector<std::pair<REGSAM, std::string>>{
+             { KEY_WOW64_64KEY, "64" },
+             { KEY_WOW64_32KEY, "32" } }) {
+        std::string version = ReadRegistryText(
+            HKEY_LOCAL_MACHINE, configKey, L"VersionToReport", candidate.first);
+        if (version.empty()) {
+            version = ReadRegistryText(
+                HKEY_LOCAL_MACHINE, configKey, L"ClientVersionToReport", candidate.first);
+        }
+        if (version.empty()) continue;
+
+        const std::string products = ReadRegistryText(
+            HKEY_LOCAL_MACHINE, configKey, L"ProductReleaseIds", candidate.first);
+        if (!requiredProductId.empty() && !ContainsInsensitive(products, requiredProductId)) continue;
+
+        if (installedVersion.empty() || CompareVersions(version, installedVersion) > 0) {
+            installedVersion = version;
+            productReleaseIds = products;
+            updateChannel = ReadRegistryText(
+                HKEY_LOCAL_MACHINE, configKey, L"UpdateChannel", candidate.first);
+            cdnBaseUrl = ReadRegistryText(
+                HKEY_LOCAL_MACHINE, configKey, L"CDNBaseUrl", candidate.first);
+            registryView = candidate.second;
+        }
+    }
+
+    const bool productPresent = !installedVersion.empty();
+    const bool meetsTarget = productPresent && VersionMeetsTarget(installedVersion, target);
+    return {
+        { "method", "office_c2r_registry" },
+        { "installedVersion", installedVersion },
+        { "installedVersions", installedVersion.empty()
+            ? json::array()
+            : json::array({ installedVersion }) },
+        { "matchingInstances", productPresent ? 1 : 0 },
+        { "meetsTarget", meetsTarget },
+        { "productId", requiredProductId },
+        { "productReleaseIds", productReleaseIds },
+        { "updateChannel", updateChannel },
+        { "cdnBaseUrl", cdnBaseUrl },
+        { "registryView", registryView },
+        { "output", productPresent
+            ? "Verified from Microsoft Office Click-to-Run configuration registry."
+            : "No matching Microsoft Office Click-to-Run product was found." }
+    };
+}
+
 bool SafeVerificationFilePath(const std::wstring& path) {
     if (path.size() < 4 || path.size() > 1024) return false;
     if (path.rfind(L"\\", 0) == 0) return false;
@@ -1200,7 +1259,7 @@ bool ManifestValid(const json& manifest, std::string& error) {
     const std::string packageId = manifest.value("packageId", std::string());
     const json verification = manifest.value("verification", json::object());
     const std::string method = Lower(verification.value("method", verification.value("provider", std::string("winget"))));
-    if (method != "winget" && method != "uninstall_registry" && method != "file_version") {
+    if (method != "winget" && method != "uninstall_registry" && method != "file_version" && method != "office_c2r_registry") {
         error = "unsupported_verification_method";
         return false;
     }
@@ -1215,6 +1274,10 @@ bool ManifestValid(const json& manifest, std::string& error) {
     }
     if (method == "file_version" && verification.value("filePath", std::string()).empty()) {
         error = "file_version_path_missing";
+        return false;
+    }
+    if (method == "office_c2r_registry" && verification.value("productId", std::string()).empty()) {
+        error = "office_c2r_product_id_missing";
         return false;
     }
 
@@ -1260,7 +1323,8 @@ bool ManifestValid(const json& manifest, std::string& error) {
             && technology != "burn"
             && technology != "installshield"
             && technology != "squirrel"
-            && technology != "install4j") {
+            && technology != "install4j"
+            && technology != "office_odt_sfx") {
             error = "unsupported_installer_technology";
             return false;
         }
@@ -1276,6 +1340,7 @@ json VerifyInstalledVersion(const json& manifest, const std::filesystem::path& r
 
     if (method == "uninstall_registry") return VerifyUninstallRegistry(verification, target);
     if (method == "file_version") return VerifyFileVersion(verification, target);
+    if (method == "office_c2r_registry") return VerifyOfficeClickToRun(verification, target);
 
     const std::string packageId = verification.value("packageId", manifest.value("packageId", std::string()));
     const std::wstring winget = ResolveWinget();
@@ -1746,12 +1811,108 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                             }
                         }
                     } else {
-                        json executionManifest = manifest;
                         const std::string configuredTechnology = Lower(
                             manifest.value("installerTechnology", std::string()));
-                        const std::string detectedTechnology = DetectInstallerTechnology(
-                            installerPath,
-                            installerType);
+                        if (configuredTechnology == "office_odt_sfx") {
+                            const std::filesystem::path odtRoot = root / L"odt";
+                            std::filesystem::remove_all(odtRoot, ec);
+                            std::filesystem::create_directories(odtRoot, ec);
+                            if (ec) {
+                                result["error"] = "office_odt_extract_directory_failed";
+                            } else {
+                                const std::wstring extractCommand =
+                                    Quote(installerPath.wstring()) +
+                                    L" /quiet /extract:" + Quote(odtRoot.wstring());
+                                const CommandResult extract = RunHidden(
+                                    extractCommand,
+                                    root / L"office-odt-extract.log",
+                                    2 * 60 * 1000);
+                                result["installAttempts"].push_back({
+                                    { "name", "office_odt_extract" },
+                                    { "args", "/quiet /extract:<job-scoped>" },
+                                    { "exitCode", extract.exitCode },
+                                    { "timedOut", extract.timedOut },
+                                    { "output", Truncate(extract.output, 2000) }
+                                });
+
+                                const std::filesystem::path setupPath = odtRoot / L"setup.exe";
+                                if (!InstallerExitSucceeded(extract.exitCode) || !std::filesystem::exists(setupPath, ec)) {
+                                    install = extract;
+                                    result["exitCode"] = extract.exitCode;
+                                    result["installerOutput"] = Truncate(extract.output, 4000);
+                                    result["error"] = extract.timedOut
+                                        ? "office_odt_extract_timeout"
+                                        : "office_odt_setup_missing";
+                                } else {
+                                    std::string setupSigner;
+                                    const std::string expectedSigner = manifest.value("expectedSigner", std::string());
+                                    if (!VerifyAuthenticodeTrust(setupPath, setupSigner)
+                                        || setupSigner.empty()
+                                        || !ContainsInsensitive(setupSigner, expectedSigner)) {
+                                        result["error"] = "office_odt_setup_signature_invalid";
+                                        result["officeOdtSetupSigner"] = setupSigner;
+                                        install = extract;
+                                        install.exitCode = 1;
+                                        result["exitCode"] = 1;
+                                    } else {
+                                        result["officeOdtSetupSigner"] = setupSigner;
+                                        std::string resolvedArgs = ResolveVendorInstallArguments(
+                                            manifest.value("installArguments", std::string()),
+                                            responseFilePath);
+                                        if (resolvedArgs.empty()) {
+                                            result["error"] = "office_odt_configure_arguments_missing";
+                                            install = extract;
+                                            install.exitCode = 1;
+                                            result["exitCode"] = 1;
+                                        } else {
+                                            const std::wstring configureCommand =
+                                                Quote(setupPath.wstring()) + L" " + Utf8ToWide(resolvedArgs);
+                                            const CommandResult configure = RunHidden(
+                                                configureCommand,
+                                                root / L"office-odt-configure.log",
+                                                30 * 60 * 1000);
+                                            const bool exitSucceeded = InstallerExitSucceeded(configure.exitCode);
+                                            const json attemptVerification = exitSucceeded
+                                                ? VerifyInstalledVersionAfterSuccessfulExe(manifest, root)
+                                                : VerifyInstalledVersionShort(manifest, root);
+                                            const bool verified = attemptVerification.value("meetsTarget", false);
+
+                                            result["installAttempts"].push_back({
+                                                { "name", "office_odt_configure" },
+                                                { "args", resolvedArgs },
+                                                { "exitCode", configure.exitCode },
+                                                { "timedOut", configure.timedOut },
+                                                { "verified", verified },
+                                                { "verification", attemptVerification },
+                                                { "output", Truncate(configure.output, 2000) }
+                                            });
+
+                                            install = configure;
+                                            verification = attemptVerification;
+                                            verificationCaptured = true;
+                                            result["exitCode"] = configure.exitCode;
+                                            result["installerOutput"] = Truncate(configure.output, 4000);
+                                            result["rebootRequired"] = configure.exitCode == 3010 || configure.exitCode == 1641;
+                                            if (verified) {
+                                                result["successfulStrategy"] = "office_odt_configure";
+                                                result.erase("error");
+                                            } else if (configure.timedOut) {
+                                                result["error"] = "office_odt_configure_timeout";
+                                                result["timeoutKilledProcessTree"] = true;
+                                            } else if (exitSucceeded) {
+                                                result["error"] = "target_version_not_verified_after_successful_installer";
+                                            } else {
+                                                result["error"] = "office_odt_configure_failed";
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            json executionManifest = manifest;
+                            const std::string detectedTechnology = DetectInstallerTechnology(
+                                installerPath,
+                                installerType);
                         if ((configuredTechnology.empty() || configuredTechnology == "generic")
                             && !detectedTechnology.empty()
                             && detectedTechnology != "generic"
@@ -1819,6 +1980,7 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                                     result["error"] = "target_version_not_verified_after_successful_installer";
                                 }
                             }
+                        }
                         }
                     }
                 }
