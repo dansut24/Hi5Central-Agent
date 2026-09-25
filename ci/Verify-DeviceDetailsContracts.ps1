@@ -45,7 +45,10 @@ Require-Literal $service 'send_bytes' 'Live network send counters are missing.'
 Require-Literal $service 'receive_link_speed_bps' 'Live receive link speed is missing.'
 Require-Literal $service 'transmit_link_speed_bps' 'Live transmit link speed is missing.'
 
-# Endpoint storage/log hygiene.
+# Inventory cadence and endpoint storage/log hygiene.
+Require-Literal $service 'for (int i = 0; i < 30 && !stop_.load(); ++i)' 'Scheduled full inventory must run every 30 seconds.'
+Require-Literal $service 'if (++housekeepingCycles >= 720)' 'Six-hour ProgramData housekeeping cadence must be preserved when inventory frequency changes.'
+Require-Literal $service 'scheduled full inventory skipped while remote session is active' 'Full inventory must remain throttled during active remote sessions.'
 Require-Literal $service 'PurgeProgramDataHousekeeping' 'ProgramData housekeeping must run on Agent startup and periodically.'
 Require-Literal $service 'C:\ProgramData\Hi5CentralUpgrade' 'Legacy standalone updater storage must be scavenged safely.'
 Require-Literal $service 'PatchHost" / L"jobs", 6' 'Abandoned PatchHost job payloads must age out after the safe grace period.'

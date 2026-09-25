@@ -6978,11 +6978,12 @@ exit 1
                 StopInventoryLoop();
                 inventoryThread_ = std::thread([this, ident = std::move(ident)]() mutable {
                     // First snapshot is sent immediately from the WebSocket open callback.
-                    // This loop sends follow-up live inventory every 60 seconds so
-                    // the RMM portal stays up-to-date without waiting five minutes.
+                    // Follow-up full inventory runs every 30 seconds. This is fast
+                    // enough for interactive RMM workflows without continuously
+                    // enumerating software/WMI/registry state.
                     int housekeepingCycles = 0;
                     while (!stop_.load()) {
-                        for (int i = 0; i < 60 && !stop_.load(); ++i) {
+                        for (int i = 0; i < 30 && !stop_.load(); ++i) {
                             std::this_thread::sleep_for(std::chrono::seconds(1));
                         }
                         if (stop_.load()) break;
@@ -6991,7 +6992,7 @@ exit 1
                             continue;
                         }
                         SendInventorySnapshotSafe(ident);
-                        if (++housekeepingCycles >= 360) {
+                        if (++housekeepingCycles >= 720) {
                             PurgeProgramDataHousekeeping();
                             housekeepingCycles = 0;
                         }
