@@ -1,4 +1,13 @@
-﻿#include "service/service_main.h"
+﻿#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0600
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#if !defined(WINVER) || WINVER < 0x0600
+#undef WINVER
+#define WINVER 0x0600
+#endif
+
+#include "service/service_main.h"
 #include "agent_identity.h"
 #include "agent_version.h"
 
@@ -594,6 +603,8 @@ namespace hi5 {
             using namespace std::chrono;
             return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
         }
+
+        static std::string NowIsoUtc();
 
         static json BuildNetworkStatsResponse(const std::string& requestId) {
             json adapters = json::array();
