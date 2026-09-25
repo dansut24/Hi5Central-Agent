@@ -10,6 +10,7 @@
 #include <winhttp.h>
 #include <winver.h>
 #include <msi.h>
+#include <msiquery.h>
 
 #include <algorithm>
 #include <chrono>
@@ -280,7 +281,7 @@ bool MachineMsiProductRegistered(const std::wstring& productCode) {
         productCode.c_str(),
         nullptr,
         MSIINSTALLCONTEXT_MACHINE,
-        INSTALLPROPERTY_VERSIONSTRING,
+        L"VersionString",
         nullptr,
         &chars);
     return result == ERROR_SUCCESS || result == ERROR_MORE_DATA;
