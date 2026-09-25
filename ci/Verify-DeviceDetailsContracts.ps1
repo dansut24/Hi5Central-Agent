@@ -30,6 +30,8 @@ Require-Literal $patchHost 'installerTechnologyAutoSelected' 'PatchHost must rec
 Require-Literal $patchHost 'VendorInstallStrategies(executionManifest)' 'PatchHost must execute silent strategies from the runtime-detected installer technology.'
 Require-Literal $patchHost 'msiManagedSourceCache' 'PatchHost must advertise managed MSI source caching.'
 Require-Literal $patchHost 'office_c2r_registry' 'PatchHost must verify Microsoft 365 Apps through Click-to-Run registry state.'
+Require-Literal $patchHost 'expectAbsent' 'PatchHost must support absence verification for Click-to-Run uninstall.'
+Require-Literal $patchHost 'officeClickToRunUninstall' 'PatchHost must advertise Microsoft 365 Apps uninstall capability.'
 Require-Literal $patchHost 'office_odt_sfx' 'PatchHost must support Microsoft Office Deployment Tool self-extracting packages.'
 Require-Literal $patchHost 'office-odt-configure.log' 'PatchHost must execute extracted ODT setup.exe with a job-scoped configuration file.'
 Require-Literal $patchHost 'ReadMsiProperty(installerPath, L"ProductCode")' 'PatchHost must identify MSI ProductCode before promotion into persistent source cache.'

@@ -30,7 +30,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kPatchHostVersion = "0.2.18";
+constexpr const char* kPatchHostVersion = "0.2.19";
 constexpr DWORD kDpapiFlags = CRYPTPROTECT_UI_FORBIDDEN;
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -873,6 +873,7 @@ json Capabilities() {
             { "silentInstallStrategyLadder", true },
             { "installerTechnologies", json::array({ "msi", "inno", "nullsoft", "nsis", "burn", "installshield", "squirrel", "install4j", "office_odt_sfx", "generic" }) },
             { "officeClickToRun", true },
+            { "officeClickToRunUninstall", true },
             { "artifactTechnologyDetection", true },
             { "artifactStorage", "job_scoped" },
             { "jobDirectoryPurgedOnExit", true },
@@ -1139,7 +1140,10 @@ json VerifyOfficeClickToRun(const json& verification, const std::string& target)
     }
 
     const bool productPresent = !installedVersion.empty();
-    const bool meetsTarget = productPresent && VersionMeetsTarget(installedVersion, target);
+    const bool expectAbsent = verification.value("expectAbsent", false);
+    const bool meetsTarget = expectAbsent
+        ? !productPresent
+        : productPresent && VersionMeetsTarget(installedVersion, target);
     return {
         { "method", "office_c2r_registry" },
         { "installedVersion", installedVersion },
@@ -1147,15 +1151,20 @@ json VerifyOfficeClickToRun(const json& verification, const std::string& target)
             ? json::array()
             : json::array({ installedVersion }) },
         { "matchingInstances", productPresent ? 1 : 0 },
+        { "expectAbsent", expectAbsent },
         { "meetsTarget", meetsTarget },
         { "productId", requiredProductId },
         { "productReleaseIds", productReleaseIds },
         { "updateChannel", updateChannel },
         { "cdnBaseUrl", cdnBaseUrl },
         { "registryView", registryView },
-        { "output", productPresent
-            ? "Verified from Microsoft Office Click-to-Run configuration registry."
-            : "No matching Microsoft Office Click-to-Run product was found." }
+        { "output", expectAbsent
+            ? (productPresent
+                ? "Microsoft Office Click-to-Run product is still present."
+                : "Verified Microsoft Office Click-to-Run product is absent.")
+            : (productPresent
+                ? "Verified from Microsoft Office Click-to-Run configuration registry."
+                : "No matching Microsoft Office Click-to-Run product was found.") }
     };
 }
 
@@ -1233,7 +1242,7 @@ bool ManifestValid(const json& manifest, std::string& error) {
     if (manifest.value("jobId", std::string()).empty()) { error = "job_id_missing"; return false; }
     if (manifest.value("deviceId", std::string()).empty()) { error = "device_id_missing"; return false; }
     const std::string intent = Lower(manifest.value("intent", std::string("update")));
-    if (intent != "install" && intent != "update") { error = "unsupported_install_intent"; return false; }
+    if (intent != "install" && intent != "update" && intent != "uninstall") { error = "unsupported_install_intent"; return false; }
 
     const long long expires = manifest.value("expiresUnixMs", 0LL);
     const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1314,6 +1323,10 @@ bool ManifestValid(const json& manifest, std::string& error) {
         }
 
         const std::string technology = Lower(manifest.value("installerTechnology", std::string()));
+        if (intent == "uninstall" && technology != "office_odt_sfx") {
+            error = "unsupported_uninstall_technology";
+            return false;
+        }
         if (!technology.empty()
             && technology != "generic"
             && technology != "msi"
