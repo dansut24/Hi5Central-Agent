@@ -60,5 +60,9 @@ Require-Literal $service 'lastSecureLaunchAttempt >= std::chrono::milliseconds(2
 Require-Literal $service 'secureTransitionBlank' 'Secure transition blank-frame safeguard is missing.'
 Require-Literal $service 'desktop_handoff_ready' 'Desktop handoff-ready signaling is missing.'
 Require-Literal $service 'secure_desktop_ready' 'Secure desktop ready signaling is missing.'
+Require-Literal $viewer 'completeDesktopSourceTransition' 'Desktop Viewer must release the UI immediately when the secure/normal source is ready.'
+Require-Literal $viewer 'if (!force && (secureDesktopActive || desktopHandoffActive)) return;' 'Desktop Viewer must suppress remote input during source handoff without blocking local UI interaction.'
+Require-Literal $viewer 'elOverlayTitle.textContent = ""' 'Desktop transition hold must clear stale Connecting overlay text.'
+Require-Literal $viewerHtml 'pointer-events: none;' 'Desktop transition overlay must not intercept input while the existing stream remains visible.'
 
 Write-Host 'Remote Viewer / Agent contract check passed.'
