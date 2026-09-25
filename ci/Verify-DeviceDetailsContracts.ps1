@@ -9,6 +9,10 @@ $service = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_servic
 $patchHost = Get-Content 'Agent/chatpass_agent/src/patching/patch_host_main.cpp' -Raw
 $logging = Get-Content 'Agent/chatpass_agent/src/util/log.h' -Raw
 $h264 = Get-Content 'Agent/chatpass_agent/src/h264_mf_encoder.cpp' -Raw
+$agentInstaller = Get-Content 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss' -Raw
+$agentBuild = Get-Content 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1' -Raw
+$windowsWorkflow = Get-Content '.github/workflows/windows-installers.yml' -Raw
+$cmake = Get-Content 'Agent/chatpass_agent/CMakeLists.txt' -Raw
 
 Require-Literal $inventory 'json LocalUsers()' 'Local-user inventory collector is missing.'
 Require-Literal $inventory '{"local_users", localUsers}' 'Inventory snapshot no longer publishes local_users.'
@@ -39,7 +43,8 @@ Require-Literal $service 'transmit_link_speed_bps' 'Live transmit link speed is 
 Require-Literal $service 'PurgeProgramDataHousekeeping' 'ProgramData housekeeping must run on Agent startup and periodically.'
 Require-Literal $service 'C:\ProgramData\Hi5CentralUpgrade' 'Legacy standalone updater storage must be scavenged safely.'
 Require-Literal $service 'PatchHost" / L"jobs", 6' 'Abandoned PatchHost job payloads must age out after the safe grace period.'
-Require-Literal $service 'Qualification" / L"jobs", 24 * 7' 'Qualification evidence must have a bounded endpoint retention period.'
+Require-Literal $service 'remove_all(qualificationRoot' 'Production Agent housekeeping must remove legacy qualification-observer evidence.'
+Require-Literal $service 'remove_all(legacyUpgrade' 'Retired Hi5CentralUpgrade storage must be removed completely.'
 Require-Literal $service 'Hi5Central\Agent\Temp' 'Temporary uninstall diagnostics must use Agent Temp instead of permanent Logs.'
 Require-Literal $service '[MSI log tail]' 'Failed MSI uninstall diagnostics must be condensed into the job result.'
 Require-Literal $service 'Remove-Item -LiteralPath $script:hi5MsiLog' 'Temporary MSI uninstall logs must be removed after the attempt.'
@@ -50,5 +55,14 @@ Require-Literal $logging 'kDiagnosticBackups = 2' 'Diagnostic log backup count m
 Require-Literal $logging 'kSupportBackups = 2' 'Support log backup count must remain bounded.'
 Require-Literal $h264 'Hi5Central\\Agent\\Temp\\hi5-h264-dump.h264' 'Opt-in raw H.264 diagnostics must live in disposable Agent Temp.'
 if ($h264.Contains('Hi5Central\\Agent\\Logs\\hi5-h264-dump.h264')) { throw 'Raw H.264 diagnostics must not pollute the bounded Agent Logs directory.' }
+
+# Qualification Observer is lab-only and must not ship in the normal Agent.
+Require-Literal $cmake 'option(HI5_BUILD_QUALIFICATION_OBSERVER "Build the lab-only Windows qualification observer" OFF)' 'Qualification Observer must default to excluded from production builds.'
+if ($agentBuild.Contains('hi5central_qualification_observer') -or $agentBuild.Contains('Hi5CentralQualificationObserver.exe')) { throw 'Production Agent build script must not build or require the Qualification Observer.' }
+if ($windowsWorkflow.Contains('Hi5CentralQualificationObserver.exe')) { throw 'Production Windows artifact must not publish the Qualification Observer.' }
+if ($agentInstaller.Contains('Source: "{#QualificationObserverExePath}"')) { throw 'Production Agent installer must not install the Qualification Observer.' }
+Require-Literal $agentInstaller 'Type: files; Name: "{app}\Hi5CentralQualificationObserver.exe"' 'Agent upgrade must delete Qualification Observer binaries left by older builds.'
+Require-Literal $agentInstaller 'Type: filesandordirs; Name: "{commonappdata}\Hi5Central\Agent\Qualification"' 'Agent upgrade must remove legacy Qualification Observer evidence.'
+Require-Literal $agentInstaller 'Type: filesandordirs; Name: "{commonappdata}\Hi5CentralUpgrade"' 'Agent upgrade must remove the retired standalone upgrade tree.'
 
 Write-Host 'Device Details Agent contract check passed.'

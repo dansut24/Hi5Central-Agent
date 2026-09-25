@@ -118,7 +118,6 @@ jobs:
             Agent/chatpass_agent/build/Release/Hi5CentralRemoteHost.exe
             Agent/chatpass_agent/build/Release/Hi5CentralMediaHost.exe
             Agent/chatpass_agent/build/Release/Hi5CentralPatchHost.exe
-            Agent/chatpass_agent/build/Release/Hi5CentralQualificationObserver.exe
             Agent/chatpass_agent/build/Release/Hi5CentralUser.exe
 
       - name: Upload Viewer installer

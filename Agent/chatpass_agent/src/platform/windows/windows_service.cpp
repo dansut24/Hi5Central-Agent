@@ -767,9 +767,17 @@ namespace hi5 {
             PurgeOldFiles(agentRoot / L"Temp", 6, true, stats);
             PurgeOldFiles(agentRoot / L"Actions", 6, true, stats);
 
-            // Qualification evidence is useful briefly for troubleshooting but
-            // should not become a permanent endpoint-side archive.
-            PurgeOldChildDirectories(agentRoot / L"Qualification" / L"jobs", 24 * 7, stats);
+            // The Qualification Observer is a lab-only tool and is no longer
+            // part of the production Agent. Remove evidence left by older builds.
+            const fs::path qualificationRoot = agentRoot / L"Qualification";
+            const uint64_t qualificationBytes = HousekeepingTreeSize(qualificationRoot);
+            ec.clear();
+            const auto qualificationRemoved = fs::remove_all(qualificationRoot, ec);
+            if (!ec && qualificationRemoved > 0) {
+                stats.bytes += qualificationBytes;
+                ++stats.directories;
+            }
+            ec.clear();
 
             // Agent-upgrade installers are transient. Keep recent logs/results
             // long enough for the diagnostics UI, not every historical build.
@@ -779,11 +787,16 @@ namespace hi5 {
             PurgeOldMatchingFiles(upgrade, "result-", ".json", 24 * 7, stats);
 
             // Pre-current updater builds used a separate ProgramData root.
-            // Current source/history has no dependency on it. Retain the most
-            // recent 24 hours defensively, then scavenge legacy content.
+            // No current Agent/platform component depends on it.
             const fs::path legacyUpgrade = LR"(C:\ProgramData\Hi5CentralUpgrade)";
-            PurgeOldFiles(legacyUpgrade, 24, true, stats);
-            RemoveEmptyDirectories(legacyUpgrade);
+            const uint64_t legacyUpgradeBytes = HousekeepingTreeSize(legacyUpgrade);
+            ec.clear();
+            const auto legacyUpgradeRemoved = fs::remove_all(legacyUpgrade, ec);
+            if (!ec && legacyUpgradeRemoved > 0) {
+                stats.bytes += legacyUpgradeBytes;
+                ++stats.directories;
+            }
+            ec.clear();
 
             PurgeOldChatLogs(30);
             RemoveEmptyDirectories(agentRoot / L"Temp");
@@ -1153,26 +1166,11 @@ namespace hi5 {
             return dir + "\\hi5central_sas_helper.exe";
         }
 
-        static std::string QualificationObserverExePath() {
-            const std::string exe = CurrentExePath();
-            const std::string dir = DirOfPath(exe);
-            return dir + "\\Hi5CentralQualificationObserver.exe";
-        }
-
         static std::string QuoteArg(const std::string& value) {
             std::string out = "\"";
             for (char c : value) { if (c == '"') out += '\\'; out += c; }
             out += "\"";
             return out;
-        }
-
-        static bool QualificationIdentifierSafe(const std::string& value) {
-            if (value.empty() || value.size() > 128) return false;
-            for (const unsigned char c : value) {
-                if (std::isalnum(c) || c == '-' || c == '_' || c == '.') continue;
-                return false;
-            }
-            return true;
         }
 
         static std::wstring WideFromUtf8(const std::string& s) {
@@ -5111,108 +5109,6 @@ exit 1
                         json result = BuildCommandActionResult(command, cr);
                         const bool ok = cr.error.empty() && cr.exitCode == 0;
                         PostJobResult(ident, jobId, ok, result, cr.error);
-                        return;
-                    }
-
-                    if (jobType == "qualification.observer.start") {
-                        const std::string observerExe = QualificationObserverExePath();
-                        if (!std::filesystem::exists(observerExe)) {
-                            PostJobResult(ident, jobId, false, json{
-                                {"success", false},
-                                {"observer_path", observerExe}
-                            }, "Qualification observer executable is not installed.");
-                            return;
-                        }
-
-                        const std::string qualificationJobId = payload.value("qualificationJobId", jobId);
-                        const std::string applicationName = payload.value("applicationName", std::string("Manual observation"));
-                        const std::string phase = payload.value("phase", std::string("manual"));
-                        const std::string args =
-                            "--job-id " + QuoteArg(qualificationJobId) +
-                            " --application " + QuoteArg(applicationName) +
-                            " --phase " + QuoteArg(phase);
-
-                        HANDLE process = hi5::LaunchInElevatedVisibleDefaultSession(observerExe, args);
-                        if (!process) {
-                            PostJobResult(ident, jobId, false, json{
-                                {"success", false},
-                                {"observer_path", observerExe},
-                                {"applicationName", applicationName},
-                                {"phase", phase}
-                            }, "Failed to launch qualification observer in the active interactive session.");
-                            return;
-                        }
-
-                        const DWORD pid = GetProcessId(process);
-                        CloseHandle(process);
-                        PostJobResult(ident, jobId, true, json{
-                            {"success", true},
-                            {"observer_path", observerExe},
-                            {"pid", pid},
-                            {"qualificationJobId", qualificationJobId},
-                            {"applicationName", applicationName},
-                            {"phase", phase},
-                            {"visible", true}
-                        });
-                        return;
-                    }
-
-                    if (jobType == "qualification.observer.collect") {
-                        const std::string qualificationJobId = payload.value("qualificationJobId", jobId);
-                        if (!QualificationIdentifierSafe(qualificationJobId)) {
-                            PostJobResult(ident, jobId, false, json{
-                                {"success", false},
-                                {"qualificationJobId", qualificationJobId}
-                            }, "Invalid qualification observer job identifier.");
-                            return;
-                        }
-
-                        const std::filesystem::path root =
-                            std::filesystem::path("C:\\ProgramData\\Hi5Central\\Agent\\Qualification");
-                        const std::filesystem::path statePath = root / "observer-state.json";
-                        const std::filesystem::path summaryPath = root / "jobs" / qualificationJobId / "summary.json";
-                        json result = {
-                            {"success", true},
-                            {"qualificationJobId", qualificationJobId},
-                            {"statePath", statePath.string()},
-                            {"summaryPath", summaryPath.string()}
-                        };
-                        bool found = false;
-
-                        if (std::filesystem::exists(statePath)) {
-                            try {
-                                std::ifstream in(statePath, std::ios::binary);
-                                json state;
-                                in >> state;
-                                result["observerState"] = std::move(state);
-                                found = true;
-                            }
-                            catch (const std::exception& ex) {
-                                result["stateReadError"] = ex.what();
-                            }
-                        }
-
-                        if (std::filesystem::exists(summaryPath)) {
-                            try {
-                                std::ifstream in(summaryPath, std::ios::binary);
-                                json summary;
-                                in >> summary;
-                                result["jobSummary"] = std::move(summary);
-                                found = true;
-                            }
-                            catch (const std::exception& ex) {
-                                result["summaryReadError"] = ex.what();
-                            }
-                        }
-
-                        result["evidenceFound"] = found;
-                        PostJobResult(
-                            ident,
-                            jobId,
-                            found,
-                            result,
-                            found ? std::string() : "No qualification observer evidence is available yet."
-                        );
                         return;
                     }
 

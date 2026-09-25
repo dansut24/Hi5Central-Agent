@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(HI5_REQUIRE_STATIC_CRT "Require static MSVC runtime (/MT) for agent builds" ON)
+option(HI5_BUILD_QUALIFICATION_OBSERVER "Build the lab-only Windows qualification observer" OFF)
 set(HI5_AGENT_VERSION "1.0.0" CACHE STRING "Hi5Central Agent runtime version reported to the control plane")
 
 if(MSVC AND HI5_REQUIRE_STATIC_CRT)
@@ -378,18 +379,20 @@ if(WIN32)
   )
   set_target_properties(hi5central_patch_host PROPERTIES OUTPUT_NAME "Hi5CentralPatchHost")
 
-  # Visible qualification-lab companion. This executable never performs
-  # installs/uninstalls itself; it observes process and uninstall-registry
-  # transitions and persists evidence/history for qualification analysis.
-  add_executable(hi5central_qualification_observer WIN32
-    src/qualification/qualification_observer_main.cpp
-  )
-  hi5_use_static_msvc_runtime(hi5central_qualification_observer)
-  target_include_directories(hi5central_qualification_observer PRIVATE src)
-  target_compile_definitions(hi5central_qualification_observer PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
-  target_link_libraries(hi5central_qualification_observer PRIVATE
-    nlohmann_json::nlohmann_json
-    wbemuuid ole32 oleaut32 advapi32 user32 shell32 wevtapi tdh
-  )
-  set_target_properties(hi5central_qualification_observer PROPERTIES OUTPUT_NAME "Hi5CentralQualificationObserver")
+  # Qualification Observer is deliberately excluded from normal Agent builds
+  # and installers. It can be built explicitly for the Hi5Central test lab.
+  if(HI5_BUILD_QUALIFICATION_OBSERVER)
+    add_executable(hi5central_qualification_observer WIN32
+      src/qualification/qualification_observer_main.cpp
+    )
+    hi5_use_static_msvc_runtime(hi5central_qualification_observer)
+    target_include_directories(hi5central_qualification_observer PRIVATE src)
+    target_compile_definitions(hi5central_qualification_observer PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
+    target_link_libraries(hi5central_qualification_observer PRIVATE
+      nlohmann_json::nlohmann_json
+      wbemuuid ole32 oleaut32 advapi32 user32 shell32 wevtapi tdh
+    )
+    set_target_properties(hi5central_qualification_observer PROPERTIES OUTPUT_NAME "Hi5CentralQualificationObserver")
+  endif()
+
 endif()
