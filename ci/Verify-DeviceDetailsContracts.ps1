@@ -13,7 +13,7 @@ Require-Literal $inventory '{"local_users", localUsers}' 'Inventory snapshot no 
 Require-Literal $inventory 'Get-LocalGroupMember -Group ''Administrators''' 'Local administrator membership collection is missing.'
 Require-Literal $inventory 'is_admin' 'Local-user administrator annotation is missing.'
 Require-Literal $inventory 'saneLinkSpeed' 'Network inventory must suppress Windows unknown-speed sentinel values.'
-Require-Literal $inventory 'Microsoft\\Windows NT\\CurrentVersion\\ProfileList' 'Software inventory must enumerate real Windows user profiles instead of LocalSystem HKCU.'
+Require-Literal $inventory 'Microsoft\Windows NT\CurrentVersion\ProfileList' 'Software inventory must enumerate real Windows user profiles instead of LocalSystem HKCU.'
 Require-Literal $inventory '"user:" + sidUtf8' 'Per-user software inventory must retain the owning user SID.'
 if ($inventory.Contains('HKEY_CURRENT_USER')) { throw 'Service software inventory must not treat LocalSystem HKCU/systemprofile as an end-user software source.' }
 Require-Literal $patchHost 'hiveUtf8 == "S-1-5-18"' 'Patch verification must reject LocalSystem uninstall registrations.'
