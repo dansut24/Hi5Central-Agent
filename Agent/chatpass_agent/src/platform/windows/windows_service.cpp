@@ -608,31 +608,39 @@ namespace hi5 {
 
         static json BuildNetworkStatsResponse(const std::string& requestId) {
             json adapters = json::array();
-            PMIB_IF_TABLE2 table = nullptr;
-            if (GetIfTable2(&table) == NO_ERROR && table) {
-                for (ULONG i = 0; i < table->NumEntries; ++i) {
-                    const MIB_IF_ROW2& row = table->Table[i];
-                    if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-                    const auto saneSpeed = [](std::uint64_t value) -> std::uint64_t {
-                        return value > 1000000000000ULL ? 0ULL : value;
-                    };
-                    adapters.push_back({
-                        {"name", WideToUtf8(row.Alias)},
-                        {"description", WideToUtf8(row.Description)},
-                        {"interface_index", row.InterfaceIndex},
-                        {"interface_luid", std::to_string(row.InterfaceLuid.Value)},
-                        {"status", row.OperStatus == IfOperStatusUp ? "Up" : "Down"},
-                        {"receive_bytes", static_cast<std::uint64_t>(row.InOctets)},
-                        {"send_bytes", static_cast<std::uint64_t>(row.OutOctets)},
-                        {"receive_link_speed_bps", saneSpeed(static_cast<std::uint64_t>(row.ReceiveLinkSpeed))},
-                        {"transmit_link_speed_bps", saneSpeed(static_cast<std::uint64_t>(row.TransmitLinkSpeed))},
-                        {"receive_errors", static_cast<std::uint64_t>(row.InErrors)},
-                        {"send_errors", static_cast<std::uint64_t>(row.OutErrors)},
-                        {"receive_discards", static_cast<std::uint64_t>(row.InDiscards)},
-                        {"send_discards", static_cast<std::uint64_t>(row.OutDiscards)}
-                    });
+            ULONG tableBytes = 0;
+            const DWORD sizeStatus = GetIfTable(nullptr, &tableBytes, FALSE);
+            if ((sizeStatus == ERROR_INSUFFICIENT_BUFFER || sizeStatus == NO_ERROR) && tableBytes > 0) {
+                std::vector<unsigned char> buffer(tableBytes);
+                auto* table = reinterpret_cast<PMIB_IFTABLE>(buffer.data());
+                if (GetIfTable(table, &tableBytes, FALSE) == NO_ERROR) {
+                    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+                        const MIB_IFROW& row = table->table[i];
+                        if (row.dwType == 24 /* software loopback */) continue;
+                        std::string description;
+                        if (row.dwDescrLen > 0) {
+                            const auto length = std::min<DWORD>(row.dwDescrLen, MAXLEN_IFDESCR);
+                            description.assign(reinterpret_cast<const char*>(row.bDescr), length);
+                            while (!description.empty() && description.back() == '\0') description.pop_back();
+                        }
+                        const std::string interfaceName = description.empty() ? WideToUtf8(std::wstring(row.wszName)) : description;
+                        const std::uint64_t linkSpeed = static_cast<std::uint64_t>(row.dwSpeed);
+                        adapters.push_back({
+                            {"name", interfaceName},
+                            {"description", description.empty() ? interfaceName : description},
+                            {"interface_index", row.dwIndex},
+                            {"status", row.dwOperStatus == 5 ? "Up" : "Down"},
+                            {"receive_bytes", static_cast<std::uint64_t>(row.dwInOctets)},
+                            {"send_bytes", static_cast<std::uint64_t>(row.dwOutOctets)},
+                            {"receive_link_speed_bps", linkSpeed},
+                            {"transmit_link_speed_bps", linkSpeed},
+                            {"receive_errors", static_cast<std::uint64_t>(row.dwInErrors)},
+                            {"send_errors", static_cast<std::uint64_t>(row.dwOutErrors)},
+                            {"receive_discards", static_cast<std::uint64_t>(row.dwInDiscards)},
+                            {"send_discards", static_cast<std::uint64_t>(row.dwOutDiscards)}
+                        });
+                    }
                 }
-                FreeMibTable(table);
             }
             return {
                 {"type", "network_stats_response"},
