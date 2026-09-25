@@ -44,6 +44,12 @@ const elStatState    = document.getElementById("stat-state");
 const elStatCodec    = document.getElementById("stat-codec");
 const elCodecDevBadge = document.getElementById("codec-dev-badge");
 const elCodecDevSelect = document.getElementById("codec-dev-select");
+const elDesktopQualityIndicator = document.getElementById("desktop-quality-indicator");
+const elBtnSettings = document.getElementById("btn-settings");
+const elSettingsPanel = document.getElementById("settings-panel");
+const elSettingsClose = document.getElementById("settings-close");
+const elViewerScaleMode = document.getElementById("viewer-scale-mode");
+const elRemoteResolutionPref = document.getElementById("remote-resolution-pref");
 const elDiagIceState = document.getElementById("diag-ice-state");
 const elDiagConnState = document.getElementById("diag-connection-state");
 const elDiagCandidatePair = document.getElementById("diag-candidate-pair");
@@ -53,6 +59,8 @@ const elDiagFrames = document.getElementById("diag-frames");
 const elDiagPacketsLost = document.getElementById("diag-packets-lost");
 const elDiagRtt = document.getElementById("diag-rtt");
 const elDiagIceServers = document.getElementById("diag-ice-servers");
+const elDiagQuality = document.getElementById("diag-quality");
+const elDiagProfile = document.getElementById("diag-profile");
 
 if (elVideo) {
   elVideo.autoplay = true;
@@ -86,10 +94,27 @@ let audioEnabled = false;
 let localInputBlocked = false;
 let remoteDescSet = false;
 let pendingRemoteIce = [];
+let viewerReconnectTimer = null;
+let viewerReconnectDeadline = 0;
+let viewerReconnectAttempts = 0;
+let viewerTransportProbeTimer = null;
+let endpointRestartUntil = 0;
+let viewerReconnectCooldownUntil = 0;
 
 let statsTimer = null;
 let transitionWatchdogTimer = null;
-let lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, jitterDelay: 0, jitterEmitted: 0 };
+let lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, packetsReceived: 0, jitterDelay: 0, jitterEmitted: 0 };
+const DESKTOP_ADAPTIVE_TIERS = [
+  { bitrate: 8000, fps: 30, label: 'Native · 8 Mbps · 30 fps' },
+  { bitrate: 6000, fps: 30, label: 'Native · 6 Mbps · 30 fps' },
+  { bitrate: 4500, fps: 24, label: 'Native · 4.5 Mbps · 24 fps' },
+  { bitrate: 3200, fps: 20, label: 'Native · 3.2 Mbps · 20 fps' },
+  { bitrate: 2200, fps: 15, label: 'Native · 2.2 Mbps · 15 fps' }
+];
+let desktopAdaptiveState = { tier: 0, bad: 0, good: 0, lastChangeAt: Date.now(), ...DESKTOP_ADAPTIVE_TIERS[0] };
+let desktopQualityState = { current: 'good', candidate: null, count: 0, changedAt: Date.now(), samples: [] };
+let desktopScaleMode = localStorage.getItem('hi5.viewer.scale') === 'stretch' ? 'stretch' : 'fit';
+let desktopResolutionPref = ['native','1080p','720p'].includes(localStorage.getItem('hi5.viewer.resolution')) ? localStorage.getItem('hi5.viewer.resolution') : 'auto';
 
 let inputBound = false;
 let controlActive = false;
@@ -156,8 +181,12 @@ const NEGOTIATION_GRACE_MS = 2500;
 ------------------------------------------ */
 
 function setStatus(dotClass, label) {
+  const text = String(label || "");
+  const hideActiveStreamTag = text === "Streaming" || text.startsWith("Streaming ·") || text === "Switching…" || text === "Switching...";
+  const statusChip = elStatusLabel?.closest(".session-meta");
+  if (statusChip) statusChip.style.display = hideActiveStreamTag ? "none" : "";
   if (elStatusDot) elStatusDot.className = dotClass || "";
-  if (elStatusLabel) elStatusLabel.textContent = label || "";
+  if (elStatusLabel) elStatusLabel.textContent = hideActiveStreamTag ? "" : text;
 }
 
 function setOverlayMode(mode) {
@@ -255,6 +284,7 @@ function showStream() {
 }
 
 function markFrameRendered() {
+  const firstRenderedFrame = !hasEverRenderedFrame;
   hasEverRenderedFrame = true;
   lastFrameAtMs = Date.now();
 
@@ -263,14 +293,11 @@ function markFrameRendered() {
   }
 
   if (desktopModePending) {
-    desktopModePendingFrames += 1;
-    if (desktopModePendingFrames >= 2 && Date.now() - desktopModeSwitchStartedAt >= 700) {
-      completeDesktopModeTransition(desktopModePending);
-      return;
-    }
+    completeDesktopModeTransition(desktopModePending);
+    return;
   }
 
-  if (revealOnNextFrame) {
+  if (firstRenderedFrame || revealOnNextFrame) {
     revealOnNextFrame = false;
     secureDesktopLikely = false;
     showStream();
@@ -907,7 +934,7 @@ function stopStatsPoll() {
     clearInterval(transitionWatchdogTimer);
     transitionWatchdogTimer = null;
   }
-  lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, jitterDelay: 0, jitterEmitted: 0 };
+  lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, packetsReceived: 0, jitterDelay: 0, jitterEmitted: 0 };
   lastFramesDecoded = 0;
 }
 
@@ -987,6 +1014,76 @@ function sendInput(kind, extra = {}, force = false) {
       ...extra,
     }));
   }
+}
+
+function sendControlObject(message) {
+  const payload = JSON.stringify(message || {});
+  for (const channel of [controlDc, inputDc]) {
+    if (!channel || channel.readyState !== 'open') continue;
+    try { channel.send(payload); return true; } catch {}
+  }
+  return false;
+}
+
+function desktopResolutionProfile() {
+  if (desktopResolutionPref === '720p') return { max_width: 1280, max_height: 720, preference: '720p' };
+  if (desktopResolutionPref === '1080p') return { max_width: 1920, max_height: 1080, preference: '1080p' };
+  return { max_width: 0, max_height: 0, preference: desktopResolutionPref === 'native' ? 'native' : 'auto' };
+}
+
+function applyDesktopScalePreference() {
+  if (elVideo) elVideo.style.objectFit = desktopScaleMode === 'stretch' ? 'fill' : 'contain';
+  if (elViewerScaleMode) elViewerScaleMode.value = desktopScaleMode;
+  if (elRemoteResolutionPref) elRemoteResolutionPref.value = desktopResolutionPref;
+}
+
+function sendDesktopStreamProfile() {
+  const cfg = DESKTOP_ADAPTIVE_TIERS[Math.max(0, Math.min(DESKTOP_ADAPTIVE_TIERS.length - 1, desktopAdaptiveState.tier))];
+  const resolution = desktopResolutionProfile();
+  desktopAdaptiveState = { ...desktopAdaptiveState, ...cfg };
+  const resolutionLabel = resolution.preference === 'auto' ? 'Native' : resolution.preference;
+  if (elDiagProfile) elDiagProfile.textContent = resolutionLabel + ' · ' + (cfg.bitrate / 1000) + ' Mbps · ' + cfg.fps + ' fps';
+  return sendControlObject({ kind: 'viewer_stream_profile', viewer_client: 'native', ...resolution, target_fps: cfg.fps, target_bitrate_kbps: cfg.bitrate });
+}
+function desktopMedian(values) {
+  const nums = values.filter(Number.isFinite).sort((a,b) => a-b);
+  if (!nums.length) return 0;
+  const mid = Math.floor(nums.length/2);
+  return nums.length % 2 ? nums[mid] : (nums[mid-1]+nums[mid])/2;
+}
+
+function observeDesktopNetworkQuality({ rttMs, jitterMs, jitterBufferMs, packetCount, packetsLostDelta }) {
+  const sample = { rtt: Number.isFinite(rttMs)&&rttMs>0?rttMs:null, jitter:Number.isFinite(jitterMs)?jitterMs:null, buffer:Number.isFinite(jitterBufferMs)?jitterBufferMs:null, packetCount:Math.max(0,Number(packetCount)||0), packetsLost:Math.max(0,Number(packetsLostDelta)||0) };
+  desktopQualityState.samples.push(sample);
+  if (desktopQualityState.samples.length > 10) desktopQualityState.samples.shift();
+  if (desktopQualityState.samples.length < 4) { if (elDiagQuality) elDiagQuality.textContent='Measuring'; return; }
+  const samples=desktopQualityState.samples;
+  const rtt=desktopMedian(samples.map(x=>x.rtt));
+  const jitter=desktopMedian(samples.map(x=>x.jitter));
+  const buffer=desktopMedian(samples.map(x=>x.buffer));
+  const packetTotal=samples.reduce((sum,x)=>sum+x.packetCount,0);
+  const lostTotal=samples.reduce((sum,x)=>sum+x.packetsLost,0);
+  const loss=packetTotal>=120?lostTotal/packetTotal:0;
+  const poor=rtt>=350||buffer>=240||jitter>=90||(packetTotal>=120&&loss>=0.04);
+  const excellent=rtt>0&&rtt<140&&buffer<90&&jitter<35&&(packetTotal<120||loss<0.008);
+  const observed=poor?'poor':(excellent?'excellent':'good');
+  if(observed===desktopQualityState.current){desktopQualityState.candidate=null;desktopQualityState.count=0;}
+  else {
+    if(desktopQualityState.candidate===observed) desktopQualityState.count+=1; else {desktopQualityState.candidate=observed;desktopQualityState.count=1;}
+    const needed=observed==='excellent'?5:3;
+    if(desktopQualityState.count>=needed&&Date.now()-desktopQualityState.changedAt>=4000){desktopQualityState.current=observed;desktopQualityState.changedAt=Date.now();desktopQualityState.candidate=null;desktopQualityState.count=0;}
+  }
+  const current=desktopQualityState.current;
+  const qualityLabel=current==='poor'?'Poor':current==='excellent'?'Excellent':'Good';
+  const qualityDetail=qualityLabel+' · '+Math.round(rtt||0)+'ms · '+(loss*100).toFixed(1)+'% loss';
+  if(elDiagQuality) elDiagQuality.textContent=qualityDetail;
+  if(elDesktopQualityIndicator){ elDesktopQualityIndicator.textContent=qualityLabel; elDesktopQualityIndicator.dataset.quality=current; elDesktopQualityIndicator.title=qualityDetail; }
+  if(current==='poor'){desktopAdaptiveState.bad+=1;desktopAdaptiveState.good=0;}
+  else if(current==='excellent'){desktopAdaptiveState.good+=1;desktopAdaptiveState.bad=0;}
+  else {desktopAdaptiveState.bad=Math.max(0,desktopAdaptiveState.bad-1);desktopAdaptiveState.good=Math.max(0,desktopAdaptiveState.good-1);}
+  const since=Date.now()-desktopAdaptiveState.lastChangeAt;
+  if(desktopAdaptiveState.bad>=5&&since>=15000&&desktopAdaptiveState.tier<DESKTOP_ADAPTIVE_TIERS.length-1){desktopAdaptiveState.tier+=1;desktopAdaptiveState.bad=0;desktopAdaptiveState.good=0;desktopAdaptiveState.lastChangeAt=Date.now();sendDesktopStreamProfile();}
+  else if(desktopAdaptiveState.good>=12&&since>=15000&&desktopAdaptiveState.tier>0){desktopAdaptiveState.tier-=1;desktopAdaptiveState.bad=0;desktopAdaptiveState.good=0;desktopAdaptiveState.lastChangeAt=Date.now();sendDesktopStreamProfile();}
 }
 
 function normalizeDesktopMode(mode) {
@@ -1185,7 +1282,7 @@ function isModifierCode(code) {
 }
 
 function isPrintableKey(ev) {
-  if (!ev || ev.ctrlKey || ev.altKey || ev.metaKey) return false;
+  if (!ev) return false;
   if (isModifierCode(ev.code)) return false;
   if (typeof ev.key !== "string") return false;
   if (ev.key.length === 0) return false;
@@ -1373,6 +1470,12 @@ function disconnect(reason, options = {}) {
     try { ws.close(); } catch {}
     ws = null;
   }
+  if (viewerReconnectTimer) { clearTimeout(viewerReconnectTimer); viewerReconnectTimer = null; }
+  clearViewerTransportProbe();
+  viewerReconnectDeadline = 0;
+  viewerReconnectAttempts = 0;
+  endpointRestartUntil = 0;
+  viewerReconnectCooldownUntil = 0;
 
   if (elVideo) {
     try { elVideo.pause(); } catch {}
@@ -1503,6 +1606,9 @@ async function pollStatsOnce() {
   let fps = NaN;
   let framesDecoded = null;
   let packetsLost = null;
+  let packetsReceived = null;
+  let packetSampleCount = 0;
+  let packetsLostDelta = 0;
   let jitterMs = null;
   let jitterBufferMs = null;
 
@@ -1510,6 +1616,7 @@ async function pollStatsOnce() {
     const bytesReceived = Number(inbound.bytesReceived || 0);
     framesDecoded = Number(inbound.framesDecoded || 0);
     packetsLost = Number(inbound.packetsLost || 0);
+    packetsReceived = Number(inbound.packetsReceived || 0);
     jitterMs = Number.isFinite(Number(inbound.jitter)) ? Number(inbound.jitter) * 1000 : null;
     const jitterDelay = Number(inbound.jitterBufferDelay || 0);
     const jitterEmitted = Number(inbound.jitterBufferEmittedCount || 0);
@@ -1537,6 +1644,9 @@ async function pollStatsOnce() {
 
         const dFrames = framesDecoded - lastStats.frames;
         fps = dFrames / dt;
+        packetsLostDelta = Math.max(0, packetsLost - lastStats.packetsLost);
+        const dReceived = Math.max(0, packetsReceived - lastStats.packetsReceived);
+        packetSampleCount = packetsLostDelta + dReceived;
       }
     }
 
@@ -1544,6 +1654,7 @@ async function pollStatsOnce() {
     lastStats.bytes = bytesReceived;
     lastStats.frames = framesDecoded;
     lastStats.packetsLost = packetsLost;
+    lastStats.packetsReceived = packetsReceived;
     lastStats.jitterDelay = jitterDelay;
     lastStats.jitterEmitted = jitterEmitted;
   }
@@ -1551,6 +1662,8 @@ async function pollStatsOnce() {
   const rttMs = selectedPair && isFinite(selectedPair.currentRoundTripTime)
     ? Math.round(selectedPair.currentRoundTripTime * 1000)
     : null;
+
+  observeDesktopNetworkQuality({ rttMs, jitterMs, jitterBufferMs, packetCount: packetSampleCount, packetsLostDelta });
 
   sendInput("viewer_diagnostics", {
     rtt_ms: rttMs ?? 0,
@@ -1918,7 +2031,9 @@ function bindRemoteInput() {
       }
     }
 
-    if (isPrintableKey(ev)) {
+    const altGraph = !!ev.getModifierState?.('AltGraph');
+    const commandModified = !!(ev.ctrlKey || ev.altKey || ev.metaKey);
+    if (isPrintableKey(ev) && (!commandModified || altGraph)) {
       sendInput("text_input", {
         code: ev.code,
         key: ev.key,
@@ -2232,6 +2347,8 @@ async function handleOffer(msg) {
   const offerSdp = msg?.sdp;
   if (!offerSdp) return;
 
+  if (pc) teardownPeerForReconnect();
+  endpointRestartUntil = 0;
   logSdpCodecSummary("remote offer", offerSdp);
 
   setStatus("", "Negotiating…");
@@ -2285,6 +2402,7 @@ async function handleOffer(msg) {
       else controlDc = channel;
 
       channel.onopen = () => {
+        sendDesktopStreamProfile();
         if (elCodecDevSelect) {
           elCodecDevSelect.disabled = false;
           elCodecDevSelect.title = "Development codec override · switches live without reconnecting";
@@ -2394,14 +2512,31 @@ async function handleOffer(msg) {
   };
 
   pc.onicegatheringstatechange = () => console.log("[rtc] iceGatheringState:", pc.iceGatheringState);
-  pc.oniceconnectionstatechange = () => console.log("[rtc] iceConnectionState:", pc.iceConnectionState);
+  pc.oniceconnectionstatechange = () => {
+    console.log("[rtc] iceConnectionState:", pc.iceConnectionState);
+    if (pc.iceConnectionState === 'failed' && endpointRestartUntil <= Date.now()) scheduleViewerReconnect('ice-failed');
+  };
   pc.onconnectionstatechange = () => {
     console.log("[rtc] connectionState:", pc.connectionState);
 
     if (pc.connectionState === "connected") {
-      if (hasEverRenderedFrame) {
-        showStream();
+      const recovered = viewerReconnectAttempts > 0 || viewerReconnectDeadline > 0;
+      viewerReconnectDeadline = 0;
+      viewerReconnectAttempts = 0;
+      clearViewerTransportProbe();
+      if (viewerReconnectTimer) { clearTimeout(viewerReconnectTimer); viewerReconnectTimer = null; }
+      if (recovered) {
+        viewerReconnectCooldownUntil = Date.now() + 10000;
+        desktopQualityState = { current: 'good', candidate: null, count: 0, changedAt: Date.now(), samples: [] };
+        if (elDiagQuality) elDiagQuality.textContent = 'Measuring';
       }
+      setStatus("online", "Streaming");
+      if (hasEverRenderedFrame) showStream();
+    } else if (pc.connectionState === 'failed' && endpointRestartUntil <= Date.now()) {
+      scheduleViewerReconnect('peer-failed');
+    } else if (pc.connectionState === 'disconnected' && endpointRestartUntil <= Date.now()) {
+      setStatus('', 'Connection interrupted · checking…');
+      scheduleViewerTransportProbe('peer-disconnected', 3500);
     }
   };
   pc.onsignalingstatechange = () => console.log("[rtc] signalingState:", pc.signalingState);
@@ -2453,6 +2588,25 @@ async function onSignalMessage(raw) {
   switch (msg.type) {
     case "viewer_connected":
       break;
+
+    case "agent_reconnecting": {
+      const graceMs = Math.max(10000, Number(msg.grace_ms || 0) || 240000);
+      endpointRestartUntil = Date.now() + graceMs;
+      clearViewerTransportProbe();
+      if (viewerReconnectTimer) { clearTimeout(viewerReconnectTimer); viewerReconnectTimer = null; }
+      viewerReconnectDeadline = 0;
+      teardownPeerForReconnect();
+      setStatus('', 'Waiting for endpoint…');
+      showOverlay('Waiting for endpoint', 'The device is restarting. Reconnecting automatically…', { spinner: true, keepVideo: hasEverRenderedFrame });
+      break;
+    }
+
+    case "agent_reconnected": {
+      endpointRestartUntil = 0;
+      setStatus('', 'Endpoint returned · reconnecting…');
+      showOverlay('Reconnecting', 'Endpoint returned. Restoring the remote session…', { spinner: true, keepVideo: hasEverRenderedFrame });
+      break;
+    }
 
     case "session_config": {
       if (currentSession) {
@@ -2684,6 +2838,105 @@ async function onSignalMessage(raw) {
   }
 }
 
+function clearViewerTransportProbe() {
+  if (viewerTransportProbeTimer) { clearTimeout(viewerTransportProbeTimer); viewerTransportProbeTimer = null; }
+}
+
+function teardownPeerForReconnect() {
+  clearViewerTransportProbe();
+  stopStatsPoll();
+  remoteDescSet = false;
+  pendingRemoteIce = [];
+  if (inputDc) { try { inputDc.close(); } catch {} inputDc = null; }
+  if (controlDc) { try { controlDc.close(); } catch {} controlDc = null; }
+  if (mouseMoveDc) { try { mouseMoveDc.close(); } catch {} mouseMoveDc = null; }
+  if (pc) {
+    try { pc.onconnectionstatechange = null; pc.oniceconnectionstatechange = null; pc.close(); } catch {}
+    pc = null;
+  }
+}
+
+function scheduleViewerTransportProbe(reason = 'transport-probe', delayMs = 3500) {
+  if (!currentSession || endpointRestartUntil > Date.now()) return false;
+  if (viewerTransportProbeTimer) clearTimeout(viewerTransportProbeTimer);
+  const cooldownRemaining = Math.max(0, viewerReconnectCooldownUntil - Date.now());
+  viewerTransportProbeTimer = setTimeout(() => {
+    viewerTransportProbeTimer = null;
+    if (!currentSession) return;
+    const peerState = pc?.connectionState || '';
+    const socketOpen = ws?.readyState === WebSocket.OPEN;
+    if (peerState === 'connected' && socketOpen) return;
+    if (peerState === 'connecting' || pc?.iceConnectionState === 'checking') {
+      scheduleViewerTransportProbe(reason, 2500);
+      return;
+    }
+    if (!socketOpen || peerState === 'failed' || peerState === 'disconnected' || !pc) scheduleViewerReconnect(reason);
+  }, Math.max(delayMs, Math.min(8000, cooldownRemaining)));
+  return true;
+}
+
+function connectViewerSignaling(reason = 'initial') {
+  if (!currentSession) return false;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return true;
+  const { sessionId, deviceId, token, wssUrl, viewerClient } = currentSession;
+  const url =
+    `${wssUrl}?session_id=${encodeURIComponent(sessionId)}` +
+    `&device_id=${encodeURIComponent(deviceId)}` +
+    (token ? `&token=${encodeURIComponent(token)}` : '') +
+    (viewerClient ? `&client=${encodeURIComponent(viewerClient)}` : '');
+  console.log('[viewer] opening signaling socket', { sessionId, deviceId, reason, attempt: viewerReconnectAttempts });
+  const socket = new WebSocket(url);
+  ws = socket;
+  socket.onopen = () => {
+    if (ws !== socket) return;
+    setStatus('', viewerReconnectAttempts ? 'Reconnecting…' : 'Connected');
+    if (viewerReconnectAttempts > 0) {
+      const attempt = viewerReconnectAttempts;
+      setTimeout(() => {
+        if (!currentSession || ws !== socket || endpointRestartUntil > Date.now()) return;
+        if (viewerReconnectAttempts !== attempt || pc?.connectionState === 'connected') return;
+        if (viewerReconnectDeadline && Date.now() >= viewerReconnectDeadline) { disconnect('Connection lost'); return; }
+        scheduleViewerReconnect('media-negotiation-timeout');
+      }, 8000);
+    }
+  };
+  socket.onmessage = onSignalMessage;
+  socket.onerror = () => {
+    if (ws !== socket || !currentSession) return;
+    if (endpointRestartUntil > Date.now()) return;
+    scheduleViewerReconnect('signaling-error');
+  };
+  socket.onclose = () => {
+    if (ws === socket) ws = null;
+    if (!currentSession || endpointRestartUntil > Date.now()) return;
+    scheduleViewerReconnect('signaling-closed', { closeSocket: false });
+  };
+  return true;
+}
+
+function scheduleViewerReconnect(reason = 'network-recovery', { closeSocket = true } = {}) {
+  if (!currentSession || endpointRestartUntil > Date.now()) return false;
+  const now = Date.now();
+  if (!viewerReconnectDeadline) viewerReconnectDeadline = now + 85000;
+  if (now >= viewerReconnectDeadline) { disconnect('Connection lost'); return false; }
+  if (viewerReconnectTimer) return true;
+  viewerReconnectAttempts += 1;
+  setStatus('', 'Reconnecting…');
+  showOverlay('Reconnecting', 'Restoring the remote session…', { spinner: true, keepVideo: hasEverRenderedFrame });
+  teardownPeerForReconnect();
+  if (closeSocket && ws) {
+    const old = ws; ws = null;
+    try { old.onclose = null; old.onerror = null; old.close(4002, 'Viewer reconnect'); } catch {}
+  }
+  const delay = Math.min(3000, 350 + (viewerReconnectAttempts - 1) * 550);
+  viewerReconnectTimer = setTimeout(() => {
+    viewerReconnectTimer = null;
+    if (!currentSession) return;
+    if (!connectViewerSignaling(reason) && Date.now() < viewerReconnectDeadline) scheduleViewerReconnect(reason, { closeSocket: false });
+  }, delay);
+  return true;
+}
+
 function startSession(params) {
   console.log("[viewer] starting authorised remote session");
 
@@ -2704,6 +2957,11 @@ function startSession(params) {
     disconnect("Invalid connection parameters");
     return;
   }
+
+  desktopAdaptiveState = { tier: 0, bad: 0, good: 0, lastChangeAt: Date.now(), ...DESKTOP_ADAPTIVE_TIERS[0] };
+  desktopQualityState = { current: 'good', candidate: null, count: 0, changedAt: Date.now(), samples: [] };
+  if (elDiagQuality) elDiagQuality.textContent = 'Measuring';
+  if (elDiagProfile) elDiagProfile.textContent = DESKTOP_ADAPTIVE_TIERS[0].label;
 
   currentSession = {
     sessionId,
@@ -2740,28 +2998,10 @@ function startSession(params) {
   setStatus("", "Connecting…");
   showOverlay("Connecting", "Starting remote session…", { spinner: true });
 
-  const url =
-    `${wssUrl}?session_id=${encodeURIComponent(sessionId)}` +
-    `&device_id=${encodeURIComponent(deviceId)}` +
-    (token ? `&token=${encodeURIComponent(token)}` : "") +
-    (viewerClient ? `&client=${encodeURIComponent(viewerClient)}` : "");
-  console.log(`[viewer] opening signaling socket session=${sessionId} device=${deviceId}`);
-
-  ws = new WebSocket(url);
-
-  ws.onopen = () => {
-    setStatus("", "Connected");
-  };
-
-  ws.onmessage = onSignalMessage;
-
-  ws.onerror = () => {
-    disconnect("Connection error");
-  };
-
-  ws.onclose = () => {
-    disconnect("Disconnected");
-  };
+  viewerReconnectDeadline = 0;
+  viewerReconnectAttempts = 0;
+  endpointRestartUntil = 0;
+  connectViewerSignaling('initial');
 }
 
 
@@ -2782,6 +3022,19 @@ if (elCodecDevSelect) {
     sendDevCodecSwitch(elCodecDevSelect.value || "auto");
   });
 }
+if (elBtnSettings) elBtnSettings.addEventListener('click', () => elSettingsPanel?.classList.toggle('visible'));
+if (elSettingsClose) elSettingsClose.addEventListener('click', () => elSettingsPanel?.classList.remove('visible'));
+if (elViewerScaleMode) elViewerScaleMode.addEventListener('change', () => {
+  desktopScaleMode = elViewerScaleMode.value === 'stretch' ? 'stretch' : 'fit';
+  localStorage.setItem('hi5.viewer.scale', desktopScaleMode);
+  applyDesktopScalePreference();
+});
+if (elRemoteResolutionPref) elRemoteResolutionPref.addEventListener('change', () => {
+  desktopResolutionPref = ['native','1080p','720p'].includes(elRemoteResolutionPref.value) ? elRemoteResolutionPref.value : 'auto';
+  localStorage.setItem('hi5.viewer.resolution', desktopResolutionPref);
+  sendDesktopStreamProfile();
+});
+applyDesktopScalePreference();
 
 /* -----------------------------------------
    App entry

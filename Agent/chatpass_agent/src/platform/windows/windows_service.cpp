@@ -753,6 +753,39 @@ namespace hi5 {
             if (code == "Tab") { vk = VK_TAB; return true; }
             if (code == "Space") { vk = VK_SPACE; return true; }
 
+            if (code == "Backquote") { vk = VK_OEM_3; return true; }
+            if (code == "Minus") { vk = VK_OEM_MINUS; return true; }
+            if (code == "Equal") { vk = VK_OEM_PLUS; return true; }
+            if (code == "BracketLeft") { vk = VK_OEM_4; return true; }
+            if (code == "BracketRight") { vk = VK_OEM_6; return true; }
+            if (code == "Backslash") { vk = VK_OEM_5; return true; }
+            if (code == "IntlBackslash") { vk = VK_OEM_102; return true; }
+            if (code == "Semicolon") { vk = VK_OEM_1; return true; }
+            if (code == "Quote") { vk = VK_OEM_7; return true; }
+            if (code == "Comma") { vk = VK_OEM_COMMA; return true; }
+            if (code == "Period") { vk = VK_OEM_PERIOD; return true; }
+            if (code == "Slash") { vk = VK_OEM_2; return true; }
+
+            if (code.size() == 7 && code.rfind("Numpad", 0) == 0 && code[6] >= '0' && code[6] <= '9') {
+                vk = static_cast<WORD>(VK_NUMPAD0 + (code[6] - '0'));
+                return true;
+            }
+            if (code == "NumpadMultiply") { vk = VK_MULTIPLY; return true; }
+            if (code == "NumpadAdd") { vk = VK_ADD; return true; }
+            if (code == "NumpadSubtract") { vk = VK_SUBTRACT; return true; }
+            if (code == "NumpadDecimal") { vk = VK_DECIMAL; return true; }
+            if (code == "NumpadDivide") { vk = VK_DIVIDE; extended = true; return true; }
+            if (code == "NumpadEnter") { vk = VK_RETURN; extended = true; return true; }
+            if (code == "NumpadEqual") { vk = VK_OEM_PLUS; return true; }
+            if (code == "NumpadComma") { vk = VK_SEPARATOR; return true; }
+
+            if (code == "CapsLock") { vk = VK_CAPITAL; return true; }
+            if (code == "NumLock") { vk = VK_NUMLOCK; extended = true; return true; }
+            if (code == "ScrollLock") { vk = VK_SCROLL; return true; }
+            if (code == "Pause") { vk = VK_PAUSE; return true; }
+            if (code == "PrintScreen") { vk = VK_SNAPSHOT; extended = true; return true; }
+            if (code == "ContextMenu") { vk = VK_APPS; extended = true; return true; }
+
             if (code == "ShiftLeft") { vk = VK_LSHIFT; return true; }
             if (code == "ShiftRight") { vk = VK_RSHIFT; return true; }
             if (code == "ControlLeft") { vk = VK_LCONTROL; return true; }
@@ -786,6 +819,32 @@ namespace hi5 {
             if (code == "F10") { vk = VK_F10; return true; }
             if (code == "F11") { vk = VK_F11; return true; }
             if (code == "F12") { vk = VK_F12; return true; }
+            if (code.size() >= 3 && code[0] == 'F') {
+                try {
+                    const int fn = std::stoi(code.substr(1));
+                    if (fn >= 13 && fn <= 24) { vk = static_cast<WORD>(VK_F13 + (fn - 13)); return true; }
+                } catch (...) {}
+            }
+
+            if (code == "BrowserBack") { vk = VK_BROWSER_BACK; extended = true; return true; }
+            if (code == "BrowserForward") { vk = VK_BROWSER_FORWARD; extended = true; return true; }
+            if (code == "BrowserRefresh") { vk = VK_BROWSER_REFRESH; extended = true; return true; }
+            if (code == "BrowserStop") { vk = VK_BROWSER_STOP; extended = true; return true; }
+            if (code == "BrowserSearch") { vk = VK_BROWSER_SEARCH; extended = true; return true; }
+            if (code == "BrowserFavorites") { vk = VK_BROWSER_FAVORITES; extended = true; return true; }
+            if (code == "BrowserHome") { vk = VK_BROWSER_HOME; extended = true; return true; }
+            if (code == "AudioVolumeMute") { vk = VK_VOLUME_MUTE; extended = true; return true; }
+            if (code == "AudioVolumeDown") { vk = VK_VOLUME_DOWN; extended = true; return true; }
+            if (code == "AudioVolumeUp") { vk = VK_VOLUME_UP; extended = true; return true; }
+            if (code == "MediaTrackNext") { vk = VK_MEDIA_NEXT_TRACK; extended = true; return true; }
+            if (code == "MediaTrackPrevious") { vk = VK_MEDIA_PREV_TRACK; extended = true; return true; }
+            if (code == "MediaStop") { vk = VK_MEDIA_STOP; extended = true; return true; }
+            if (code == "MediaPlayPause") { vk = VK_MEDIA_PLAY_PAUSE; extended = true; return true; }
+            if (code == "LaunchMail") { vk = VK_LAUNCH_MAIL; extended = true; return true; }
+            if (code == "LaunchMediaPlayer") { vk = VK_LAUNCH_MEDIA_SELECT; extended = true; return true; }
+            if (code == "LaunchApp1") { vk = VK_LAUNCH_APP1; extended = true; return true; }
+            if (code == "LaunchApp2") { vk = VK_LAUNCH_APP2; extended = true; return true; }
+            if (code == "Sleep") { vk = VK_SLEEP; extended = true; return true; }
 
             return false;
         }
@@ -9054,8 +9113,8 @@ exit 1
                                 }
                                 else if (!ctx.unifiedSecureReady && !ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
                                     ctx.uacDetectedAt.time_since_epoch().count() != 0 &&
-                                    now - ctx.uacDetectedAt >= std::chrono::milliseconds(350) &&
-                                    now - ctx.lastSecureLaunchAttempt >= std::chrono::milliseconds(300)) {
+                                    now - ctx.uacDetectedAt >= std::chrono::milliseconds(220) &&
+                                    now - ctx.lastSecureLaunchAttempt >= std::chrono::milliseconds(200)) {
                                     LogW("dynamic desktop did not produce a secure frame quickly; launching fallback secure helper session=" + ctx.sessionId);
                                     LaunchSecureStreamer(ctx);
                                 }

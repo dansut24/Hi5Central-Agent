@@ -490,6 +490,10 @@
       font-size: 12px;
     }
     .diag-row:last-child { border-bottom: 0; }
+    #desktop-quality-indicator { display:inline-flex; align-items:center; min-height:24px; padding:0 8px; border:1px solid rgba(255,255,255,.14); border-radius:999px; font-size:10px; font-weight:800; color:var(--text); background:rgba(255,255,255,.04); }
+    #desktop-quality-indicator[data-quality="excellent"] { border-color:rgba(52,211,153,.55); }
+    #desktop-quality-indicator[data-quality="good"] { border-color:rgba(99,102,241,.55); }
+    #desktop-quality-indicator[data-quality="poor"], #desktop-quality-indicator[data-quality="reconnecting"] { border-color:rgba(251,191,36,.65); }
     .diag-row span:first-child { color: var(--muted); }
     .diag-row span:last-child { color: var(--text); font-weight: 700; text-align: right; word-break: break-word; }
 
@@ -565,6 +569,7 @@
         <div id="status-dot"></div>
         <div id="status-label">Waiting for connection…</div>
         <div id="codec-dev-badge" title="Negotiated remote video codec">Codec: —</div>
+        <div id="desktop-quality-indicator" data-quality="good" title="Connection quality">Measuring</div>
         <select id="codec-dev-select" title="Development codec override" disabled>
           <option value="auto">Auto</option>
           <option value="vp8">VP8</option>
@@ -659,6 +664,8 @@
         <div class="diag-row"><span>Resolution</span><span id="stat-res">—</span></div>
         <div class="diag-row"><span>Codec</span><span id="stat-codec">—</span></div>
         <div class="diag-row"><span>State</span><span id="stat-state">—</span></div>
+        <div class="diag-row"><span>Quality</span><span id="diag-quality">Measuring</span></div>
+        <div class="diag-row"><span>Adaptive profile</span><span id="diag-profile">Native · 8 Mbps · 30 fps</span></div>
       </div>
       <div class="settings-card">
         <h3>WebRTC</h3>

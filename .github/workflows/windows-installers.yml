@@ -64,6 +64,10 @@ jobs:
           if ($service -notmatch 'signalingReconnectRequested_') { throw 'Signaling reconnect state is missing.' }
           if ($service -notmatch 'scheduling reconnect') { throw 'WebSocket close no longer schedules reconnect.' }
 
+      - name: Verify remote Viewer and input contracts
+        shell: pwsh
+        run: ./ci/Verify-RemoteViewerContracts.ps1
+
       - name: Ensure Inno Setup is available
         shell: pwsh
         run: |
