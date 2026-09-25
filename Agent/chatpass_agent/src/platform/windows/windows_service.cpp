@@ -745,6 +745,7 @@ namespace hi5 {
         static void PurgeProgramDataHousekeeping() {
             namespace fs = std::filesystem;
             HousekeepingStats stats{};
+            std::error_code ec;
             const fs::path agentRoot = LR"(C:\ProgramData\Hi5Central\Agent)";
             const fs::path logs = agentRoot / L"Logs";
             const fs::path upgrade = agentRoot / L"Upgrade";
