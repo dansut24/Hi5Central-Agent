@@ -1001,8 +1001,9 @@ function sendInput(kind, extra = {}, force = false) {
 
   const payload = JSON.stringify({ kind, ...extra });
 
-  if (inputDc && inputDc.readyState === "open") {
-    inputDc.send(payload);
+  const inputChannel = controlDc && controlDc.readyState === "open" ? controlDc : inputDc;
+  if (inputChannel && inputChannel.readyState === "open") {
+    inputChannel.send(payload);
     return;
   }
 
@@ -1056,7 +1057,7 @@ function observeDesktopNetworkQuality({ rttMs, jitterMs, jitterBufferMs, packetC
   const sample = { rtt: Number.isFinite(rttMs)&&rttMs>0?rttMs:null, jitter:Number.isFinite(jitterMs)?jitterMs:null, buffer:Number.isFinite(jitterBufferMs)?jitterBufferMs:null, packetCount:Math.max(0,Number(packetCount)||0), packetsLost:Math.max(0,Number(packetsLostDelta)||0) };
   desktopQualityState.samples.push(sample);
   if (desktopQualityState.samples.length > 10) desktopQualityState.samples.shift();
-  if (desktopQualityState.samples.length < 4) { if (elDiagQuality) elDiagQuality.textContent='Measuring'; return; }
+  if (desktopQualityState.samples.length < 4) { if (elDiagQuality) elDiagQuality.textContent='Measuring'; if (elDesktopQualityIndicator) { elDesktopQualityIndicator.textContent='Measuring'; elDesktopQualityIndicator.dataset.quality='good'; elDesktopQualityIndicator.title='Collecting stable network samples'; } return; }
   const samples=desktopQualityState.samples;
   const rtt=desktopMedian(samples.map(x=>x.rtt));
   const jitter=desktopMedian(samples.map(x=>x.jitter));
@@ -2529,6 +2530,7 @@ async function handleOffer(msg) {
         viewerReconnectCooldownUntil = Date.now() + 10000;
         desktopQualityState = { current: 'good', candidate: null, count: 0, changedAt: Date.now(), samples: [] };
         if (elDiagQuality) elDiagQuality.textContent = 'Measuring';
+        if (elDesktopQualityIndicator) { elDesktopQualityIndicator.textContent='Measuring'; elDesktopQualityIndicator.dataset.quality='good'; elDesktopQualityIndicator.title='Connection restored · stabilising measurements'; }
       }
       setStatus("online", "Streaming");
       if (hasEverRenderedFrame) showStream();
@@ -2596,6 +2598,7 @@ async function onSignalMessage(raw) {
       if (viewerReconnectTimer) { clearTimeout(viewerReconnectTimer); viewerReconnectTimer = null; }
       viewerReconnectDeadline = 0;
       teardownPeerForReconnect();
+      if (elDesktopQualityIndicator) { elDesktopQualityIndicator.textContent='Reconnecting'; elDesktopQualityIndicator.dataset.quality='reconnecting'; elDesktopQualityIndicator.title='Endpoint restarting'; }
       setStatus('', 'Waiting for endpoint…');
       showOverlay('Waiting for endpoint', 'The device is restarting. Reconnecting automatically…', { spinner: true, keepVideo: hasEverRenderedFrame });
       break;
@@ -2603,6 +2606,8 @@ async function onSignalMessage(raw) {
 
     case "agent_reconnected": {
       endpointRestartUntil = 0;
+      desktopQualityState = { current: 'good', candidate: null, count: 0, changedAt: Date.now(), samples: [] };
+      if (elDesktopQualityIndicator) { elDesktopQualityIndicator.textContent='Measuring'; elDesktopQualityIndicator.dataset.quality='good'; elDesktopQualityIndicator.title='Endpoint returned · stabilising measurements'; }
       setStatus('', 'Endpoint returned · reconnecting…');
       showOverlay('Reconnecting', 'Endpoint returned. Restoring the remote session…', { spinner: true, keepVideo: hasEverRenderedFrame });
       break;
@@ -2921,6 +2926,7 @@ function scheduleViewerReconnect(reason = 'network-recovery', { closeSocket = tr
   if (now >= viewerReconnectDeadline) { disconnect('Connection lost'); return false; }
   if (viewerReconnectTimer) return true;
   viewerReconnectAttempts += 1;
+  if (elDesktopQualityIndicator) { elDesktopQualityIndicator.textContent='Reconnecting'; elDesktopQualityIndicator.dataset.quality='reconnecting'; elDesktopQualityIndicator.title=reason; }
   setStatus('', 'Reconnecting…');
   showOverlay('Reconnecting', 'Restoring the remote session…', { spinner: true, keepVideo: hasEverRenderedFrame });
   teardownPeerForReconnect();
@@ -3035,6 +3041,24 @@ if (elRemoteResolutionPref) elRemoteResolutionPref.addEventListener('change', ()
   sendDesktopStreamProfile();
 });
 applyDesktopScalePreference();
+
+window.addEventListener('offline', () => {
+  if (!currentSession) return;
+  if (elDesktopQualityIndicator) { elDesktopQualityIndicator.textContent='Offline'; elDesktopQualityIndicator.dataset.quality='reconnecting'; elDesktopQualityIndicator.title='Waiting for network'; }
+  setStatus('', 'Network offline · waiting…');
+});
+window.addEventListener('online', () => {
+  if (!currentSession || endpointRestartUntil > Date.now()) return;
+  if (pc?.connectionState === 'connected' && ws?.readyState === WebSocket.OPEN) return;
+  setStatus('', 'Network restored · checking…');
+  scheduleViewerTransportProbe('network-online', 3000);
+});
+navigator.connection?.addEventListener?.('change', () => {
+  if (!currentSession || endpointRestartUntil > Date.now()) return;
+  if (pc?.connectionState === 'connected' && ws?.readyState === WebSocket.OPEN) return;
+  setStatus('', 'Network path changed · checking…');
+  scheduleViewerTransportProbe('network-path-change', 3500);
+});
 
 /* -----------------------------------------
    App entry
