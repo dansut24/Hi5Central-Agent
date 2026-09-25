@@ -1525,7 +1525,24 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                         result["installerOutput"] = Truncate(install.output, 4000);
                         result["rebootRequired"] = install.exitCode == 3010 || install.exitCode == 1641;
                     } else {
-                        const auto strategies = VendorInstallStrategies(manifest);
+                        json executionManifest = manifest;
+                        const std::string configuredTechnology = Lower(
+                            manifest.value("installerTechnology", std::string()));
+                        const std::string detectedTechnology = DetectInstallerTechnology(
+                            installerPath,
+                            installerType);
+                        if ((configuredTechnology.empty() || configuredTechnology == "generic")
+                            && !detectedTechnology.empty()
+                            && detectedTechnology != "generic"
+                            && detectedTechnology != "unknown") {
+                            executionManifest["installerTechnology"] = detectedTechnology;
+                            result["configuredInstallerTechnology"] = configuredTechnology.empty()
+                                ? "generic"
+                                : configuredTechnology;
+                            result["detectedInstallerTechnology"] = detectedTechnology;
+                            result["installerTechnologyAutoSelected"] = true;
+                        }
+                        const auto strategies = VendorInstallStrategies(executionManifest);
                         if (strategies.empty()) {
                             result["error"] = "silent_install_strategy_missing";
                         } else {
