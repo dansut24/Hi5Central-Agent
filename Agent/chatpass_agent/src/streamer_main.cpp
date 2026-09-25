@@ -329,10 +329,19 @@ namespace {
     void SendKeyEvent(const hi5::InputCmd& cmd) {
         INPUT in{};
         in.type = INPUT_KEYBOARD;
-        in.ki.wScan = cmd.key.scanCode;
-        in.ki.dwFlags = KEYEVENTF_SCANCODE;
-        if (!cmd.key.down) in.ki.dwFlags |= KEYEVENTF_KEYUP;
-        if (cmd.key.isExtended) in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+        // Pause/Break and Print Screen use special multi-byte hardware sequences.
+        // Let Windows synthesize those sequences from the virtual key rather than
+        // forcing them through the normal E0/scancode path.
+        if (cmd.key.vk == VK_PAUSE || cmd.key.vk == VK_SNAPSHOT) {
+            in.ki.wVk = cmd.key.vk;
+            in.ki.wScan = 0;
+            in.ki.dwFlags = cmd.key.down ? 0 : KEYEVENTF_KEYUP;
+        } else {
+            in.ki.wScan = cmd.key.scanCode;
+            in.ki.dwFlags = KEYEVENTF_SCANCODE;
+            if (!cmd.key.down) in.ki.dwFlags |= KEYEVENTF_KEYUP;
+            if (cmd.key.isExtended) in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+        }
         SendInput(1, &in, sizeof(INPUT));
     }
 

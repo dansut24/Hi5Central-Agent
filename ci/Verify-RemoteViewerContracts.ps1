@@ -13,6 +13,7 @@ $viewer = Get-Content 'Viewer/chatpass_viewer/web/renderer.js' -Raw
 $viewerHtml = Get-Content 'Viewer/chatpass_viewer/web/index.html' -Raw
 $service = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
 $sender = Get-Content 'Agent/chatpass_agent/src/webrtc_sender.cpp' -Raw
+$streamer = Get-Content 'Agent/chatpass_agent/src/streamer_main.cpp' -Raw
 
 # Desktop Viewer parity / recovery
 Require-Literal $viewer 'scheduleViewerReconnect' 'Desktop Viewer signaling reconnect engine is missing.'
@@ -49,6 +50,8 @@ Require-Literal $service 'VK_F13' 'Windows key map must support F13-F24.'
 # Adaptive profile / transfer cleanup contracts
 Require-Literal $sender 'target_bitrate_kbps' 'Viewer-requested bitrate target support is missing.'
 Require-Literal $service 'HandleRemoteFileUploadCancel' 'Endpoint upload cancellation is missing.'
+Require-Literal $streamer 'cmd.key.vk == VK_PAUSE || cmd.key.vk == VK_SNAPSHOT' 'Pause/Print Screen special Windows injection path is missing.'
+Require-Literal $streamer 'in.ki.wVk = cmd.key.vk' 'Pause/Print Screen must use Windows virtual-key synthesis.'
 Require-Literal $service 'std::filesystem::remove(target' 'Cancelled/abandoned upload partial-file cleanup is missing.'
 
 # CAD / secure desktop responsiveness keeps safety checks but starts fallback quickly.
