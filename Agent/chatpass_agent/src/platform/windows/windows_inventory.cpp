@@ -270,7 +270,7 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
         std::array<char, 4096> buffer{};
         while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe)) {
             output += buffer.data();
-            if (output.size() > 4 * 1024 * 1024) break;
+            if (output.size() > 8 * 1024 * 1024) { output.clear(); break; }
         }
 #if defined(_WIN32)
         _pclose(pipe);
@@ -1110,7 +1110,7 @@ json DeepInventoryInfo() {
         }
     }
 
-    const json fresh = RunPowerShellJson(std::string(R"PS(
+    std::string deepScript = R"PS(
 function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
 function WmiChars($v) {
   if ($null -eq $v) { return '' }
@@ -1194,6 +1194,8 @@ if (-not $physicalDisks.Count) {
   })
 }
 
+)PS";
+    deepScript += R"PS(
 $monitors = @()
 try {
   $monitors = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop | ForEach-Object {
@@ -1358,6 +1360,8 @@ $usbDevices = @(Get-CimInstance Win32_PnPEntity |
     }
   })
 
+)PS";
+    deepScript += R"PS(
 $optionalFeatures = @()
 if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
   try {
@@ -1493,6 +1497,8 @@ try {
   }
 } catch {}
 
+)PS";
+    deepScript += R"PS(
 $machineCertificates = @()
 foreach ($storePath in @('Cert:\LocalMachine\My','Cert:\LocalMachine\WebHosting')) {
   if (-not (Test-Path $storePath)) { continue }
@@ -1636,7 +1642,8 @@ try {
   firewall_profiles = @($firewallProfiles)
   battery = $battery
 } | ConvertTo-Json -Depth 9 -Compress
-)PS", json::object());
+)PS";
+    const json fresh = RunPowerShellJson(deepScript, json::object());
 
     if (!fresh.is_object() || fresh.empty()) {
         std::lock_guard<std::mutex> lock(cacheMutex);

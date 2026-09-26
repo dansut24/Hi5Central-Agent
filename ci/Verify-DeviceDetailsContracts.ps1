@@ -58,8 +58,10 @@ Require-Literal $service 'transmit_link_speed_bps' 'Live transmit link speed is 
 # Deep endpoint intelligence must remain available without turning fast inventory into a heavyweight scan.
 Require-Literal $inventory 'json DeepInventoryInfo()' 'Deep endpoint inventory collector is missing.'
 Require-Literal $inventory 'std::chrono::minutes(15)' 'Deep endpoint inventory must remain cached on a slower cadence.'
-Require-Literal $inventory 'std::string(R"PS(' 'Deep inventory PowerShell must begin in a dynamically concatenated string so MSVC literal-size limits are not exceeded.'
-Require-Literal $inventory ')PS" + R"PS(' 'Deep inventory PowerShell must remain split into MSVC-safe raw-string chunks.'
+Require-Literal $inventory 'output.size() > 8 * 1024 * 1024' 'Deep inventory PowerShell capture must support the bounded 8 MiB endpoint-intelligence payload.'
+Require-Literal $inventory 'std::string deepScript = R"PS(' 'Deep inventory PowerShell must begin in a runtime string so MSVC literal-size limits are not exceeded.'
+Require-Literal $inventory 'deepScript += R"PS(' 'Deep inventory PowerShell must remain split into MSVC-safe raw-string chunks.'
+Require-Literal $inventory 'RunPowerShellJson(deepScript, json::object())' 'Deep inventory chunks must execute as one PowerShell script so collector state is preserved.'
 foreach ($field in @(
   'memory_modules','motherboard','physical_disks','monitors','drivers','problem_devices',
   'installed_hotfixes','windows_licensing','reboot_state','startup_items','scheduled_tasks',
