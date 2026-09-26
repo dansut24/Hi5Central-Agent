@@ -62,6 +62,9 @@ Require-Literal $inventory 'output.size() > 8 * 1024 * 1024' 'Deep inventory Pow
 Require-Literal $inventory 'std::string deepScript = R"PS(' 'Deep inventory PowerShell must begin in a runtime string so MSVC literal-size limits are not exceeded.'
 Require-Literal $inventory 'deepScript += R"PS(' 'Deep inventory PowerShell must remain split into MSVC-safe raw-string chunks.'
 Require-Literal $inventory 'RunPowerShellJson(deepScript, json::object())' 'Deep inventory chunks must execute as one PowerShell script so collector state is preserved.'
+Require-Literal $inventory '__HI5_JSON_BEGIN__' 'Deep inventory must frame JSON so non-data PowerShell output cannot corrupt parsing.'
+Require-Literal $inventory '__HI5_JSON_END__' 'Deep inventory must terminate its framed JSON payload explicitly.'
+Require-Literal $inventory 'deep_inventory_status' 'Inventory must report whether deep collection succeeded, failed or was not requested.'
 Require-Literal $inventory 'bool includeDeepInventory' 'Inventory snapshots must support lightweight snapshots without repeating deep endpoint data.'
 Require-Literal $inventory 'deep_inventory_included' 'Inventory snapshots must tell the server whether deep fields are present.'
 Require-Literal $service 'for (int i = 0; i < 300' 'Scheduled core inventory must run every five minutes rather than every 30 seconds.'
@@ -110,6 +113,9 @@ $tempDeepScript = Join-Path $env:TEMP 'hi5-deep-inventory-contract.ps1'
 @(
   '$ProgressPreference = ''SilentlyContinue'''
   '$ErrorActionPreference = ''SilentlyContinue'''
+  '$WarningPreference = ''SilentlyContinue'''
+  '$InformationPreference = ''SilentlyContinue'''
+  '$VerbosePreference = ''SilentlyContinue'''
   $deepScript
 ) | Set-Content -LiteralPath $tempDeepScript -Encoding UTF8
 $deepOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $tempDeepScript 2>&1
@@ -117,7 +123,15 @@ $deepExit = $LASTEXITCODE
 Remove-Item -LiteralPath $tempDeepScript -Force -ErrorAction SilentlyContinue
 $deepText = ($deepOutput | Out-String).Trim()
 if (-not $deepText) { throw ('Embedded deep inventory PowerShell returned no JSON. Exit code: ' + $deepExit) }
-try { $deepJson = $deepText | ConvertFrom-Json -ErrorAction Stop } catch { throw ('Embedded deep inventory PowerShell returned invalid JSON: ' + $_.Exception.Message + ' Output: ' + $deepText.Substring(0,[Math]::Min(1000,$deepText.Length))) }
+$begin = '__HI5_JSON_BEGIN__'
+$end = '__HI5_JSON_END__'
+$beginAt = $deepText.LastIndexOf($begin)
+if ($beginAt -lt 0) { throw ('Embedded deep inventory PowerShell did not emit the Hi5 JSON begin marker. Output: ' + $deepText.Substring(0,[Math]::Min(1000,$deepText.Length))) }
+$beginAt += $begin.Length
+$endAt = $deepText.IndexOf($end,$beginAt)
+if ($endAt -lt 0) { throw 'Embedded deep inventory PowerShell did not emit the Hi5 JSON end marker.' }
+$deepJsonText = $deepText.Substring($beginAt,$endAt-$beginAt)
+try { $deepJson = $deepJsonText | ConvertFrom-Json -ErrorAction Stop } catch { throw ('Embedded deep inventory PowerShell returned invalid marked JSON: ' + $_.Exception.Message) }
 foreach ($required in @('memory_modules','physical_disks','drivers','installed_hotfixes','scheduled_tasks','windows_licensing','reboot_state','battery')) {
   if ($null -eq $deepJson.PSObject.Properties[$required]) { throw ('Deep inventory runtime JSON is missing ' + $required + '.') }
 }

@@ -256,6 +256,9 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
         if (!f) return fallback;
         f << "$ProgressPreference = 'SilentlyContinue'\n";
         f << "$ErrorActionPreference = 'SilentlyContinue'\n";
+        f << "$WarningPreference = 'SilentlyContinue'\n";
+        f << "$InformationPreference = 'SilentlyContinue'\n";
+        f << "$VerbosePreference = 'SilentlyContinue'\n";
         f << script << "\n";
     }
 
@@ -280,10 +283,21 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
     }
     DeleteFileW(scriptPath.c_str());
 
-    const auto first = output.find_first_of("[{\"");
-    if (first != std::string::npos) output = output.substr(first);
-    const auto lastObj = output.find_last_of("]}");
-    if (lastObj != std::string::npos) output = output.substr(0, lastObj + 1);
+    constexpr const char* kJsonBegin = "__HI5_JSON_BEGIN__";
+    constexpr const char* kJsonEnd = "__HI5_JSON_END__";
+    const auto markedBegin = output.rfind(kJsonBegin);
+    if (markedBegin != std::string::npos) {
+        const auto jsonStart = markedBegin + std::char_traits<char>::length(kJsonBegin);
+        const auto markedEnd = output.find(kJsonEnd, jsonStart);
+        if (markedEnd != std::string::npos) {
+            output = output.substr(jsonStart, markedEnd - jsonStart);
+        }
+    } else {
+        const auto first = output.find_first_of("[{\"");
+        if (first != std::string::npos) output = output.substr(first);
+        const auto lastObj = output.find_last_of("]}");
+        if (lastObj != std::string::npos) output = output.substr(0, lastObj + 1);
+    }
     if (output.empty()) return fallback;
 
     try {
@@ -1609,7 +1623,7 @@ try {
   }
 } catch {}
 
-[pscustomobject]@{
+$deepResult = [pscustomobject]@{
   collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
   memory_modules = @($memoryModules)
   motherboard = $motherboard
@@ -1637,7 +1651,9 @@ try {
   defender = $defender
   firewall_profiles = @($firewallProfiles)
   battery = $battery
-} | ConvertTo-Json -Depth 9 -Compress
+}
+$deepJson = $deepResult | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $deepJson + '__HI5_JSON_END__')
 )PS";
     const json fresh = RunPowerShellJson(deepScript, json::object());
 
@@ -1974,8 +1990,10 @@ json BuildInventorySnapshot(const AgentIdentity& identity, bool includeDeepInven
             {"notes", "Includes Windows 11 build-name correction, BitLocker, software, updates, event health, GPU, TPM and warranty-ready WMI identity."}
         }}
     };
-    snapshot["deep_inventory_included"] = includeDeepInventory;
-    if (!includeDeepInventory) {
+    const bool deepInventoryAvailable = includeDeepInventory && deep.is_object() && !deep.empty();
+    snapshot["deep_inventory_included"] = deepInventoryAvailable;
+    snapshot["deep_inventory_status"] = includeDeepInventory ? (deepInventoryAvailable ? "included" : "failed") : "not_requested";
+    if (!deepInventoryAvailable) {
         for (const auto* key : {
             "memory_modules","motherboard","physical_disks","monitors","drivers","problem_devices",
             "installed_hotfixes","windows_licensing","reboot_state","startup_items","scheduled_tasks",
