@@ -7,6 +7,7 @@ function Require-Literal([string]$Text, [string]$Needle, [string]$Message) {
 $main = Get-Content 'Agent/chatpass_agent/src/main.cpp' -Raw
 $senderHeader = Get-Content 'Agent/chatpass_agent/src/webrtc_sender.h' -Raw
 $senderSource = Get-Content 'Agent/chatpass_agent/src/webrtc_sender.cpp' -Raw
+$input = Get-Content 'Agent/chatpass_agent/src/input_injector.cpp' -Raw
 $workflow = Get-Content '.github/workflows/windows-installers.yml' -Raw
 
 Require-Literal $main 'ConnectTicketFromArgs' 'Portable Connect ticket parser is missing.'
@@ -21,6 +22,11 @@ Require-Literal $main 'type == "input_event"' 'Portable Connect must preserve th
 Require-Literal $main 'type == "end_session" || type == "session_terminated"' 'Portable Connect must terminate on server-side session end.'
 Require-Literal $senderHeader 'void handleInputEvent(const nlohmann::json& msg);' 'WebRTC sender must expose the existing input injector for portable fallback input.'
 Require-Literal $senderSource 'm_injector.handleMessage(msg);' 'Portable fallback input must use the existing Windows input injector.'
+Require-Literal $input 'kind == "mouse_click"' 'Portable Connect input must support mobile tap/click events.'
+Require-Literal $input 'kind == "text_input"' 'Portable Connect input must support mobile text entry.'
+Require-Literal $input 'kind == "clipboard_paste"' 'Portable Connect input must support mobile clipboard paste.'
+Require-Literal $input 'sendUnicodeText' 'Portable Connect text entry must use Windows Unicode input.'
+Require-Literal $input 'sendShortcut' 'Portable Connect input must support common mobile Windows shortcuts.'
 Require-Literal $workflow 'Hi5CentralConnect.exe' 'Windows CI must publish the portable Connect executable.'
 if ($main -match 'cout\s*<<\s*ticket' -or $main -match 'cerr\s*<<\s*ticket') {
   throw 'Portable Connect must never print its one-time host ticket.'

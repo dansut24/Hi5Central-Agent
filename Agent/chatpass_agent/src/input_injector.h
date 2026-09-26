@@ -15,8 +15,11 @@ public:
 private:
     bool sendAbsoluteMoveNorm(double xNorm, double yNorm);
     bool sendMouseFlag(DWORD flags);
+    bool sendMouseClick(int button, int clickCount = 1);
     bool sendWheel(int deltaX, int deltaY);
     bool sendKey(const std::string& code, bool isDown);
+    bool sendUnicodeText(const std::string& text);
+    bool sendShortcut(const std::string& action);
 
     bool mapDomCodeToVk(const std::string& code, WORD& vk, bool& extended);
 

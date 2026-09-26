@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -45,6 +47,16 @@ void InputInjector::handleMessage(const json& msg) {
         return;
     }
 
+    if (kind == "mouse_click") {
+        if (msg.contains("x_norm") && msg.contains("y_norm")) {
+            sendAbsoluteMoveNorm(msg.value("x_norm", 0.0), msg.value("y_norm", 0.0));
+        }
+        const int button = std::max(0, std::min(2, msg.value("button", 0)));
+        const int clickCount = std::max(1, std::min(2, msg.value("click_count", 1)));
+        sendMouseClick(button, clickCount);
+        return;
+    }
+
     if (kind == "wheel") {
         const int dx = msg.value("delta_x", 0);
         const int dy = msg.value("delta_y", 0);
@@ -59,6 +71,30 @@ void InputInjector::handleMessage(const json& msg) {
 
     if (kind == "key_up") {
         sendKey(msg.value("code", ""), false);
+        return;
+    }
+
+    if (kind == "key_press") {
+        std::string code = msg.value("code", msg.value("key", std::string()));
+        if (code == "Esc") code = "Escape";
+        if (code == "Del") code = "Delete";
+        if (!code.empty()) {
+            sendKey(code, true);
+            sendKey(code, false);
+        }
+        return;
+    }
+
+    if (kind == "text_input" || kind == "text" || kind == "insert_text" || kind == "key_text" ||
+        kind == "clipboard_paste") {
+        const std::string text = msg.value("text", msg.value("key", std::string()));
+        if (!text.empty()) sendUnicodeText(text);
+        return;
+    }
+
+    if (kind == "shortcut" || kind == "system_shortcut" || kind == "service_shortcut") {
+        const std::string action = msg.value("action", msg.value("shortcut", std::string()));
+        if (!action.empty()) sendShortcut(action);
         return;
     }
 }
@@ -114,6 +150,26 @@ bool InputInjector::sendMouseFlag(DWORD flags) {
     return SendInput(1, &in, sizeof(INPUT)) == 1;
 }
 
+bool InputInjector::sendMouseClick(int button, int clickCount) {
+    DWORD down = MOUSEEVENTF_LEFTDOWN;
+    DWORD up = MOUSEEVENTF_LEFTUP;
+    if (button == 1) {
+        down = MOUSEEVENTF_MIDDLEDOWN;
+        up = MOUSEEVENTF_MIDDLEUP;
+    } else if (button == 2) {
+        down = MOUSEEVENTF_RIGHTDOWN;
+        up = MOUSEEVENTF_RIGHTUP;
+    }
+
+    bool ok = true;
+    clickCount = std::max(1, std::min(2, clickCount));
+    for (int i = 0; i < clickCount; ++i) {
+        ok = sendMouseFlag(down) && ok;
+        ok = sendMouseFlag(up) && ok;
+    }
+    return ok;
+}
+
 bool InputInjector::sendWheel(int deltaX, int deltaY) {
     bool ok = true;
 
@@ -154,6 +210,98 @@ bool InputInjector::sendKey(const std::string& code, bool isDown) {
     }
 
     return SendInput(1, &in, sizeof(INPUT)) == 1;
+}
+
+bool InputInjector::sendUnicodeText(const std::string& text) {
+    if (text.empty()) return false;
+
+    const int length = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        text.data(),
+        static_cast<int>(text.size()),
+        nullptr,
+        0
+    );
+    if (length <= 0) return false;
+
+    std::wstring wide(static_cast<size_t>(length), L'\0');
+    if (MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        text.data(),
+        static_cast<int>(text.size()),
+        wide.data(),
+        length
+    ) != length) {
+        return false;
+    }
+
+    std::vector<INPUT> inputs;
+    inputs.reserve(wide.size() * 2);
+    for (wchar_t ch : wide) {
+        INPUT down{};
+        down.type = INPUT_KEYBOARD;
+        down.ki.wVk = 0;
+        down.ki.wScan = static_cast<WORD>(ch);
+        down.ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs.push_back(down);
+
+        INPUT up = down;
+        up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs.push_back(up);
+    }
+
+    if (inputs.empty()) return false;
+    return SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT)) == inputs.size();
+}
+
+bool InputInjector::sendShortcut(const std::string& action) {
+    auto chord = [&](std::initializer_list<const char*> codes) -> bool {
+        std::vector<std::string> pressed;
+        bool ok = true;
+        for (const char* code : codes) {
+            if (!code || !*code) continue;
+            ok = sendKey(code, true) && ok;
+            pressed.emplace_back(code);
+        }
+        for (auto it = pressed.rbegin(); it != pressed.rend(); ++it) {
+            ok = sendKey(*it, false) && ok;
+        }
+        return ok;
+    };
+
+    if (action == "start_menu" || action == "windows_key" || action == "win") {
+        return chord({ "MetaLeft" });
+    }
+    if (action == "win_d" || action == "show_desktop") {
+        return chord({ "MetaLeft", "KeyD" });
+    }
+    if (action == "win_r" || action == "run_dialog") {
+        return chord({ "MetaLeft", "KeyR" });
+    }
+    if (action == "win_e" || action == "explorer" || action == "file_explorer") {
+        return chord({ "MetaLeft", "KeyE" });
+    }
+    if (action == "win_tab" || action == "task_view") {
+        return chord({ "MetaLeft", "Tab" });
+    }
+    if (action == "alt_tab" || action == "app_switcher") {
+        return chord({ "AltLeft", "Tab" });
+    }
+    if (action == "alt_f4" || action == "close_window") {
+        return chord({ "AltLeft", "F4" });
+    }
+    if (action == "ctrl_shift_esc" || action == "task_manager_shortcut") {
+        return chord({ "ControlLeft", "ShiftLeft", "Escape" });
+    }
+    if (action == "ctrl_esc") {
+        return chord({ "ControlLeft", "Escape" });
+    }
+    if (action == "lock" || action == "lock_workstation") {
+        return chord({ "MetaLeft", "KeyL" });
+    }
+    return false;
 }
 
 bool InputInjector::mapDomCodeToVk(const std::string& code, WORD& vk, bool& extended) {
