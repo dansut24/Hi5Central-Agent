@@ -1110,7 +1110,7 @@ json DeepInventoryInfo() {
         }
     }
 
-    const json fresh = RunPowerShellJson(R"PS(
+    const json fresh = RunPowerShellJson(std::string(R"PS(
 function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
 function WmiChars($v) {
   if ($null -eq $v) { return '' }
@@ -1243,6 +1243,7 @@ $problemDevices = @(Get-CimInstance Win32_PnPEntity |
     }
   })
 
+)PS") + R"PS(
 $hotfixes = @(Get-HotFix |
   Sort-Object InstalledOn -Descending |
   Select-Object -First 200 |
@@ -1282,6 +1283,7 @@ try {
 } catch {}
 $rebootState = [pscustomobject]@{ pending = [bool]$rebootReasons.Count; reasons = @($rebootReasons) }
 
+)PS" + R"PS(
 $startupItems = @(Get-CimInstance Win32_StartupCommand |
   Sort-Object Name |
   Select-Object -First 300 |
@@ -1386,6 +1388,7 @@ if (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue) {
   })
 }
 
+)PS" + R"PS(
 $networkConfigurations = @(Get-CimInstance Win32_NetworkAdapterConfiguration |
   Where-Object { $_.IPEnabled } |
   ForEach-Object {
@@ -1575,6 +1578,7 @@ if (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
   } catch {}
 }
 
+)PS" + R"PS(
 $battery = [pscustomobject]@{}
 try {
   $wb = Get-CimInstance Win32_Battery | Select-Object -First 1
