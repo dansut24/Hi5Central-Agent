@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -386,13 +387,28 @@ $csp = Get-CimInstance Win32_ComputerSystemProduct | Select-Object -First 1
 json CpuInfo() {
     SYSTEM_INFO si{};
     GetNativeSystemInfo(&si);
-    return {
+    json out = {
         {"name", RegString(HKEY_LOCAL_MACHINE, LR"(HARDWARE\DESCRIPTION\System\CentralProcessor\0)", L"ProcessorNameString")},
         {"vendor", RegString(HKEY_LOCAL_MACHINE, LR"(HARDWARE\DESCRIPTION\System\CentralProcessor\0)", L"VendorIdentifier")},
         {"logical_processors", static_cast<int>(si.dwNumberOfProcessors)},
         {"cores", static_cast<int>(si.dwNumberOfProcessors)},
         {"max_clock_mhz", RegDword(HKEY_LOCAL_MACHINE, LR"(HARDWARE\DESCRIPTION\System\CentralProcessor\0)", L"~MHz", 0)}
     };
+    const json wmi = RunPowerShellJson(R"PS(
+$cpus = @(Get-CimInstance Win32_Processor)
+[pscustomobject]@{
+  cores = [int](($cpus | Measure-Object -Property NumberOfCores -Sum).Sum)
+  logical_processors = [int](($cpus | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
+  max_clock_mhz = [int](($cpus | Measure-Object -Property MaxClockSpeed -Maximum).Maximum)
+  sockets = @($cpus).Count
+} | ConvertTo-Json -Compress
+)PS", json::object());
+    if (wmi.is_object()) {
+        for (const auto& key : {"cores","logical_processors","max_clock_mhz","sockets"}) {
+            if (wmi.contains(key) && !wmi[key].is_null()) out[key] = wmi[key];
+        }
+    }
+    return out;
 }
 
 json MemoryInfo() {
@@ -425,6 +441,14 @@ if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
       lock_status = [string]$_.LockStatus
       encryption_method = [string]$_.EncryptionMethod
       key_protector_count = @($_.KeyProtector).Count
+      recovery_protector_count = @($_.KeyProtector | Where-Object { [string]$_.KeyProtectorType -eq 'RecoveryPassword' }).Count
+      recovery_password_present = @($_.KeyProtector | Where-Object { [string]$_.KeyProtectorType -eq 'RecoveryPassword' }).Count -gt 0
+      key_protectors = @($_.KeyProtector | ForEach-Object {
+        [pscustomobject]@{
+          id = [string]$_.KeyProtectorId
+          type = [string]$_.KeyProtectorType
+        }
+      })
       auto_unlock_enabled = $_.AutoUnlockEnabled
     }
   }
@@ -743,13 +767,15 @@ json SecurityInfo(const json& bitlockerVolumes, const json& tpm, const json& loc
         }
     }
 
-    return {
+    json out = {
         {"defender_service_running", ServiceRunning(L"WinDefend")},
         {"defender_enabled", disableAntiSpyware == 0 && ServiceRunning(L"WinDefend")},
         {"defender_realtime_enabled", disableRealtime == 0},
         {"defender_real_time", disableRealtime == 0 ? "Enabled" : "Disabled"},
         {"firewall_enabled", ServiceRunning(L"MpsSvc")},
         {"firewall_service_running", ServiceRunning(L"MpsSvc")},
+        {"mde_service_state", ServiceState(L"Sense")},
+        {"mde_present", ServiceState(L"Sense") != "Not installed"},
         {"secure_boot_enabled", secureBootKnown ? json(secureBootEnabled) : json(nullptr)},
         {"secure_boot", secureBootKnown ? (secureBootEnabled ? "Enabled" : "Disabled") : "Unknown"},
         {"tpm_present", tpm.value("present", ServiceRunning(L"TBS"))},
@@ -761,6 +787,60 @@ json SecurityInfo(const json& bitlockerVolumes, const json& tpm, const json& loc
         {"local_admin_count", localAdmins.value("count", json(nullptr))},
         {"local_admins", localAdmins.value("members", json::array())}
     };
+
+    const json detailed = RunPowerShellJson(R"PS(
+$mp = $null
+if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+  try { $mp = Get-MpComputerStatus } catch {}
+}
+$profiles = @()
+if (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
+  try {
+    $profiles = @(Get-NetFirewallProfile | ForEach-Object {
+      [pscustomobject]@{
+        name = [string]$_.Name
+        enabled = [bool]$_.Enabled
+        default_inbound_action = [string]$_.DefaultInboundAction
+        default_outbound_action = [string]$_.DefaultOutboundAction
+        notify_on_listen = [bool]$_.NotifyOnListen
+        log_file = [string]$_.LogFileName
+        log_allowed = [bool]$_.LogAllowed
+        log_blocked = [bool]$_.LogBlocked
+      }
+    })
+  } catch {}
+}
+[pscustomobject]@{
+  defender = if ($mp) {
+    [pscustomobject]@{
+      antivirus_enabled = [bool]$mp.AntivirusEnabled
+      antispyware_enabled = [bool]$mp.AntispywareEnabled
+      realtime_protection_enabled = [bool]$mp.RealTimeProtectionEnabled
+      behavior_monitor_enabled = [bool]$mp.BehaviorMonitorEnabled
+      ioav_protection_enabled = [bool]$mp.IoavProtectionEnabled
+      nis_enabled = [bool]$mp.NISEnabled
+      tamper_protection_source = [string]$mp.TamperProtectionSource
+      is_tamper_protected = if ($mp.IsTamperProtected -ne $null) { [bool]$mp.IsTamperProtected } else { $null }
+      engine_version = [string]$mp.AMEngineVersion
+      product_version = [string]$mp.AMProductVersion
+      antivirus_signature_version = [string]$mp.AntivirusSignatureVersion
+      antivirus_signature_last_updated = if ($mp.AntivirusSignatureLastUpdated) { $mp.AntivirusSignatureLastUpdated.ToUniversalTime().ToString('o') } else { $null }
+      antispyware_signature_version = [string]$mp.AntispywareSignatureVersion
+      nis_signature_version = [string]$mp.NISSignatureVersion
+      quick_scan_age_days = $mp.QuickScanAge
+      quick_scan_end = if ($mp.QuickScanEndTime) { $mp.QuickScanEndTime.ToUniversalTime().ToString('o') } else { $null }
+      full_scan_age_days = $mp.FullScanAge
+      full_scan_end = if ($mp.FullScanEndTime) { $mp.FullScanEndTime.ToUniversalTime().ToString('o') } else { $null }
+      computer_state = [string]$mp.ComputerState
+    }
+  } else { $null }
+  firewall_profiles = @($profiles)
+} | ConvertTo-Json -Depth 6 -Compress
+)PS", json::object());
+    if (detailed.is_object()) {
+        for (auto it = detailed.begin(); it != detailed.end(); ++it) out[it.key()] = it.value();
+    }
+    return out;
 }
 
 std::string RegStringFromOpenedKey(HKEY key, const wchar_t* name) {
@@ -1016,6 +1096,556 @@ $items = Get-CimInstance Win32_VideoController | ForEach-Object {
     return result.is_array() ? result : json::array();
 }
 
+json DeepInventoryInfo() {
+    static std::mutex cacheMutex;
+    static json cached = json::object();
+    static auto cachedAt = std::chrono::steady_clock::time_point{};
+
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        if (!cached.empty() && cachedAt.time_since_epoch().count() != 0 &&
+            now - cachedAt < std::chrono::minutes(15)) {
+            return cached;
+        }
+    }
+
+    const json fresh = RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$memoryModules = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
+  [pscustomobject]@{
+    bank_label = $_.BankLabel
+    device_locator = $_.DeviceLocator
+    capacity_bytes = [uint64]$_.Capacity
+    manufacturer = (Text $_.Manufacturer).Trim()
+    part_number = (Text $_.PartNumber).Trim()
+    serial_number = (Text $_.SerialNumber).Trim()
+    speed_mhz = [int]$_.Speed
+    configured_speed_mhz = [int]$_.ConfiguredClockSpeed
+    form_factor = [int]$_.FormFactor
+    memory_type = [int]$_.SMBIOSMemoryType
+  }
+})
+
+$board = Get-CimInstance Win32_BaseBoard | Select-Object -First 1
+$bios = Get-CimInstance Win32_BIOS | Select-Object -First 1
+$motherboard = [pscustomobject]@{
+  manufacturer = Text $board.Manufacturer
+  product = Text $board.Product
+  serial_number = Text $board.SerialNumber
+  version = Text $board.Version
+  bios_manufacturer = Text $bios.Manufacturer
+  bios_version = Text $bios.SMBIOSBIOSVersion
+  bios_serial_number = Text $bios.SerialNumber
+  smbios_version = if ($bios.SMBIOSMajorVersion -ne $null) { ([string]$bios.SMBIOSMajorVersion + '.' + [string]$bios.SMBIOSMinorVersion) } else { '' }
+}
+
+$physicalDisks = @()
+if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
+  $physicalDisks = @(Get-PhysicalDisk | ForEach-Object {
+    $pd = $_
+    $rel = $null
+    try { $rel = $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch {}
+    [pscustomobject]@{
+      friendly_name = Text $pd.FriendlyName
+      serial_number = (Text $pd.SerialNumber).Trim()
+      unique_id = Text $pd.UniqueId
+      device_id = Text $pd.DeviceId
+      media_type = Text $pd.MediaType
+      bus_type = Text $pd.BusType
+      health_status = Text $pd.HealthStatus
+      operational_status = (@($pd.OperationalStatus) -join ', ')
+      size_bytes = [uint64]$pd.Size
+      firmware_version = Text $pd.FirmwareVersion
+      can_pool = [bool]$pd.CanPool
+      temperature_c = if ($rel -and $rel.Temperature -ne $null) { [int]$rel.Temperature } else { $null }
+      wear_percent = if ($rel -and $rel.Wear -ne $null) { [int]$rel.Wear } else { $null }
+      power_on_hours = if ($rel -and $rel.PowerOnHours -ne $null) { [uint64]$rel.PowerOnHours } else { $null }
+      read_errors_total = if ($rel -and $rel.ReadErrorsTotal -ne $null) { [uint64]$rel.ReadErrorsTotal } else { $null }
+      write_errors_total = if ($rel -and $rel.WriteErrorsTotal -ne $null) { [uint64]$rel.WriteErrorsTotal } else { $null }
+    }
+  })
+}
+if (-not $physicalDisks.Count) {
+  $physicalDisks = @(Get-CimInstance Win32_DiskDrive | ForEach-Object {
+    [pscustomobject]@{
+      friendly_name = Text $_.Model
+      serial_number = (Text $_.SerialNumber).Trim()
+      unique_id = Text $_.PNPDeviceID
+      device_id = Text $_.DeviceID
+      media_type = Text $_.MediaType
+      bus_type = Text $_.InterfaceType
+      health_status = Text $_.Status
+      operational_status = Text $_.Status
+      size_bytes = [uint64]$_.Size
+      firmware_version = Text $_.FirmwareRevision
+      can_pool = $false
+      temperature_c = $null
+      wear_percent = $null
+      power_on_hours = $null
+      read_errors_total = $null
+      write_errors_total = $null
+    }
+  })
+}
+
+$monitors = @()
+try {
+  $monitors = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop | ForEach-Object {
+    [pscustomobject]@{
+      instance_name = Text $_.InstanceName
+      manufacturer = WmiChars $_.ManufacturerName
+      model = WmiChars $_.UserFriendlyName
+      serial_number = WmiChars $_.SerialNumberID
+      product_code = WmiChars $_.ProductCodeID
+      active = [bool]$_.Active
+      manufacture_week = [int]$_.WeekOfManufacture
+      manufacture_year = [int]$_.YearOfManufacture
+    }
+  })
+} catch {}
+
+$drivers = @(Get-CimInstance Win32_PnPSignedDriver |
+  Where-Object { $_.DeviceName } |
+  Sort-Object DeviceClass,DeviceName |
+  Select-Object -First 600 |
+  ForEach-Object {
+    [pscustomobject]@{
+      device_name = Text $_.DeviceName
+      device_class = Text $_.DeviceClass
+      manufacturer = Text $_.Manufacturer
+      driver_provider = Text $_.DriverProviderName
+      driver_version = Text $_.DriverVersion
+      driver_date = if ($_.DriverDate) { $_.DriverDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+      inf_name = Text $_.InfName
+      pnp_device_id = Text $_.DeviceID
+      signed = [bool]$_.IsSigned
+      signer = Text $_.Signer
+    }
+  })
+
+$problemDevices = @(Get-CimInstance Win32_PnPEntity |
+  Where-Object { $_.ConfigManagerErrorCode -ne $null -and [int]$_.ConfigManagerErrorCode -ne 0 } |
+  Select-Object -First 200 |
+  ForEach-Object {
+    [pscustomobject]@{
+      name = Text $_.Name
+      device_id = Text $_.DeviceID
+      pnp_class = Text $_.PNPClass
+      status = Text $_.Status
+      error_code = [int]$_.ConfigManagerErrorCode
+      manufacturer = Text $_.Manufacturer
+    }
+  })
+
+$hotfixes = @(Get-HotFix |
+  Sort-Object InstalledOn -Descending |
+  Select-Object -First 200 |
+  ForEach-Object {
+    [pscustomobject]@{
+      hotfix_id = Text $_.HotFixID
+      description = Text $_.Description
+      installed_by = Text $_.InstalledBy
+      installed_on = if ($_.InstalledOn) { $_.InstalledOn.ToString('yyyy-MM-dd') } else { $null }
+    }
+  })
+
+$licenseProduct = Get-CimInstance SoftwareLicensingProduct |
+  Where-Object { $_.PartialProductKey -and $_.Name -like 'Windows*' } |
+  Sort-Object LicenseStatus -Descending |
+  Select-Object -First 1
+$licenseMap = @{0='Unlicensed';1='Licensed';2='OOB grace';3='OOT grace';4='Non-genuine grace';5='Notification';6='Extended grace'}
+$licensing = [pscustomobject]@{
+  status_code = if ($licenseProduct) { [int]$licenseProduct.LicenseStatus } else { $null }
+  status = if ($licenseProduct) { $licenseMap[[int]$licenseProduct.LicenseStatus] } else { 'Not reported' }
+  name = if ($licenseProduct) { Text $licenseProduct.Name } else { '' }
+  description = if ($licenseProduct) { Text $licenseProduct.Description } else { '' }
+  partial_product_key = if ($licenseProduct) { Text $licenseProduct.PartialProductKey } else { '' }
+}
+
+$rebootReasons = @()
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $rebootReasons += 'Component Based Servicing' }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $rebootReasons += 'Windows Update' }
+try {
+  $rename = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction Stop).PendingFileRenameOperations
+  if ($rename) { $rebootReasons += 'Pending file rename operations' }
+} catch {}
+try {
+  $active = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name ComputerName -ErrorAction Stop).ComputerName
+  $pending = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -Name ComputerName -ErrorAction Stop).ComputerName
+  if ($active -and $pending -and $active -ne $pending) { $rebootReasons += 'Pending computer rename' }
+} catch {}
+$rebootState = [pscustomobject]@{ pending = [bool]$rebootReasons.Count; reasons = @($rebootReasons) }
+
+$startupItems = @(Get-CimInstance Win32_StartupCommand |
+  Sort-Object Name |
+  Select-Object -First 300 |
+  ForEach-Object {
+    [pscustomobject]@{
+      name = Text $_.Name
+      command = Text $_.Command
+      location = Text $_.Location
+      user = Text $_.User
+    }
+  })
+
+$scheduledTasks = @()
+if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+  $scheduledTasks = @(Get-ScheduledTask |
+    Sort-Object TaskPath,TaskName |
+    Select-Object -First 500 |
+    ForEach-Object {
+      [pscustomobject]@{
+        name = Text $_.TaskName
+        path = Text $_.TaskPath
+        state = Text $_.State
+        author = Text $_.Author
+        description = Text $_.Description
+      }
+    })
+}
+
+$localGroups = @()
+if (Get-Command Get-LocalGroup -ErrorAction SilentlyContinue) {
+  $localGroups = @(Get-LocalGroup | Sort-Object Name | ForEach-Object {
+    $group = $_
+    $members = @()
+    try {
+      $members = @(Get-LocalGroupMember -Group $group.Name -ErrorAction Stop | ForEach-Object {
+        [pscustomobject]@{ name = Text $_.Name; object_class = Text $_.ObjectClass; principal_source = Text $_.PrincipalSource; sid = Text $_.SID }
+      })
+    } catch {}
+    [pscustomobject]@{
+      name = Text $group.Name
+      description = Text $group.Description
+      sid = Text $group.SID
+      members = @($members)
+    }
+  })
+}
+
+$printers = @(Get-CimInstance Win32_Printer | Sort-Object Name | Select-Object -First 150 | ForEach-Object {
+  [pscustomobject]@{
+    name = Text $_.Name
+    driver_name = Text $_.DriverName
+    port_name = Text $_.PortName
+    network = [bool]$_.Network
+    shared = [bool]$_.Shared
+    default = [bool]$_.Default
+    status = Text $_.PrinterStatus
+  }
+})
+
+$usbDevices = @(Get-CimInstance Win32_PnPEntity |
+  Where-Object { $_.PNPDeviceID -like 'USB*' -and $_.Name } |
+  Sort-Object Name |
+  Select-Object -First 250 |
+  ForEach-Object {
+    [pscustomobject]@{
+      name = Text $_.Name
+      device_id = Text $_.DeviceID
+      pnp_class = Text $_.PNPClass
+      manufacturer = Text $_.Manufacturer
+      status = Text $_.Status
+      service = Text $_.Service
+    }
+  })
+
+$optionalFeatures = @()
+if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+  try {
+    $optionalFeatures = @(Get-WindowsOptionalFeature -Online -ErrorAction Stop |
+      Where-Object { [string]$_.State -eq 'Enabled' } |
+      Select-Object -First 300 |
+      ForEach-Object { [pscustomobject]@{ name = Text $_.FeatureName; state = Text $_.State } })
+  } catch {}
+}
+
+$powerPlan = ''
+try {
+  $powerLine = (& powercfg.exe /getactivescheme 2>$null | Select-Object -First 1)
+  if ($powerLine -match '\((.+)\)') { $powerPlan = $Matches[1] } else { $powerPlan = Text $powerLine }
+} catch {}
+
+$networkProfiles = @()
+if (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue) {
+  $networkProfiles = @(Get-NetConnectionProfile | ForEach-Object {
+    [pscustomobject]@{
+      name = Text $_.Name
+      interface_alias = Text $_.InterfaceAlias
+      interface_index = [int]$_.InterfaceIndex
+      network_category = Text $_.NetworkCategory
+      ipv4_connectivity = Text $_.IPv4Connectivity
+      ipv6_connectivity = Text $_.IPv6Connectivity
+    }
+  })
+}
+
+$networkConfigurations = @(Get-CimInstance Win32_NetworkAdapterConfiguration |
+  Where-Object { $_.IPEnabled } |
+  ForEach-Object {
+    [pscustomobject]@{
+      description = Text $_.Description
+      setting_id = Text $_.SettingID
+      interface_index = [int]$_.InterfaceIndex
+      dhcp_enabled = [bool]$_.DHCPEnabled
+      dhcp_server = Text $_.DHCPServer
+      dhcp_lease_obtained = if ($_.DHCPLeaseObtained) { $_.DHCPLeaseObtained.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+      dhcp_lease_expires = if ($_.DHCPLeaseExpires) { $_.DHCPLeaseExpires.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+      dns_host_name = Text $_.DNSHostName
+      dns_domain = Text $_.DNSDomain
+      dns_servers = @($_.DNSServerSearchOrder)
+      ip_addresses = @($_.IPAddress)
+      subnets = @($_.IPSubnet)
+      gateways = @($_.DefaultIPGateway)
+      wins_primary = Text $_.WINSPrimaryServer
+      wins_secondary = Text $_.WINSSecondaryServer
+      mac_address = Text $_.MACAddress
+    }
+  })
+
+$wifiInterfaces = @()
+try {
+  $rawWifi = @(& netsh.exe wlan show interfaces 2>$null)
+  $current = $null
+  foreach ($line in $rawWifi) {
+    if ($line -match '^\s*Name\s*:\s*(.+)$') {
+      if ($current) { $wifiInterfaces += [pscustomobject]$current }
+      $current = [ordered]@{ name=$Matches[1].Trim(); state=''; ssid=''; bssid=''; signal=''; channel=''; radio_type=''; authentication=''; cipher=''; receive_rate_mbps=''; transmit_rate_mbps='' }
+      continue
+    }
+    if (-not $current) { continue }
+    if ($line -match '^\s*State\s*:\s*(.+)$') { $current.state = $Matches[1].Trim(); continue }
+    if ($line -match '^\s*SSID\s*:\s*(.+)$' -and $line -notmatch 'BSSID') { $current.ssid = $Matches[1].Trim(); continue }
+    if ($line -match '^\s*BSSID\s*:\s*(.+)$') { $current.bssid = $Matches[1].Trim(); continue }
+    if ($line -match '^\s*Signal\s*:\s*(.+)$') { $current.signal = $Matches[1].Trim(); continue }
+    if ($line -match '^\s*Channel\s*:\s*(.+)$') { $current.channel = $Matches[1].Trim(); continue }
+    if ($line -match '^\s*Radio type\s*:\s*(.+)$') { $current.radio_type = $Matches[1].Trim(); continue }
+    if ($line -match '^\s*Authentication\s*:\s*(.+)$') { $current.authentication = $Matches[1].Trim(); continue }
+    if ($line -match '^\s*Cipher\s*:\s*(.+)$') { $current.cipher = $Matches[1].Trim(); continue }
+    if ($line -match '^\s*Receive rate \(Mbps\)\s*:\s*(.+)$') { $current.receive_rate_mbps = $Matches[1].Trim(); continue }
+    if ($line -match '^\s*Transmit rate \(Mbps\)\s*:\s*(.+)$') { $current.transmit_rate_mbps = $Matches[1].Trim(); continue }
+  }
+  if ($current) { $wifiInterfaces += [pscustomobject]$current }
+} catch {}
+
+$defaultRoutes = @()
+if (Get-Command Get-NetRoute -ErrorAction SilentlyContinue) {
+  $defaultRoutes = @(Get-NetRoute -ErrorAction SilentlyContinue |
+    Where-Object { $_.DestinationPrefix -in @('0.0.0.0/0','::/0') } |
+    Sort-Object RouteMetric,InterfaceMetric |
+    Select-Object -First 20 |
+    ForEach-Object {
+      [pscustomobject]@{
+        destination = Text $_.DestinationPrefix
+        next_hop = Text $_.NextHop
+        interface_alias = Text $_.InterfaceAlias
+        interface_index = [int]$_.InterfaceIndex
+        route_metric = [int]$_.RouteMetric
+        protocol = Text $_.Protocol
+        address_family = Text $_.AddressFamily
+      }
+    })
+}
+
+$directoryJoin = [pscustomobject]@{}
+try {
+  $csJoin = Get-CimInstance Win32_ComputerSystem | Select-Object -First 1
+  $azureAdJoined = $null
+  $domainJoined = [bool]$csJoin.PartOfDomain
+  $workplaceJoined = $null
+  $deviceId = ''
+  $tenantId = ''
+  $tenantName = ''
+  try {
+    $dsreg = @(& dsregcmd.exe /status 2>$null)
+    foreach ($line in $dsreg) {
+      if ($line -match '^\s*AzureAdJoined\s*:\s*(YES|NO)') { $azureAdJoined = $Matches[1] -eq 'YES'; continue }
+      if ($line -match '^\s*DomainJoined\s*:\s*(YES|NO)') { $domainJoined = $Matches[1] -eq 'YES'; continue }
+      if ($line -match '^\s*WorkplaceJoined\s*:\s*(YES|NO)') { $workplaceJoined = $Matches[1] -eq 'YES'; continue }
+      if ($line -match '^\s*DeviceId\s*:\s*(.+)$') { $deviceId = $Matches[1].Trim(); continue }
+      if ($line -match '^\s*TenantId\s*:\s*(.+)$') { $tenantId = $Matches[1].Trim(); continue }
+      if ($line -match '^\s*TenantName\s*:\s*(.+)$') { $tenantName = $Matches[1].Trim(); continue }
+    }
+  } catch {}
+  $roleMap = @{0='Standalone workstation';1='Member workstation';2='Standalone server';3='Member server';4='Backup domain controller';5='Primary domain controller'}
+  $directoryJoin = [pscustomobject]@{
+    computer_name = Text $csJoin.Name
+    part_of_domain = [bool]$csJoin.PartOfDomain
+    domain = Text $csJoin.Domain
+    workgroup = Text $csJoin.Workgroup
+    domain_role_code = [int]$csJoin.DomainRole
+    domain_role = $roleMap[[int]$csJoin.DomainRole]
+    azure_ad_joined = $azureAdJoined
+    domain_joined = $domainJoined
+    workplace_joined = $workplaceJoined
+    entra_device_id = $deviceId
+    entra_tenant_id = $tenantId
+    entra_tenant_name = $tenantName
+  }
+} catch {}
+
+$machineCertificates = @()
+foreach ($storePath in @('Cert:\LocalMachine\My','Cert:\LocalMachine\WebHosting')) {
+  if (-not (Test-Path $storePath)) { continue }
+  try {
+    $storeName = ($storePath -split '\\')[-1]
+    $machineCertificates += @(Get-ChildItem $storePath -ErrorAction Stop | Select-Object -First 250 | ForEach-Object {
+      [pscustomobject]@{
+        store = $storeName
+        subject = Text $_.Subject
+        issuer = Text $_.Issuer
+        thumbprint = Text $_.Thumbprint
+        serial_number = Text $_.SerialNumber
+        not_before = if ($_.NotBefore) { $_.NotBefore.ToUniversalTime().ToString('o') } else { $null }
+        not_after = if ($_.NotAfter) { $_.NotAfter.ToUniversalTime().ToString('o') } else { $null }
+        has_private_key = [bool]$_.HasPrivateKey
+        friendly_name = Text $_.FriendlyName
+        signature_algorithm = if ($_.SignatureAlgorithm) { Text $_.SignatureAlgorithm.FriendlyName } else { '' }
+        public_key_algorithm = if ($_.PublicKey -and $_.PublicKey.Oid) { Text $_.PublicKey.Oid.FriendlyName } else { '' }
+        enhanced_key_usage = @($_.EnhancedKeyUsageList | ForEach-Object { Text $_.FriendlyName })
+      }
+    })
+  } catch {}
+}
+
+$virtualization = [pscustomobject]@{}
+try {
+  $csVirtual = Get-CimInstance Win32_ComputerSystem | Select-Object -First 1
+  $cpuVirtual = Get-CimInstance Win32_Processor | Select-Object -First 1
+  $virtualization = [pscustomobject]@{
+    hypervisor_present = if ($csVirtual.HypervisorPresent -ne $null) { [bool]$csVirtual.HypervisorPresent } else { $null }
+    vm_monitor_mode_extensions = if ($cpuVirtual.VMMonitorModeExtensions -ne $null) { [bool]$cpuVirtual.VMMonitorModeExtensions } else { $null }
+    virtualization_firmware_enabled = if ($cpuVirtual.VirtualizationFirmwareEnabled -ne $null) { [bool]$cpuVirtual.VirtualizationFirmwareEnabled } else { $null }
+    second_level_address_translation = if ($cpuVirtual.SecondLevelAddressTranslationExtensions -ne $null) { [bool]$cpuVirtual.SecondLevelAddressTranslationExtensions } else { $null }
+    data_execution_prevention_available = if ($cpuVirtual.DataExecutionPrevention_Available -ne $null) { [bool]$cpuVirtual.DataExecutionPrevention_Available } else { $null }
+  }
+} catch {}
+
+$defender = [pscustomobject]@{}
+if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+  try {
+    $mp = Get-MpComputerStatus -ErrorAction Stop
+    $defender = [pscustomobject]@{
+      antivirus_enabled = [bool]$mp.AntivirusEnabled
+      antispyware_enabled = [bool]$mp.AntispywareEnabled
+      realtime_protection_enabled = [bool]$mp.RealTimeProtectionEnabled
+      behavior_monitor_enabled = [bool]$mp.BehaviorMonitorEnabled
+      ioav_protection_enabled = [bool]$mp.IoavProtectionEnabled
+      nis_enabled = [bool]$mp.NISEnabled
+      antivirus_signature_version = Text $mp.AntivirusSignatureVersion
+      antivirus_signature_last_updated = if ($mp.AntivirusSignatureLastUpdated) { $mp.AntivirusSignatureLastUpdated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+      antispyware_signature_version = Text $mp.AntispywareSignatureVersion
+      engine_version = Text $mp.AMEngineVersion
+      product_version = Text $mp.AMProductVersion
+      is_tamper_protected = if ($mp.IsTamperProtected -ne $null) { [bool]$mp.IsTamperProtected } else { $null }
+      tamper_protection_source = Text $mp.TamperProtectionSource
+      quick_scan_age_days = if ($mp.QuickScanAge -ne $null) { [int]$mp.QuickScanAge } else { $null }
+      quick_scan_end = if ($mp.QuickScanEndTime) { $mp.QuickScanEndTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+      full_scan_age_days = if ($mp.FullScanAge -ne $null) { [int]$mp.FullScanAge } else { $null }
+      full_scan_end = if ($mp.FullScanEndTime) { $mp.FullScanEndTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+      reboot_required = if ($mp.RebootRequired -ne $null) { [bool]$mp.RebootRequired } else { $null }
+      computer_state = Text $mp.ComputerState
+    }
+  } catch {}
+}
+
+$firewallProfiles = @()
+if (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
+  try {
+    $firewallProfiles = @(Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {
+      [pscustomobject]@{
+        name = Text $_.Name
+        enabled = [bool]$_.Enabled
+        default_inbound_action = Text $_.DefaultInboundAction
+        default_outbound_action = Text $_.DefaultOutboundAction
+        notify_on_listen = [bool]$_.NotifyOnListen
+        allow_inbound_rules = Text $_.AllowInboundRules
+        allow_local_firewall_rules = Text $_.AllowLocalFirewallRules
+        log_allowed = [bool]$_.LogAllowed
+        log_blocked = [bool]$_.LogBlocked
+        log_file_name = Text $_.LogFileName
+      }
+    })
+  } catch {}
+}
+
+$battery = [pscustomobject]@{}
+try {
+  $wb = Get-CimInstance Win32_Battery | Select-Object -First 1
+  $bs = Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction SilentlyContinue | Select-Object -First 1
+  $bf = Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction SilentlyContinue | Select-Object -First 1
+  $bc = Get-CimInstance -Namespace root\wmi -ClassName BatteryCycleCount -ErrorAction SilentlyContinue | Select-Object -First 1
+  $bst = Get-CimInstance -Namespace root\wmi -ClassName BatteryStatus -ErrorAction SilentlyContinue | Select-Object -First 1
+  $design = if ($bs -and $bs.DesignedCapacity) { [uint64]$bs.DesignedCapacity } elseif ($wb -and $wb.DesignCapacity) { [uint64]$wb.DesignCapacity } else { $null }
+  $full = if ($bf -and $bf.FullChargedCapacity) { [uint64]$bf.FullChargedCapacity } elseif ($wb -and $wb.FullChargeCapacity) { [uint64]$wb.FullChargeCapacity } else { $null }
+  $healthPct = if ($design -and $full -and $design -gt 0) { [math]::Round(100.0 * $full / $design, 1) } else { $null }
+  $battery = [pscustomobject]@{
+    name = if ($wb) { Text $wb.Name } else { '' }
+    manufacturer = if ($wb) { Text $wb.Manufacturer } else { '' }
+    chemistry = if ($wb) { Text $wb.Chemistry } else { '' }
+    design_capacity_mwh = $design
+    full_charge_capacity_mwh = $full
+    health_percent = $healthPct
+    wear_percent = if ($healthPct -ne $null) { [math]::Round([math]::Max(0,100-$healthPct),1) } else { $null }
+    cycle_count = if ($bc -and $bc.CycleCount -ne $null) { [int]$bc.CycleCount } else { $null }
+    voltage_mv = if ($bst -and $bst.Voltage -ne $null) { [int]$bst.Voltage } else { $null }
+    rate_mw = if ($bst -and $bst.Rate -ne $null) { [int]$bst.Rate } else { $null }
+    remaining_capacity_mwh = if ($bst -and $bst.RemainingCapacity -ne $null) { [uint64]$bst.RemainingCapacity } else { $null }
+    power_online = if ($bst -and $bst.PowerOnline -ne $null) { [bool]$bst.PowerOnline } else { $null }
+    discharging = if ($bst -and $bst.Discharging -ne $null) { [bool]$bst.Discharging } else { $null }
+    charging = if ($bst -and $bst.Charging -ne $null) { [bool]$bst.Charging } else { $null }
+  }
+} catch {}
+
+[pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  memory_modules = @($memoryModules)
+  motherboard = $motherboard
+  physical_disks = @($physicalDisks)
+  monitors = @($monitors)
+  drivers = @($drivers)
+  problem_devices = @($problemDevices)
+  installed_hotfixes = @($hotfixes)
+  windows_licensing = $licensing
+  reboot_state = $rebootState
+  startup_items = @($startupItems)
+  scheduled_tasks = @($scheduledTasks)
+  local_groups = @($localGroups)
+  printers = @($printers)
+  usb_devices = @($usbDevices)
+  optional_features = @($optionalFeatures)
+  power_plan = $powerPlan
+  network_profiles = @($networkProfiles)
+  network_configurations = @($networkConfigurations)
+  wifi_interfaces = @($wifiInterfaces)
+  default_routes = @($defaultRoutes)
+  directory_join = $directoryJoin
+  machine_certificates = @($machineCertificates)
+  virtualization = $virtualization
+  defender = $defender
+  firewall_profiles = @($firewallProfiles)
+  battery = $battery
+} | ConvertTo-Json -Depth 9 -Compress
+)PS", json::object());
+
+    if (!fresh.is_object() || fresh.empty()) {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        return cached;
+    }
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        cached = fresh;
+        cachedAt = now;
+        return cached;
+    }
+}
+
 json BatteryInfo() {
     SYSTEM_POWER_STATUS sps{};
     if (!GetSystemPowerStatus(&sps)) return json::object();
@@ -1197,6 +1827,36 @@ json HealthInfo(const json& memory, const json& storage, const json& security, c
 
 } // namespace
 
+json BuildBitLockerRecoveryEscrow(const AgentIdentity& identity) {
+    json entries = RunPowerShellJson(R"PS(
+$items = @()
+if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+  foreach ($volume in @(Get-BitLockerVolume)) {
+    foreach ($protector in @($volume.KeyProtector)) {
+      if ([string]$protector.KeyProtectorType -ne 'RecoveryPassword') { continue }
+      $password = [string]$protector.RecoveryPassword
+      if ([string]::IsNullOrWhiteSpace($password)) { continue }
+      $items += [pscustomobject]@{
+        drive = [string]$volume.MountPoint
+        protector_id = [string]$protector.KeyProtectorId
+        protector_type = [string]$protector.KeyProtectorType
+        recovery_password = $password
+      }
+    }
+  }
+}
+@($items) | ConvertTo-Json -Depth 5 -Compress
+)PS", json::array());
+    if (entries.is_object()) entries = json::array({entries});
+    if (!entries.is_array()) entries = json::array();
+    return {
+        {"type", "bitlocker_recovery_escrow"},
+        {"device_id", identity.deviceId},
+        {"collected_at", NowIsoUtc()},
+        {"entries", entries}
+    };
+}
+
 json BuildInventorySnapshot(const AgentIdentity& identity) {
     const auto collectedAt = NowIsoUtc();
 
@@ -1211,7 +1871,20 @@ json BuildInventorySnapshot(const AgentIdentity& identity) {
     json storage = StorageInfo(bitlocker);
     json security = SecurityInfo(bitlocker, tpm, localAdmins);
     json network = NetworkInfo();
+    json deep = DeepInventoryInfo();
+    if (deep.contains("network_configurations")) network["configurations"] = deep["network_configurations"];
+    if (deep.contains("wifi_interfaces")) network["wifi_interfaces"] = deep["wifi_interfaces"];
+    if (deep.contains("default_routes")) network["default_routes"] = deep["default_routes"];
+    if (deep.contains("defender")) security["defender"] = deep["defender"];
+    if (deep.contains("firewall_profiles")) security["firewall_profiles"] = deep["firewall_profiles"];
     json battery = BatteryInfo();
+    if (deep.contains("battery") && deep["battery"].is_object()) {
+        for (auto it = deep["battery"].begin(); it != deep["battery"].end(); ++it) {
+            if (!it.value().is_null() && !(it.value().is_string() && it.value().get<std::string>().empty())) {
+                battery[it.key()] = it.value();
+            }
+        }
+    }
     json gpu = GpuInfo();
     json displays = DisplayInfo(gpu);
     json sessions = SessionsInfo();
@@ -1250,6 +1923,30 @@ json BuildInventorySnapshot(const AgentIdentity& identity) {
         {"displays", displays},
         {"gpu", gpu},
         {"battery", battery},
+        {"memory_modules", deep.value("memory_modules", json::array())},
+        {"motherboard", deep.value("motherboard", json::object())},
+        {"physical_disks", deep.value("physical_disks", json::array())},
+        {"monitors", deep.value("monitors", json::array())},
+        {"drivers", deep.value("drivers", json::array())},
+        {"problem_devices", deep.value("problem_devices", json::array())},
+        {"installed_hotfixes", deep.value("installed_hotfixes", json::array())},
+        {"windows_licensing", deep.value("windows_licensing", json::object())},
+        {"reboot_state", deep.value("reboot_state", json::object())},
+        {"startup_items", deep.value("startup_items", json::array())},
+        {"scheduled_tasks", deep.value("scheduled_tasks", json::array())},
+        {"local_groups", deep.value("local_groups", json::array())},
+        {"printers", deep.value("printers", json::array())},
+        {"usb_devices", deep.value("usb_devices", json::array())},
+        {"optional_features", deep.value("optional_features", json::array())},
+        {"power_plan", deep.value("power_plan", "")},
+        {"network_profiles", deep.value("network_profiles", json::array())},
+        {"network_configurations", deep.value("network_configurations", json::array())},
+        {"wifi_interfaces", deep.value("wifi_interfaces", json::array())},
+        {"default_routes", deep.value("default_routes", json::array())},
+        {"directory_join", deep.value("directory_join", json::object())},
+        {"machine_certificates", deep.value("machine_certificates", json::array())},
+        {"virtualization", deep.value("virtualization", json::object())},
+        {"deep_inventory_collected_at", deep.value("collected_at", "")},
         {"agent", agent},
         {"health", health},
         {"software", software},

@@ -2746,6 +2746,18 @@ LogI(
                         return;
                     }
 
+                    if (type == "bitlocker_recovery_escrow_request") {
+                        const std::string requestId = msg.value("request_id", msg.value("requestId", std::string()));
+                        auto escrow = hi5::BuildBitLockerRecoveryEscrow(ident);
+                        if (!requestId.empty()) escrow["request_id"] = requestId;
+                        if (signaling_) signaling_->send(escrow.dump());
+                        const auto entryCount = escrow.contains("entries") && escrow["entries"].is_array()
+                            ? escrow["entries"].size() : 0;
+                        LogI("bitlocker recovery escrow request completed entries=" + std::to_string(entryCount));
+                        FlushBridgeOutgoing();
+                        return;
+                    }
+
                     if (type == "refresh_inventory" || type == "inventory_refresh") {
                         LogI("refresh_inventory requested by control server");
                         SendInventorySnapshotSafe(ident);

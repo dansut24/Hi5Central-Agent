@@ -55,6 +55,42 @@ Require-Literal $service 'send_bytes' 'Live network send counters are missing.'
 Require-Literal $service 'receive_link_speed_bps' 'Live receive link speed is missing.'
 Require-Literal $service 'transmit_link_speed_bps' 'Live transmit link speed is missing.'
 
+# Deep endpoint intelligence must remain available without turning fast inventory into a heavyweight scan.
+Require-Literal $inventory 'json DeepInventoryInfo()' 'Deep endpoint inventory collector is missing.'
+Require-Literal $inventory 'std::chrono::minutes(15)' 'Deep endpoint inventory must remain cached on a slower cadence.'
+foreach ($field in @(
+  'memory_modules','motherboard','physical_disks','monitors','drivers','problem_devices',
+  'installed_hotfixes','windows_licensing','reboot_state','startup_items','scheduled_tasks',
+  'local_groups','printers','usb_devices','optional_features','network_configurations',
+  'wifi_interfaces','default_routes','directory_join','machine_certificates','virtualization'
+)) {
+  Require-Literal $inventory ('{"' + $field + '", deep.value') ('Inventory snapshot no longer publishes ' + $field + '.')
+}
+Require-Literal $inventory 'Get-StorageReliabilityCounter' 'Physical disk reliability / SMART counters are missing.'
+Require-Literal $inventory 'BatteryFullChargedCapacity' 'Battery full-charge capacity collector is missing.'
+Require-Literal $inventory 'BatteryCycleCount' 'Battery cycle-count collector is missing.'
+Require-Literal $inventory 'Win32_PhysicalMemory' 'DIMM-level memory inventory is missing.'
+Require-Literal $inventory 'Win32_PnPSignedDriver' 'Signed driver inventory is missing.'
+Require-Literal $inventory 'ConfigManagerErrorCode' 'Problem-device inventory is missing.'
+Require-Literal $inventory 'SoftwareLicensingProduct' 'Windows licensing inventory is missing.'
+Require-Literal $inventory 'RebootPending' 'Pending-reboot detection is missing.'
+Require-Literal $inventory 'WmiMonitorID' 'Physical monitor EDID inventory is missing.'
+Require-Literal $inventory 'Cert:\LocalMachine\My' 'Machine certificate metadata inventory is missing.'
+Require-Literal $inventory 'dsregcmd.exe /status' 'Entra/domain join-state inventory is missing.'
+Require-Literal $inventory 'Get-NetRoute' 'Default-route inventory is missing.'
+Require-Literal $inventory 'Win32_NetworkAdapterConfiguration' 'DHCP/DNS network configuration inventory is missing.'
+Require-Literal $inventory 'VirtualizationFirmwareEnabled' 'Virtualization capability inventory is missing.'
+
+# Recovery-password secrets must be isolated from ordinary inventory.
+Require-Literal $inventory 'recovery_password_present' 'BitLocker inventory must report whether a recovery protector exists.'
+Require-Literal $inventory 'key_protectors' 'BitLocker inventory must report protector metadata.'
+Require-Literal $inventory 'json BuildBitLockerRecoveryEscrow' 'Dedicated BitLocker recovery escrow collector is missing.'
+Require-Literal $service 'bitlocker_recovery_escrow_request' 'Agent no longer handles explicit BitLocker recovery escrow requests.'
+$snapshotMarker = $inventory.IndexOf('json BuildInventorySnapshot')
+if ($snapshotMarker -lt 0) { throw 'BuildInventorySnapshot is missing.' }
+$snapshotSource = $inventory.Substring($snapshotMarker)
+if ($snapshotSource.Contains('recovery_password')) { throw 'Normal inventory snapshot must never contain a BitLocker recovery password.' }
+
 # Inventory cadence and endpoint storage/log hygiene.
 Require-Literal $service 'for (int i = 0; i < 30 && !stop_.load(); ++i)' 'Scheduled full inventory must run every 30 seconds.'
 Require-Literal $service 'if (++housekeepingCycles >= 720)' 'Six-hour ProgramData housekeeping cadence must be preserved when inventory frequency changes.'
