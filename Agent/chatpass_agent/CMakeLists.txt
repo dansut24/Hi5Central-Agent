@@ -38,6 +38,7 @@ set(HI5_LIBDATACHANNEL_VERSION "v0.24.5" CACHE STRING "Pinned libdatachannel rel
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 
 find_path(VPX_INCLUDE_DIRS "vpx/vpx_encoder.h")
 find_library(VPX_LIBRARIES NAMES vpx libvpx)
@@ -242,6 +243,7 @@ target_link_libraries(native_vp8_stream PRIVATE
   Threads::Threads
   OpenSSL::SSL
   OpenSSL::Crypto
+  ZLIB::ZLIB
   ${VPX_LIBRARIES}
   ${OPUS_LIBRARY}
   d3d11

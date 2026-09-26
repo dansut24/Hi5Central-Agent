@@ -24,6 +24,7 @@
 #include "inventory/inventory_snapshot.h"
 
 #include <nlohmann/json.hpp>
+#include <zlib.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -6125,6 +6126,34 @@ exit 1
 
 
 
+            bool GzipCompressBytes(const std::string& input, std::vector<unsigned char>& output) {
+                output.clear();
+                if (input.empty()) return false;
+
+                z_stream stream{};
+                if (deflateInit2(&stream, Z_BEST_SPEED, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+                    return false;
+                }
+
+                stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
+                stream.avail_in = static_cast<uInt>(input.size());
+                std::array<unsigned char, 16384> buffer{};
+                int rc = Z_OK;
+                while (rc == Z_OK) {
+                    stream.next_out = buffer.data();
+                    stream.avail_out = static_cast<uInt>(buffer.size());
+                    rc = deflate(&stream, Z_FINISH);
+                    const size_t produced = buffer.size() - stream.avail_out;
+                    output.insert(output.end(), buffer.data(), buffer.data() + produced);
+                }
+                deflateEnd(&stream);
+                if (rc != Z_STREAM_END) {
+                    output.clear();
+                    return false;
+                }
+                return !output.empty();
+            }
+
             std::string Base64EncodeBytes(const unsigned char* data, size_t len) {
                 static const char* table =
                     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -7010,7 +7039,7 @@ exit 1
                             "installed_hotfixes","windows_licensing","reboot_state","startup_items","scheduled_tasks",
                             "local_groups","printers","usb_devices","optional_features","power_plan","network_profiles",
                             "network_configurations","wifi_interfaces","default_routes","directory_join",
-                            "machine_certificates","virtualization"
+                            "machine_certificates","virtualization","deep_inventory_sections"
                         }) {
                             if (snapshot.contains(key)) deepDigest[key] = snapshot[key];
                         }
@@ -7072,8 +7101,34 @@ exit 1
                     }
                     snapshot["deep_inventory_included"] = deepIncluded;
                     const std::string serialized = snapshot.dump();
-                    signaling_->send(serialized);
+                    constexpr size_t kInventoryCompressionThreshold = 128 * 1024;
+                    bool sentCompressed = false;
+                    size_t wireBytes = serialized.size();
+
+                    if (serialized.size() >= kInventoryCompressionThreshold) {
+                        std::vector<unsigned char> compressed;
+                        if (GzipCompressBytes(serialized, compressed)) {
+                            const std::string encoded = Base64EncodeBytes(compressed.data(), compressed.size());
+                            json envelope = {
+                                {"type", "inventory_snapshot_compressed"},
+                                {"encoding", "gzip+base64"},
+                                {"uncompressed_bytes", serialized.size()},
+                                {"compressed_bytes", compressed.size()},
+                                {"payload", encoded}
+                            };
+                            const std::string wire = envelope.dump();
+                            if (wire.size() < serialized.size()) {
+                                signaling_->send(wire);
+                                sentCompressed = true;
+                                wireBytes = wire.size();
+                            }
+                        }
+                    }
+                    if (!sentCompressed) signaling_->send(serialized);
+
                     LogI("inventory_snapshot sent bytes=" + std::to_string(serialized.size())
+                        + " wire_bytes=" + std::to_string(wireBytes)
+                        + " compressed=" + std::string(sentCompressed ? "true" : "false")
                         + " deep=" + std::string(deepIncluded ? "true" : "false")
                         + " deep_status=" + snapshot.value("deep_inventory_status", std::string("unknown"))
                         + " collected_at=" + snapshot.value("collected_at", std::string()));

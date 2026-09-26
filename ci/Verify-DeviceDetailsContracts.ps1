@@ -13,6 +13,7 @@ $agentInstaller = Get-Content 'Agent/chatpass_agent/installer/windows/Hi5Central
 $agentBuild = Get-Content 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1' -Raw
 $windowsWorkflow = Get-Content '.github/workflows/windows-installers.yml' -Raw
 $cmake = Get-Content 'Agent/chatpass_agent/CMakeLists.txt' -Raw
+$vcpkg = Get-Content 'Agent/chatpass_agent/vcpkg.json' -Raw
 
 Require-Literal $inventory 'json LocalUsers()' 'Local-user inventory collector is missing.'
 Require-Literal $inventory '{"local_users", localUsers}' 'Inventory snapshot no longer publishes local_users.'
@@ -58,28 +59,40 @@ Require-Literal $service 'transmit_link_speed_bps' 'Live transmit link speed is 
 # Deep endpoint intelligence must remain available without turning fast inventory into a heavyweight scan.
 Require-Literal $inventory 'json DeepInventoryInfo()' 'Deep endpoint inventory collector is missing.'
 Require-Literal $inventory 'std::chrono::minutes(15)' 'Deep endpoint inventory must remain cached on a slower cadence.'
-Require-Literal $inventory 'output.size() > 8 * 1024 * 1024' 'Deep inventory PowerShell capture must support the bounded 8 MiB endpoint-intelligence payload.'
-Require-Literal $inventory 'std::string deepScript = R"PS(' 'Deep inventory PowerShell must begin in a runtime string so MSVC literal-size limits are not exceeded.'
-Require-Literal $inventory 'deepScript += R"PS(' 'Deep inventory PowerShell must remain split into MSVC-safe raw-string chunks.'
-Require-Literal $inventory 'RunPowerShellJson(deepScript, json::object(), "deep_inventory")' 'Deep inventory chunks must execute as one diagnostic PowerShell script so collector state is preserved.'
-Require-Literal $inventory '__HI5_JSON_BEGIN__' 'Deep inventory must frame JSON so non-data PowerShell output cannot corrupt parsing.'
-Require-Literal $inventory '__HI5_JSON_END__' 'Deep inventory must terminate its framed JSON payload explicitly.'
-Require-Literal $inventory 'deep_inventory_status' 'Inventory must report whether deep collection succeeded, partially succeeded, failed or was not requested.'
-Require-Literal $inventory 'collector_error' 'Deep inventory must preserve a safe collector error while still returning partial data.'
-Require-Literal $inventory 'RunPowerShellJson(deepScript, json::object(), "deep_inventory")' 'Deep inventory must request bounded PowerShell failure diagnostics.'
-Require-Literal $inventory 'PowerShellDiagnosticFallback' 'PowerShell deep inventory failures must return a safe bounded reason instead of collapsing to an empty object.'
-Require-Literal $inventory 'output_overflow' 'Deep inventory diagnostics must distinguish bounded output overflow.'
-Require-Literal $inventory 'missing_begin_marker' 'Deep inventory diagnostics must distinguish missing JSON framing.'
-Require-Literal $inventory 'json_parse_failed' 'Deep inventory diagnostics must distinguish JSON parsing failures.'
-Require-Literal $inventory 'deep_inventory_output_bytes' 'Deep inventory diagnostics must expose only the bounded output byte count, not raw command output.'
+Require-Literal $inventory 'output.size() > 8 * 1024 * 1024' 'PowerShell capture must remain bounded at 8 MiB.'
+Require-Literal $inventory 'section_status' 'Independent deep collector section status is missing.'
+Require-Literal $inventory 'successful_section_count' 'Deep collector success count is missing.'
+Require-Literal $inventory 'failed_section_count' 'Deep collector failure count is missing.'
+Require-Literal $inventory 'deep_inventory_sections' 'Inventory snapshots must publish per-section deep collector status.'
+Require-Literal $inventory 'PowerShellDiagnosticFallback' 'PowerShell collector failures must return a safe bounded reason.'
+Require-Literal $inventory '__HI5_JSON_BEGIN__' 'Collector JSON framing begin marker is missing.'
+Require-Literal $inventory '__HI5_JSON_END__' 'Collector JSON framing end marker is missing.'
+Require-Literal $inventory 'output_overflow' 'Collector diagnostics must distinguish bounded output overflow.'
+Require-Literal $inventory 'missing_begin_marker' 'Collector diagnostics must distinguish missing JSON framing.'
+Require-Literal $inventory 'json_parse_failed' 'Collector diagnostics must distinguish JSON parsing failures.'
 Require-Literal $service 'const bool deepAvailable = snapshot.value("deep_inventory_included", false)' 'Service transport must not confuse a requested deep scan with a successful deep scan.'
-Require-Literal $service 'deep_status=' 'Agent inventory logs must include the deep collection status.'
+Require-Literal $service 'deep_status=' 'Agent inventory logs must include deep collection status.'
 Require-Literal $inventory 'bool includeDeepInventory' 'Inventory snapshots must support lightweight snapshots without repeating deep endpoint data.'
 Require-Literal $inventory 'deep_inventory_included' 'Inventory snapshots must tell the server whether deep fields are present.'
 Require-Literal $service 'for (int i = 0; i < 300' 'Scheduled core inventory must run every five minutes rather than every 30 seconds.'
 Require-Literal $service 'deepInventoryCycles >= 3' 'Deep endpoint intelligence must be reconsidered on the 15-minute cadence.'
 Require-Literal $service 'deepHash != lastDeepInventoryHash_' 'Deep inventory must be sent on change rather than repeated unchanged.'
 Require-Literal $service 'std::chrono::hours(6)' 'Deep inventory must have a bounded periodic safety refresh.'
+Require-Literal $vcpkg '"zlib"' 'Agent dependency manifest must include zlib for bounded inventory compression.'
+Require-Literal $cmake 'find_package(ZLIB REQUIRED)' 'Agent build must resolve zlib.'
+Require-Literal $cmake 'ZLIB::ZLIB' 'Agent service must link zlib.'
+Require-Literal $service 'kInventoryCompressionThreshold = 128 * 1024' 'Inventory compression threshold must remain at 128 KiB.'
+Require-Literal $service 'inventory_snapshot_compressed' 'Large inventory snapshots must use the compressed envelope.'
+Require-Literal $service '"gzip+base64"' 'Compressed inventory envelope must declare gzip+base64 encoding.'
+Require-Literal $service 'wire_bytes=' 'Agent inventory logs must report actual wire size after optional compression.'
+
+$expectedSections = @(
+  'core_hardware','storage','monitors','drivers','windows_state','scheduled_tasks','local_groups',
+  'peripherals','features_power','network','directory_join','certificates','virtualization','security','battery'
+)
+foreach ($section in $expectedSections) {
+  Require-Literal $inventory ('mergeSection("' + $section + '"') ('Independent deep collector is missing: ' + $section)
+}
 foreach ($field in @(
   'memory_modules','motherboard','physical_disks','monitors','drivers','problem_devices',
   'installed_hotfixes','windows_licensing','reboot_state','startup_items','scheduled_tasks',
@@ -103,46 +116,54 @@ Require-Literal $inventory 'Get-NetRoute' 'Default-route inventory is missing.'
 Require-Literal $inventory 'Win32_NetworkAdapterConfiguration' 'DHCP/DNS network configuration inventory is missing.'
 Require-Literal $inventory 'VirtualizationFirmwareEnabled' 'Virtualization capability inventory is missing.'
 
-# Parse and execute the exact embedded deep-inventory PowerShell on the Windows CI runner.
-$deepStart = $inventory.IndexOf('std::string deepScript = R"PS(')
-$deepEnd = $inventory.IndexOf('const json fresh = RunPowerShellJson(deepScript', $deepStart)
-if ($deepStart -lt 0 -or $deepEnd -lt 0) { throw 'Could not locate embedded deep inventory PowerShell.' }
-$deepSource = $inventory.Substring($deepStart, $deepEnd - $deepStart)
-$chunkMatches = [regex]::Matches($deepSource, 'R"PS\((.*?)\)PS"', [System.Text.RegularExpressions.RegexOptions]::Singleline)
-if ($chunkMatches.Count -lt 2) { throw 'Deep inventory PowerShell chunk reconstruction failed.' }
-$deepScript = ($chunkMatches | ForEach-Object { $_.Groups[1].Value }) -join ''
-$tokens = $null
-$parseErrors = $null
-[System.Management.Automation.Language.Parser]::ParseInput($deepScript, [ref]$tokens, [ref]$parseErrors) | Out-Null
-if ($parseErrors.Count) {
-  $messages = ($parseErrors | ForEach-Object { $_.Message + ' at line ' + $_.Extent.StartLineNumber }) -join '; '
-  throw ('Embedded deep inventory PowerShell parse failed: ' + $messages)
+# Parse and execute each embedded collector independently on the Windows CI runner.
+$collectorPattern = 'mergeSection\("([^"]+)", RunPowerShellJson\(R"PS\((.*?)\)PS", json::object\(\), "([^"]+)"\)\);'
+$collectorMatches = [regex]::Matches($inventory, $collectorPattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+if ($collectorMatches.Count -ne $expectedSections.Count) {
+  throw ('Expected ' + $expectedSections.Count + ' independent deep collectors but found ' + $collectorMatches.Count + '.')
 }
-$tempDeepScript = Join-Path $env:TEMP 'hi5-deep-inventory-contract.ps1'
-@(
-  '$ProgressPreference = ''SilentlyContinue'''
-  '$ErrorActionPreference = ''SilentlyContinue'''
-  '$WarningPreference = ''SilentlyContinue'''
-  '$InformationPreference = ''SilentlyContinue'''
-  '$VerbosePreference = ''SilentlyContinue'''
-  $deepScript
-) | Set-Content -LiteralPath $tempDeepScript -Encoding UTF8
-$deepOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $tempDeepScript 2>&1
-$deepExit = $LASTEXITCODE
-Remove-Item -LiteralPath $tempDeepScript -Force -ErrorAction SilentlyContinue
-$deepText = ($deepOutput | Out-String).Trim()
-if (-not $deepText) { throw ('Embedded deep inventory PowerShell returned no JSON. Exit code: ' + $deepExit) }
-$begin = '__HI5_JSON_BEGIN__'
-$end = '__HI5_JSON_END__'
-$beginAt = $deepText.LastIndexOf($begin)
-if ($beginAt -lt 0) { throw ('Embedded deep inventory PowerShell did not emit the Hi5 JSON begin marker. Output: ' + $deepText.Substring(0,[Math]::Min(1000,$deepText.Length))) }
-$beginAt += $begin.Length
-$endAt = $deepText.IndexOf($end,$beginAt)
-if ($endAt -lt 0) { throw 'Embedded deep inventory PowerShell did not emit the Hi5 JSON end marker.' }
-$deepJsonText = $deepText.Substring($beginAt,$endAt-$beginAt)
-try { $deepJson = $deepJsonText | ConvertFrom-Json -ErrorAction Stop } catch { throw ('Embedded deep inventory PowerShell returned invalid marked JSON: ' + $_.Exception.Message) }
-foreach ($required in @('memory_modules','physical_disks','drivers','installed_hotfixes','scheduled_tasks','windows_licensing','reboot_state','battery')) {
-  if ($null -eq $deepJson.PSObject.Properties[$required]) { throw ('Deep inventory runtime JSON is missing ' + $required + '.') }
+$seenSections = @{}
+foreach ($match in $collectorMatches) {
+  $sectionName = $match.Groups[1].Value
+  $diagnosticTag = $match.Groups[3].Value
+  $collectorScript = $match.Groups[2].Value
+  $seenSections[$sectionName] = $true
+  if ($diagnosticTag -ne ('deep_' + $sectionName)) { throw ('Collector diagnostic tag mismatch for ' + $sectionName + '.') }
+  $tokens = $null
+  $parseErrors = $null
+  [System.Management.Automation.Language.Parser]::ParseInput($collectorScript, [ref]$tokens, [ref]$parseErrors) | Out-Null
+  if ($parseErrors.Count) {
+    $messages = ($parseErrors | ForEach-Object { $_.Message + ' at line ' + $_.Extent.StartLineNumber }) -join '; '
+    throw ('Deep collector ' + $sectionName + ' PowerShell parse failed: ' + $messages)
+  }
+  $tempCollector = Join-Path $env:TEMP ('hi5-deep-' + $sectionName + '.ps1')
+  @(
+    '$ProgressPreference = ''SilentlyContinue'''
+    '$ErrorActionPreference = ''SilentlyContinue'''
+    '$WarningPreference = ''SilentlyContinue'''
+    '$InformationPreference = ''SilentlyContinue'''
+    '$VerbosePreference = ''SilentlyContinue'''
+    $collectorScript
+  ) | Set-Content -LiteralPath $tempCollector -Encoding UTF8
+  $collectorOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $tempCollector 2>&1
+  $collectorExit = $LASTEXITCODE
+  Remove-Item -LiteralPath $tempCollector -Force -ErrorAction SilentlyContinue
+  $collectorText = ($collectorOutput | Out-String).Trim()
+  if (-not $collectorText) { throw ('Deep collector ' + $sectionName + ' returned no JSON. Exit code: ' + $collectorExit) }
+  $begin = '__HI5_JSON_BEGIN__'
+  $end = '__HI5_JSON_END__'
+  $beginAt = $collectorText.LastIndexOf($begin)
+  if ($beginAt -lt 0) { throw ('Deep collector ' + $sectionName + ' did not emit the JSON begin marker.') }
+  $beginAt += $begin.Length
+  $endAt = $collectorText.IndexOf($end,$beginAt)
+  if ($endAt -lt 0) { throw ('Deep collector ' + $sectionName + ' did not emit the JSON end marker.') }
+  $collectorJsonText = $collectorText.Substring($beginAt,$endAt-$beginAt)
+  try { $collectorJson = $collectorJsonText | ConvertFrom-Json -ErrorAction Stop } catch { throw ('Deep collector ' + $sectionName + ' returned invalid JSON: ' + $_.Exception.Message) }
+  if ($null -eq $collectorJson.PSObject.Properties['collected_at']) { throw ('Deep collector ' + $sectionName + ' is missing collected_at.') }
+  if ($null -eq $collectorJson.PSObject.Properties['collector_error']) { throw ('Deep collector ' + $sectionName + ' is missing collector_error status.') }
+}
+foreach ($section in $expectedSections) {
+  if (-not $seenSections[$section]) { throw ('Deep collector contract did not execute ' + $section + '.') }
 }
 
 # Recovery-password secrets must be isolated from ordinary inventory.

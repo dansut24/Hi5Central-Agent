@@ -1150,18 +1150,36 @@ $items = Get-CimInstance Win32_VideoController | ForEach-Object {
 json DeepInventoryInfo() {
     static std::mutex cacheMutex;
     static json cached = json::object();
-    static auto cachedAt = std::chrono::steady_clock::time_point{};
-
+    static std::chrono::steady_clock::time_point cachedAt{};
     const auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(cacheMutex);
         if (!cached.empty() && cachedAt.time_since_epoch().count() != 0 &&
-            now - cachedAt < std::chrono::minutes(15)) {
-            return cached;
-        }
+            now - cachedAt < std::chrono::minutes(15)) return cached;
     }
 
-    std::string deepScript = R"PS(
+    json combined = {{"collected_at", NowIsoUtc()}, {"section_status", json::object()}};
+    int successfulSections = 0;
+    int failedSections = 0;
+    auto mergeSection = [&](const char* name, const json& section) {
+        const bool valid = section.is_object() && section.contains("collected_at");
+        const std::string error = section.is_object() ? section.value("collector_error", std::string()) : std::string();
+        json status = {{"status", valid && error.empty() ? "collected" : "failed"}};
+        if (section.is_object() && section.contains("collected_at")) status["collected_at"] = section["collected_at"];
+        if (!error.empty()) status["error"] = error.substr(0, 320);
+        if (section.is_object() && section.contains("collector_output_bytes")) status["output_bytes"] = section["collector_output_bytes"];
+        if (section.is_object() && section.contains("collector_process_status")) status["process_status"] = section["collector_process_status"];
+        combined["section_status"][name] = status;
+        if (!valid || !error.empty()) { ++failedSections; return; }
+        ++successfulSections;
+        for (auto it = section.begin(); it != section.end(); ++it) {
+            if (it.key() == "collected_at" || it.key() == "collector_error" ||
+                it.key() == "collector_output_bytes" || it.key() == "collector_process_status") continue;
+            combined[it.key()] = it.value();
+        }
+    };
+
+    mergeSection("core_hardware", RunPowerShellJson(R"PS(
 function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
 function WmiChars($v) {
   if ($null -eq $v) { return '' }
@@ -1197,7 +1215,28 @@ $motherboard = [pscustomobject]@{
   bios_serial_number = Text $bios.SerialNumber
   smbios_version = if ($bios.SMBIOSMajorVersion -ne $null) { ([string]$bios.SMBIOSMajorVersion + '.' + [string]$bios.SMBIOSMinorVersion) } else { '' }
 }
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  memory_modules = @($memoryModules)
+  motherboard = $motherboard
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_core_hardware"));
 
+    mergeSection("storage", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $physicalDisks = @()
 if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
   $physicalDisks = @(Get-PhysicalDisk | ForEach-Object {
@@ -1246,9 +1285,27 @@ if (-not $physicalDisks.Count) {
     }
   })
 }
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  physical_disks = @($physicalDisks)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_storage"));
 
-)PS";
-    deepScript += R"PS(
+    mergeSection("monitors", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $monitors = @()
 try {
   $monitors = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop | ForEach-Object {
@@ -1264,7 +1321,27 @@ try {
     }
   })
 } catch {}
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  monitors = @($monitors)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_monitors"));
 
+    mergeSection("drivers", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $drivers = @(Get-CimInstance Win32_PnPSignedDriver |
   Where-Object { $_.DeviceName } |
   Sort-Object DeviceClass,DeviceName |
@@ -1297,7 +1374,28 @@ $problemDevices = @(Get-CimInstance Win32_PnPEntity |
       manufacturer = Text $_.Manufacturer
     }
   })
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  drivers = @($drivers)
+  problem_devices = @($problemDevices)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_drivers"));
 
+    mergeSection("windows_state", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $hotfixes = @(Get-HotFix |
   Sort-Object InstalledOn -Descending |
   Select-Object -First 200 |
@@ -1348,7 +1446,30 @@ $startupItems = @(Get-CimInstance Win32_StartupCommand |
       user = Text $_.User
     }
   })
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  installed_hotfixes = @($hotfixes)
+  windows_licensing = $licensing
+  reboot_state = $rebootState
+  startup_items = @($startupItems)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_windows_state"));
 
+    mergeSection("scheduled_tasks", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $scheduledTasks = @()
 if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
   $scheduledTasks = @(Get-ScheduledTask |
@@ -1364,7 +1485,27 @@ if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
       }
     })
 }
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  scheduled_tasks = @($scheduledTasks)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_scheduled_tasks"));
 
+    mergeSection("local_groups", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $localGroups = @()
 if (Get-Command Get-LocalGroup -ErrorAction SilentlyContinue) {
   $localGroups = @(Get-LocalGroup | Sort-Object Name | ForEach-Object {
@@ -1383,7 +1524,27 @@ if (Get-Command Get-LocalGroup -ErrorAction SilentlyContinue) {
     }
   })
 }
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  local_groups = @($localGroups)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_local_groups"));
 
+    mergeSection("peripherals", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $printers = @(Get-CimInstance Win32_Printer | Sort-Object Name | Select-Object -First 150 | ForEach-Object {
   [pscustomobject]@{
     name = Text $_.Name
@@ -1410,9 +1571,28 @@ $usbDevices = @(Get-CimInstance Win32_PnPEntity |
       service = Text $_.Service
     }
   })
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  printers = @($printers)
+  usb_devices = @($usbDevices)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_peripherals"));
 
-)PS";
-    deepScript += R"PS(
+    mergeSection("features_power", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $optionalFeatures = @()
 if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
   try {
@@ -1428,7 +1608,28 @@ try {
   $powerLine = (& powercfg.exe /getactivescheme 2>$null | Select-Object -First 1)
   if ($powerLine -match '\((.+)\)') { $powerPlan = $Matches[1] } else { $powerPlan = Text $powerLine }
 } catch {}
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  optional_features = @($optionalFeatures)
+  power_plan = $powerPlan
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_features_power"));
 
+    mergeSection("network", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $networkProfiles = @()
 if (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue) {
   $networkProfiles = @(Get-NetConnectionProfile | ForEach-Object {
@@ -1509,7 +1710,30 @@ if (Get-Command Get-NetRoute -ErrorAction SilentlyContinue) {
       }
     })
 }
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  network_profiles = @($networkProfiles)
+  network_configurations = @($networkConfigurations)
+  wifi_interfaces = @($wifiInterfaces)
+  default_routes = @($defaultRoutes)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_network"));
 
+    mergeSection("directory_join", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $directoryJoin = [pscustomobject]@{}
 try {
   $csJoin = Get-CimInstance Win32_ComputerSystem | Select-Object -First 1
@@ -1546,9 +1770,27 @@ try {
     entra_tenant_name = $tenantName
   }
 } catch {}
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  directory_join = $directoryJoin
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_directory_join"));
 
-)PS";
-    deepScript += R"PS(
+    mergeSection("certificates", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $machineCertificates = @()
 foreach ($storePath in @('Cert:\LocalMachine\My','Cert:\LocalMachine\WebHosting')) {
   if (-not (Test-Path $storePath)) { continue }
@@ -1572,7 +1814,27 @@ foreach ($storePath in @('Cert:\LocalMachine\My','Cert:\LocalMachine\WebHosting'
     })
   } catch {}
 }
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  machine_certificates = @($machineCertificates)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_certificates"));
 
+    mergeSection("virtualization", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $virtualization = [pscustomobject]@{}
 try {
   $csVirtual = Get-CimInstance Win32_ComputerSystem | Select-Object -First 1
@@ -1585,7 +1847,27 @@ try {
     data_execution_prevention_available = if ($cpuVirtual.DataExecutionPrevention_Available -ne $null) { [bool]$cpuVirtual.DataExecutionPrevention_Available } else { $null }
   }
 } catch {}
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  virtualization = $virtualization
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_virtualization"));
 
+    mergeSection("security", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $defender = [pscustomobject]@{}
 if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
   try {
@@ -1633,7 +1915,28 @@ if (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
     })
   } catch {}
 }
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  defender = $defender
+  firewall_profiles = @($firewallProfiles)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_security"));
 
+    mergeSection("battery", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $battery = [pscustomobject]@{}
 try {
   $wb = Get-CimInstance Win32_Battery | Select-Object -First 1
@@ -1661,56 +1964,26 @@ try {
     charging = if ($bst -and $bst.Charging -ne $null) { [bool]$bst.Charging } else { $null }
   }
 } catch {}
-
 } catch {
   $collectorError = [string]$_.Exception.Message
 }
-
-$deepResult = [pscustomobject]@{
+$result = [pscustomobject]@{
   collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
   collector_error = $collectorError
-  memory_modules = @($memoryModules)
-  motherboard = $motherboard
-  physical_disks = @($physicalDisks)
-  monitors = @($monitors)
-  drivers = @($drivers)
-  problem_devices = @($problemDevices)
-  installed_hotfixes = @($hotfixes)
-  windows_licensing = $licensing
-  reboot_state = $rebootState
-  startup_items = @($startupItems)
-  scheduled_tasks = @($scheduledTasks)
-  local_groups = @($localGroups)
-  printers = @($printers)
-  usb_devices = @($usbDevices)
-  optional_features = @($optionalFeatures)
-  power_plan = $powerPlan
-  network_profiles = @($networkProfiles)
-  network_configurations = @($networkConfigurations)
-  wifi_interfaces = @($wifiInterfaces)
-  default_routes = @($defaultRoutes)
-  directory_join = $directoryJoin
-  machine_certificates = @($machineCertificates)
-  virtualization = $virtualization
-  defender = $defender
-  firewall_profiles = @($firewallProfiles)
   battery = $battery
 }
-$deepJson = $deepResult | ConvertTo-Json -Depth 9 -Compress
-Write-Output ('__HI5_JSON_BEGIN__' + $deepJson + '__HI5_JSON_END__')
-)PS";
-    const json fresh = RunPowerShellJson(deepScript, json::object(), "deep_inventory");
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_battery"));
 
-    if (!fresh.is_object() || fresh.empty()) {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        return cached;
-    }
+    combined["successful_section_count"] = successfulSections;
+    combined["failed_section_count"] = failedSections;
     {
         std::lock_guard<std::mutex> lock(cacheMutex);
-        cached = fresh;
+        cached = combined;
         cachedAt = now;
-        return cached;
     }
+    return combined;
 }
 
 json BatteryInfo() {
@@ -2034,21 +2307,23 @@ json BuildInventorySnapshot(const AgentIdentity& identity, bool includeDeepInven
             {"notes", "Includes Windows 11 build-name correction, BitLocker, software, updates, event health, GPU, TPM and warranty-ready WMI identity."}
         }}
     };
-    const bool deepInventoryAvailable = includeDeepInventory && deep.is_object() && deep.contains("collected_at");
-    const std::string deepInventoryError = deep.is_object() ? deep.value("collector_error", std::string()) : std::string();
-    const bool deepInventoryPartial = deepInventoryAvailable && !deepInventoryError.empty();
+    const int successfulDeepSections = includeDeepInventory && deep.is_object()
+        ? deep.value("successful_section_count", 0) : 0;
+    const int failedDeepSections = includeDeepInventory && deep.is_object()
+        ? deep.value("failed_section_count", 0) : 0;
+    const bool deepInventoryAvailable = successfulDeepSections > 0;
+    const bool deepInventoryPartial = successfulDeepSections > 0 && failedDeepSections > 0;
     snapshot["deep_inventory_included"] = deepInventoryAvailable;
+    snapshot["deep_inventory_mode"] = includeDeepInventory ? "sectioned" : "core";
+    snapshot["deep_inventory_successful_sections"] = successfulDeepSections;
+    snapshot["deep_inventory_failed_sections"] = failedDeepSections;
+    if (deep.is_object() && deep.contains("section_status")) {
+        snapshot["deep_inventory_sections"] = deep["section_status"];
+    }
     if (!includeDeepInventory) snapshot["deep_inventory_status"] = "not_requested";
     else if (!deepInventoryAvailable) snapshot["deep_inventory_status"] = "failed";
     else if (deepInventoryPartial) snapshot["deep_inventory_status"] = "partial";
     else snapshot["deep_inventory_status"] = "included";
-    if (!deepInventoryError.empty()) snapshot["deep_inventory_error"] = deepInventoryError;
-    if (deep.is_object() && deep.contains("collector_output_bytes")) {
-        snapshot["deep_inventory_output_bytes"] = deep["collector_output_bytes"];
-    }
-    if (deep.is_object() && deep.contains("collector_process_status")) {
-        snapshot["deep_inventory_process_status"] = deep["collector_process_status"];
-    }
     if (!deepInventoryAvailable) {
         for (const auto* key : {
             "memory_modules","motherboard","physical_disks","monitors","drivers","problem_devices",
