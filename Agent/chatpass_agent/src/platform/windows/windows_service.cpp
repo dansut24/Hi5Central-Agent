@@ -7097,7 +7097,7 @@ exit 1
                         }
                         if (stop_.load()) break;
                         if (HasActiveSessions()) {
-                            LogI("scheduled full inventory skipped while remote session is active");
+                            LogI("scheduled inventory skipped while remote session is active");
                             continue;
                         }
                         const bool collectDeepInventory = ++deepInventoryCycles >= 3;

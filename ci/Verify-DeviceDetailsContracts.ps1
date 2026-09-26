@@ -102,9 +102,9 @@ $snapshotSource = $inventory.Substring($snapshotMarker)
 if ($snapshotSource.Contains('recovery_password')) { throw 'Normal inventory snapshot must never contain a BitLocker recovery password.' }
 
 # Inventory cadence and endpoint storage/log hygiene.
-Require-Literal $service 'for (int i = 0; i < 30 && !stop_.load(); ++i)' 'Scheduled full inventory must run every 30 seconds.'
-Require-Literal $service 'if (++housekeepingCycles >= 720)' 'Six-hour ProgramData housekeeping cadence must be preserved when inventory frequency changes.'
-Require-Literal $service 'scheduled full inventory skipped while remote session is active' 'Full inventory must remain throttled during active remote sessions.'
+Require-Literal $service 'for (int i = 0; i < 300 && !stop_.load(); ++i)' 'Scheduled core inventory must run every five minutes.'
+Require-Literal $service 'if (++housekeepingCycles >= 72)' 'Six-hour ProgramData housekeeping cadence must be preserved when inventory frequency changes.'
+Require-Literal $service 'scheduled inventory skipped while remote session is active' 'Scheduled inventory must remain throttled during active remote sessions.'
 Require-Literal $service 'PurgeProgramDataHousekeeping' 'ProgramData housekeeping must run on Agent startup and periodically.'
 Require-Literal $service 'C:\ProgramData\Hi5CentralUpgrade' 'Legacy standalone updater storage must be scavenged safely.'
 Require-Literal $service 'PatchHost" / L"jobs", 6' 'Abandoned PatchHost job payloads must age out after the safe grace period.'
