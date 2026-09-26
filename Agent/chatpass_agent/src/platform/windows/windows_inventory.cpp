@@ -278,6 +278,8 @@ json RunPowerShellJson(
         f << "$WarningPreference = 'SilentlyContinue'\n";
         f << "$InformationPreference = 'SilentlyContinue'\n";
         f << "$VerbosePreference = 'SilentlyContinue'\n";
+        f << "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n";
+        f << "$OutputEncoding = [Console]::OutputEncoding\n";
         f << script << "\n";
     }
 
@@ -1360,7 +1362,27 @@ $drivers = @(Get-CimInstance Win32_PnPSignedDriver |
       signer = Text $_.Signer
     }
   })
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+$result = [pscustomobject]@{
+  collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
+  drivers = @($drivers)
+}
+$json = $result | ConvertTo-Json -Depth 9 -Compress
+Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
+)PS", json::object(), "deep_drivers"));
 
+    mergeSection("problem_devices", RunPowerShellJson(R"PS(
+function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }
+function WmiChars($v) {
+  if ($null -eq $v) { return '' }
+  return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
+}
+
+$collectorError = ''
+try {
 $problemDevices = @(Get-CimInstance Win32_PnPEntity |
   Where-Object { $_.ConfigManagerErrorCode -ne $null -and [int]$_.ConfigManagerErrorCode -ne 0 } |
   Select-Object -First 200 |
@@ -1380,12 +1402,11 @@ $problemDevices = @(Get-CimInstance Win32_PnPEntity |
 $result = [pscustomobject]@{
   collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
   collector_error = $collectorError
-  drivers = @($drivers)
   problem_devices = @($problemDevices)
 }
 $json = $result | ConvertTo-Json -Depth 9 -Compress
 Write-Output ('__HI5_JSON_BEGIN__' + $json + '__HI5_JSON_END__')
-)PS", json::object(), "deep_drivers"));
+)PS", json::object(), "deep_problem_devices"));
 
     mergeSection("windows_state", RunPowerShellJson(R"PS(
 function Text($v) { if ($null -eq $v) { return '' }; return [string]$v }

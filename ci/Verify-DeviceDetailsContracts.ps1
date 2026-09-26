@@ -85,9 +85,10 @@ Require-Literal $service 'kInventoryCompressionThreshold = 128 * 1024' 'Inventor
 Require-Literal $service 'inventory_snapshot_compressed' 'Large inventory snapshots must use the compressed envelope.'
 Require-Literal $service '"gzip+base64"' 'Compressed inventory envelope must declare gzip+base64 encoding.'
 Require-Literal $service 'wire_bytes=' 'Agent inventory logs must report actual wire size after optional compression.'
+Require-Literal $inventory '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8' 'PowerShell inventory collectors must force UTF-8 stdout before JSON parsing.'
 
 $expectedSections = @(
-  'core_hardware','storage','monitors','drivers','windows_state','scheduled_tasks','local_groups',
+  'core_hardware','storage','monitors','drivers','problem_devices','windows_state','scheduled_tasks','local_groups',
   'peripherals','features_power','network','directory_join','certificates','virtualization','security','battery'
 )
 foreach ($section in $expectedSections) {
@@ -143,6 +144,8 @@ foreach ($match in $collectorMatches) {
     '$WarningPreference = ''SilentlyContinue'''
     '$InformationPreference = ''SilentlyContinue'''
     '$VerbosePreference = ''SilentlyContinue'''
+    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8'
+    '$OutputEncoding = [Console]::OutputEncoding'
     $collectorScript
   ) | Set-Content -LiteralPath $tempCollector -Encoding UTF8
   $collectorOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $tempCollector 2>&1
