@@ -108,14 +108,15 @@ if ($parseErrors.Count) {
 }
 $tempDeepScript = Join-Path $env:TEMP 'hi5-deep-inventory-contract.ps1'
 @(
-  "$ProgressPreference = 'SilentlyContinue'"
-  "$ErrorActionPreference = 'SilentlyContinue'"
+  '$ProgressPreference = ''SilentlyContinue'''
+  '$ErrorActionPreference = ''SilentlyContinue'''
   $deepScript
 ) | Set-Content -LiteralPath $tempDeepScript -Encoding UTF8
 $deepOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $tempDeepScript 2>&1
+$deepExit = $LASTEXITCODE
 Remove-Item -LiteralPath $tempDeepScript -Force -ErrorAction SilentlyContinue
 $deepText = ($deepOutput | Out-String).Trim()
-if (-not $deepText) { throw 'Embedded deep inventory PowerShell returned no JSON.' }
+if (-not $deepText) { throw ('Embedded deep inventory PowerShell returned no JSON. Exit code: ' + $deepExit) }
 try { $deepJson = $deepText | ConvertFrom-Json -ErrorAction Stop } catch { throw ('Embedded deep inventory PowerShell returned invalid JSON: ' + $_.Exception.Message + ' Output: ' + $deepText.Substring(0,[Math]::Min(1000,$deepText.Length))) }
 foreach ($required in @('memory_modules','physical_disks','drivers','installed_hotfixes','scheduled_tasks','windows_licensing','reboot_state','battery')) {
   if ($null -eq $deepJson.PSObject.Properties[$required]) { throw ('Deep inventory runtime JSON is missing ' + $required + '.') }
