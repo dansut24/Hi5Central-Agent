@@ -1131,6 +1131,8 @@ function WmiChars($v) {
   return (-join @($v | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })).Trim()
 }
 
+$collectorError = ''
+try {
 $memoryModules = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
   [pscustomobject]@{
     bank_label = $_.BankLabel
@@ -1623,8 +1625,13 @@ try {
   }
 } catch {}
 
+} catch {
+  $collectorError = [string]$_.Exception.Message
+}
+
 $deepResult = [pscustomobject]@{
   collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  collector_error = $collectorError
   memory_modules = @($memoryModules)
   motherboard = $motherboard
   physical_disks = @($physicalDisks)
@@ -1991,8 +1998,14 @@ json BuildInventorySnapshot(const AgentIdentity& identity, bool includeDeepInven
         }}
     };
     const bool deepInventoryAvailable = includeDeepInventory && deep.is_object() && !deep.empty();
+    const std::string deepInventoryError = deepInventoryAvailable ? deep.value("collector_error", std::string()) : std::string();
+    const bool deepInventoryPartial = deepInventoryAvailable && !deepInventoryError.empty();
     snapshot["deep_inventory_included"] = deepInventoryAvailable;
-    snapshot["deep_inventory_status"] = includeDeepInventory ? (deepInventoryAvailable ? "included" : "failed") : "not_requested";
+    if (!includeDeepInventory) snapshot["deep_inventory_status"] = "not_requested";
+    else if (!deepInventoryAvailable) snapshot["deep_inventory_status"] = "failed";
+    else if (deepInventoryPartial) snapshot["deep_inventory_status"] = "partial";
+    else snapshot["deep_inventory_status"] = "included";
+    if (deepInventoryPartial) snapshot["deep_inventory_error"] = deepInventoryError;
     if (!deepInventoryAvailable) {
         for (const auto* key : {
             "memory_modules","motherboard","physical_disks","monitors","drivers","problem_devices",

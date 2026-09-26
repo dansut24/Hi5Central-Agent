@@ -7001,8 +7001,9 @@ exit 1
                 if (!signaling_) return;
                 try {
                     auto snapshot = hi5::BuildInventorySnapshot(ident, collectDeepInventory);
-                    bool deepIncluded = collectDeepInventory;
-                    if (collectDeepInventory) {
+                    const bool deepAvailable = snapshot.value("deep_inventory_included", false);
+                    bool deepIncluded = false;
+                    if (collectDeepInventory && deepAvailable) {
                         json deepDigest = json::object();
                         for (const auto* key : {
                             "memory_modules","motherboard","physical_disks","monitors","drivers","problem_devices",
@@ -7065,11 +7066,16 @@ exit 1
                             }
                         }
                     }
+                    if (collectDeepInventory && deepAvailable && !deepIncluded
+                        && snapshot.value("deep_inventory_status", std::string()) == "included") {
+                        snapshot["deep_inventory_status"] = "unchanged";
+                    }
                     snapshot["deep_inventory_included"] = deepIncluded;
                     const std::string serialized = snapshot.dump();
                     signaling_->send(serialized);
                     LogI("inventory_snapshot sent bytes=" + std::to_string(serialized.size())
                         + " deep=" + std::string(deepIncluded ? "true" : "false")
+                        + " deep_status=" + snapshot.value("deep_inventory_status", std::string("unknown"))
                         + " collected_at=" + snapshot.value("collected_at", std::string()));
                 }
                 catch (const std::exception& ex) {
