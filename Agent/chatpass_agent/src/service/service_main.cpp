@@ -3961,6 +3961,22 @@ if ($uninstall) {
         Add-Hi5Candidate $candidates 'inno_silent' ($uninstall + ' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-')
     }
     if ($lower -match '(uninstall|uninst)\.exe') {
+        $resolvedUninstall = Resolve-Hi5RegisteredCommand $uninstall
+        $resolvedCommand = [string]$resolvedUninstall.command
+        $nsisExe = ''
+        if ($resolvedCommand -match '^"([^"]+\.exe)"') {
+            $nsisExe = [string]$matches[1]
+        } elseif ($resolvedCommand -match '^([^\s"]+\.exe)') {
+            $nsisExe = [string]$matches[1]
+        }
+        if ($nsisExe) {
+            try {
+                $nsisDir = Split-Path -LiteralPath $nsisExe -Parent
+                if ($nsisDir) {
+                    Add-Hi5Candidate $candidates 'nsis_inplace_silent' ($resolvedCommand + ' /S _?=' + $nsisDir)
+                }
+            } catch {}
+        }
         Add-Hi5Candidate $candidates 'install4j_quiet' ($uninstall + ' -q')
         Add-Hi5Candidate $candidates 'nsis_silent' ($uninstall + ' /S')
     }

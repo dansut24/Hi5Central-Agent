@@ -39,6 +39,8 @@ Require-Literal $patchHost 'InstallerCache\Msi' 'Verified MSI packages must use 
 Require-Literal $patchHost 'PurgeOrphanedManagedMsiSources();' 'PatchHost must remove managed MSI sources after their products are no longer registered.'
 Require-Literal $service "'msi_cached_source'" 'Software uninstall must prefer a retained managed MSI source when available.'
 Require-Literal $service 'Remove-Hi5MsiCache $productCode' 'Verified MSI uninstall must purge its managed source cache.'
+Require-Literal $service "'nsis_inplace_silent'" 'Software uninstall must include the NSIS in-place silent strategy.'
+Require-Literal $service "' /S _?='" 'NSIS uninstall must pin the install directory to avoid asynchronous temp-child cleanup.'
 
 Require-Literal $service 'BuildNetworkStatsResponse' 'Native live network statistics response is missing.'
 Require-Literal $service 'static std::string NowIsoUtc();' 'Network stats UTC helper must be declared before use.'
