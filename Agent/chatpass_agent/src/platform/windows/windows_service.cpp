@@ -2694,7 +2694,7 @@ LogI(
                     if (signaling_) {
                         signaling_->send(json{{"type", "hello"}, {"agent_version", hi5::kAgentVersion}}.dump());
                         LogI("hello sent");
-                        SendInventorySnapshotSafe(ident);
+                        SendInventorySnapshotSafe(ident, true, true);
                     }
                     });
 
@@ -2760,7 +2760,7 @@ LogI(
 
                     if (type == "refresh_inventory" || type == "inventory_refresh") {
                         LogI("refresh_inventory requested by control server");
-                        SendInventorySnapshotSafe(ident);
+                        SendInventorySnapshotSafe(ident, true, true);
                         FlushBridgeOutgoing();
                         return;
                     }
@@ -3973,7 +3973,7 @@ if ($failed -gt 0) { exit 1 }
 
                         if (actionType == "refresh_inventory" || actionType == "inventory_refresh") {
                             SendActionProgress(actionId, "running", 40, "Collecting inventory");
-                            SendInventorySnapshotSafe(ident);
+                            SendInventorySnapshotSafe(ident, true, true);
                             SendActionResult(actionId, "completed", 100, "Inventory refresh completed", json{ {"inventory_sent", true} });
                             return;
                         }
@@ -5159,7 +5159,7 @@ exit 1
                     LogI("job claimed id=" + jobId + " type=" + jobType);
 
                     if (jobType == "inventory.scan" || jobType == "policy.refresh") {
-                        SendInventorySnapshotSafe(ident);
+                        SendInventorySnapshotSafe(ident, true, true);
                         PostJobResult(ident, jobId, true, json{
                             {"inventory_sent", true},
                             {"job_type", jobType}
@@ -6997,12 +6997,80 @@ exit 1
                 }
             }
 
-            void SendInventorySnapshotSafe(const AgentIdentity& ident) {
+            void SendInventorySnapshotSafe(const AgentIdentity& ident, bool collectDeepInventory = false, bool forceDeepSend = false) {
                 if (!signaling_) return;
                 try {
-                    auto snapshot = hi5::BuildInventorySnapshot(ident);
-                    signaling_->send(snapshot.dump());
-                    LogI("inventory_snapshot sent collected_at=" + snapshot.value("collected_at", std::string()));
+                    auto snapshot = hi5::BuildInventorySnapshot(ident, collectDeepInventory);
+                    bool deepIncluded = collectDeepInventory;
+                    if (collectDeepInventory) {
+                        json deepDigest = json::object();
+                        for (const auto* key : {
+                            "memory_modules","motherboard","physical_disks","monitors","drivers","problem_devices",
+                            "installed_hotfixes","windows_licensing","reboot_state","startup_items","scheduled_tasks",
+                            "local_groups","printers","usb_devices","optional_features","power_plan","network_profiles",
+                            "network_configurations","wifi_interfaces","default_routes","directory_join",
+                            "machine_certificates","virtualization"
+                        }) {
+                            if (snapshot.contains(key)) deepDigest[key] = snapshot[key];
+                        }
+                        if (snapshot.contains("network") && snapshot["network"].is_object()) {
+                            for (const auto* key : {"configurations","wifi_interfaces","default_routes"}) {
+                                if (snapshot["network"].contains(key)) deepDigest["network"][key] = snapshot["network"][key];
+                            }
+                        }
+                        if (snapshot.contains("security") && snapshot["security"].is_object()) {
+                            for (const auto* key : {"defender","firewall_profiles"}) {
+                                if (snapshot["security"].contains(key)) deepDigest["security"][key] = snapshot["security"][key];
+                            }
+                        }
+                        if (snapshot.contains("battery") && snapshot["battery"].is_object()) {
+                            for (const auto* key : {
+                                "name","manufacturer","chemistry","design_capacity_mwh","full_charge_capacity_mwh",
+                                "health_percent","wear_percent","cycle_count","voltage_mv","rate_mw","remaining_capacity_mwh"
+                            }) {
+                                if (snapshot["battery"].contains(key)) deepDigest["battery"][key] = snapshot["battery"][key];
+                            }
+                        }
+                        const size_t deepHash = std::hash<std::string>{}(deepDigest.dump());
+                        const auto now = std::chrono::steady_clock::now();
+                        {
+                            std::lock_guard<std::mutex> lock(deepInventoryStateMu_);
+                            const bool safetyRefreshDue = lastDeepInventorySentAt_.time_since_epoch().count() == 0
+                                || now - lastDeepInventorySentAt_ >= std::chrono::hours(6);
+                            deepIncluded = forceDeepSend || lastDeepInventoryHash_ == 0
+                                || deepHash != lastDeepInventoryHash_ || safetyRefreshDue;
+                            if (deepIncluded) {
+                                lastDeepInventoryHash_ = deepHash;
+                                lastDeepInventorySentAt_ = now;
+                            }
+                        }
+                        if (!deepIncluded) {
+                            for (const auto* key : {
+                                "memory_modules","motherboard","physical_disks","monitors","drivers","problem_devices",
+                                "installed_hotfixes","windows_licensing","reboot_state","startup_items","scheduled_tasks",
+                                "local_groups","printers","usb_devices","optional_features","power_plan","network_profiles",
+                                "network_configurations","wifi_interfaces","default_routes","directory_join",
+                                "machine_certificates","virtualization","deep_inventory_collected_at"
+                            }) {
+                                snapshot.erase(key);
+                            }
+                            if (snapshot.contains("network") && snapshot["network"].is_object()) {
+                                snapshot["network"].erase("configurations");
+                                snapshot["network"].erase("wifi_interfaces");
+                                snapshot["network"].erase("default_routes");
+                            }
+                            if (snapshot.contains("security") && snapshot["security"].is_object()) {
+                                snapshot["security"].erase("defender");
+                                snapshot["security"].erase("firewall_profiles");
+                            }
+                        }
+                    }
+                    snapshot["deep_inventory_included"] = deepIncluded;
+                    const std::string serialized = snapshot.dump();
+                    signaling_->send(serialized);
+                    LogI("inventory_snapshot sent bytes=" + std::to_string(serialized.size())
+                        + " deep=" + std::string(deepIncluded ? "true" : "false")
+                        + " collected_at=" + snapshot.value("collected_at", std::string()));
                 }
                 catch (const std::exception& ex) {
                     LogW(std::string("inventory_snapshot failed: ") + ex.what());
@@ -7016,12 +7084,15 @@ exit 1
                 StopInventoryLoop();
                 inventoryThread_ = std::thread([this, ident = std::move(ident)]() mutable {
                     // First snapshot is sent immediately from the WebSocket open callback.
-                    // Follow-up full inventory runs every 30 seconds. This is fast
-                    // enough for interactive RMM workflows without continuously
-                    // enumerating software/WMI/registry state.
+                    // Follow-up core inventory runs every five minutes because live
+                    // CPU/RAM/disk/user state already uses the independent 10-second
+                    // telemetry channel. Deep endpoint intelligence is reconsidered
+                    // every 15 minutes and only sent when its content changes, with a
+                    // six-hour safety refresh.
                     int housekeepingCycles = 0;
+                    int deepInventoryCycles = 0;
                     while (!stop_.load()) {
-                        for (int i = 0; i < 30 && !stop_.load(); ++i) {
+                        for (int i = 0; i < 300 && !stop_.load(); ++i) {
                             std::this_thread::sleep_for(std::chrono::seconds(1));
                         }
                         if (stop_.load()) break;
@@ -7029,8 +7100,10 @@ exit 1
                             LogI("scheduled full inventory skipped while remote session is active");
                             continue;
                         }
-                        SendInventorySnapshotSafe(ident);
-                        if (++housekeepingCycles >= 720) {
+                        const bool collectDeepInventory = ++deepInventoryCycles >= 3;
+                        SendInventorySnapshotSafe(ident, collectDeepInventory, false);
+                        if (collectDeepInventory) deepInventoryCycles = 0;
+                        if (++housekeepingCycles >= 72) {
                             PurgeProgramDataHousekeeping();
                             housekeepingCycles = 0;
                         }
@@ -9871,6 +9944,9 @@ exit 1
             std::unique_ptr<SignalingClient> signaling_;
             std::thread inventoryThread_;
             std::thread trayThread_;
+            std::mutex deepInventoryStateMu_;
+            size_t lastDeepInventoryHash_{ 0 };
+            std::chrono::steady_clock::time_point lastDeepInventorySentAt_{};
 
             std::mutex sessionsMu_;
             std::unordered_map<std::string, std::unique_ptr<SessionContext>> sessions_;

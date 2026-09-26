@@ -62,6 +62,12 @@ Require-Literal $inventory 'output.size() > 8 * 1024 * 1024' 'Deep inventory Pow
 Require-Literal $inventory 'std::string deepScript = R"PS(' 'Deep inventory PowerShell must begin in a runtime string so MSVC literal-size limits are not exceeded.'
 Require-Literal $inventory 'deepScript += R"PS(' 'Deep inventory PowerShell must remain split into MSVC-safe raw-string chunks.'
 Require-Literal $inventory 'RunPowerShellJson(deepScript, json::object())' 'Deep inventory chunks must execute as one PowerShell script so collector state is preserved.'
+Require-Literal $inventory 'bool includeDeepInventory' 'Inventory snapshots must support lightweight snapshots without repeating deep endpoint data.'
+Require-Literal $inventory 'deep_inventory_included' 'Inventory snapshots must tell the server whether deep fields are present.'
+Require-Literal $service 'for (int i = 0; i < 300' 'Scheduled core inventory must run every five minutes rather than every 30 seconds.'
+Require-Literal $service 'deepInventoryCycles >= 3' 'Deep endpoint intelligence must be reconsidered on the 15-minute cadence.'
+Require-Literal $service 'deepHash != lastDeepInventoryHash_' 'Deep inventory must be sent on change rather than repeated unchanged.'
+Require-Literal $service 'std::chrono::hours(6)' 'Deep inventory must have a bounded periodic safety refresh.'
 foreach ($field in @(
   'memory_modules','motherboard','physical_disks','monitors','drivers','problem_devices',
   'installed_hotfixes','windows_licensing','reboot_state','startup_items','scheduled_tasks',

@@ -1245,7 +1245,6 @@ $problemDevices = @(Get-CimInstance Win32_PnPEntity |
     }
   })
 
-)PS") + R"PS(
 $hotfixes = @(Get-HotFix |
   Sort-Object InstalledOn -Descending |
   Select-Object -First 200 |
@@ -1285,7 +1284,6 @@ try {
 } catch {}
 $rebootState = [pscustomobject]@{ pending = [bool]$rebootReasons.Count; reasons = @($rebootReasons) }
 
-)PS" + R"PS(
 $startupItems = @(Get-CimInstance Win32_StartupCommand |
   Sort-Object Name |
   Select-Object -First 300 |
@@ -1392,7 +1390,6 @@ if (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue) {
   })
 }
 
-)PS" + R"PS(
 $networkConfigurations = @(Get-CimInstance Win32_NetworkAdapterConfiguration |
   Where-Object { $_.IPEnabled } |
   ForEach-Object {
@@ -1584,7 +1581,6 @@ if (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
   } catch {}
 }
 
-)PS" + R"PS(
 $battery = [pscustomobject]@{}
 try {
   $wb = Get-CimInstance Win32_Battery | Select-Object -First 1
@@ -1868,7 +1864,7 @@ if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
     };
 }
 
-json BuildInventorySnapshot(const AgentIdentity& identity) {
+json BuildInventorySnapshot(const AgentIdentity& identity, bool includeDeepInventory) {
     const auto collectedAt = NowIsoUtc();
 
     json bitlocker = BitLockerVolumes();
@@ -1882,7 +1878,7 @@ json BuildInventorySnapshot(const AgentIdentity& identity) {
     json storage = StorageInfo(bitlocker);
     json security = SecurityInfo(bitlocker, tpm, localAdmins);
     json network = NetworkInfo();
-    json deep = DeepInventoryInfo();
+    json deep = includeDeepInventory ? DeepInventoryInfo() : json::object();
     if (deep.contains("network_configurations")) network["configurations"] = deep["network_configurations"];
     if (deep.contains("wifi_interfaces")) network["wifi_interfaces"] = deep["wifi_interfaces"];
     if (deep.contains("default_routes")) network["default_routes"] = deep["default_routes"];
@@ -1907,7 +1903,7 @@ json BuildInventorySnapshot(const AgentIdentity& identity) {
     json summary = SummaryInfo(os, hardware, memory, storage);
     json health = HealthInfo(memory, storage, security, events, updates);
 
-    return {
+    json snapshot = {
         {"type", "inventory_snapshot"},
         {"device_id", identity.deviceId},
         {"collected_at", collectedAt},
@@ -1978,6 +1974,19 @@ json BuildInventorySnapshot(const AgentIdentity& identity) {
             {"notes", "Includes Windows 11 build-name correction, BitLocker, software, updates, event health, GPU, TPM and warranty-ready WMI identity."}
         }}
     };
+    snapshot["deep_inventory_included"] = includeDeepInventory;
+    if (!includeDeepInventory) {
+        for (const auto* key : {
+            "memory_modules","motherboard","physical_disks","monitors","drivers","problem_devices",
+            "installed_hotfixes","windows_licensing","reboot_state","startup_items","scheduled_tasks",
+            "local_groups","printers","usb_devices","optional_features","power_plan","network_profiles",
+            "network_configurations","wifi_interfaces","default_routes","directory_join",
+            "machine_certificates","virtualization","deep_inventory_collected_at"
+        }) {
+            snapshot.erase(key);
+        }
+    }
+    return snapshot;
 }
 
 } // namespace hi5
