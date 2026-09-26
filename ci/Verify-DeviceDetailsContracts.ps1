@@ -91,6 +91,36 @@ Require-Literal $inventory 'Get-NetRoute' 'Default-route inventory is missing.'
 Require-Literal $inventory 'Win32_NetworkAdapterConfiguration' 'DHCP/DNS network configuration inventory is missing.'
 Require-Literal $inventory 'VirtualizationFirmwareEnabled' 'Virtualization capability inventory is missing.'
 
+# Parse and execute the exact embedded deep-inventory PowerShell on the Windows CI runner.
+$deepStart = $inventory.IndexOf('std::string deepScript = R"PS(')
+$deepEnd = $inventory.IndexOf('const json fresh = RunPowerShellJson(deepScript', $deepStart)
+if ($deepStart -lt 0 -or $deepEnd -lt 0) { throw 'Could not locate embedded deep inventory PowerShell.' }
+$deepSource = $inventory.Substring($deepStart, $deepEnd - $deepStart)
+$chunkMatches = [regex]::Matches($deepSource, 'R"PS\((.*?)\)PS"', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+if ($chunkMatches.Count -lt 2) { throw 'Deep inventory PowerShell chunk reconstruction failed.' }
+$deepScript = ($chunkMatches | ForEach-Object { $_.Groups[1].Value }) -join ''
+$tokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseInput($deepScript, [ref]$tokens, [ref]$parseErrors) | Out-Null
+if ($parseErrors.Count) {
+  $messages = ($parseErrors | ForEach-Object { $_.Message + ' at line ' + $_.Extent.StartLineNumber }) -join '; '
+  throw ('Embedded deep inventory PowerShell parse failed: ' + $messages)
+}
+$tempDeepScript = Join-Path $env:TEMP 'hi5-deep-inventory-contract.ps1'
+@(
+  "$ProgressPreference = 'SilentlyContinue'"
+  "$ErrorActionPreference = 'SilentlyContinue'"
+  $deepScript
+) | Set-Content -LiteralPath $tempDeepScript -Encoding UTF8
+$deepOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $tempDeepScript 2>&1
+Remove-Item -LiteralPath $tempDeepScript -Force -ErrorAction SilentlyContinue
+$deepText = ($deepOutput | Out-String).Trim()
+if (-not $deepText) { throw 'Embedded deep inventory PowerShell returned no JSON.' }
+try { $deepJson = $deepText | ConvertFrom-Json -ErrorAction Stop } catch { throw ('Embedded deep inventory PowerShell returned invalid JSON: ' + $_.Exception.Message + ' Output: ' + $deepText.Substring(0,[Math]::Min(1000,$deepText.Length))) }
+foreach ($required in @('memory_modules','physical_disks','drivers','installed_hotfixes','scheduled_tasks','windows_licensing','reboot_state','battery')) {
+  if ($null -eq $deepJson.PSObject.Properties[$required]) { throw ('Deep inventory runtime JSON is missing ' + $required + '.') }
+}
+
 # Recovery-password secrets must be isolated from ordinary inventory.
 Require-Literal $inventory 'recovery_password_present' 'BitLocker inventory must report whether a recovery protector exists.'
 Require-Literal $inventory 'key_protectors' 'BitLocker inventory must report protector metadata.'
