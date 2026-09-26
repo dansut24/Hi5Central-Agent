@@ -240,12 +240,31 @@ std::string EscapeForSingleQuotedPowerShell(const std::string& value) {
     return out;
 }
 
-json RunPowerShellJson(const std::string& script, const json& fallback = json::object()) {
+json PowerShellDiagnosticFallback(
+    const json& fallback,
+    const char* diagnosticTag,
+    const std::string& reason,
+    std::size_t outputBytes = 0,
+    int processStatus = -1
+) {
+    if (!diagnosticTag || !*diagnosticTag) return fallback;
+    json out = fallback.is_object() ? fallback : json::object();
+    out["collector_error"] = std::string(diagnosticTag) + ":" + reason;
+    out["collector_output_bytes"] = static_cast<std::uint64_t>(outputBytes);
+    if (processStatus >= 0) out["collector_process_status"] = processStatus;
+    return out;
+}
+
+json RunPowerShellJson(
+    const std::string& script,
+    const json& fallback = json::object(),
+    const char* diagnosticTag = nullptr
+) {
     wchar_t tempPath[MAX_PATH]{};
-    if (!GetTempPathW(MAX_PATH, tempPath)) return fallback;
+    if (!GetTempPathW(MAX_PATH, tempPath)) return PowerShellDiagnosticFallback(fallback, diagnosticTag, "temp_path_failed");
 
     wchar_t tempFile[MAX_PATH]{};
-    if (!GetTempFileNameW(tempPath, L"h5i", 0, tempFile)) return fallback;
+    if (!GetTempFileNameW(tempPath, L"h5i", 0, tempFile)) return PowerShellDiagnosticFallback(fallback, diagnosticTag, "temp_file_failed");
 
     std::wstring scriptPath = tempFile;
     scriptPath += L".ps1";
@@ -253,7 +272,7 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
 
     {
         std::ofstream f(WideToUtf8(scriptPath), std::ios::binary | std::ios::trunc);
-        if (!f) return fallback;
+        if (!f) return PowerShellDiagnosticFallback(fallback, diagnosticTag, "script_open_failed");
         f << "$ProgressPreference = 'SilentlyContinue'\n";
         f << "$ErrorActionPreference = 'SilentlyContinue'\n";
         f << "$WarningPreference = 'SilentlyContinue'\n";
@@ -264,46 +283,64 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
 
     std::string cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + WideToUtf8(scriptPath) + "\"";
     std::string output;
+    bool outputOverflow = false;
+    int processStatus = -1;
 #if defined(_WIN32)
     FILE* pipe = _popen(cmd.c_str(), "r");
 #else
     FILE* pipe = popen(cmd.c_str(), "r");
 #endif
-    if (pipe) {
-        std::array<char, 4096> buffer{};
-        while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe)) {
-            output += buffer.data();
-            if (output.size() > 8 * 1024 * 1024) { output.clear(); break; }
-        }
-#if defined(_WIN32)
-        _pclose(pipe);
-#else
-        pclose(pipe);
-#endif
+    if (!pipe) {
+        DeleteFileW(scriptPath.c_str());
+        return PowerShellDiagnosticFallback(fallback, diagnosticTag, "process_start_failed");
     }
+    std::array<char, 4096> buffer{};
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe)) {
+        output += buffer.data();
+        if (output.size() > 8 * 1024 * 1024) {
+            outputOverflow = true;
+            break;
+        }
+    }
+#if defined(_WIN32)
+    processStatus = _pclose(pipe);
+#else
+    processStatus = pclose(pipe);
+#endif
     DeleteFileW(scriptPath.c_str());
+    if (outputOverflow) {
+        return PowerShellDiagnosticFallback(fallback, diagnosticTag, "output_overflow", output.size(), processStatus);
+    }
 
+    const std::size_t rawOutputBytes = output.size();
     constexpr const char* kJsonBegin = "__HI5_JSON_BEGIN__";
     constexpr const char* kJsonEnd = "__HI5_JSON_END__";
     const auto markedBegin = output.rfind(kJsonBegin);
     if (markedBegin != std::string::npos) {
         const auto jsonStart = markedBegin + std::char_traits<char>::length(kJsonBegin);
         const auto markedEnd = output.find(kJsonEnd, jsonStart);
-        if (markedEnd != std::string::npos) {
-            output = output.substr(jsonStart, markedEnd - jsonStart);
+        if (markedEnd == std::string::npos) {
+            return PowerShellDiagnosticFallback(fallback, diagnosticTag, "missing_end_marker", rawOutputBytes, processStatus);
         }
+        output = output.substr(jsonStart, markedEnd - jsonStart);
     } else {
+        if (diagnosticTag && *diagnosticTag) {
+            const std::string reason = output.empty() ? "empty_output" : "missing_begin_marker";
+            return PowerShellDiagnosticFallback(fallback, diagnosticTag, reason, rawOutputBytes, processStatus);
+        }
         const auto first = output.find_first_of("[{\"");
         if (first != std::string::npos) output = output.substr(first);
         const auto lastObj = output.find_last_of("]}");
         if (lastObj != std::string::npos) output = output.substr(0, lastObj + 1);
     }
-    if (output.empty()) return fallback;
+    if (output.empty()) {
+        return PowerShellDiagnosticFallback(fallback, diagnosticTag, "empty_json_payload", rawOutputBytes, processStatus);
+    }
 
     try {
         return json::parse(output);
     } catch (...) {
-        return fallback;
+        return PowerShellDiagnosticFallback(fallback, diagnosticTag, "json_parse_failed", rawOutputBytes, processStatus);
     }
 }
 
@@ -1662,7 +1699,7 @@ $deepResult = [pscustomobject]@{
 $deepJson = $deepResult | ConvertTo-Json -Depth 9 -Compress
 Write-Output ('__HI5_JSON_BEGIN__' + $deepJson + '__HI5_JSON_END__')
 )PS";
-    const json fresh = RunPowerShellJson(deepScript, json::object());
+    const json fresh = RunPowerShellJson(deepScript, json::object(), "deep_inventory");
 
     if (!fresh.is_object() || fresh.empty()) {
         std::lock_guard<std::mutex> lock(cacheMutex);
@@ -1997,15 +2034,21 @@ json BuildInventorySnapshot(const AgentIdentity& identity, bool includeDeepInven
             {"notes", "Includes Windows 11 build-name correction, BitLocker, software, updates, event health, GPU, TPM and warranty-ready WMI identity."}
         }}
     };
-    const bool deepInventoryAvailable = includeDeepInventory && deep.is_object() && !deep.empty();
-    const std::string deepInventoryError = deepInventoryAvailable ? deep.value("collector_error", std::string()) : std::string();
+    const bool deepInventoryAvailable = includeDeepInventory && deep.is_object() && deep.contains("collected_at");
+    const std::string deepInventoryError = deep.is_object() ? deep.value("collector_error", std::string()) : std::string();
     const bool deepInventoryPartial = deepInventoryAvailable && !deepInventoryError.empty();
     snapshot["deep_inventory_included"] = deepInventoryAvailable;
     if (!includeDeepInventory) snapshot["deep_inventory_status"] = "not_requested";
     else if (!deepInventoryAvailable) snapshot["deep_inventory_status"] = "failed";
     else if (deepInventoryPartial) snapshot["deep_inventory_status"] = "partial";
     else snapshot["deep_inventory_status"] = "included";
-    if (deepInventoryPartial) snapshot["deep_inventory_error"] = deepInventoryError;
+    if (!deepInventoryError.empty()) snapshot["deep_inventory_error"] = deepInventoryError;
+    if (deep.is_object() && deep.contains("collector_output_bytes")) {
+        snapshot["deep_inventory_output_bytes"] = deep["collector_output_bytes"];
+    }
+    if (deep.is_object() && deep.contains("collector_process_status")) {
+        snapshot["deep_inventory_process_status"] = deep["collector_process_status"];
+    }
     if (!deepInventoryAvailable) {
         for (const auto* key : {
             "memory_modules","motherboard","physical_disks","monitors","drivers","problem_devices",
