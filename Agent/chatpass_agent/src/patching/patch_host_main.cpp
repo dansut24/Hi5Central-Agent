@@ -1014,15 +1014,26 @@ void AppendUninstallRegistryMatches(
         const std::string keyName = WideToUtf8(name);
         nameChars = ARRAYSIZE(name);
 
-        if (!productCode.empty() && Lower(keyName) != Lower(productCode)) continue;
+        const bool exactProductCodeMatch =
+            !productCode.empty() && Lower(keyName) == Lower(productCode);
+        if (!productCode.empty() && !exactProductCodeMatch) continue;
 
         const std::wstring subkey = base + L"\\" + name;
         const std::string displayName = ReadRegistryText(root, subkey, L"DisplayName", view);
         const std::string publisher = ReadRegistryText(root, subkey, L"Publisher", view);
         const std::string version = ReadRegistryText(root, subkey, L"DisplayVersion", view);
         if (displayName.empty() || version.empty()) continue;
-        if (!displayNameContains.empty() && !ContainsInsensitive(displayName, displayNameContains)) continue;
-        if (!publisherContains.empty() && !ContainsInsensitive(publisher, publisherContains)) continue;
+
+        // For MSI verification the ProductCode is the authoritative installed
+        // identity. DisplayName/Publisher can legitimately drift between the
+        // signed installer metadata and the Add/Remove Programs registration
+        // (for example Amazon Web Services, Inc. vs Amazon.com, Inc.).
+        // Keep the text filters for non-MSI/name-based verification, but do not
+        // let them veto an exact ProductCode registration.
+        if (!exactProductCodeMatch) {
+            if (!displayNameContains.empty() && !ContainsInsensitive(displayName, displayNameContains)) continue;
+            if (!publisherContains.empty() && !ContainsInsensitive(publisher, publisherContains)) continue;
+        }
 
         matches.push_back({
             { "registryKey", keyName },
@@ -1030,7 +1041,8 @@ void AppendUninstallRegistryMatches(
             { "publisher", publisher },
             { "version", version },
             { "scope", scope },
-            { "view", registryView }
+            { "view", registryView },
+            { "identitySource", exactProductCodeMatch ? "product_code" : "registry_metadata" }
         });
     }
     RegCloseKey(uninstall);
