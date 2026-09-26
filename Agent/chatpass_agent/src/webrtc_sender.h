@@ -70,6 +70,7 @@ public:
     void handleSignalingMessage(const std::string& jsonText);
 
     bool switchMonitor(int index);
+    void handleInputEvent(const nlohmann::json& msg);
     nlohmann::json buildMonitorInfoMessage() const;
 
     bool isExternalFeedMode() const { return m_mode == Mode::ExternalFeed; }

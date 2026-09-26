@@ -1,6 +1,7 @@
 ﻿#include "signaling_client.h"
 #include "webrtc_sender.h"
 #include "agent_identity.h"
+#include "agent_version.h"
 #include "service/service_main.h"
 #include "util/log.h"
 #include "platform/platform.h"
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <csignal>
 #include <iostream>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -137,6 +139,188 @@ static void LogPlatformInfo() {
         " inventory=" + inventoryCaps.providerName +
         " available=" + std::string(inventoryCaps.available ? "true" : "false")
     );
+}
+
+static std::string ConnectTicketFromArgs(int argc, char** argv) {
+    const std::string explicitTicket = argValue(argc, argv, "--connect-ticket");
+    if (!explicitTicket.empty()) return explicitTicket;
+    if (argc <= 0 || !argv || !argv[0]) return {};
+
+    try {
+        const std::string stem = std::filesystem::path(argv[0]).stem().string();
+        const std::string prefix = "Hi5CentralConnect-";
+        if (stem.rfind(prefix, 0) == 0 && stem.size() > prefix.size()) {
+            return stem.substr(prefix.size());
+        }
+    }
+    catch (...) {
+    }
+    return {};
+}
+
+static std::string ConnectHostName() {
+#ifdef _WIN32
+    char name[MAX_COMPUTERNAME_LENGTH + 1]{};
+    DWORD size = static_cast<DWORD>(sizeof(name));
+    if (GetComputerNameA(name, &size) && size > 0) return std::string(name, size);
+#endif
+    return "Customer computer";
+}
+
+static int RunConnectHost(const std::string& ticket) {
+    if (ticket.empty()) {
+        std::cerr << "[connect] This support download is missing its one-time ticket.\n";
+        std::cerr << "[connect] Return to https://connect.hi5central.com and download it again.\n";
+        return 2;
+    }
+
+    g_running = true;
+    std::signal(SIGINT, signalHandler);
+    std::signal(SIGTERM, signalHandler);
+    rtc::InitLogger(rtc::LogLevel::Info);
+
+#ifdef _WIN32
+    SetConsoleTitleW(L"Hi5Central Connect - Remote Support");
+#endif
+
+    std::cout << "\n";
+    std::cout << "============================================================\n";
+    std::cout << " Hi5Central Connect - one-time remote support\n";
+    std::cout << " Close this window at any time to end remote access.\n";
+    std::cout << " No managed Hi5Central Agent is being installed.\n";
+    std::cout << "============================================================\n\n";
+    std::cout << "[connect] Preparing secure support session...\n";
+
+    constexpr int width = 0;
+    constexpr int height = 0;
+    constexpr int fps = 30;
+    constexpr int bitrateKbps = 6000;
+    const std::string wsUrl =
+        "wss://rmm.hi5central.com/connect/host/ws?ticket=" + ticket;
+
+    try {
+        SignalingClient signaling(wsUrl);
+        std::mutex sessionsMu;
+        std::unordered_map<std::string, std::unique_ptr<WebRtcSender>> sessions;
+
+        auto sendFn = [&signaling](const std::string& payload) {
+            signaling.send(payload);
+        };
+
+        signaling.onOpen([&]() {
+            std::cout << "[connect] Secure connection established. Waiting for technician...\n";
+            signaling.send(json{
+                {"type", "connect_hello"},
+                {"host_name", ConnectHostName()},
+                {"platform", "Windows"},
+                {"version", hi5::kAgentVersion}
+            }.dump());
+        });
+
+        signaling.onMessage([&](const std::string& text) {
+            const auto msg = json::parse(text, nullptr, false);
+            if (msg.is_discarded()) return;
+
+            const std::string type = msg.value("type", "");
+            std::string sessionId = msg.value("session_id", "");
+            if (sessionId.empty()) sessionId = msg.value("session", "");
+
+            if (type == "connect_ready") {
+                const std::string technician = msg.value("technician_name", std::string("Hi5Central technician"));
+                const std::string organisation = msg.value("organisation_name", std::string("Hi5Central"));
+                std::cout << "[connect] Support request verified.\n";
+                std::cout << "[connect] Organisation: " << organisation << "\n";
+                std::cout << "[connect] Technician: " << technician << "\n";
+                std::cout << "[connect] Waiting for the technician to open the remote session...\n";
+                return;
+            }
+
+            if (type == "start_webrtc") {
+                if (sessionId.empty()) return;
+                std::cout << "[connect] Technician connected. Starting remote desktop...\n";
+                auto iceServers = parseIceServers(msg);
+                auto sender = std::make_unique<WebRtcSender>(
+                    sessionId, iceServers, sendFn,
+                    width, height, fps, bitrateKbps
+                );
+                sender->start();
+                signaling.send(sender->buildMonitorInfoMessage().dump());
+                std::lock_guard<std::mutex> lock(sessionsMu);
+                auto prior = sessions.find(sessionId);
+                if (prior != sessions.end()) prior->second->stop();
+                sessions[sessionId] = std::move(sender);
+                return;
+            }
+
+            if (type == "webrtc_answer" || type == "ice_candidate" ||
+                type == "answer" || type == "candidate" || type == "viewer_answer") {
+                std::lock_guard<std::mutex> lock(sessionsMu);
+                auto it = sessions.find(sessionId);
+                if (it != sessions.end()) it->second->handleSignalingMessage(text);
+                return;
+            }
+
+            if (type == "switch_monitor") {
+                const int requested = msg.value("monitor_index", 0);
+                std::lock_guard<std::mutex> lock(sessionsMu);
+                auto it = sessions.find(sessionId);
+                if (it != sessions.end() && it->second->switchMonitor(requested)) {
+                    signaling.send(it->second->buildMonitorInfoMessage().dump());
+                }
+                return;
+            }
+
+            if (type == "input_event") {
+                std::lock_guard<std::mutex> lock(sessionsMu);
+                auto it = sessions.find(sessionId);
+                if (it != sessions.end()) it->second->handleInputEvent(msg);
+                return;
+            }
+
+            if (type == "viewer_disconnected" || type == "viewer_closed" ||
+                type == "viewer_left" || type == "stop_webrtc") {
+                std::lock_guard<std::mutex> lock(sessionsMu);
+                auto it = sessions.find(sessionId);
+                if (it != sessions.end()) {
+                    it->second->stop();
+                    sessions.erase(it);
+                }
+                std::cout << "[connect] Technician viewer disconnected. Support app remains ready.\n";
+                return;
+            }
+
+            if (type == "end_session" || type == "session_terminated") {
+                std::cout << "[connect] Support session ended. You can close this window.\n";
+                g_running = false;
+                return;
+            }
+        });
+
+        signaling.onClosed([&]() {
+            std::cout << "[connect] Secure support connection closed.\n";
+            g_running = false;
+        });
+
+        signaling.connect();
+
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(sessionsMu);
+            for (auto& [_, sender] : sessions) sender->stop();
+            sessions.clear();
+        }
+
+        std::cout << "[connect] Remote access has ended.\n";
+        return 0;
+    }
+    catch (const std::exception& ex) {
+        std::cerr << "[connect] Unable to start support session: " << ex.what() << "\n";
+        std::cerr << "[connect] Return to https://connect.hi5central.com and ask your technician for a new code.\n";
+        return 1;
+    }
 }
 
 static int RunDirectAgent(int argc, char** argv) {
@@ -298,6 +482,13 @@ int main(int argc, char** argv) {
 
     std::cout << "[main] process start\n";
     LogInfo("[main] process start");
+
+    const std::string connectTicket = ConnectTicketFromArgs(argc, argv);
+    if (!connectTicket.empty()) {
+        std::cout << "[main] mode=connect-host\n";
+        LogInfo("[main] mode=connect-host");
+        return RunConnectHost(connectTicket);
+    }
 
     std::string mode = "direct-agent";
     for (int i = 1; i < argc; ++i) {

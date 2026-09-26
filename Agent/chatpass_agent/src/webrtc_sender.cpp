@@ -604,6 +604,14 @@ void WebRtcSender::setInputEventHandler(InputEventFn fn) {
     m_inputEventFn = std::move(fn);
 }
 
+void WebRtcSender::handleInputEvent(const json& msg) {
+    if (m_mode == Mode::ExternalFeed && m_inputEventFn) {
+        m_inputEventFn(msg);
+        return;
+    }
+    m_injector.handleMessage(msg);
+}
+
 void WebRtcSender::setDirectMouseMoveHandler(DirectMouseMoveFn fn) {
     m_directMouseMoveFn = std::move(fn);
 }
