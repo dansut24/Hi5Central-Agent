@@ -58,6 +58,13 @@ static std::string argValue(int argc, char** argv, const std::string& name, cons
     return fallback;
 }
 
+static bool hasArg(int argc, char** argv, const std::string& name) {
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] && std::string(argv[i]) == name) return true;
+    }
+    return false;
+}
+
 static int RunSasHelperMain(int argc, char** argv) {
 #ifdef _WIN32
     const std::string sessionId = argValue(argc, argv, "--session", "unknown");
@@ -371,6 +378,17 @@ static int RunConnectHost(const std::string& ticket) {
         };
 #endif
 
+        // Show the attended customer window immediately. The previous flow only
+        // created it after connect_ready arrived, which meant a slow or interrupted
+        // signaling handshake looked like "nothing happened" even though the
+        // portable process was alive in Task Manager.
+#ifdef _WIN32
+        startSupportUi("", "Waiting for technician", "Hi5Central");
+        if (supportUiStarted.load()) {
+            supportWindow.SetConnectionState("Connecting securely...", false);
+        }
+#endif
+
         signaling.onOpen([&]() {
             signalingConnected.store(true);
             reconnectRequested.store(false);
@@ -388,7 +406,7 @@ static int RunConnectHost(const std::string& ticket) {
             }.dump());
 #ifdef _WIN32
             if (supportUiStarted.load()) {
-                supportWindow.SetConnectionState("Waiting for technician", false);
+                supportWindow.SetConnectionState("Verifying support session...", false);
             }
 #endif
         });
@@ -411,8 +429,10 @@ static int RunConnectHost(const std::string& ticket) {
                 std::cout << "[connect] Waiting for the technician to open the remote session...\n";
 #ifdef _WIN32
                 startSupportUi(sessionId, technician, organisation);
-                if (!heldUntil.empty() && supportUiStarted.load()) {
-                    supportWindow.SetConnectionState("Session on hold", false);
+                if (supportUiStarted.load()) {
+                    supportWindow.SetConnectionState(
+                        heldUntil.empty() ? "Waiting for technician" : "Session on hold",
+                        false);
                 }
 #endif
                 return;
@@ -866,7 +886,40 @@ int main(int argc, char** argv) {
     if (!connectTicket.empty()) {
         std::cout << "[main] mode=connect-host\n";
         LogInfo("[main] mode=connect-host");
+
+#ifdef _WIN32
+        HANDLE connectInstanceMutex = nullptr;
+        const bool elevatedHandoff =
+            hasArg(argc, argv, "--connect-elevated-handoff");
+        if (!elevatedHandoff) {
+            connectInstanceMutex = CreateMutexW(
+                nullptr, FALSE,
+                L"Local\\Hi5CentralConnectSingleInstanceV2");
+            if (connectInstanceMutex &&
+                GetLastError() == ERROR_ALREADY_EXISTS) {
+                LogInfo("[connect] duplicate attended launch ignored");
+                if (HWND existing =
+                    FindWindowW(nullptr, L"Hi5Central Connect")) {
+                    ShowWindow(existing, SW_RESTORE);
+                    SetForegroundWindow(existing);
+                    FLASHWINFO flash{};
+                    flash.cbSize = sizeof(flash);
+                    flash.hwnd = existing;
+                    flash.dwFlags = FLASHW_TRAY;
+                    flash.uCount = 2;
+                    FlashWindowEx(&flash);
+                }
+                CloseHandle(connectInstanceMutex);
+                return 0;
+            }
+        }
+
+        const int result = RunConnectHost(connectTicket);
+        if (connectInstanceMutex) CloseHandle(connectInstanceMutex);
+        return result;
+#else
         return RunConnectHost(connectTicket);
+#endif
     }
 
     std::string mode = "direct-agent";
