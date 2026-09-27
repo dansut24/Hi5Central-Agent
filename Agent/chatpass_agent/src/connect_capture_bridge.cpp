@@ -620,9 +620,25 @@ void ConnectCaptureBridge::PumpLoop() {
             if (secureNow) {
                 // Match the managed Agent's transition fence: never release the
                 // Viewer onto a frame captured before Windows actually switched
-                // desktops. The dynamic LocalSystem streamer is preferred; the
-                // dedicated winsta0\Winlogon helper remains the fallback.
-                if (gotSecure && frameIsPostTransition(secureTs)) {
+                // desktops. Prefer the dedicated winsta0\Winlogon fallback once
+                // it has a usable frame, otherwise accept the LocalSystem
+                // dynamic-desktop stream after it follows the secure desktop.
+                const auto now = std::chrono::steady_clock::now();
+                const bool transitionWindow =
+                    secureEnteredAt.time_since_epoch().count() != 0 &&
+                    now - secureEnteredAt < std::chrono::milliseconds(250);
+                const bool secureUsable =
+                    gotSecure &&
+                    frameIsPostTransition(secureTs) &&
+                    !(transitionWindow &&
+                      IsNearBlackTransitionFrame(secureFrame));
+                const bool normalUsable =
+                    gotNormal &&
+                    frameIsPostTransition(normalTs) &&
+                    !(transitionWindow &&
+                      IsNearBlackTransitionFrame(normalFrame));
+
+                if (secureUsable) {
                     secureFallbackReady_.store(true, std::memory_order_release);
                     sender->sendExternalRawI420(
                         secureFrame, secureTs,
@@ -631,7 +647,7 @@ void ConnectCaptureBridge::PumpLoop() {
                         secureReadyAnnounced = true;
                         if (state) state("secure_desktop_ready");
                     }
-                } else if (gotNormal && frameIsPostTransition(normalTs)) {
+                } else if (normalUsable) {
                     sender->sendExternalRawI420(
                         normalFrame, normalTs,
                         normalForce || !secureReadyAnnounced);
@@ -641,14 +657,21 @@ void ConnectCaptureBridge::PumpLoop() {
                     }
                 }
             } else if (gotNormal && frameIsPostTransition(normalTs)) {
-                sender->sendExternalRawI420(
-                    normalFrame, normalTs,
-                    normalForce || normalReturnPending);
-                if (normalReturnPending) {
-                    normalReturnPending = false;
-                    if (state) {
-                        state("desktop_handoff_ready");
-                        state("secure_desktop_exited");
+                const auto now = std::chrono::steady_clock::now();
+                const bool transitionWindow =
+                    normalReturnAt.time_since_epoch().count() != 0 &&
+                    now - normalReturnAt < std::chrono::milliseconds(250);
+                if (!(transitionWindow &&
+                      IsNearBlackTransitionFrame(normalFrame))) {
+                    sender->sendExternalRawI420(
+                        normalFrame, normalTs,
+                        normalForce || normalReturnPending);
+                    if (normalReturnPending) {
+                        normalReturnPending = false;
+                        if (state) {
+                            state("desktop_handoff_ready");
+                            state("secure_desktop_exited");
+                        }
                     }
                 }
             }
