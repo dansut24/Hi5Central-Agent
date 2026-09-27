@@ -155,6 +155,24 @@ void DrawLine(HDC dc, int x1, int y1, int x2, int y2,
     DeleteObject(pen);
 }
 
+RECT CenteredSquareRect(int centerX, int centerY, int requestedSize) {
+    const int size = std::max(2, requestedSize);
+    const int left = centerX - size / 2;
+    const int top = centerY - size / 2;
+    return RECT{ left, top, left + size, top + size };
+}
+
+void DrawFilledPolygon(HDC dc, const POINT* points, int count,
+    COLORREF color) {
+    HBRUSH brush = CreateSolidBrush(color);
+    HGDIOBJ oldBrush = SelectObject(dc, brush);
+    HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+    Polygon(dc, points, count);
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(brush);
+}
+
 HICON CreateBrandIcon(int size) {
     HDC screen = GetDC(nullptr);
     HDC colorDc = CreateCompatibleDC(screen);
@@ -171,7 +189,7 @@ HICON CreateBrandIcon(int size) {
     HFONT font = CreateFontW(
         -std::max(8, size * 5 / 9), 0, 0, 0, FW_BOLD,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS,
-        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, VARIABLE_PITCH, L"Segoe UI");
     DrawTextStyled(colorDc, L"H5", rect, font, RGB(255, 255, 255),
         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     DeleteObject(font);
@@ -195,43 +213,57 @@ HICON CreateBrandIcon(int size) {
 void DrawPersonIcon(HDC dc, int x, int y, int size, COLORREF color) {
     const int head = std::max(4, size / 3);
     Circle(dc, x + (size - head) / 2, y, head, color);
-    HBRUSH brush = CreateSolidBrush(color);
-    HGDIOBJ oldBrush = SelectObject(dc, brush);
-    HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-    RoundRect(dc, x + size / 5, y + size / 2,
-        x + size - size / 5, y + size, size / 3, size / 3);
-    SelectObject(dc, oldPen);
-    SelectObject(dc, oldBrush);
-    DeleteObject(brush);
+    RECT shoulders{
+        x + size / 5,
+        y + size / 2,
+        x + size - size / 5,
+        y + size
+    };
+    RoundBox(dc, shoulders, std::max(2, size / 6), color);
 }
 
 void DrawBuildingIcon(HDC dc, int x, int y, int size, COLORREF color) {
-    HPEN pen = CreatePen(PS_SOLID, std::max(1, size / 9), color);
-    HGDIOBJ old = SelectObject(dc, pen);
-    Rectangle(dc, x + size / 5, y + size / 6,
-        x + size - size / 5, y + size);
+    // Prefer filled geometry at this size. Thin outlined rectangles become
+    // visibly soft once the remote desktop is scaled in a mobile viewer.
+    const int bodyLeft = x + size / 5;
+    const int bodyTop = y + size / 8;
+    const int bodyRight = x + size - size / 5;
+    const int bodyBottom = y + size;
+    RECT body{ bodyLeft, bodyTop, bodyRight, bodyBottom };
+    RoundBox(dc, body, std::max(1, size / 12), color);
+
+    const int window = std::max(2, size / 8);
+    const int gapX = std::max(3, size / 5);
+    const int startX = bodyLeft + std::max(2, size / 8);
+    const int startY = bodyTop + std::max(3, size / 5);
     for (int row = 0; row < 2; ++row) {
         for (int col = 0; col < 2; ++col) {
-            const int wx = x + size / 3 + col * size / 4;
-            const int wy = y + size / 3 + row * size / 4;
-            Rectangle(dc, wx, wy, wx + size / 10, wy + size / 10);
+            RECT pane{
+                startX + col * gapX,
+                startY + row * gapX,
+                startX + col * gapX + window,
+                startY + row * gapX + window
+            };
+            FillSolid(dc, pane, kCard);
         }
     }
-    SelectObject(dc, old);
-    DeleteObject(pen);
 }
 
 void DrawClockIcon(HDC dc, int x, int y, int size, COLORREF color) {
-    HPEN pen = CreatePen(PS_SOLID, std::max(1, size / 10), color);
-    HGDIOBJ oldPen = SelectObject(dc, pen);
-    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    Ellipse(dc, x, y, x + size, y + size);
-    MoveToEx(dc, x + size / 2, y + size / 4, nullptr);
-    LineTo(dc, x + size / 2, y + size / 2);
-    LineTo(dc, x + size * 3 / 4, y + size * 2 / 3);
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    DeleteObject(pen);
+    // Build the ring from two filled circles so the edge remains crisp at
+    // 100%, 125% and 150% DPI instead of relying on a tiny stroked ellipse.
+    Circle(dc, x, y, size, color);
+    const int ring = std::max(2, size / 9);
+    const int innerSize = std::max(4, size - ring * 2);
+    Circle(dc, x + ring, y + ring, innerSize, kCard);
+
+    const int cx = x + size / 2;
+    const int cy = y + size / 2;
+    const int stroke = std::max(2, size / 11);
+    DrawLine(dc, cx, cy, cx, y + size / 4, color, stroke);
+    DrawLine(dc, cx, cy, x + size * 3 / 4, y + size * 2 / 3,
+        color, stroke);
+    Circle(dc, cx - stroke, cy - stroke, stroke * 2, color);
 }
 
 void DrawShieldIcon(HDC dc, int x, int y, int size, COLORREF color) {
@@ -242,21 +274,79 @@ void DrawShieldIcon(HDC dc, int x, int y, int size, COLORREF color) {
         { x + size / 2, y + size },
         { x + size / 5, y + size * 3 / 4 },
     };
-    HBRUSH brush = CreateSolidBrush(color);
-    HGDIOBJ oldBrush = SelectObject(dc, brush);
-    HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-    Polygon(dc, points, 5);
-    SelectObject(dc, oldPen);
-    SelectObject(dc, oldBrush);
-    DeleteObject(brush);
+    DrawFilledPolygon(dc, points, 5, color);
 
-    HPEN check = CreatePen(PS_SOLID, std::max(1, size / 10), RGB(255, 255, 255));
-    HGDIOBJ oldCheck = SelectObject(dc, check);
-    MoveToEx(dc, x + size / 3, y + size / 2, nullptr);
-    LineTo(dc, x + size * 9 / 20, y + size * 13 / 20);
-    LineTo(dc, x + size * 7 / 10, y + size * 7 / 20);
-    SelectObject(dc, oldCheck);
-    DeleteObject(check);
+    const int stroke = std::max(2, size / 10);
+    DrawLine(dc,
+        x + size / 3, y + size / 2,
+        x + size * 9 / 20, y + size * 13 / 20,
+        RGB(255, 255, 255), stroke);
+    DrawLine(dc,
+        x + size * 9 / 20, y + size * 13 / 20,
+        x + size * 7 / 10, y + size * 7 / 20,
+        RGB(255, 255, 255), stroke);
+}
+
+void DrawInfoIcon(HDC dc, int x, int y, int size, COLORREF color) {
+    Circle(dc, x, y, size, color);
+    const int cx = x + size / 2;
+    const int dot = std::max(2, size / 7);
+    Circle(dc, cx - dot / 2, y + size / 4, dot, RGB(255, 255, 255));
+    RECT stem{
+        cx - std::max(1, dot / 2),
+        y + size * 9 / 20,
+        cx + std::max(1, dot / 2),
+        y + size * 3 / 4
+    };
+    FillSolid(dc, stem, RGB(255, 255, 255));
+}
+
+void DrawAttachmentIcon(HDC dc, int x, int y, int width, int height,
+    COLORREF color, COLORREF background) {
+    // Two nested filled capsules produce a much cleaner small paperclip than
+    // thin GDI outline arcs after the remote desktop is scaled.
+    RECT outer{ x, y, x + width, y + height };
+    RoundBox(dc, outer, std::max(2, width / 2), color);
+    const int inset = std::max(2, width / 5);
+    RECT outerHole{
+        outer.left + inset,
+        outer.top + inset,
+        outer.right - inset,
+        outer.bottom - inset
+    };
+    RoundBox(dc, outerHole, std::max(1, width / 3), background);
+
+    const int innerWidth = std::max(5, width / 2);
+    const int innerHeight = std::max(8, height * 2 / 3);
+    RECT inner{
+        x + width / 3,
+        y + height / 7,
+        x + width / 3 + innerWidth,
+        y + height / 7 + innerHeight
+    };
+    RoundBox(dc, inner, std::max(2, innerWidth / 2), color);
+    const int innerInset = std::max(2, innerWidth / 3);
+    RECT innerHole{
+        inner.left + innerInset,
+        inner.top + innerInset,
+        inner.right - innerInset,
+        inner.bottom - innerInset
+    };
+    if (innerHole.right > innerHole.left &&
+        innerHole.bottom > innerHole.top) {
+        RoundBox(dc, innerHole, std::max(1, innerWidth / 4), background);
+    }
+}
+
+void DrawPaperPlaneIcon(HDC dc, int x, int y, int width, int height,
+    COLORREF color) {
+    POINT plane[4] = {
+        { x, y + height / 2 },
+        { x + width, y },
+        { x + width * 3 / 5, y + height },
+        { x + width * 2 / 5, y + height * 3 / 5 },
+    };
+    DrawFilledPolygon(dc, plane, 4, color);
 }
 
 } // namespace
@@ -475,7 +565,9 @@ bool NativeConnectWindow::CreateUi() {
         1.0f, static_cast<float>(GetDpiForWindow(hwnd)) / 96.0f);
 
     appIcon_ = CreateBrandIcon(32);
-    appIconSmall_ = CreateBrandIcon(16);
+    // Let Windows downscale a clean 32px source for the titlebar rather than
+    // rasterising tiny H5 glyphs directly at 16px.
+    appIconSmall_ = CreateBrandIcon(32);
     if (appIcon_) {
         SendMessageW(hwnd, WM_SETICON, ICON_BIG,
             reinterpret_cast<LPARAM>(appIcon_));
@@ -848,16 +940,11 @@ void NativeConnectWindow::PaintTrustCard(
         subline, smallFont_, RGB(87, 110, 149),
         DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-    Circle(hdc, card.right - S(31), card.top + S(21),
-        S(18), RGB(255, 255, 255), kBlue);
-    RECT info{
+    DrawInfoIcon(hdc,
         card.right - S(31),
         card.top + S(21),
-        card.right - S(13),
-        card.top + S(39)
-    };
-    DrawTextStyled(hdc, L"i", info, smallFont_, kBlue,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        S(18),
+        kBlue);
 }
 
 void NativeConnectWindow::PaintChat(
@@ -1065,23 +1152,10 @@ void NativeConnectWindow::PaintComposer(
         kCard, kBorder);
 
     const int iconX = composerRect_.left + S(14);
-    const int iconY = composerRect_.top + S(14);
-    HPEN clipPen = CreatePen(PS_SOLID, S(2),
-        RGB(91, 114, 153));
-    HGDIOBJ oldPen = SelectObject(hdc, clipPen);
-    HGDIOBJ oldBrush =
-        SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    RoundRect(hdc,
-        iconX, iconY,
-        iconX + S(17), iconY + S(22),
-        S(8), S(8));
-    RoundRect(hdc,
-        iconX + S(5), iconY + S(3),
-        iconX + S(13), iconY + S(17),
-        S(5), S(5));
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(clipPen);
+    const int iconY = composerRect_.top + S(13);
+    DrawAttachmentIcon(hdc,
+        iconX, iconY, S(17), S(24),
+        RGB(91, 114, 153), kCard);
 
     const bool sendEnabled =
         remoteControlActive_ && !ending_;
@@ -1091,21 +1165,10 @@ void NativeConnectWindow::PaintComposer(
     RoundBox(hdc, sendRect_, S(13), sendFill);
 
     const int planeX = sendRect_.left + S(18);
-    const int planeY = sendRect_.top + S(16);
-    HPEN plane = CreatePen(PS_SOLID, S(2),
+    const int planeY = sendRect_.top + S(14);
+    DrawPaperPlaneIcon(hdc,
+        planeX, planeY, S(24), S(22),
         RGB(255, 255, 255));
-    HGDIOBJ oldPlane = SelectObject(hdc, plane);
-    MoveToEx(hdc, planeX, planeY + S(10), nullptr);
-    LineTo(hdc, planeX + S(24), planeY);
-    LineTo(hdc, planeX + S(14), planeY + S(22));
-    LineTo(hdc, planeX + S(10), planeY + S(12));
-    LineTo(hdc, planeX, planeY + S(10));
-    MoveToEx(hdc,
-        planeX + S(10), planeY + S(12), nullptr);
-    LineTo(hdc,
-        planeX + S(24), planeY);
-    SelectObject(hdc, oldPlane);
-    DeleteObject(plane);
 
     RECT sendLabel{
         sendRect_.left + S(48),
@@ -1155,12 +1218,10 @@ void NativeConnectWindow::PaintFooter(
     Circle(hdc, iconLeft, iconTop, iconSize,
         dangerText);
 
-    RECT stop{
-        iconLeft + S(7),
-        iconTop + S(7),
-        iconLeft + S(15),
-        iconTop + S(15)
-    };
+    const int iconCenterX = iconLeft + iconSize / 2;
+    const int iconCenterY = iconTop + iconSize / 2;
+    RECT stop = CenteredSquareRect(
+        iconCenterX, iconCenterY, S(8));
     FillSolid(hdc, stop, RGB(255, 255, 255));
 
     RECT label{

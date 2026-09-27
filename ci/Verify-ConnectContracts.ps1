@@ -45,6 +45,11 @@ Require-Literal $connectWindow 'kTechBubble' 'Connect chat must retain technicia
 Require-Literal $connectWindow 'kUserBubble' 'Connect chat must retain customer bubble styling.'
 Require-Literal $connectWindow 'PaintComposer' 'Connect attended window must render the modern chat composer.'
 Require-Literal $connectWindow 'PaintFooter' 'Connect attended window must render the dedicated destructive-session footer.'
+Require-Literal $connectWindow 'CenteredSquareRect' 'Connect End session stop glyph must be centred mathematically at every DPI.'
+Require-Literal $connectWindow 'DrawInfoIcon' 'Connect attended window must use a crisp filled information icon.'
+Require-Literal $connectWindow 'DrawAttachmentIcon' 'Connect attended window must use the crisp attachment glyph.'
+Require-Literal $connectWindow 'DrawPaperPlaneIcon' 'Connect attended window must use the crisp filled Send glyph.'
+Require-Literal $connectWindow 'ANTIALIASED_QUALITY' 'Connect taskbar/titlebar branding must avoid ClearType colour fringing inside icon bitmaps.'
 Require-Literal $connectWindow 'L"End session"' 'Connect attended window must expose the styled End session action.'
 if ($connectWindow.Contains('CreateWindowExW(0, L"BUTTON"')) { throw 'Connect attended window must not regress to generic Win32 push buttons.' }
 if ($connectWindow.Contains('WS_EX_CLIENTEDGE')) { throw 'Connect attended window must not regress to generic client-edge chat controls.' }
