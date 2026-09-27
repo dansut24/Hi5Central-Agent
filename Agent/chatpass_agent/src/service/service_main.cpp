@@ -2560,6 +2560,8 @@ function Get-Hi5UpdateInfo($u) {
     $isDriver = $false
     foreach ($c in $cats) { if ($c -match 'Driver') { $isDriver = $true } }
     [pscustomobject]@{
+        update_id = $(try { [string]$u.Identity.UpdateID } catch { '' })
+        revision_number = $(try { [int]$u.Identity.RevisionNumber } catch { 0 })
         title = [string]$u.Title
         kb_articles = $kbs
         categories = $cats
@@ -2570,6 +2572,9 @@ function Get-Hi5UpdateInfo($u) {
         eula_accepted = $(try { [bool]$u.EulaAccepted } catch { $false })
         size_bytes = $(try { [int64]$u.MaxDownloadSize } catch { 0 })
         support_url = $(try { [string]$u.SupportUrl } catch { '' })
+        last_deployment_change_time = $(try { ([datetime]$u.LastDeploymentChangeTime).ToUniversalTime().ToString('o') } catch { '' })
+        auto_select = $(try { [bool]$u.AutoSelectOnWebSites } catch { $false })
+        browse_only = $(try { [bool]$u.BrowseOnly } catch { $false })
     }
 }
 )HI5PS";
@@ -4095,6 +4100,39 @@ exit 1
                         json result = BuildCommandActionResult(command, cr);
                         const bool ok = cr.error.empty() && cr.exitCode == 0;
                         PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "windows_update.scan") {
+                        const int timeoutSeconds = std::max(60, std::min(3600, payload.value("timeout_seconds", 1800)));
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildWindowsUpdateScanScript(), timeoutSeconds);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        if (ok) {
+                            try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                        }
+                        return;
+                    }
+
+                    if (jobType == "windows_update.history") {
+                        const int timeoutSeconds = std::max(30, std::min(1800, payload.value("timeout_seconds", 300)));
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildWindowsUpdateHistoryScript(payload), timeoutSeconds);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "windows_update.install") {
+                        const int timeoutSeconds = std::max(300, std::min(14400, payload.value("timeout_seconds", 7200)));
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildWindowsUpdateInstallScript(payload), timeoutSeconds);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        if (ok) {
+                            try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                        }
                         return;
                     }
 

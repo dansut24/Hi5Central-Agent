@@ -5,7 +5,9 @@ function Require-Literal([string]$Text, [string]$Needle, [string]$Message) {
 }
 
 $inventory = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
+$inventorySnapshot = Get-Content 'Agent/chatpass_agent/src/inventory/inventory_snapshot.cpp' -Raw
 $service = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
+$serviceMain = Get-Content 'Agent/chatpass_agent/src/service/service_main.cpp' -Raw
 $patchHost = Get-Content 'Agent/chatpass_agent/src/patching/patch_host_main.cpp' -Raw
 $logging = Get-Content 'Agent/chatpass_agent/src/util/log.h' -Raw
 $h264 = Get-Content 'Agent/chatpass_agent/src/h264_mf_encoder.cpp' -Raw
@@ -16,6 +18,12 @@ $cmake = Get-Content 'Agent/chatpass_agent/CMakeLists.txt' -Raw
 $vcpkg = Get-Content 'Agent/chatpass_agent/vcpkg.json' -Raw
 
 Require-Literal $inventory 'json LocalUsers()' 'Local-user inventory collector is missing.'
+Require-Literal $inventorySnapshot 'update_id = $(try { [string]$u.Identity.UpdateID } catch { '''' })' 'Windows Update inventory must publish stable UpdateID identity for scheduling.'
+Require-Literal $inventorySnapshot 'last_deployment_change_time' 'Windows Update inventory must publish the Windows release/change time used by deployment-delay policy.'
+Require-Literal $serviceMain 'jobType == "windows_update.scan"' 'Claimed Agent jobs must support scheduled Windows Update scans.'
+Require-Literal $serviceMain 'jobType == "windows_update.install"' 'Claimed Agent jobs must support scheduled Windows Update installation.'
+Require-Literal $serviceMain 'BuildWindowsUpdateInstallScript(payload)' 'Scheduled Windows patch jobs must use the existing WUA install implementation.'
+Require-Literal $serviceMain 'SendInventorySnapshotSafe(ident);' 'Windows Update jobs must refresh inventory after successful execution.'
 Require-Literal $inventory '{"local_users", localUsers}' 'Inventory snapshot no longer publishes local_users.'
 Require-Literal $inventory 'Get-LocalGroupMember -Group ''Administrators''' 'Local administrator membership collection is missing.'
 Require-Literal $inventory 'is_admin' 'Local-user administrator annotation is missing.'

@@ -893,12 +893,17 @@ try {
   for ($i = 0; $i -lt $result.Updates.Count; $i++) {
     $u = $result.Updates.Item($i)
     $updates += [pscustomobject]@{
+      update_id = $(try { [string]$u.Identity.UpdateID } catch { '' })
+      revision_number = $(try { [int]$u.Identity.RevisionNumber } catch { 0 })
       title = $u.Title
       kb = @($u.KBArticleIDs)
       severity = $u.MsrcSeverity
       downloaded = $u.IsDownloaded
       mandatory = $u.IsMandatory
       reboot_required = $u.RebootRequired
+      last_deployment_change_time = $(try { ([datetime]$u.LastDeploymentChangeTime).ToUniversalTime().ToString('o') } catch { '' })
+      auto_select = $(try { [bool]$u.AutoSelectOnWebSites } catch { $false })
+      browse_only = $(try { [bool]$u.BrowseOnly } catch { $false })
       categories = @($u.Categories | ForEach-Object { $_.Name })
     }
   }
