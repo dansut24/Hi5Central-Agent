@@ -192,7 +192,8 @@ bool IsNearBlackTransitionFrame(const I420Frame& frame) {
 }
 
 ShortcutAction ShortcutFromString(const std::string& action) {
-    if (action == "ctrl_alt_del" || action == "cad" || action == "sas" ||
+    if (action == "ctrl_alt_del" || action == "ctrl_alt_del_service" ||
+        action == "cad" || action == "sas" ||
         action == "secure_attention") return ShortcutAction::CtrlAltDel;
     if (action == "start_menu" || action == "windows_key" || action == "win")
         return ShortcutAction::StartMenu;
@@ -349,7 +350,7 @@ bool SendSecureAttentionSequenceFromBroker(
 } // namespace
 
 ConnectCaptureBridge::~ConnectCaptureBridge() {
-    Stop();
+    Stop(ownsBroker_);
 }
 
 bool ConnectCaptureBridge::CreateSharedObjects(const std::string& prefix) {
@@ -479,6 +480,7 @@ bool ConnectCaptureBridge::InstallAndStartBroker() {
         << " --cad-request " << QuoteArg(cadRequestName_)
         << " --cad-success " << QuoteArg(cadSuccessName_)
         << " --cad-failure " << QuoteArg(cadFailureName_)
+        << " --connect-ticket " << QuoteArg(connectTicket_)
         << " --fps " << fps_
         << " --display " << displayIndex_.load()
         << " --parent-pid " << pid;
@@ -582,7 +584,8 @@ void ConnectCaptureBridge::RemoveBrokerService() {
 }
 
 bool ConnectCaptureBridge::Start(
-    const std::string& sessionId, int fps, int displayIndex) {
+    const std::string& sessionId, int fps, int displayIndex,
+    const std::string& connectTicket) {
     if (running_.load(std::memory_order_acquire) &&
         sessionId_ == sessionId) {
         return true;
@@ -591,6 +594,8 @@ bool ConnectCaptureBridge::Start(
     Stop();
 
     sessionId_ = sessionId;
+    connectTicket_ = connectTicket;
+    ownsBroker_ = true;
     fps_ = std::clamp(fps, 1, 60);
     displayIndex_.store(std::max(0, displayIndex));
 
@@ -632,15 +637,58 @@ bool ConnectCaptureBridge::Start(
     return true;
 }
 
-void ConnectCaptureBridge::Stop() {
+bool ConnectCaptureBridge::AttachExisting(
+    const std::string& sessionId,
+    const std::string& serviceName,
+    const std::string& normalShmem,
+    const std::string& secureShmem,
+    const std::string& normalInput,
+    const std::string& secureInput,
+    const std::string& normalStop,
+    const std::string& secureStop,
+    const std::string& brokerStop,
+    const std::string& loginDesktop,
+    const std::string& cadRequest,
+    const std::string& cadSuccess,
+    const std::string& cadFailure) {
+    Stop(false);
+
+    sessionId_ = sessionId;
+    serviceName_ = serviceName;
+    normalShmemName_ = normalShmem;
+    secureShmemName_ = secureShmem;
+    normalInputName_ = normalInput;
+    secureInputName_ = secureInput;
+    normalStopName_ = normalStop;
+    secureStopName_ = secureStop;
+    brokerStopName_ = brokerStop;
+    loginDesktopName_ = loginDesktop;
+    cadRequestName_ = cadRequest;
+    cadSuccessName_ = cadSuccess;
+    cadFailureName_ = cadFailure;
+    ownsBroker_ = false;
+
+    if (!OpenSharedObjects()) {
+        Stop(false);
+        return false;
+    }
+
+    running_.store(true, std::memory_order_release);
+    LogInfo("[connect-broker] continuity host attached to existing broker session=" +
+        sessionId_);
+    return true;
+}
+
+void ConnectCaptureBridge::Stop(bool stopBroker) {
     StopPump();
     running_.store(false, std::memory_order_release);
 
-    if (brokerStopEvent_) SetEvent(brokerStopEvent_);
-    if (normalStopEvent_) SetEvent(normalStopEvent_);
-    if (secureStopEvent_) SetEvent(secureStopEvent_);
-
-    RemoveBrokerService();
+    if (stopBroker) {
+        if (brokerStopEvent_) SetEvent(brokerStopEvent_);
+        if (normalStopEvent_) SetEvent(normalStopEvent_);
+        if (secureStopEvent_) SetEvent(secureStopEvent_);
+        RemoveBrokerService();
+    }
 
     if (normalStopEvent_) {
         CloseHandle(normalStopEvent_);
@@ -680,6 +728,8 @@ void ConnectCaptureBridge::Stop() {
     secureFallbackReady_.store(false);
     sessionId_.clear();
     serviceName_.clear();
+    connectTicket_.clear();
+    ownsBroker_ = false;
 }
 
 bool ConnectCaptureBridge::StartPump(
@@ -1184,6 +1234,7 @@ struct BrokerConfig {
     std::string cadRequest;
     std::string cadSuccess;
     std::string cadFailure;
+    std::string connectTicket;
     int fps{ 30 };
     int display{ 0 };
     DWORD parentPid{ 0 };
@@ -1308,6 +1359,56 @@ HANDLE LaunchBrokerSecureStreamer(
         exe, command, consoleSession);
 }
 
+
+HANDLE LaunchContinuityHost(const BrokerConfig& config) {
+    const std::string exe = CurrentExePath();
+    if (exe.empty() || config.connectTicket.empty()) return nullptr;
+
+    const std::string command =
+        QuoteArg(exe) +
+        " --connect-continuity-host" +
+        " --connect-ticket " + QuoteArg(config.connectTicket) +
+        " --session " + QuoteArg(config.sessionId) +
+        " --service-name " + QuoteArg(config.serviceName) +
+        " --normal-shmem " + QuoteArg(config.normalShmem) +
+        " --secure-shmem " + QuoteArg(config.secureShmem) +
+        " --normal-input " + QuoteArg(config.normalInput) +
+        " --secure-input " + QuoteArg(config.secureInput) +
+        " --normal-stop " + QuoteArg(config.normalStop) +
+        " --secure-stop " + QuoteArg(config.secureStop) +
+        " --broker-stop " + QuoteArg(config.brokerStop) +
+        " --login-desktop " + QuoteArg(config.loginDesktop) +
+        " --cad-request " + QuoteArg(config.cadRequest) +
+        " --cad-success " + QuoteArg(config.cadSuccess) +
+        " --cad-failure " + QuoteArg(config.cadFailure);
+
+    std::wstring wideExe = Wide(exe);
+    std::wstring wideCommand = Wide(command);
+    if (wideExe.empty() || wideCommand.empty()) return nullptr;
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    const BOOL ok = CreateProcessW(
+        wideExe.c_str(),
+        wideCommand.data(),
+        nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW,
+        nullptr, nullptr,
+        &startup, &process);
+    if (!ok) {
+        LogError("[connect-broker-service] continuity host launch failed err=" +
+            std::to_string(GetLastError()));
+        return nullptr;
+    }
+
+    CloseHandle(process.hThread);
+    LogInfo("[connect-broker-service] LocalSystem continuity host launched session=" +
+        config.sessionId +
+        " pid=" + std::to_string(process.dwProcessId));
+    return process.hProcess;
+}
+
 void DeleteOwnBrokerService(const std::string& serviceName) {
     const std::wstring wideName = Wide(serviceName);
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
@@ -1416,6 +1517,12 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
 
     HANDLE normalProcess = nullptr;
     HANDLE secureProcess = nullptr;
+    HANDLE continuityProcess = nullptr;
+    bool continuityTakeover = false;
+    bool parentExitPending = false;
+    std::chrono::steady_clock::time_point parentExitedAt{};
+    const auto brokerStartedAt = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastContinuityLaunchAt{};
 
     if (interactiveReady) {
         ResetEvent(loginDesktop);
@@ -1451,9 +1558,15 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
         " interactive=" + std::string(interactiveReady ? "1" : "0"));
 
     while (WaitForSingleObject(gBrokerScmStopEvent, 0) != WAIT_OBJECT_0 &&
-           WaitForSingleObject(brokerStop, 0) != WAIT_OBJECT_0 &&
-           (!parent || WaitForSingleObject(parent, 0) != WAIT_OBJECT_0)) {
+           WaitForSingleObject(brokerStop, 0) != WAIT_OBJECT_0) {
         const auto now = std::chrono::steady_clock::now();
+
+        // Fail-safe: a temporary attended broker must never become permanent.
+        if (now - brokerStartedAt >= std::chrono::hours(24)) {
+            LogWarn("[connect-broker-service] 24h safety lifetime reached session=" +
+                gBrokerConfig.sessionId);
+            break;
+        }
 
         const uint64_t sessionChangeSeq =
             gBrokerSessionChangeSeq.load(std::memory_order_acquire);
@@ -1502,6 +1615,56 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
                     std::to_string(changeType) +
                     " session=" + gBrokerConfig.sessionId);
             }
+        }
+
+        if (parent && WaitForSingleObject(parent, 0) == WAIT_OBJECT_0) {
+            CloseHandle(parent);
+            parent = nullptr;
+            parentExitPending = true;
+            parentExitedAt = now;
+            LogInfo("[connect-broker-service] attended host process exited; checking for Windows sign-out session=" +
+                gBrokerConfig.sessionId);
+        }
+
+        if (parentExitPending) {
+            // SERVICE_CONTROL_SESSIONCHANGE and WTS token removal can trail the
+            // user process by a few hundred milliseconds. Give Windows a short
+            // grace window before deciding that a process exit was intentional.
+            const bool loginBoundary =
+                sessionLocked || !InteractiveUserSessionReady(consoleSession);
+            if (loginBoundary) {
+                parentExitPending = false;
+                continuityTakeover = true;
+                lastContinuityLaunchAt = now;
+                continuityProcess = LaunchContinuityHost(gBrokerConfig);
+                if (!continuityProcess) {
+                    LogError("[connect-broker-service] failed to take over Connect signaling after sign-out session=" +
+                        gBrokerConfig.sessionId);
+                } else {
+                    LogInfo("[connect-broker-service] continuity takeover armed session=" +
+                        gBrokerConfig.sessionId);
+                }
+            } else if (now - parentExitedAt >= std::chrono::seconds(2)) {
+                parentExitPending = false;
+                LogInfo("[connect-broker-service] attended host exited outside sign-out; stopping session=" +
+                    gBrokerConfig.sessionId);
+                SetEvent(gBrokerScmStopEvent);
+                continue;
+            }
+        }
+
+        if (continuityProcess &&
+            WaitForSingleObject(continuityProcess, 0) == WAIT_OBJECT_0) {
+            CloseHandle(continuityProcess);
+            continuityProcess = nullptr;
+            LogWarn("[connect-broker-service] continuity host exited session=" +
+                gBrokerConfig.sessionId);
+        }
+
+        if (continuityTakeover && !continuityProcess &&
+            now - lastContinuityLaunchAt >= std::chrono::seconds(2)) {
+            lastContinuityLaunchAt = now;
+            continuityProcess = LaunchContinuityHost(gBrokerConfig);
         }
 
         if (WaitForSingleObject(cadRequest, 0) == WAIT_OBJECT_0) {
@@ -1671,6 +1834,14 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
     SetBrokerServiceState(SERVICE_STOP_PENDING, NO_ERROR, 3000);
     CloseChildProcess(secureProcess, secureStop, "secure");
     CloseChildProcess(normalProcess, normalStop, "normal");
+    if (continuityProcess) {
+        if (WaitForSingleObject(continuityProcess, 600) != WAIT_OBJECT_0) {
+            TerminateProcess(continuityProcess, 0);
+            WaitForSingleObject(continuityProcess, 500);
+        }
+        CloseHandle(continuityProcess);
+        continuityProcess = nullptr;
+    }
 
     normalInput.Close();
     secureInput.Close();
@@ -1733,6 +1904,8 @@ int RunConnectCaptureBrokerService(int argc, char** argv) {
         ArgValue(argc, argv, "--cad-success");
     gBrokerConfig.cadFailure =
         ArgValue(argc, argv, "--cad-failure");
+    gBrokerConfig.connectTicket =
+        ArgValue(argc, argv, "--connect-ticket");
     gBrokerConfig.fps =
         std::clamp(ParseIntArg(argc, argv, "--fps", 30), 1, 60);
     gBrokerConfig.display =
@@ -1753,7 +1926,8 @@ int RunConnectCaptureBrokerService(int argc, char** argv) {
         gBrokerConfig.loginDesktop.empty() ||
         gBrokerConfig.cadRequest.empty() ||
         gBrokerConfig.cadSuccess.empty() ||
-        gBrokerConfig.cadFailure.empty()) {
+        gBrokerConfig.cadFailure.empty() ||
+        gBrokerConfig.connectTicket.empty()) {
         LogError("[connect-broker-service] missing required arguments");
         return 2;
     }

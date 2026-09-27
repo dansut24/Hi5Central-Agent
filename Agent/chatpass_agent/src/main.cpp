@@ -269,7 +269,11 @@ static bool ConnectLaunchElevatedCopy(const std::string& ticket) {
 }
 #endif
 
-static int RunConnectHost(const std::string& ticket) {
+static int RunConnectHost(
+    const std::string& ticket,
+    int argc = 0,
+    char** argv = nullptr,
+    bool continuityHost = false) {
     if (ticket.empty()) {
         std::cerr << "[connect] This support download is missing its one-time ticket.\n";
         std::cerr << "[connect] Return to https://connect.hi5central.com and download it again.\n";
@@ -312,6 +316,30 @@ static int RunConnectHost(const std::string& ticket) {
     std::string connectSessionId;
     const bool connectElevated = hi5::getPlatformInfo().isElevated;
     hi5::ConnectCaptureBridge connectCapture;
+    const std::string continuityServiceName =
+        continuityHost ? argValue(argc, argv, "--service-name") : std::string();
+    const std::string continuityNormalShmem =
+        continuityHost ? argValue(argc, argv, "--normal-shmem") : std::string();
+    const std::string continuitySecureShmem =
+        continuityHost ? argValue(argc, argv, "--secure-shmem") : std::string();
+    const std::string continuityNormalInput =
+        continuityHost ? argValue(argc, argv, "--normal-input") : std::string();
+    const std::string continuitySecureInput =
+        continuityHost ? argValue(argc, argv, "--secure-input") : std::string();
+    const std::string continuityNormalStop =
+        continuityHost ? argValue(argc, argv, "--normal-stop") : std::string();
+    const std::string continuitySecureStop =
+        continuityHost ? argValue(argc, argv, "--secure-stop") : std::string();
+    const std::string continuityBrokerStop =
+        continuityHost ? argValue(argc, argv, "--broker-stop") : std::string();
+    const std::string continuityLoginDesktop =
+        continuityHost ? argValue(argc, argv, "--login-desktop") : std::string();
+    const std::string continuityCadRequest =
+        continuityHost ? argValue(argc, argv, "--cad-request") : std::string();
+    const std::string continuityCadSuccess =
+        continuityHost ? argValue(argc, argv, "--cad-success") : std::string();
+    const std::string continuityCadFailure =
+        continuityHost ? argValue(argc, argv, "--cad-failure") : std::string();
 #else
     const bool connectElevated = false;
 #endif
@@ -387,9 +415,13 @@ static int RunConnectHost(const std::string& ticket) {
         // signaling handshake looked like "nothing happened" even though the
         // portable process was alive in Task Manager.
 #ifdef _WIN32
-        startSupportUi("", "Waiting for technician", "Hi5Central");
-        if (supportUiStarted.load()) {
-            supportWindow.SetConnectionState("Connecting securely...", false);
+        if (!continuityHost) {
+            startSupportUi("", "Waiting for technician", "Hi5Central");
+            if (supportUiStarted.load()) {
+                supportWindow.SetConnectionState("Connecting securely...", false);
+            }
+        } else {
+            LogInfo("[connect] LocalSystem continuity host starting without customer UI");
         }
 #endif
 
@@ -403,7 +435,8 @@ static int RunConnectHost(const std::string& ticket) {
                 {"platform", "Windows"},
                 {"version", hi5::kAgentVersion},
 #ifdef _WIN32
-                {"elevated", connectElevated}
+                {"elevated", connectElevated},
+                {"continuity_host", continuityHost}
 #else
                 {"elevated", false}
 #endif
@@ -435,11 +468,13 @@ static int RunConnectHost(const std::string& ticket) {
                 std::cout << "[connect] Technician: " << technician << "\n";
                 std::cout << "[connect] Waiting for the technician to open the remote session...\n";
 #ifdef _WIN32
-                startSupportUi(sessionId, technician, organisation);
-                if (supportUiStarted.load()) {
-                    supportWindow.SetConnectionState(
-                        heldUntil.empty() ? "Waiting for technician" : "Session on hold",
-                        false);
+                if (!continuityHost) {
+                    startSupportUi(sessionId, technician, organisation);
+                    if (supportUiStarted.load()) {
+                        supportWindow.SetConnectionState(
+                            heldUntil.empty() ? "Waiting for technician" : "Session on hold",
+                            false);
+                    }
                 }
 #endif
                 return;
@@ -452,9 +487,28 @@ static int RunConnectHost(const std::string& ticket) {
 
 #ifdef _WIN32
                 bool useManagedCapturePath = false;
-                if (connectElevated) {
+                if (continuityHost) {
+                    useManagedCapturePath = connectCapture.AttachExisting(
+                        sessionId,
+                        continuityServiceName,
+                        continuityNormalShmem,
+                        continuitySecureShmem,
+                        continuityNormalInput,
+                        continuitySecureInput,
+                        continuityNormalStop,
+                        continuitySecureStop,
+                        continuityBrokerStop,
+                        continuityLoginDesktop,
+                        continuityCadRequest,
+                        continuityCadSuccess,
+                        continuityCadFailure);
+                    if (!useManagedCapturePath) {
+                        LogError("[connect-broker] continuity host could not attach to the temporary broker session=" +
+                            sessionId);
+                    }
+                } else if (connectElevated) {
                     useManagedCapturePath =
-                        connectCapture.Start(sessionId, fps, 0);
+                        connectCapture.Start(sessionId, fps, 0, ticket);
                     if (!useManagedCapturePath) {
                         LogWarn(
                             "[connect-broker] temporary LocalSystem capture broker unavailable; "
@@ -463,6 +517,18 @@ static int RunConnectHost(const std::string& ticket) {
                 }
 #else
                 const bool useManagedCapturePath = false;
+#endif
+
+#ifdef _WIN32
+                if (continuityHost && !useManagedCapturePath) {
+                    signaling.send(json{
+                        {"type", "remote_error"},
+                        {"session_id", sessionId},
+                        {"code", "continuity_capture_attach_failed"},
+                        {"message", "Temporary Connect service could not attach to the Windows desktop capture broker."}
+                    }.dump());
+                    return;
+                }
 #endif
 
                 auto sender = std::make_unique<WebRtcSender>(
@@ -642,6 +708,9 @@ static int RunConnectHost(const std::string& ticket) {
                 if (permission == "files") {
                     if (fileAccessGranted.load()) {
                         approved = true;
+                    } else if (continuityHost) {
+                        approved = false;
+                        reason = "customer_ui_unavailable";
                     } else {
                         approved = ConnectPromptCustomer(
                             L"Hi5Central Connect - File access",
@@ -718,6 +787,17 @@ static int RunConnectHost(const std::string& ticket) {
             if (type == "connect_hold_request") {
                 const int requestedMinutes = std::clamp(
                     msg.value("duration_minutes", 24 * 60), 30, 24 * 60);
+                if (continuityHost) {
+                    signaling.send(json{
+                        {"type", "connect_hold_response"},
+                        {"session_id", sessionId},
+                        {"approved", false},
+                        {"duration_minutes", requestedMinutes},
+                        {"restart_registered", false},
+                        {"reason", "customer_ui_unavailable"}
+                    }.dump());
+                    return;
+                }
                 const bool approved = ConnectPromptCustomer(
                     L"Hi5Central Connect - Keep session available",
                     L"Your technician would like to keep this support session available so they can return later.\n\n"
@@ -876,8 +956,8 @@ static int RunConnectHost(const std::string& ticket) {
 #ifdef _WIN32
         connectFiles.CancelAll();
         connectCapture.StopPump();
-        connectCapture.Stop();
-        if (sessionExplicitlyEnded.load()) ConnectSetRestartResume(false, ticket);
+        connectCapture.Stop(!continuityHost || sessionExplicitlyEnded.load());
+        if (sessionExplicitlyEnded.load() && !continuityHost) ConnectSetRestartResume(false, ticket);
         supportWindow.Stop();
 #endif
 
@@ -893,14 +973,16 @@ static int RunConnectHost(const std::string& ticket) {
     catch (const std::exception& ex) {
 #ifdef _WIN32
         connectCapture.StopPump();
-        connectCapture.Stop();
+        connectCapture.Stop(!continuityHost);
         supportWindow.Stop();
-        const std::string detail = std::string("Unable to start the secure support session.\n\n") + ex.what() +
-            "\n\nReturn to connect.hi5central.com and ask your technician for a new support code.";
-        const int wideLength = MultiByteToWideChar(CP_UTF8, 0, detail.c_str(), static_cast<int>(detail.size()), nullptr, 0);
-        std::wstring wideDetail(static_cast<size_t>(std::max(0, wideLength)), L'\0');
-        if (wideLength > 0) MultiByteToWideChar(CP_UTF8, 0, detail.c_str(), static_cast<int>(detail.size()), wideDetail.data(), wideLength);
-        MessageBoxW(nullptr, wideDetail.c_str(), L"Hi5Central Connect", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+        if (!continuityHost) {
+            const std::string detail = std::string("Unable to start the secure support session.\n\n") + ex.what() +
+                "\n\nReturn to connect.hi5central.com and ask your technician for a new support code.";
+            const int wideLength = MultiByteToWideChar(CP_UTF8, 0, detail.c_str(), static_cast<int>(detail.size()), nullptr, 0);
+            std::wstring wideDetail(static_cast<size_t>(std::max(0, wideLength)), L'\0');
+            if (wideLength > 0) MultiByteToWideChar(CP_UTF8, 0, detail.c_str(), static_cast<int>(detail.size()), wideDetail.data(), wideLength);
+            MessageBoxW(nullptr, wideDetail.c_str(), L"Hi5Central Connect", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+        }
 #endif
         std::cerr << "[connect] Unable to start support session: " << ex.what() << "\n";
         std::cerr << "[connect] Return to https://connect.hi5central.com and ask your technician for a new code.\n";
@@ -1073,6 +1155,11 @@ int main(int argc, char** argv) {
         LogInfo("[main] mode=connect-capture-broker");
         return hi5::RunConnectCaptureBrokerService(argc, argv);
     }
+    if (hasArg(argc, argv, "--connect-continuity-host")) {
+        const std::string ticket = ConnectTicketFromArgs(argc, argv);
+        LogInfo("[main] mode=connect-continuity-host");
+        return RunConnectHost(ticket, argc, argv, true);
+    }
 #endif
 
     // The portable Connect filename contains its one-time ticket. Internal
@@ -1146,11 +1233,11 @@ int main(int argc, char** argv) {
             }
         }
 
-        const int result = RunConnectHost(connectTicket);
+        const int result = RunConnectHost(connectTicket, argc, argv, false);
         if (connectInstanceMutex) CloseHandle(connectInstanceMutex);
         return result;
 #else
-        return RunConnectHost(connectTicket);
+        return RunConnectHost(connectTicket, argc, argv, false);
 #endif
     }
 

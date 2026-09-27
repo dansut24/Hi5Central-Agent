@@ -24,8 +24,23 @@ public:
     ConnectCaptureBridge() = default;
     ~ConnectCaptureBridge();
 
-    bool Start(const std::string& sessionId, int fps, int displayIndex = 0);
-    void Stop();
+    bool Start(const std::string& sessionId, int fps, int displayIndex = 0,
+        const std::string& connectTicket = {});
+    bool AttachExisting(
+        const std::string& sessionId,
+        const std::string& serviceName,
+        const std::string& normalShmem,
+        const std::string& secureShmem,
+        const std::string& normalInput,
+        const std::string& secureInput,
+        const std::string& normalStop,
+        const std::string& secureStop,
+        const std::string& brokerStop,
+        const std::string& loginDesktop,
+        const std::string& cadRequest,
+        const std::string& cadSuccess,
+        const std::string& cadFailure);
+    void Stop(bool stopBroker = true);
 
     bool StartPump(WebRtcSender* sender, StateCallback stateCallback);
     void StopPump();
@@ -66,6 +81,8 @@ private:
     std::string cadRequestName_;
     std::string cadSuccessName_;
     std::string cadFailureName_;
+    std::string connectTicket_;
+    bool ownsBroker_{ false };
 
     ShmemRing normalShmem_;
     ShmemRing secureShmem_;
