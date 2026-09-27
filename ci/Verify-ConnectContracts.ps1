@@ -9,6 +9,8 @@ $senderHeader = Get-Content 'Agent/chatpass_agent/src/webrtc_sender.h' -Raw
 $senderSource = Get-Content 'Agent/chatpass_agent/src/webrtc_sender.cpp' -Raw
 $windowsInput = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_input.cpp' -Raw
 $connectWindow = Get-Content 'Agent/chatpass_agent/src/ui/native_connect_window.cpp' -Raw
+$connectFiles = Get-Content 'Agent/chatpass_agent/src/connect_file_browser.cpp' -Raw
+$signalingSource = Get-Content 'Agent/chatpass_agent/src/signaling_client.cpp' -Raw
 $cmake = Get-Content 'Agent/chatpass_agent/CMakeLists.txt' -Raw
 $workflow = Get-Content '.github/workflows/windows-installers.yml' -Raw
 
@@ -28,10 +30,26 @@ if ($main.Contains('hi5::NativeBanner supportPanel')) { throw 'Portable Connect 
 Require-Literal $main 'supportWindow.AppendMessage(chat)' 'Portable Connect customer chat must stay inside the attended-support window.'
 Require-Literal $main '"customer_ended_session"' 'Portable Connect local End session must revoke technician access.'
 Require-Literal $main '{"type", "chat_message"}' 'Portable Connect customer chat must relay through the authenticated session.'
+Require-Literal $main 'type == "connect_permission_request"' 'Connect must process explicit customer permission requests.'
+Require-Literal $main 'permission == "elevation"' 'Connect must gate elevation behind customer approval.'
+Require-Literal $main 'ConnectLaunchElevatedCopy' 'Connect must support a customer-approved UAC handoff to an elevated copy.'
+Require-Literal $main 'lpVerb = L"runas"' 'Connect elevation must use the standard Windows UAC runas flow.'
+Require-Literal $main 'ConnectSetRestartResume' 'Connect must support temporary restart-resume persistence only when approved.'
+Require-Literal $main 'CurrentVersion\\RunOnce' 'Connect restart persistence must be one-shot rather than a permanent service or startup entry.'
+Require-Literal $main 'type == "connect_hold_request"' 'Connect must expose customer-approved session hold.'
+Require-Literal $main 'supportWindow.SetConnectionState("Reconnecting...", false)' 'Connect must visibly enter reconnect state after a transport loss.'
+Require-Literal $main 'reconnectBackoffSeconds = std::min(reconnectBackoffSeconds * 2, 30)' 'Connect host reconnect must use bounded exponential backoff.'
+Require-Literal $main 'type.rfind("remote_file_", 0) == 0' 'Connect file operations must be dispatched only through the consent-gated file channel.'
 Require-Literal $senderHeader 'void handleInputEvent(const nlohmann::json& msg);' 'WebRTC sender must expose the existing input injector for portable fallback input.'
 Require-Literal $senderSource 'm_injector.handleMessage(msg);' 'Portable fallback input must use the existing Windows input injector.'
 Require-Literal $cmake 'src/platform/windows/windows_input.cpp' 'Windows builds must compile the platform input injector checked by this contract.'
 Require-Literal $cmake 'src/ui/native_connect_window.cpp' 'Windows builds must compile the dedicated Connect customer window.'
+Require-Literal $cmake 'src/connect_file_browser.cpp' 'Windows builds must compile the attended Connect file browser.'
+Require-Literal $connectFiles 'remote_file_list_request' 'Connect file browser must support consent-gated folder listing.'
+Require-Literal $connectFiles 'remote_file_download_request' 'Connect file browser must support downloads.'
+Require-Literal $connectFiles 'remote_file_upload_start' 'Connect file browser must support chunked uploads.'
+Require-Literal $connectFiles 'IsProtectedPath' 'Connect file browser must retain protected/system-path safeguards.'
+Require-Literal $signalingSource 'return m_ws == candidate;' 'Signaling reconnect must ignore stale WebSocket callbacks.'
 Require-Literal $connectWindow 'WS_MINIMIZEBOX' 'Connect customer window must be minimisable.'
 Require-Literal $connectWindow 'WS_EX_APPWINDOW' 'Connect customer window must appear as a normal taskbar application.'
 Require-Literal $connectWindow 'CenterWindow()' 'Connect customer window must open centred on the customer screen.'

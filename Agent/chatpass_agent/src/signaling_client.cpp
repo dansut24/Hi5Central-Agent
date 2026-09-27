@@ -8,18 +8,34 @@ SignalingClient::SignalingClient(std::string url)
 
 void SignalingClient::connect() {
     auto ws = std::make_shared<rtc::WebSocket>();
+    std::weak_ptr<rtc::WebSocket> weak = ws;
 
-    ws->onOpen([this]() {
+    auto isCurrent = [this, weak]() {
+        auto candidate = weak.lock();
+        if (!candidate) return false;
+        std::lock_guard<std::mutex> lock(m_wsMu);
+        return m_ws == candidate;
+    };
+
+    ws->onOpen([this, isCurrent]() {
+        if (!isCurrent()) return;
         if (m_openHandler) m_openHandler();
         });
 
-    ws->onMessage([this](rtc::message_variant data) {
+    ws->onMessage([this, isCurrent](rtc::message_variant data) {
+        if (!isCurrent()) return;
         if (const auto* s = std::get_if<std::string>(&data)) {
             if (m_messageHandler) m_messageHandler(*s);
         }
         });
 
-    ws->onClosed([this]() {
+    ws->onClosed([this, weak, isCurrent]() {
+        if (!isCurrent()) return;
+        {
+            std::lock_guard<std::mutex> lock(m_wsMu);
+            auto candidate = weak.lock();
+            if (candidate && m_ws == candidate) m_ws.reset();
+        }
         if (m_closedHandler) m_closedHandler();
         });
 

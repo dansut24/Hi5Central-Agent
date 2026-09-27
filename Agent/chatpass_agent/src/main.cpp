@@ -1,4 +1,5 @@
 ﻿#include "signaling_client.h"
+#include "connect_file_browser.h"
 #include "webrtc_sender.h"
 #include "agent_identity.h"
 #include "agent_version.h"
@@ -32,6 +33,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
 using json = nlohmann::json;
@@ -171,6 +173,94 @@ static std::string ConnectHostName() {
     return "Customer computer";
 }
 
+#ifdef _WIN32
+static std::wstring ConnectWide(const std::string& value) {
+    if (value.empty()) return {};
+    const int count = MultiByteToWideChar(
+        CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
+    if (count <= 0) return {};
+    std::wstring out(static_cast<size_t>(count), L'\0');
+    MultiByteToWideChar(
+        CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), out.data(), count);
+    return out;
+}
+
+static std::wstring ConnectExecutablePath() {
+    std::wstring buffer(32768, L'\0');
+    const DWORD count = GetModuleFileNameW(
+        nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (!count || count >= buffer.size()) return {};
+    buffer.resize(count);
+    return buffer;
+}
+
+static bool ConnectPromptCustomer(const std::wstring& title, const std::wstring& message) {
+    return MessageBoxW(
+        nullptr,
+        message.c_str(),
+        title.c_str(),
+        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND
+    ) == IDYES;
+}
+
+static bool ConnectSetRestartResume(bool enabled, const std::string& ticket = {}) {
+    HKEY key = nullptr;
+    const LONG open = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (open != ERROR_SUCCESS || !key) return false;
+
+    constexpr wchar_t valueName[] = L"Hi5CentralConnectResume";
+    LONG result = ERROR_SUCCESS;
+    if (!enabled) {
+        result = RegDeleteValueW(key, valueName);
+        if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
+    } else {
+        const std::wstring exe = ConnectExecutablePath();
+        if (exe.empty()) {
+            RegCloseKey(key);
+            return false;
+        }
+        const std::wstring wideTicket = ConnectWide(ticket);
+        if (wideTicket.empty()) {
+            RegCloseKey(key);
+            return false;
+        }
+        const std::wstring command =
+            L"\"" + exe + L"\" --connect-ticket \"" + wideTicket +
+            L"\" --connect-held-resume";
+        result = RegSetValueExW(
+            key, valueName, 0, REG_SZ,
+            reinterpret_cast<const BYTE*>(command.c_str()),
+            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    }
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+static bool ConnectLaunchElevatedCopy(const std::string& ticket) {
+    const std::wstring exe = ConnectExecutablePath();
+    const std::wstring wideTicket = ConnectWide(ticket);
+    if (exe.empty() || wideTicket.empty()) return false;
+    const std::wstring parameters =
+        L"--connect-ticket \"" + wideTicket + L"\" --connect-elevated-handoff";
+
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    info.hwnd = nullptr;
+    info.lpVerb = L"runas";
+    info.lpFile = exe.c_str();
+    info.lpParameters = parameters.c_str();
+    info.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&info)) return false;
+    if (info.hProcess) CloseHandle(info.hProcess);
+    return true;
+}
+#endif
+
 static int RunConnectHost(const std::string& ticket) {
     if (ticket.empty()) {
         std::cerr << "[connect] This support download is missing its one-time ticket.\n";
@@ -208,7 +298,11 @@ static int RunConnectHost(const std::string& ticket) {
 #ifdef _WIN32
     hi5::NativeConnectWindow supportWindow;
     std::atomic<bool> supportUiStarted{ false };
+    std::atomic<bool> fileAccessGranted{ false };
+    std::atomic<bool> elevationHandoffRequested{ false };
+    std::atomic<bool> sessionExplicitlyEnded{ false };
     std::string connectSessionId;
+    const bool connectElevated = hi5::getPlatformInfo().isElevated;
 #endif
 
     try {
@@ -220,7 +314,13 @@ static int RunConnectHost(const std::string& ticket) {
             signaling.send(payload);
         };
 
+        std::atomic<bool> signalingConnected{ false };
+        std::atomic<bool> reconnectRequested{ false };
+
 #ifdef _WIN32
+        hi5::ConnectFileBrowser connectFiles([&signaling](const json& payload) {
+            signaling.send(payload.dump());
+        });
         auto startSupportUi = [&](const std::string& sessionId,
             const std::string& technician,
             const std::string& organisation) {
@@ -246,6 +346,7 @@ static int RunConnectHost(const std::string& ticket) {
                     }.dump());
                 },
                 [&]() {
+                    sessionExplicitlyEnded.store(true);
                     if (!connectSessionId.empty()) {
                         signaling.send(json{
                             {"type", "session_ended"},
@@ -253,6 +354,7 @@ static int RunConnectHost(const std::string& ticket) {
                             {"reason", "customer_ended_session"}
                         }.dump());
                     }
+                    ConnectSetRestartResume(false, ticket);
                     g_running = false;
                 })) {
                 LogWarn("[connect-ui] failed to create centred customer support window session=" + sessionId);
@@ -270,13 +372,25 @@ static int RunConnectHost(const std::string& ticket) {
 #endif
 
         signaling.onOpen([&]() {
+            signalingConnected.store(true);
+            reconnectRequested.store(false);
             std::cout << "[connect] Secure connection established. Waiting for technician...\n";
             signaling.send(json{
                 {"type", "connect_hello"},
                 {"host_name", ConnectHostName()},
                 {"platform", "Windows"},
-                {"version", hi5::kAgentVersion}
+                {"version", hi5::kAgentVersion},
+#ifdef _WIN32
+                {"elevated", connectElevated}
+#else
+                {"elevated", false}
+#endif
             }.dump());
+#ifdef _WIN32
+            if (supportUiStarted.load()) {
+                supportWindow.SetConnectionState("Waiting for technician", false);
+            }
+#endif
         });
 
         signaling.onMessage([&](const std::string& text) {
@@ -290,12 +404,16 @@ static int RunConnectHost(const std::string& ticket) {
             if (type == "connect_ready") {
                 const std::string technician = msg.value("technician_name", std::string("Hi5Central technician"));
                 const std::string organisation = msg.value("organisation_name", std::string("Hi5Central"));
+                const std::string heldUntil = msg.value("held_until", std::string());
                 std::cout << "[connect] Support request verified.\n";
                 std::cout << "[connect] Organisation: " << organisation << "\n";
                 std::cout << "[connect] Technician: " << technician << "\n";
                 std::cout << "[connect] Waiting for the technician to open the remote session...\n";
 #ifdef _WIN32
                 startSupportUi(sessionId, technician, organisation);
+                if (!heldUntil.empty() && supportUiStarted.load()) {
+                    supportWindow.SetConnectionState("Session on hold", false);
+                }
 #endif
                 return;
             }
@@ -346,6 +464,119 @@ static int RunConnectHost(const std::string& ticket) {
             }
 
 #ifdef _WIN32
+            if (type == "connect_permission_request") {
+                const std::string permission = msg.value("permission", std::string());
+                bool approved = false;
+                std::string reason;
+
+                if (permission == "files") {
+                    if (fileAccessGranted.load()) {
+                        approved = true;
+                    } else {
+                        approved = ConnectPromptCustomer(
+                            L"Hi5Central Connect - File access",
+                            L"Your technician is requesting access to browse and transfer files on this computer.\n\n"
+                            L"If you allow this, they can view folders and upload, download, rename, create or delete files for this support session.\n\n"
+                            L"Allow file access?"
+                        );
+                        fileAccessGranted.store(approved);
+                        reason = approved ? "customer_approved" : "customer_denied";
+                    }
+                }
+                else if (permission == "elevation") {
+                    if (connectElevated) {
+                        approved = true;
+                        reason = "already_elevated";
+                    } else {
+                        const bool customerApproved = ConnectPromptCustomer(
+                            L"Hi5Central Connect - Administrator access",
+                            L"Your technician is requesting administrator access for this support session.\n\n"
+                            L"Windows will show a User Account Control prompt next. Only approve that Windows prompt if you want the technician to continue with administrator access.\n\n"
+                            L"Continue?"
+                        );
+                        if (!customerApproved) {
+                            reason = "customer_denied";
+                        } else if (ConnectLaunchElevatedCopy(ticket)) {
+                            approved = true;
+                            reason = "elevation_started";
+                            elevationHandoffRequested.store(true);
+                            if (supportUiStarted.load()) {
+                                supportWindow.SetConnectionState("Elevating session...", false);
+                            }
+                        } else {
+                            reason = "uac_cancelled_or_failed";
+                        }
+                    }
+                }
+                else {
+                    reason = "unsupported_permission";
+                }
+
+                signaling.send(json{
+                    {"type", "connect_permission_response"},
+                    {"session_id", sessionId},
+                    {"permission", permission},
+                    {"approved", approved},
+                    {"reason", reason},
+                    {"elevated", connectElevated}
+                }.dump());
+                return;
+            }
+
+            if (type == "connect_hold_request") {
+                const int requestedMinutes = std::clamp(
+                    msg.value("duration_minutes", 24 * 60), 30, 24 * 60);
+                const bool approved = ConnectPromptCustomer(
+                    L"Hi5Central Connect - Keep session available",
+                    L"Your technician would like to keep this support session available so they can return later.\n\n"
+                    L"If you allow this, Hi5Central Connect may start once after your next Windows sign-in so the same support session can reconnect after a restart. The session will still expire automatically.\n\n"
+                    L"Allow this session to remain available?"
+                );
+                const bool restartRegistered = approved && ConnectSetRestartResume(true, ticket);
+                if (approved) {
+                    std::lock_guard<std::mutex> lock(sessionsMu);
+                    auto it = sessions.find(sessionId);
+                    if (it != sessions.end()) {
+                        it->second->stop();
+                        sessions.erase(it);
+                    }
+                }
+                signaling.send(json{
+                    {"type", "connect_hold_response"},
+                    {"session_id", sessionId},
+                    {"approved", approved},
+                    {"duration_minutes", requestedMinutes},
+                    {"restart_registered", restartRegistered}
+                }.dump());
+                if (approved && supportUiStarted.load()) {
+                    supportWindow.SetConnectionState("Session on hold", false);
+                }
+                return;
+            }
+
+            if (type == "connect_hold_released") {
+                ConnectSetRestartResume(false, ticket);
+                if (supportUiStarted.load()) {
+                    supportWindow.SetConnectionState("Waiting for technician", false);
+                }
+                return;
+            }
+
+            if (type.rfind("remote_file_", 0) == 0) {
+                if (!fileAccessGranted.load()) {
+                    signaling.send(json{
+                        {"type", "connect_permission_response"},
+                        {"session_id", sessionId},
+                        {"permission", "files"},
+                        {"approved", false},
+                        {"reason", "permission_required"}
+                    }.dump());
+                    return;
+                }
+                connectFiles.Handle(sessionId, msg);
+                return;
+            }
+
             if (type == "chat_message") {
                 hi5::ConnectChatMessage chat{};
                 chat.sender = msg.value("sender", std::string("tech"));
@@ -379,23 +610,70 @@ static int RunConnectHost(const std::string& ticket) {
 
             if (type == "end_session" || type == "session_terminated") {
                 std::cout << "[connect] Support session ended. You can close this window.\n";
+#ifdef _WIN32
+                sessionExplicitlyEnded.store(true);
+                ConnectSetRestartResume(false, ticket);
+                connectFiles.CancelAll();
+#endif
                 g_running = false;
                 return;
             }
         });
 
         signaling.onClosed([&]() {
+            signalingConnected.store(false);
             std::cout << "[connect] Secure support connection closed.\n";
-            g_running = false;
+
+            {
+                std::lock_guard<std::mutex> lock(sessionsMu);
+                for (auto& [_, sender] : sessions) sender->stop();
+                sessions.clear();
+            }
+
+#ifdef _WIN32
+            if (elevationHandoffRequested.load()) {
+                std::cout << "[connect] Elevated Connect instance is taking over the session.\n";
+                g_running = false;
+                return;
+            }
+            if (supportUiStarted.load()) {
+                supportWindow.SetConnectionState("Reconnecting...", false);
+            }
+#endif
+            if (g_running) reconnectRequested.store(true);
         });
 
+        reconnectRequested.store(false);
+        signalingConnected.store(false);
         signaling.connect();
 
+        auto nextReconnect = std::chrono::steady_clock::now();
+        int reconnectBackoffSeconds = 2;
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const auto now = std::chrono::steady_clock::now();
+
+            if (signalingConnected.load()) {
+                reconnectBackoffSeconds = 2;
+            }
+            else if (reconnectRequested.load() && now >= nextReconnect) {
+                reconnectRequested.store(false);
+                try {
+                    std::cout << "[connect] Reconnecting secure support channel...\n";
+                    signaling.connect();
+                }
+                catch (const std::exception& ex) {
+                    LogWarn(std::string("[connect] signaling reconnect failed: ") + ex.what());
+                    reconnectRequested.store(true);
+                }
+                nextReconnect = now + std::chrono::seconds(reconnectBackoffSeconds);
+                reconnectBackoffSeconds = std::min(reconnectBackoffSeconds * 2, 30);
+            }
         }
 
 #ifdef _WIN32
+        connectFiles.CancelAll();
+        if (sessionExplicitlyEnded.load()) ConnectSetRestartResume(false, ticket);
         supportWindow.Stop();
 #endif
 

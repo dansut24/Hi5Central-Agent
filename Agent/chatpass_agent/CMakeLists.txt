@@ -160,6 +160,7 @@ add_executable(native_vp8_stream
   src/backstage/backstage_browser_host.cpp
   src/backstage/backstage_cef_browser.cpp
   src/signaling_client.cpp
+  src/connect_file_browser.cpp
   src/h264_mf_encoder.cpp
   src/vp8_encoder.cpp
   src/vp9_mf_encoder.cpp
