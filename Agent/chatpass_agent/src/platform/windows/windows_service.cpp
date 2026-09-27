@@ -367,6 +367,116 @@ namespace hi5 {
         }
 
 
+        static std::string HttpPostJsonWithAgentAuthResponse(
+            const std::string& url,
+            const std::string& body,
+            const AgentIdentity& ident
+        ) {
+            const std::wstring wideUrl = Utf8ToWide(url);
+            URL_COMPONENTS parts{};
+            parts.dwStructSize = sizeof(parts);
+            wchar_t host[256]{};
+            wchar_t path[2048]{};
+            parts.lpszHostName = host;
+            parts.dwHostNameLength = static_cast<DWORD>(std::size(host));
+            parts.lpszUrlPath = path;
+            parts.dwUrlPathLength = static_cast<DWORD>(std::size(path));
+            parts.dwSchemeLength = static_cast<DWORD>(-1);
+            parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+            if (!WinHttpCrackUrl(wideUrl.c_str(), 0, 0, &parts)) {
+                throw std::runtime_error("app portal WinHttpCrackUrl failed");
+            }
+            std::wstring requestPath(path, parts.dwUrlPathLength);
+            if (parts.dwExtraInfoLength != static_cast<DWORD>(-1) && parts.dwExtraInfoLength > 0 && parts.lpszExtraInfo) {
+                requestPath.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+            }
+            const bool https = parts.nScheme == INTERNET_SCHEME_HTTPS;
+            HINTERNET session = WinHttpOpen(
+                L"Hi5CentralAgent/app-portal",
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS,
+                0);
+            if (!session) throw std::runtime_error("app portal WinHttpOpen failed");
+            HINTERNET connect = WinHttpConnect(
+                session,
+                std::wstring(host, parts.dwHostNameLength).c_str(),
+                parts.nPort,
+                0);
+            if (!connect) {
+                WinHttpCloseHandle(session);
+                throw std::runtime_error("app portal WinHttpConnect failed");
+            }
+            HINTERNET request = WinHttpOpenRequest(
+                connect,
+                L"POST",
+                requestPath.c_str(),
+                nullptr,
+                WINHTTP_NO_REFERER,
+                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                https ? WINHTTP_FLAG_SECURE : 0);
+            if (!request) {
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                throw std::runtime_error("app portal WinHttpOpenRequest failed");
+            }
+            DWORD timeoutMs = 15000;
+            WinHttpSetOption(request, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+            WinHttpSetOption(request, WINHTTP_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+            WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+            const std::wstring headers =
+                L"Content-Type: application/json\r\n"
+                L"x-hi5-device-id: " + Utf8ToWide(ident.deviceId) + L"\r\n"
+                L"x-hi5-agent-secret: " + Utf8ToWide(ident.deviceKey) + L"\r\n";
+            BOOL ok = WinHttpSendRequest(
+                request,
+                headers.c_str(),
+                static_cast<DWORD>(headers.size()),
+                body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.data(),
+                static_cast<DWORD>(body.size()),
+                static_cast<DWORD>(body.size()),
+                0);
+            if (!ok || !WinHttpReceiveResponse(request, nullptr)) {
+                const DWORD err = GetLastError();
+                WinHttpCloseHandle(request);
+                WinHttpCloseHandle(connect);
+                WinHttpCloseHandle(session);
+                throw std::runtime_error("app portal WinHTTP request failed err=" + std::to_string(err));
+            }
+            DWORD status = 0;
+            DWORD statusSize = sizeof(status);
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &status,
+                &statusSize,
+                WINHTTP_NO_HEADER_INDEX);
+            std::string response;
+            for (;;) {
+                DWORD available = 0;
+                if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+                if (response.size() + available > 2 * 1024 * 1024) {
+                    WinHttpCloseHandle(request);
+                    WinHttpCloseHandle(connect);
+                    WinHttpCloseHandle(session);
+                    throw std::runtime_error("app portal response too large");
+                }
+                std::string chunk(available, '\0');
+                DWORD read = 0;
+                if (!WinHttpReadData(request, chunk.data(), available, &read) || read == 0) break;
+                chunk.resize(read);
+                response += chunk;
+            }
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            if (status < 200 || status >= 300) {
+                throw std::runtime_error("app portal HTTP status " + std::to_string(status) + " body=" + response);
+            }
+            return response;
+        }
+
         static std::string HttpGetJsonWithAgentAuth(
             const std::string& url,
             const AgentIdentity& ident
@@ -492,6 +602,195 @@ namespace hi5 {
             }
 
             return response;
+        }
+
+        static json AppPortalClientIdentity(HANDLE pipe) {
+            json identity = {
+                {"sid", ""},
+                {"username", ""},
+                {"upn", ""},
+                {"displayName", ""},
+                {"sessionId", ""}
+            };
+            if (!ImpersonateNamedPipeClient(pipe)) {
+                throw std::runtime_error("app portal client impersonation failed");
+            }
+
+            HANDLE token = nullptr;
+            if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
+                RevertToSelf();
+                throw std::runtime_error("app portal client token unavailable");
+            }
+
+            DWORD userBytes = 0;
+            GetTokenInformation(token, TokenUser, nullptr, 0, &userBytes);
+            std::vector<BYTE> userBuffer(userBytes);
+            if (userBytes > 0 && GetTokenInformation(token, TokenUser, userBuffer.data(), userBytes, &userBytes)) {
+                const TOKEN_USER* tokenUser = reinterpret_cast<const TOKEN_USER*>(userBuffer.data());
+                LPWSTR sidText = nullptr;
+                if (ConvertSidToStringSidW(tokenUser->User.Sid, &sidText) && sidText) {
+                    identity["sid"] = WideToUtf8(sidText);
+                    LocalFree(sidText);
+                }
+
+                wchar_t userName[256]{};
+                wchar_t domainName[256]{};
+                DWORD userNameChars = static_cast<DWORD>(std::size(userName));
+                DWORD domainChars = static_cast<DWORD>(std::size(domainName));
+                SID_NAME_USE use{};
+                if (LookupAccountSidW(
+                        nullptr,
+                        tokenUser->User.Sid,
+                        userName,
+                        &userNameChars,
+                        domainName,
+                        &domainChars,
+                        &use)) {
+                    const std::string user = WideToUtf8(userName);
+                    const std::string domain = WideToUtf8(domainName);
+                    identity["username"] = domain.empty() ? user : domain + "\\" + user;
+                    identity["displayName"] = user;
+                }
+            }
+
+            DWORD sessionId = 0;
+            DWORD sessionBytes = sizeof(sessionId);
+            if (GetTokenInformation(token, TokenSessionId, &sessionId, sizeof(sessionId), &sessionBytes)) {
+                identity["sessionId"] = std::to_string(sessionId);
+            }
+
+            CloseHandle(token);
+            RevertToSelf();
+            return identity;
+        }
+
+        static bool AppPortalWriteResponse(HANDLE pipe, const json& payload) {
+            const std::string encoded = payload.dump();
+            if (encoded.size() > 2 * 1024 * 1024) return false;
+            DWORD written = 0;
+            return WriteFile(
+                pipe,
+                encoded.data(),
+                static_cast<DWORD>(encoded.size()),
+                &written,
+                nullptr) && written == encoded.size();
+        }
+
+        static std::string AppPortalReadRequest(HANDLE pipe) {
+            std::vector<char> buffer(64 * 1024);
+            std::string request;
+            for (;;) {
+                DWORD read = 0;
+                const BOOL ok = ReadFile(
+                    pipe,
+                    buffer.data(),
+                    static_cast<DWORD>(buffer.size()),
+                    &read,
+                    nullptr);
+                if (read > 0) request.append(buffer.data(), read);
+                if (request.size() > 64 * 1024) {
+                    throw std::runtime_error("app portal request too large");
+                }
+                if (ok) break;
+                if (GetLastError() == ERROR_MORE_DATA) continue;
+                throw std::runtime_error("app portal pipe read failed");
+            }
+            return request;
+        }
+
+        static void HandleAppPortalClient(HANDLE pipe, AgentIdentity ident) {
+            try {
+                const std::string raw = AppPortalReadRequest(pipe);
+                const json request = json::parse(raw, nullptr, false);
+                if (request.is_discarded() || !request.is_object()) {
+                    AppPortalWriteResponse(pipe, {{"success", false}, {"error", "Invalid request."}});
+                } else {
+                    const std::string type = request.value("type", std::string());
+                    json body = json::object();
+                    body["identity"] = AppPortalClientIdentity(pipe);
+
+                    std::string url;
+                    if (type == "catalogue") {
+                        url = "https://api.hi5central.com/api/v1/agent/app-portal/catalogue";
+                    } else if (type == "install") {
+                        const std::string appId = request.value("appId", std::string());
+                        if (appId.empty() || appId.size() > 80) {
+                            throw std::runtime_error("app portal application id invalid");
+                        }
+                        body["appId"] = appId;
+                        const std::string reason = request.value("reason", std::string());
+                        if (!reason.empty()) body["reason"] = reason.substr(0, 2000);
+                        url = "https://api.hi5central.com/api/v1/agent/app-portal/install";
+                    } else {
+                        AppPortalWriteResponse(pipe, {{"success", false}, {"error", "Unsupported App Portal request."}});
+                        FlushFileBuffers(pipe);
+                        DisconnectNamedPipe(pipe);
+                        CloseHandle(pipe);
+                        return;
+                    }
+
+                    const std::string response = HttpPostJsonWithAgentAuthResponse(url, body.dump(), ident);
+                    const json payload = json::parse(response, nullptr, false);
+                    if (payload.is_discarded()) {
+                        AppPortalWriteResponse(pipe, {{"success", false}, {"error", "Invalid response from Hi5Central."}});
+                    } else {
+                        AppPortalWriteResponse(pipe, payload);
+                    }
+                }
+            } catch (const std::exception& ex) {
+                LogW(std::string("app portal broker request failed: ") + ex.what());
+                AppPortalWriteResponse(pipe, {{"success", false}, {"error", "App Portal request failed. Please try again."}});
+            }
+            FlushFileBuffers(pipe);
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        }
+
+        static void StartAppPortalBroker(const AgentIdentity& ident) {
+            std::thread([ident]() {
+                PSECURITY_DESCRIPTOR descriptor = nullptr;
+                if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)",
+                        SDDL_REVISION_1,
+                        &descriptor,
+                        nullptr)) {
+                    LogE("app portal broker security descriptor creation failed");
+                    return;
+                }
+                SECURITY_ATTRIBUTES security{};
+                security.nLength = sizeof(security);
+                security.lpSecurityDescriptor = descriptor;
+                security.bInheritHandle = FALSE;
+
+                LogI("app portal broker starting");
+                while (!g_stopRequested.load()) {
+                    HANDLE pipe = CreateNamedPipeW(
+                        L"\\\\.\\pipe\\Hi5CentralAppPortal",
+                        PIPE_ACCESS_DUPLEX,
+                        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                        8,
+                        2 * 1024 * 1024,
+                        64 * 1024,
+                        0,
+                        &security);
+                    if (pipe == INVALID_HANDLE_VALUE) {
+                        LogE("app portal broker CreateNamedPipe failed err=" + std::to_string(GetLastError()));
+                        Sleep(1000);
+                        continue;
+                    }
+                    const BOOL connected = ConnectNamedPipe(pipe, nullptr)
+                        ? TRUE
+                        : (GetLastError() == ERROR_PIPE_CONNECTED);
+                    if (!connected) {
+                        CloseHandle(pipe);
+                        if (!g_stopRequested.load()) Sleep(100);
+                        continue;
+                    }
+                    std::thread(HandleAppPortalClient, pipe, ident).detach();
+                }
+                LocalFree(descriptor);
+                LogI("app portal broker stopped");
+            }).detach();
         }
 
         static std::string ReadMachineEnvironmentValue(const char* name) {
@@ -1087,6 +1386,12 @@ namespace hi5 {
             if (code == "End") { vk = VK_END; extended = true; return true; }
             if (code == "PageUp") { vk = VK_PRIOR; extended = true; return true; }
             if (code == "PageDown") { vk = VK_NEXT; extended = true; return true; }
+            if (code == "CapsLock") { vk = VK_CAPITAL; return true; }
+            if (code == "NumLock") { vk = VK_NUMLOCK; extended = true; return true; }
+            if (code == "ScrollLock") { vk = VK_SCROLL; return true; }
+            if (code == "Pause") { vk = VK_PAUSE; return true; }
+            if (code == "PrintScreen") { vk = VK_SNAPSHOT; extended = true; return true; }
+            if (code == "ContextMenu") { vk = VK_APPS; extended = true; return true; }
 
             if (code == "F1") { vk = VK_F1; return true; }
             if (code == "F2") { vk = VK_F2; return true; }
@@ -1133,20 +1438,40 @@ namespace hi5 {
 
         static bool IsTextualKeyboardKey(const std::string& key) {
             if (key.empty()) return false;
-            if (key == "Alt" || key == "AltGraph" || key == "CapsLock" ||
-                key == "Control" || key == "Dead" || key == "Delete" ||
-                key == "End" || key == "Enter" || key == "Escape" ||
-                key == "Fn" || key == "FnLock" || key == "Home" ||
-                key == "Hyper" || key == "Insert" || key == "Meta" ||
-                key == "NumLock" || key == "OS" || key == "PageDown" ||
-                key == "PageUp" || key == "Process" || key == "ScrollLock" ||
-                key == "Shift" || key == "Super" || key == "Symbol" ||
-                key == "SymbolLock" || key == "Tab" || key == "Unidentified" ||
-                key == "ContextMenu" || key == "Pause" || key == "PrintScreen") {
+
+            // Text is exactly one Unicode scalar value. Do not infer text from
+            // byte length: short DOM names such as ArrowUp/ArrowDown otherwise
+            // get injected literally into the remote desktop.
+            const int chars = MultiByteToWideChar(
+                CP_UTF8,
+                MB_ERR_INVALID_CHARS,
+                key.data(),
+                static_cast<int>(key.size()),
+                nullptr,
+                0);
+            if (chars <= 0 || chars > 2) return false;
+
+            std::wstring wide(static_cast<size_t>(chars), L'\0');
+            if (MultiByteToWideChar(
+                CP_UTF8,
+                MB_ERR_INVALID_CHARS,
+                key.data(),
+                static_cast<int>(key.size()),
+                wide.data(),
+                chars) != chars) {
                 return false;
             }
-            // UTF-8 printable characters may be 1-4 bytes. Browser named keys are longer.
-            return key.size() <= 8;
+
+            if (chars == 1) {
+                const wchar_t ch = wide[0];
+                if (ch >= 0xD800 && ch <= 0xDFFF) return false;
+                return ch >= 0x20 && ch != 0x7F;
+            }
+
+            const wchar_t hi = wide[0];
+            const wchar_t lo = wide[1];
+            return hi >= 0xD800 && hi <= 0xDBFF &&
+                   lo >= 0xDC00 && lo <= 0xDFFF;
         }
 
 
@@ -2681,6 +3006,7 @@ LogI(
                 StartTelemetryLoop(ident);
                 StartJobLoop(ident);
                 StartTrayLoop(ident);
+                StartAppPortalBroker(ident);
 
                 auto sendFn = [this](const std::string& payload) {
                     if (signaling_) {

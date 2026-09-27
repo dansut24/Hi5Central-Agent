@@ -70,6 +70,19 @@ bool ContainsInsensitive(const std::string& haystack, const std::string& needle)
     return needle.empty() || Lower(haystack).find(Lower(needle)) != std::string::npos;
 }
 
+bool WingetVersionSafe(const std::string& value) {
+    if (value.empty() || value.size() > 128) return false;
+    for (const unsigned char ch : value) {
+        if (std::isalnum(ch)
+            || ch == '.' || ch == '-' || ch == '_' || ch == '+'
+            || ch == ':' || ch == '~') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 bool EndsWithInsensitive(const std::string& value, const std::string& suffix) {
     const std::string left = Lower(value);
     const std::string right = Lower(suffix);
@@ -860,6 +873,11 @@ json Capabilities() {
         { "windowsUpdateDiscovery", false },
         { "windowsUpdateInstall", false },
         { "providers", json::array({ "winget", "vendor_direct" }) },
+        { "winget", {
+            { "exactVersionInstall", true },
+            { "exactVersionUpgrade", true },
+            { "packageIdRequired", true }
+        } },
         { "manifestMode", "dpapi_job_scoped" },
         { "catalogueOnDevice", false },
         { "vendorDirect", {
@@ -881,6 +899,10 @@ json Capabilities() {
             { "msiSourceCacheScope", "product_code" },
             { "jobScopedResponseFiles", true },
             { "responseFileTargetVersionToken", true },
+            { "customExecution", true },
+            { "customExecutionModes", json::array({ "powershell", "batch" }) },
+            { "customExecutionMaxBytes", 131072 },
+            { "customExecutionTimeoutMaxSeconds", 3600 },
             { "winInetCacheUsed", false }
         } }
     };
@@ -1278,6 +1300,11 @@ bool ManifestValid(const json& manifest, std::string& error) {
     if (provider != "winget" && provider != "vendor_direct") { error = "unsupported_provider"; return false; }
 
     const std::string packageId = manifest.value("packageId", std::string());
+    const std::string providerVersion = manifest.value("providerVersion", std::string());
+    if (provider == "winget" && !providerVersion.empty() && !WingetVersionSafe(providerVersion)) {
+        error = "invalid_winget_provider_version";
+        return false;
+    }
     const json verification = manifest.value("verification", json::object());
     const std::string method = Lower(verification.value("method", verification.value("provider", std::string("winget"))));
     if (method != "winget" && method != "uninstall_registry" && method != "file_version" && method != "office_c2r_registry") {
@@ -1310,6 +1337,35 @@ bool ManifestValid(const json& manifest, std::string& error) {
         if (sha.size() != 64) { error = "vendor_sha256_missing"; return false; }
         if (type != "msi" && type != "exe") { error = "unsupported_installer_type"; return false; }
         if (manifest.value("expectedSigner", std::string()).empty()) { error = "expected_signer_missing"; return false; }
+
+        const json customExecution = manifest.value("customExecution", json());
+        const bool hasCustomExecution = customExecution.is_object() && !customExecution.empty();
+        if (hasCustomExecution) {
+            const std::string mode = Lower(customExecution.value("mode", std::string()));
+            const std::string script = customExecution.value("script", std::string());
+            const int timeoutSeconds = customExecution.value("timeoutSeconds", 600);
+            if (mode != "powershell" && mode != "batch") { error = "custom_execution_mode_invalid"; return false; }
+            if (script.empty() || script.size() > 128 * 1024) { error = "custom_execution_script_invalid"; return false; }
+            if (timeoutSeconds < 30 || timeoutSeconds > 3600) { error = "custom_execution_timeout_invalid"; return false; }
+            if (customExecution.contains("successExitCodes")) {
+                if (!customExecution["successExitCodes"].is_array() || customExecution["successExitCodes"].size() > 16) {
+                    error = "custom_execution_success_codes_invalid";
+                    return false;
+                }
+                for (const auto& code : customExecution["successExitCodes"]) {
+                    if (!code.is_number_integer() || code.get<int>() < 0 || code.get<int>() > 65535) {
+                        error = "custom_execution_success_codes_invalid";
+                        return false;
+                    }
+                }
+            }
+            if (!manifest.value("installArguments", std::string()).empty()
+                || manifest.contains("installStrategies")
+                || manifest.contains("responseFile")) {
+                error = "custom_execution_conflicting_install_configuration";
+                return false;
+            }
+        }
 
         const std::string installArguments = manifest.value("installArguments", std::string());
         if (!installArguments.empty() && !InstallerArgsSafe(installArguments)) {
@@ -1610,16 +1666,66 @@ bool InstallerExitSucceeded(int exitCode) {
     return exitCode == 0 || exitCode == 3010 || exitCode == 1641;
 }
 
+bool InstallerExitSucceededForManifest(const json& manifest, int exitCode) {
+    const json customExecution = manifest.value("customExecution", json());
+    if (customExecution.is_object()
+        && customExecution.contains("successExitCodes")
+        && customExecution["successExitCodes"].is_array()
+        && !customExecution["successExitCodes"].empty()) {
+        for (const auto& code : customExecution["successExitCodes"]) {
+            if (code.is_number_integer() && code.get<int>() == exitCode) return true;
+        }
+        return false;
+    }
+    return InstallerExitSucceeded(exitCode);
+}
+
+CommandResult RunCustomExecution(
+    const json& manifest,
+    const std::filesystem::path& root,
+    const std::filesystem::path& installerPath
+) {
+    const json customExecution = manifest.value("customExecution", json());
+    const std::string mode = Lower(customExecution.value("mode", std::string()));
+    const std::string script = customExecution.value("script", std::string());
+    const int timeoutSeconds = std::clamp(customExecution.value("timeoutSeconds", 600), 30, 3600);
+    const std::filesystem::path scriptPath =
+        root / (mode == "powershell" ? L"install.ps1" : L"install.cmd");
+    if (!WriteFileUtf8(scriptPath, script)) {
+        return { ERROR_WRITE_FAULT, "Could not write custom install script", false };
+    }
+
+    SetEnvironmentVariableW(L"HI5_INSTALLER", installerPath.wstring().c_str());
+    SetEnvironmentVariableW(L"HI5_WORKDIR", root.wstring().c_str());
+
+    const std::wstring command = mode == "powershell"
+        ? L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + Quote(scriptPath.wstring())
+        : L"call " + Quote(scriptPath.wstring());
+
+    const CommandResult result = RunHidden(
+        command,
+        root / (mode == "powershell" ? L"custom-powershell.log" : L"custom-batch.log"),
+        static_cast<DWORD>(timeoutSeconds) * 1000);
+
+    SetEnvironmentVariableW(L"HI5_INSTALLER", nullptr);
+    SetEnvironmentVariableW(L"HI5_WORKDIR", nullptr);
+    return result;
+}
+
 CommandResult RunWingetInstallOrUpgrade(const json& manifest, const std::filesystem::path& root, const std::wstring& suffix = L"winget-install.log") {
     const std::string packageId = manifest.value("packageId", std::string());
     const std::string intent = Lower(manifest.value("intent", std::string("update")));
     const std::wstring verb = intent == "install" ? L" install --id " : L" upgrade --id ";
     const std::wstring winget = ResolveWinget();
     const std::string installArguments = manifest.value("installArguments", std::string());
+    const std::string providerVersion = manifest.value("providerVersion", std::string());
     std::wstring command =
         L"set \"TEMP=" + root.wstring() + L"\" && set \"TMP=" + root.wstring() + L"\" && " +
         Quote(winget) + verb + Quote(Utf8ToWide(packageId)) +
         L" --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --nowarn";
+    if (!providerVersion.empty()) {
+        command += L" --version " + Quote(Utf8ToWide(providerVersion));
+    }
     // Curated package-specific silent arguments can be supplied by the control
     // plane. Keep them a single quoted WinGet --override value; they never become
     // shell syntax and the manifest itself is DPAPI job-scoped.
@@ -1724,6 +1830,7 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         { "applicationName", applicationName },
         { "packageId", packageId },
         { "provider", provider },
+        { "providerVersion", manifest.value("providerVersion", std::string()) },
         { "intent", intent },
         { "installedVersion", installedVersion },
         { "targetVersion", targetVersion },
@@ -1780,6 +1887,28 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
                     result["signatureVerified"] = !signer.empty() && ContainsInsensitive(signer, expectedSigner);
                     if (!result["signatureVerified"].get<bool>()) {
                         result["error"] = "unexpected_signer";
+                    } else if (manifest.value("customExecution", json()).is_object()
+                        && !manifest.value("customExecution", json()).empty()) {
+                        const json customExecution = manifest["customExecution"];
+                        const std::string mode = Lower(customExecution.value("mode", std::string()));
+                        install = RunCustomExecution(manifest, root, installerPath);
+                        const bool exitSucceeded = InstallerExitSucceededForManifest(manifest, install.exitCode);
+                        result["installAttempts"].push_back({
+                            { "name", "custom_" + mode },
+                            { "exitCode", install.exitCode },
+                            { "timedOut", install.timedOut },
+                            { "output", Truncate(install.output, 2000) }
+                        });
+                        result["customExecutionMode"] = mode;
+                        result["exitCode"] = install.exitCode;
+                        result["installerOutput"] = Truncate(install.output, 4000);
+                        result["rebootRequired"] = install.exitCode == 3010 || install.exitCode == 1641;
+                        if (install.timedOut) {
+                            result["error"] = "installer_timeout";
+                            result["timeoutKilledProcessTree"] = true;
+                        } else if (!exitSucceeded) {
+                            result["error"] = "custom_install_script_failed";
+                        }
                     } else if (installerType == "msi") {
                         // Some MSI packages require their original source for later
                         // repair/uninstall. Never install an MSI from the disposable
@@ -2020,7 +2149,7 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         result["rebootRequired"] = install.exitCode == 3010 || install.exitCode == 1641;
     }
 
-    const bool installerSucceeded = InstallerExitSucceeded(install.exitCode);
+    const bool installerSucceeded = InstallerExitSucceededForManifest(manifest, install.exitCode);
     if (!verificationCaptured) {
         verification = VerifyInstalledVersionWithRetry(manifest, root, installerSucceeded);
     }
@@ -2036,7 +2165,7 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         result["fallbackExitCode"] = fallback.exitCode;
         result["fallbackOutput"] = Truncate(fallback.output, 3000);
         result["rebootRequired"] = result["rebootRequired"].get<bool>() || fallback.exitCode == 3010 || fallback.exitCode == 1641;
-        const bool fallbackSucceeded = InstallerExitSucceeded(fallback.exitCode);
+        const bool fallbackSucceeded = InstallerExitSucceededForManifest(manifest, fallback.exitCode);
         verification = VerifyInstalledVersionWithRetry(manifest, root, fallbackSucceeded);
         result["verifiedVersion"] = verification.value("installedVersion", std::string());
         result["verification"] = verification;
@@ -2044,7 +2173,7 @@ json ExecuteManifest(const std::filesystem::path& encryptedManifestPath) {
         if (fallbackSucceeded) install = fallback;
     }
 
-    const bool finalInstallerSucceeded = InstallerExitSucceeded(install.exitCode);
+    const bool finalInstallerSucceeded = InstallerExitSucceededForManifest(manifest, install.exitCode);
     const bool success = result["verificationPassed"].get<bool>();
     result["success"] = success;
 

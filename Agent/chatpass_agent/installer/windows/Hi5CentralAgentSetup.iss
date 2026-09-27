@@ -2,6 +2,7 @@
 #define MyAppPublisher "Hi5Central"
 #define MyAppExeName "Hi5CentralAgentService.exe"
 #define MyUserExeName "Hi5CentralUser.exe"
+#define MyAppPortalExeName "Hi5CentralAppPortal.exe"
 #define MyRemoteHostExeName "Hi5CentralRemoteHost.exe"
 #define MyMediaHostExeName "Hi5CentralMediaHost.exe"
 #define MyPatchHostExeName "Hi5CentralPatchHost.exe"
@@ -66,9 +67,13 @@ Name: "{commonappdata}\Hi5Central\Agent\ChatLogs"; Permissions: users-readexec a
 [Files]
 Source: "{#AgentExePath}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "{#UserExePath}"; DestDir: "{app}"; DestName: "{#MyUserExeName}"; Flags: ignoreversion
+Source: "{#AppPortalExePath}"; DestDir: "{app}"; DestName: "{#MyAppPortalExeName}"; Flags: ignoreversion
 Source: "{#RemoteHostExePath}"; DestDir: "{app}"; DestName: "{#MyRemoteHostExeName}"; Flags: ignoreversion
 Source: "{#MediaHostExePath}"; DestDir: "{app}"; DestName: "{#MyMediaHostExeName}"; Flags: ignoreversion
 Source: "{#PatchHostExePath}"; DestDir: "{app}"; DestName: "{#MyPatchHostExeName}"; Flags: ignoreversion
+
+[Icons]
+Name: "{commonprograms}\\Hi5Central\\Hi5Central App Portal"; Filename: "{app}\\{#MyAppPortalExeName}"; WorkingDir: "{app}"
 
 [InstallDelete]
 Type: files; Name: "{app}\Hi5CentralAgent.exe"

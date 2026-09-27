@@ -126,6 +126,9 @@ jobs:
           if (-not $capabilities.vendorDirect.artifactTechnologyDetection) { throw 'PatchHost artifact technology detection capability is missing.' }
           if (-not $capabilities.vendorDirect.jobScopedResponseFiles) { throw 'PatchHost job-scoped response-file capability is missing.' }
           if (-not $capabilities.vendorDirect.responseFileTargetVersionToken) { throw 'PatchHost response-file target-version token support is missing.' }
+          if (-not $capabilities.vendorDirect.customExecution) { throw 'PatchHost App Portal custom execution capability is missing.' }
+          if (-not ($capabilities.vendorDirect.customExecutionModes -contains 'powershell')) { throw 'PatchHost PowerShell custom execution mode is missing.' }
+          if (-not ($capabilities.vendorDirect.customExecutionModes -contains 'batch')) { throw 'PatchHost batch custom execution mode is missing.' }
           $patchHostSource = Get-Content 'Agent/chatpass_agent/src/patching/patch_host_main.cpp' -Raw
           if ($patchHostSource -notmatch 'msi_configured_arguments') { throw 'PatchHost MSI catalogue argument support is missing.' }
           if ($patchHostSource -notmatch 'configuredArgs = manifest.value') { throw 'PatchHost MSI path no longer reads validated installArguments.' }
@@ -145,6 +148,7 @@ jobs:
             Agent/chatpass_agent/build/Release/Hi5CentralMediaHost.exe
             Agent/chatpass_agent/build/Release/Hi5CentralPatchHost.exe
             Agent/chatpass_agent/build/Release/Hi5CentralUser.exe
+            Agent/chatpass_agent/build/Release/Hi5CentralAppPortal.exe
 
       - name: Upload Viewer installer
         uses: actions/upload-artifact@v4
