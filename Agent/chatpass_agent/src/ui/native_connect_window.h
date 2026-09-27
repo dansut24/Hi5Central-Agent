@@ -25,6 +25,7 @@ public:
 
     NativeConnectWindow();
     ~NativeConnectWindow();
+
     bool Start(const std::string& sessionId,
         const std::string& technicianName,
         const std::string& organisationName,
@@ -40,6 +41,14 @@ public:
     void Restore();
 
 private:
+    struct DisplayMessage {
+        std::string sender;
+        std::string displayName;
+        std::string body;
+        std::wstring timeText;
+        bool outgoing{ false };
+    };
+
     enum class UiActionType {
         Identity,
         ConnectionState,
@@ -47,6 +56,7 @@ private:
         Restore,
         Stop,
     };
+
     struct UiAction {
         UiActionType type{ UiActionType::Restore };
         std::string first;
@@ -57,13 +67,25 @@ private:
 
     static LRESULT CALLBACK StaticWndProc(
         HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK StaticInputProc(
+        HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
     void UiThreadMain();
     bool CreateUi();
     void DestroyUi();
+    void CreateFonts();
     void LayoutChildren();
     void CenterWindow();
+
+    void Paint(HDC hdc, const RECT& client);
+    void PaintHeader(HDC hdc, const RECT& client);
+    void PaintSessionCard(HDC hdc, const RECT& client);
+    void PaintTrustCard(HDC hdc, const RECT& client);
+    void PaintChat(HDC hdc, const RECT& client);
+    void PaintComposer(HDC hdc, const RECT& client);
+    void PaintFooter(HDC hdc, const RECT& client);
+
     void ApplyIdentity(const std::string& technicianName,
         const std::string& organisationName);
     void ApplyConnectionState(const std::string& statusText,
@@ -71,15 +93,22 @@ private:
     void AppendMessageOnUiThread(const ConnectChatMessage& message);
     void HandleSend();
     void HandleEndSession();
-    void UpdateDurationText();
     void PostAction(UiAction action);
     bool PopAction(UiAction& action);
     void DrainActions();
+
+    int S(int logical) const;
+    std::wstring SessionTimeText() const;
+    std::wstring SessionStateText() const;
+    void UpdateHoverState(POINT point);
+    void UpdateChatScroll(int delta);
+    void FlashTaskbar();
 
 private:
     std::string sessionId_;
     std::string technicianName_;
     std::string organisationName_;
+    std::string statusText_{ "Waiting for technician" };
     SendCallback onSend_;
     EndCallback onEnd_;
 
@@ -89,27 +118,40 @@ private:
     std::atomic<HWND> hwnd_{ nullptr };
     HANDLE readyEvent_{ nullptr };
 
-    HWND headerLabel_{ nullptr };
-    HWND statusLabel_{ nullptr };
-    HWND technicianLabel_{ nullptr };
-    HWND organisationLabel_{ nullptr };
-    HWND durationLabel_{ nullptr };
-    HWND trustLabel_{ nullptr };
-    HWND chatLog_{ nullptr };
     HWND chatInput_{ nullptr };
-    HWND sendButton_{ nullptr };
-    HWND endButton_{ nullptr };
+    WNDPROC inputOldProc_{ nullptr };
 
     HFONT titleFont_{ nullptr };
+    HFONT subtitleFont_{ nullptr };
+    HFONT headingFont_{ nullptr };
     HFONT bodyFont_{ nullptr };
     HFONT smallFont_{ nullptr };
+    HFONT tinyFont_{ nullptr };
+    HBRUSH inputBrush_{ nullptr };
+    HICON appIcon_{ nullptr };
+    HICON appIconSmall_{ nullptr };
 
     std::mutex queueMu_;
     std::vector<UiAction> queue_;
+    std::vector<DisplayMessage> messages_;
+
+    float dpiScale_{ 1.0f };
     bool remoteControlActive_{ false };
     bool remoteControlStarted_{ false };
     bool ending_{ false };
+    bool hoverSend_{ false };
+    bool hoverEnd_{ false };
+    bool trackingMouse_{ false };
+    bool autoScrollChat_{ true };
     std::chrono::steady_clock::time_point remoteControlStartedAt_{};
+
+    RECT chatRect_{};
+    RECT composerRect_{};
+    RECT sendRect_{};
+    RECT endRect_{};
+    int chatScrollOffset_{ 0 };
+    int chatContentHeight_{ 0 };
+    int chatViewportHeight_{ 0 };
 
     static constexpr UINT WM_HI5_CONNECT_QUEUE = WM_APP + 211;
     static constexpr UINT_PTR TIMER_DURATION = 211;
