@@ -730,6 +730,12 @@ void ConnectCaptureBridge::Stop(bool stopBroker) {
     serviceName_.clear();
     connectTicket_.clear();
     ownsBroker_ = false;
+
+    if (stopBroker) {
+        std::lock_guard<std::mutex> lock(frameCacheMu_);
+        cachedVisibleFrame_ = {};
+        cachedVisibleTimestampNs_ = 0;
+    }
 }
 
 bool ConnectCaptureBridge::StartPump(
@@ -741,6 +747,27 @@ bool ConnectCaptureBridge::StartPump(
         std::lock_guard<std::mutex> lock(callbackMu_);
         sender_ = sender;
         stateCallback_ = std::move(stateCallback);
+    }
+
+    // A Viewer reconnect should never begin on a black decoder surface while
+    // the temporary broker/Winlogon helper is still healthy. Seed the new
+    // WebRTC sender with the most recent known-good frame, then let PumpLoop
+    // replace it with the current desktop as soon as a fresh frame arrives.
+    I420Frame seedFrame;
+    uint64_t seedTimestampNs = 0;
+    {
+        std::lock_guard<std::mutex> lock(frameCacheMu_);
+        if (!cachedVisibleFrame_.y.empty() &&
+            cachedVisibleFrame_.width > 0 &&
+            cachedVisibleFrame_.height > 0) {
+            seedFrame = cachedVisibleFrame_;
+            seedTimestampNs = cachedVisibleTimestampNs_;
+        }
+    }
+    if (!seedFrame.y.empty()) {
+        sender->sendExternalRawI420(seedFrame, seedTimestampNs, true);
+        LogInfo("[connect-broker] seeded Viewer reconnect with cached visible frame session=" +
+            sessionId_);
     }
 
     pumpRunning_.store(true, std::memory_order_release);
@@ -795,6 +822,24 @@ void ConnectCaptureBridge::PumpLoop() {
     uint64_t lastStatsSeq = 0;
     std::chrono::steady_clock::time_point secureEnteredAt{};
     std::chrono::steady_clock::time_point normalReturnAt{};
+    std::chrono::steady_clock::time_point lastFrameCacheAt{};
+
+    const auto cacheVisibleFrame =
+        [this, &lastFrameCacheAt](const I420Frame& frame, uint64_t tsNs, bool force) {
+            if (frame.y.empty() || frame.width <= 0 || frame.height <= 0) return;
+            const auto now = std::chrono::steady_clock::now();
+            if (!force &&
+                lastFrameCacheAt.time_since_epoch().count() != 0 &&
+                now - lastFrameCacheAt < std::chrono::milliseconds(350)) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(frameCacheMu_);
+                cachedVisibleFrame_ = frame;
+                cachedVisibleTimestampNs_ = tsNs;
+            }
+            lastFrameCacheAt = now;
+        };
 
     while (pumpRunning_.load(std::memory_order_acquire)) {
         const bool loginDesktopActive =
@@ -905,6 +950,9 @@ void ConnectCaptureBridge::PumpLoop() {
                     sender->sendExternalRawI420(
                         secureFrame, secureTs,
                         secureForce || !secureReadyAnnounced);
+                    cacheVisibleFrame(
+                        secureFrame, secureTs,
+                        secureForce || !secureReadyAnnounced);
                     if (!secureReadyAnnounced) {
                         secureReadyAnnounced = true;
                         if (state) {
@@ -915,6 +963,9 @@ void ConnectCaptureBridge::PumpLoop() {
                     }
                 } else if (normalUsable) {
                     sender->sendExternalRawI420(
+                        normalFrame, normalTs,
+                        normalForce || !secureReadyAnnounced);
+                    cacheVisibleFrame(
                         normalFrame, normalTs,
                         normalForce || !secureReadyAnnounced);
                     if (!secureReadyAnnounced) {
@@ -934,6 +985,9 @@ void ConnectCaptureBridge::PumpLoop() {
                 if (!(transitionWindow &&
                       IsNearBlackTransitionFrame(normalFrame))) {
                     sender->sendExternalRawI420(
+                        normalFrame, normalTs,
+                        normalForce || normalReturnPending);
+                    cacheVisibleFrame(
                         normalFrame, normalTs,
                         normalForce || normalReturnPending);
                     if (normalReturnPending) {

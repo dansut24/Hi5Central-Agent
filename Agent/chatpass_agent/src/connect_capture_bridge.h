@@ -108,6 +108,10 @@ private:
     WebRtcSender* sender_{ nullptr };
     StateCallback stateCallback_;
     mutable std::mutex callbackMu_;
+
+    I420Frame cachedVisibleFrame_;
+    uint64_t cachedVisibleTimestampNs_{ 0 };
+    mutable std::mutex frameCacheMu_;
 };
 
 int RunConnectCaptureBrokerService(int argc, char** argv);
