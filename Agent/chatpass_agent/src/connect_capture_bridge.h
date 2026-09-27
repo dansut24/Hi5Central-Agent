@@ -31,6 +31,7 @@ public:
     void StopPump();
 
     bool HandleInputEvent(const nlohmann::json& msg);
+    bool RequestSecureAttention();
     bool HandleFastMouse(double xNorm, double yNorm, uint64_t seq, double clientTsMs);
     bool SwitchMonitor(int index);
     nlohmann::json BuildMonitorInfoMessage(const std::string& sessionId) const;
@@ -61,6 +62,10 @@ private:
     std::string normalStopName_;
     std::string secureStopName_;
     std::string brokerStopName_;
+    std::string loginDesktopName_;
+    std::string cadRequestName_;
+    std::string cadSuccessName_;
+    std::string cadFailureName_;
 
     ShmemRing normalShmem_;
     ShmemRing secureShmem_;
@@ -70,6 +75,10 @@ private:
     HANDLE normalStopEvent_{ nullptr };
     HANDLE secureStopEvent_{ nullptr };
     HANDLE brokerStopEvent_{ nullptr };
+    HANDLE loginDesktopEvent_{ nullptr };
+    HANDLE cadRequestEvent_{ nullptr };
+    HANDLE cadSuccessEvent_{ nullptr };
+    HANDLE cadFailureEvent_{ nullptr };
 
     std::atomic<bool> running_{ false };
     std::atomic<bool> pumpRunning_{ false };

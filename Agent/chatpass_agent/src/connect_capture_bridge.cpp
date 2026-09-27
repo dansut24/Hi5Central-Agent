@@ -213,6 +213,139 @@ ShortcutAction ShortcutFromString(const std::string& action) {
     return ShortcutAction::None;
 }
 
+bool InteractiveUserSessionReady(DWORD sessionId) {
+    if (sessionId == 0xFFFFFFFF) return false;
+    HANDLE token = nullptr;
+    if (!WTSQueryUserToken(sessionId, &token) || !token) return false;
+    CloseHandle(token);
+    return true;
+}
+
+struct SoftwareSasGenerationBackup {
+    bool changed{ false };
+    bool hadValue{ false };
+    DWORD oldValue{ 0 };
+};
+
+bool EnsureTemporarySoftwareSasForServices(
+    SoftwareSasGenerationBackup& backup) {
+    constexpr const wchar_t* kPath =
+        LR"(SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System)";
+    constexpr const wchar_t* kName = L"SoftwareSASGeneration";
+
+    backup = {};
+    HKEY key = nullptr;
+    DWORD disposition = 0;
+    LONG rc = RegCreateKeyExW(
+        HKEY_LOCAL_MACHINE, kPath, 0, nullptr, REG_OPTION_NON_VOLATILE,
+        KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, &disposition);
+    if (rc != ERROR_SUCCESS || !key) {
+        LogError("[connect-cad] temporary SoftwareSASGeneration open failed err=" +
+            std::to_string(static_cast<DWORD>(rc)));
+        return false;
+    }
+
+    DWORD value = 0;
+    DWORD type = 0;
+    DWORD bytes = sizeof(value);
+    rc = RegQueryValueExW(
+        key, kName, nullptr, &type,
+        reinterpret_cast<LPBYTE>(&value), &bytes);
+    if (rc == ERROR_SUCCESS && type == REG_DWORD) {
+        backup.hadValue = true;
+        backup.oldValue = value;
+    }
+
+    if (backup.hadValue && ((backup.oldValue & 0x1u) != 0)) {
+        RegCloseKey(key);
+        return true;
+    }
+
+    // Match the managed Agent exactly: enable the Services bit only for the
+    // SendSAS call, preserving every pre-existing policy bit, then restore it.
+    const DWORD newValue =
+        backup.hadValue ? (backup.oldValue | 0x1u) : 1u;
+    rc = RegSetValueExW(
+        key, kName, 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&newValue), sizeof(newValue));
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS) {
+        LogError("[connect-cad] temporary SoftwareSASGeneration set failed err=" +
+            std::to_string(static_cast<DWORD>(rc)));
+        return false;
+    }
+    backup.changed = true;
+    return true;
+}
+
+void RestoreTemporarySoftwareSasGeneration(
+    const SoftwareSasGenerationBackup& backup) {
+    if (!backup.changed) return;
+
+    constexpr const wchar_t* kPath =
+        LR"(SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System)";
+    constexpr const wchar_t* kName = L"SoftwareSASGeneration";
+    HKEY key = nullptr;
+    LONG rc = RegOpenKeyExW(
+        HKEY_LOCAL_MACHINE, kPath, 0, KEY_SET_VALUE, &key);
+    if (rc != ERROR_SUCCESS || !key) {
+        LogWarn("[connect-cad] temporary SoftwareSASGeneration restore open failed err=" +
+            std::to_string(static_cast<DWORD>(rc)));
+        return;
+    }
+
+    if (backup.hadValue) {
+        DWORD oldValue = backup.oldValue;
+        rc = RegSetValueExW(
+            key, kName, 0, REG_DWORD,
+            reinterpret_cast<const BYTE*>(&oldValue), sizeof(oldValue));
+    } else {
+        rc = RegDeleteValueW(key, kName);
+        if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
+    }
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS) {
+        LogWarn("[connect-cad] temporary SoftwareSASGeneration restore failed err=" +
+            std::to_string(static_cast<DWORD>(rc)));
+    }
+}
+
+bool SendSecureAttentionSequenceFromBroker(
+    const std::string& sessionId) {
+    SoftwareSasGenerationBackup backup;
+    const bool policyReady =
+        EnsureTemporarySoftwareSasForServices(backup);
+
+    bool sent = false;
+    if (policyReady) {
+        using SendSasFn = void (WINAPI*)(BOOL);
+        HMODULE sas = LoadLibraryW(L"sas.dll");
+        if (sas) {
+            auto fn = reinterpret_cast<SendSasFn>(
+                GetProcAddress(sas, "SendSAS"));
+            if (fn) {
+                LogInfo("[connect-cad] LocalSystem SendSAS(FALSE) session=" +
+                    sessionId);
+                fn(FALSE);
+                Sleep(150);
+                sent = true;
+            } else {
+                LogWarn("[connect-cad] GetProcAddress(SendSAS) failed err=" +
+                    std::to_string(GetLastError()));
+            }
+            FreeLibrary(sas);
+        } else {
+            LogWarn("[connect-cad] LoadLibrary(sas.dll) failed err=" +
+                std::to_string(GetLastError()));
+        }
+    }
+
+    RestoreTemporarySoftwareSasGeneration(backup);
+    LogInfo("[connect-cad] request complete session=" + sessionId +
+        " sent=" + std::string(sent ? "true" : "false"));
+    return sent;
+}
+
 } // namespace
 
 ConnectCaptureBridge::~ConnectCaptureBridge() {
@@ -230,6 +363,10 @@ bool ConnectCaptureBridge::CreateSharedObjects(const std::string& prefix) {
     normalStopName_ = "Global\\Hi5ConnectStop_" + prefix;
     secureStopName_ = "Global\\Hi5ConnectStop_UAC_" + prefix;
     brokerStopName_ = "Global\\Hi5ConnectBrokerStop_" + prefix;
+    loginDesktopName_ = "Global\\Hi5ConnectLoginDesktop_" + prefix;
+    cadRequestName_ = "Global\\Hi5ConnectCadRequest_" + prefix;
+    cadSuccessName_ = "Global\\Hi5ConnectCadSuccess_" + prefix;
+    cadFailureName_ = "Global\\Hi5ConnectCadFailure_" + prefix;
     return true;
 }
 
@@ -263,6 +400,26 @@ bool ConnectCaptureBridge::OpenSharedObjects() {
                 EVENT_MODIFY_STATE | SYNCHRONIZE,
                 FALSE, brokerStopName_.c_str());
         }
+        if (!loginDesktopEvent_) {
+            loginDesktopEvent_ = OpenEventA(
+                EVENT_MODIFY_STATE | SYNCHRONIZE,
+                FALSE, loginDesktopName_.c_str());
+        }
+        if (!cadRequestEvent_) {
+            cadRequestEvent_ = OpenEventA(
+                EVENT_MODIFY_STATE | SYNCHRONIZE,
+                FALSE, cadRequestName_.c_str());
+        }
+        if (!cadSuccessEvent_) {
+            cadSuccessEvent_ = OpenEventA(
+                EVENT_MODIFY_STATE | SYNCHRONIZE,
+                FALSE, cadSuccessName_.c_str());
+        }
+        if (!cadFailureEvent_) {
+            cadFailureEvent_ = OpenEventA(
+                EVENT_MODIFY_STATE | SYNCHRONIZE,
+                FALSE, cadFailureName_.c_str());
+        }
 
         const bool ready =
             normalShmem_.IsOpen() &&
@@ -271,7 +428,11 @@ bool ConnectCaptureBridge::OpenSharedObjects() {
             secureInput_.IsOpen() &&
             normalStopEvent_ &&
             secureStopEvent_ &&
-            brokerStopEvent_;
+            brokerStopEvent_ &&
+            loginDesktopEvent_ &&
+            cadRequestEvent_ &&
+            cadSuccessEvent_ &&
+            cadFailureEvent_;
 
         // A successful normal monitor publication is the authoritative proof
         // that the broker and its session-bound LocalSystem streamer are live.
@@ -279,11 +440,12 @@ bool ConnectCaptureBridge::OpenSharedObjects() {
             for (int monitorAttempt = 0;
                  monitorAttempt < 100;
                  ++monitorAttempt) {
-                if (normalInput_.GetMonitorCount() > 0) return true;
+                if (normalInput_.GetMonitorCount() > 0 ||
+                    secureInput_.GetMonitorCount() > 0) return true;
                 Sleep(20);
             }
             LogError(
-                "[connect-broker] LocalSystem streamer opened but did not publish monitor geometry");
+                "[connect-broker] LocalSystem streamer opened but did not publish normal/login monitor geometry");
             return false;
         }
 
@@ -313,6 +475,10 @@ bool ConnectCaptureBridge::InstallAndStartBroker() {
         << " --normal-stop " << QuoteArg(normalStopName_)
         << " --secure-stop " << QuoteArg(secureStopName_)
         << " --broker-stop " << QuoteArg(brokerStopName_)
+        << " --login-desktop " << QuoteArg(loginDesktopName_)
+        << " --cad-request " << QuoteArg(cadRequestName_)
+        << " --cad-success " << QuoteArg(cadSuccessName_)
+        << " --cad-failure " << QuoteArg(cadFailureName_)
         << " --fps " << fps_
         << " --display " << displayIndex_.load()
         << " --parent-pid " << pid;
@@ -488,6 +654,22 @@ void ConnectCaptureBridge::Stop() {
         CloseHandle(brokerStopEvent_);
         brokerStopEvent_ = nullptr;
     }
+    if (loginDesktopEvent_) {
+        CloseHandle(loginDesktopEvent_);
+        loginDesktopEvent_ = nullptr;
+    }
+    if (cadRequestEvent_) {
+        CloseHandle(cadRequestEvent_);
+        cadRequestEvent_ = nullptr;
+    }
+    if (cadSuccessEvent_) {
+        CloseHandle(cadSuccessEvent_);
+        cadSuccessEvent_ = nullptr;
+    }
+    if (cadFailureEvent_) {
+        CloseHandle(cadFailureEvent_);
+        cadFailureEvent_ = nullptr;
+    }
 
     normalShmem_.Close();
     secureShmem_.Close();
@@ -551,7 +733,11 @@ void ConnectCaptureBridge::PumpLoop() {
     std::chrono::steady_clock::time_point normalReturnAt{};
 
     while (pumpRunning_.load(std::memory_order_acquire)) {
-        const bool secureNow = normalInput_.GetUACActive();
+        const bool loginDesktopActive =
+            loginDesktopEvent_ &&
+            WaitForSingleObject(loginDesktopEvent_, 0) == WAIT_OBJECT_0;
+        const bool secureNow =
+            loginDesktopActive || normalInput_.GetUACActive();
 
         if (secureNow != lastSecure) {
             lastSecure = secureNow;
@@ -570,9 +756,14 @@ void ConnectCaptureBridge::PumpLoop() {
                 normalReturnPending = false;
                 secureEnteredAt = std::chrono::steady_clock::now();
                 normalReturnAt = {};
-                if (state) state("secure_desktop_entering");
-                LogInfo("[connect-broker] secure desktop detected session=" +
-                    sessionId_);
+                if (state) {
+                    state(loginDesktopActive
+                        ? "login_desktop_entering"
+                        : "secure_desktop_entering");
+                }
+                LogInfo(std::string("[connect-broker] ") +
+                    (loginDesktopActive ? "Windows login desktop" : "secure desktop") +
+                    " detected session=" + sessionId_);
             } else {
                 normalReturnPending = true;
                 normalReturnAt = std::chrono::steady_clock::now();
@@ -645,7 +836,11 @@ void ConnectCaptureBridge::PumpLoop() {
                         secureForce || !secureReadyAnnounced);
                     if (!secureReadyAnnounced) {
                         secureReadyAnnounced = true;
-                        if (state) state("secure_desktop_ready");
+                        if (state) {
+                            state(loginDesktopActive
+                                ? "login_desktop_ready"
+                                : "secure_desktop_ready");
+                        }
                     }
                 } else if (normalUsable) {
                     sender->sendExternalRawI420(
@@ -653,7 +848,11 @@ void ConnectCaptureBridge::PumpLoop() {
                         normalForce || !secureReadyAnnounced);
                     if (!secureReadyAnnounced) {
                         secureReadyAnnounced = true;
-                        if (state) state("secure_desktop_ready");
+                        if (state) {
+                            state(loginDesktopActive
+                                ? "login_desktop_ready"
+                                : "secure_desktop_ready");
+                        }
                     }
                 }
             } else if (gotNormal && frameIsPostTransition(normalTs)) {
@@ -776,6 +975,23 @@ bool ConnectCaptureBridge::WriteMouseButton(
     return pipe.Write(cmd);
 }
 
+bool ConnectCaptureBridge::RequestSecureAttention() {
+    if (!cadRequestEvent_ || !cadSuccessEvent_ || !cadFailureEvent_) return false;
+
+    ResetEvent(cadSuccessEvent_);
+    ResetEvent(cadFailureEvent_);
+    if (!SetEvent(cadRequestEvent_)) return false;
+
+    HANDLE resultEvents[2] = { cadSuccessEvent_, cadFailureEvent_ };
+    const DWORD wait = WaitForMultipleObjects(2, resultEvents, FALSE, 2000);
+    if (wait == WAIT_OBJECT_0) return true;
+    if (wait == WAIT_OBJECT_0 + 1) return false;
+
+    LogWarn("[connect-broker] Ctrl+Alt+Del broker result timed out session=" +
+        sessionId_);
+    return false;
+}
+
 bool ConnectCaptureBridge::HandleInputEvent(const nlohmann::json& msg) {
     InputPipeWriter& pipe = ActiveInputPipe();
     const std::string kind = msg.value("kind", std::string());
@@ -855,11 +1071,21 @@ bool ConnectCaptureBridge::HandleInputEvent(const nlohmann::json& msg) {
         kind == "system_shortcut" || type == "system_shortcut" ||
         kind == "service_shortcut" || type == "service_shortcut" ||
         kind == "service_command" || type == "service_command") {
-        return WriteShortcut(
-            pipe,
-            ShortcutFromString(
-                msg.value("action",
-                    msg.value("shortcut", std::string()))));
+        const std::string action =
+            msg.value("action",
+                msg.value("shortcut", std::string()));
+        const ShortcutAction shortcut = ShortcutFromString(action);
+
+        if (shortcut == ShortcutAction::CtrlAltDel) {
+            // The installed Agent sends CAD from its LocalSystem service using
+            // the temporary SoftwareSASGeneration policy. Do the same here,
+            // while retaining the streamer's normal shortcut as a VM fallback.
+            const bool sasSent = RequestSecureAttention();
+            (void)WriteShortcut(pipe, ShortcutAction::CtrlAltDel);
+            return sasSent;
+        }
+
+        return WriteShortcut(pipe, shortcut);
     }
 
     return false;
@@ -896,7 +1122,9 @@ bool ConnectCaptureBridge::HandleFastMouse(
 }
 
 bool ConnectCaptureBridge::SwitchMonitor(int index) {
-    const int count = normalInput_.GetMonitorCount();
+    const int normalCount = normalInput_.GetMonitorCount();
+    const int secureCount = secureInput_.GetMonitorCount();
+    const int count = normalCount > 0 ? normalCount : secureCount;
     if (count <= 0) return false;
     const int wanted = std::clamp(index, 0, count - 1);
     displayIndex_.store(wanted, std::memory_order_release);
@@ -918,9 +1146,14 @@ nlohmann::json ConnectCaptureBridge::BuildMonitorInfoMessage(
         {"monitors", nlohmann::json::array()}
     };
 
-    const int count = normalInput_.GetMonitorCount();
+    const int normalCount = normalInput_.GetMonitorCount();
+    const int secureCount = secureInput_.GetMonitorCount();
+    const bool useSecure = normalCount <= 0 && secureCount > 0;
+    const int count = useSecure ? secureCount : normalCount;
     for (int i = 0; i < count && i < 8; ++i) {
-        const auto monitor = normalInput_.GetMonitorInfo(i);
+        const auto monitor = useSecure
+            ? secureInput_.GetMonitorInfo(i)
+            : normalInput_.GetMonitorInfo(i);
         out["monitors"].push_back({
             {"index", i},
             {"name", "Display " + std::to_string(i + 1)},
@@ -946,6 +1179,10 @@ struct BrokerConfig {
     std::string normalStop;
     std::string secureStop;
     std::string brokerStop;
+    std::string loginDesktop;
+    std::string cadRequest;
+    std::string cadSuccess;
+    std::string cadFailure;
     int fps{ 30 };
     int display{ 0 };
     DWORD parentPid{ 0 };
@@ -955,6 +1192,9 @@ BrokerConfig gBrokerConfig;
 SERVICE_STATUS_HANDLE gBrokerStatusHandle = nullptr;
 SERVICE_STATUS gBrokerStatus{};
 HANDLE gBrokerScmStopEvent = nullptr;
+std::atomic<uint64_t> gBrokerSessionChangeSeq{ 0 };
+std::atomic<DWORD> gBrokerSessionChangeType{ 0 };
+std::atomic<DWORD> gBrokerSessionChangeSessionId{ 0xFFFFFFFF };
 
 void SetBrokerServiceState(
     DWORD state,
@@ -966,16 +1206,18 @@ void SetBrokerServiceState(
     gBrokerStatus.dwWin32ExitCode = win32ExitCode;
     gBrokerStatus.dwWaitHint = waitHint;
     gBrokerStatus.dwControlsAccepted =
-        state == SERVICE_START_PENDING
-            ? 0
-            : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
+        state == SERVICE_RUNNING
+            ? (SERVICE_ACCEPT_STOP |
+               SERVICE_ACCEPT_SHUTDOWN |
+               SERVICE_ACCEPT_SESSIONCHANGE)
+            : 0;
     SetServiceStatus(gBrokerStatusHandle, &gBrokerStatus);
 }
 
 DWORD WINAPI ConnectBrokerControlHandler(
     DWORD control,
-    DWORD,
-    LPVOID,
+    DWORD eventType,
+    LPVOID eventData,
     LPVOID) {
     if (control == SERVICE_CONTROL_STOP ||
         control == SERVICE_CONTROL_SHUTDOWN) {
@@ -983,6 +1225,23 @@ DWORD WINAPI ConnectBrokerControlHandler(
         if (gBrokerScmStopEvent) SetEvent(gBrokerScmStopEvent);
         return NO_ERROR;
     }
+
+    if (control == SERVICE_CONTROL_SESSIONCHANGE) {
+        DWORD sessionId = 0xFFFFFFFF;
+        if (eventData) {
+            const auto* note =
+                static_cast<const WTSSESSION_NOTIFICATION*>(eventData);
+            sessionId = note->dwSessionId;
+        }
+        gBrokerSessionChangeSessionId.store(
+            sessionId, std::memory_order_release);
+        gBrokerSessionChangeType.store(
+            eventType, std::memory_order_release);
+        gBrokerSessionChangeSeq.fetch_add(
+            1, std::memory_order_acq_rel);
+        return NO_ERROR;
+    }
+
     return ERROR_CALL_NOT_IMPLEMENTED;
 }
 
@@ -1103,13 +1362,26 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
     HANDLE secureStop = CreateEventA(
         &sharedSecurity.attributes, TRUE, FALSE,
         gBrokerConfig.secureStop.c_str());
+    HANDLE loginDesktop = CreateEventA(
+        &sharedSecurity.attributes, TRUE, FALSE,
+        gBrokerConfig.loginDesktop.c_str());
+    HANDLE cadRequest = CreateEventA(
+        &sharedSecurity.attributes, TRUE, FALSE,
+        gBrokerConfig.cadRequest.c_str());
+    HANDLE cadSuccess = CreateEventA(
+        &sharedSecurity.attributes, TRUE, FALSE,
+        gBrokerConfig.cadSuccess.c_str());
+    HANDLE cadFailure = CreateEventA(
+        &sharedSecurity.attributes, TRUE, FALSE,
+        gBrokerConfig.cadFailure.c_str());
     HANDLE parent = gBrokerConfig.parentPid
         ? OpenProcess(SYNCHRONIZE, FALSE, gBrokerConfig.parentPid)
         : nullptr;
 
     if (!normalFramesReady || !secureFramesReady ||
         !normalInputReady || !secureInputReady ||
-        !brokerStop || !normalStop || !secureStop) {
+        !brokerStop || !normalStop || !secureStop ||
+        !loginDesktop || !cadRequest || !cadSuccess || !cadFailure) {
         const DWORD err = GetLastError();
         LogError("[connect-broker-service] Global shared-object create failed err=" +
             std::to_string(err));
@@ -1117,6 +1389,10 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
         if (brokerStop) CloseHandle(brokerStop);
         if (normalStop) CloseHandle(normalStop);
         if (secureStop) CloseHandle(secureStop);
+        if (loginDesktop) CloseHandle(loginDesktop);
+        if (cadRequest) CloseHandle(cadRequest);
+        if (cadSuccess) CloseHandle(cadSuccess);
+        if (cadFailure) CloseHandle(cadFailure);
         normalInput.Close();
         secureInput.Close();
         normalFrames.Close();
@@ -1129,29 +1405,115 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
     }
 
     DWORD consoleSession = WTSGetActiveConsoleSessionId();
+    bool interactiveReady =
+        InteractiveUserSessionReady(consoleSession);
     ResetEvent(normalStop);
     ResetEvent(secureStop);
+    ResetEvent(cadRequest);
+    ResetEvent(cadSuccess);
+    ResetEvent(cadFailure);
 
-    HANDLE normalProcess =
-        LaunchBrokerNormalStreamer(gBrokerConfig, consoleSession);
+    HANDLE normalProcess = nullptr;
     HANDLE secureProcess = nullptr;
+
+    if (interactiveReady) {
+        ResetEvent(loginDesktop);
+        normalProcess =
+            LaunchBrokerNormalStreamer(gBrokerConfig, consoleSession);
+        if (!normalProcess) {
+            LogError("[connect-broker-service] normal LocalSystem streamer failed");
+            SetEvent(gBrokerScmStopEvent);
+        }
+    } else {
+        // Same Winlogon boundary used by the managed Agent: a real console id
+        // without a WTS user token means Windows is showing the sign-in screen.
+        SetEvent(loginDesktop);
+        secureProcess =
+            LaunchBrokerSecureStreamer(gBrokerConfig, consoleSession);
+        if (!secureProcess) {
+            LogError("[connect-broker-service] Winlogon login streamer failed");
+            SetEvent(gBrokerScmStopEvent);
+        }
+    }
+
     bool lastUac = false;
+    bool sessionLocked = false;
+    uint64_t lastSessionChangeSeq =
+        gBrokerSessionChangeSeq.load(std::memory_order_acquire);
     std::chrono::steady_clock::time_point uacEnteredAt{};
     std::chrono::steady_clock::time_point secureStopRequestedAt{};
 
-    if (!normalProcess) {
-        LogError("[connect-broker-service] normal LocalSystem streamer failed");
-        SetEvent(gBrokerScmStopEvent);
-    }
-
     SetBrokerServiceState(SERVICE_RUNNING);
     LogInfo("[connect-broker-service] running session=" +
-        gBrokerConfig.sessionId);
+        gBrokerConfig.sessionId +
+        " console=" + std::to_string(consoleSession) +
+        " interactive=" + std::string(interactiveReady ? "1" : "0"));
 
     while (WaitForSingleObject(gBrokerScmStopEvent, 0) != WAIT_OBJECT_0 &&
            WaitForSingleObject(brokerStop, 0) != WAIT_OBJECT_0 &&
            (!parent || WaitForSingleObject(parent, 0) != WAIT_OBJECT_0)) {
         const auto now = std::chrono::steady_clock::now();
+
+        const uint64_t sessionChangeSeq =
+            gBrokerSessionChangeSeq.load(std::memory_order_acquire);
+        if (sessionChangeSeq != lastSessionChangeSeq) {
+            lastSessionChangeSeq = sessionChangeSeq;
+            const DWORD changeType =
+                gBrokerSessionChangeType.load(std::memory_order_acquire);
+            const DWORD changeSession =
+                gBrokerSessionChangeSessionId.load(std::memory_order_acquire);
+            const bool relevant =
+                changeSession == consoleSession ||
+                changeSession == 0xFFFFFFFF;
+
+            if (relevant &&
+                (changeType == WTS_SESSION_LOCK ||
+                 changeType == WTS_SESSION_LOGOFF)) {
+                sessionLocked = true;
+                SetEvent(loginDesktop);
+                ResetEvent(secureStop);
+                secureStopRequestedAt = {};
+                if (!secureProcess) {
+                    secureProcess =
+                        LaunchBrokerSecureStreamer(
+                            gBrokerConfig, consoleSession);
+                }
+                LogInfo("[connect-broker-service] Winlogon/sign-in desktop entered session=" +
+                    gBrokerConfig.sessionId +
+                    " event=" + std::to_string(changeType));
+            }
+            else if (relevant &&
+                (changeType == WTS_SESSION_UNLOCK ||
+                 changeType == WTS_SESSION_LOGON)) {
+                sessionLocked = false;
+                if (interactiveReady) ResetEvent(loginDesktop);
+                if (interactiveReady && !normalProcess) {
+                    ResetEvent(normalStop);
+                    normalProcess =
+                        LaunchBrokerNormalStreamer(
+                            gBrokerConfig, consoleSession);
+                }
+                if (secureProcess) {
+                    SetEvent(secureStop);
+                    secureStopRequestedAt = now;
+                }
+                LogInfo("[connect-broker-service] interactive desktop session event=" +
+                    std::to_string(changeType) +
+                    " session=" + gBrokerConfig.sessionId);
+            }
+        }
+
+        if (WaitForSingleObject(cadRequest, 0) == WAIT_OBJECT_0) {
+            ResetEvent(cadRequest);
+            ResetEvent(cadSuccess);
+            ResetEvent(cadFailure);
+            const bool sent =
+                SendSecureAttentionSequenceFromBroker(gBrokerConfig.sessionId);
+            SetEvent(sent ? cadSuccess : cadFailure);
+            LogInfo("[connect-broker-service] Ctrl+Alt+Del result session=" +
+                gBrokerConfig.sessionId +
+                " ok=" + std::string(sent ? "1" : "0"));
+        }
 
         const DWORD currentConsole = WTSGetActiveConsoleSessionId();
         if (currentConsole != 0xFFFFFFFF &&
@@ -1161,20 +1523,87 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
             CloseChildProcess(secureProcess, secureStop, "secure");
             ResetEvent(normalStop);
             ResetEvent(secureStop);
-            normalProcess =
-                LaunchBrokerNormalStreamer(gBrokerConfig, consoleSession);
+            normalInput.ResetConsumerState();
+            secureInput.ResetConsumerState();
+
+            interactiveReady =
+                InteractiveUserSessionReady(consoleSession);
+            sessionLocked = false;
+            if (interactiveReady) {
+                ResetEvent(loginDesktop);
+                normalProcess =
+                    LaunchBrokerNormalStreamer(gBrokerConfig, consoleSession);
+            } else {
+                SetEvent(loginDesktop);
+                secureProcess =
+                    LaunchBrokerSecureStreamer(gBrokerConfig, consoleSession);
+            }
+
             lastUac = false;
             uacEnteredAt = {};
             secureStopRequestedAt = {};
+            LogInfo("[connect-broker-service] console handoff session=" +
+                gBrokerConfig.sessionId +
+                " console=" + std::to_string(consoleSession) +
+                " interactive=" + std::string(interactiveReady ? "1" : "0"));
+        }
+
+        const bool interactiveNow =
+            InteractiveUserSessionReady(consoleSession);
+        if (interactiveNow != interactiveReady) {
+            interactiveReady = interactiveNow;
+            lastUac = false;
+            uacEnteredAt = {};
+            secureStopRequestedAt = {};
+
+            if (!interactiveReady) {
+                // Winlogon becomes authoritative. Retire the normal/default
+                // helper and keep the dedicated secure helper alive.
+                SetEvent(loginDesktop);
+                CloseChildProcess(normalProcess, normalStop, "normal");
+                ResetEvent(normalStop);
+                ResetEvent(secureStop);
+                normalInput.ResetConsumerState();
+                secureInput.ResetConsumerState();
+                if (!secureProcess) {
+                    secureProcess =
+                        LaunchBrokerSecureStreamer(
+                            gBrokerConfig, consoleSession);
+                }
+                LogInfo("[connect-broker-service] Windows sign-in desktop active session=" +
+                    gBrokerConfig.sessionId);
+            } else {
+                // A user token appeared. Warm the normal desktop while the
+                // Winlogon feed remains available for the handoff. If Windows
+                // still reports the console as locked, Winlogon remains the
+                // authoritative visible desktop until the UNLOCK event.
+                if (!sessionLocked) ResetEvent(loginDesktop);
+                ResetEvent(normalStop);
+                normalInput.ResetConsumerState();
+                if (!normalProcess) {
+                    normalProcess =
+                        LaunchBrokerNormalStreamer(
+                            gBrokerConfig, consoleSession);
+                }
+                if (secureProcess) {
+                    SetEvent(secureStop);
+                    secureStopRequestedAt = now;
+                }
+                LogInfo("[connect-broker-service] interactive desktop restored session=" +
+                    gBrokerConfig.sessionId);
+            }
         }
 
         if (normalProcess &&
             WaitForSingleObject(normalProcess, 0) == WAIT_OBJECT_0) {
             CloseHandle(normalProcess);
             normalProcess = nullptr;
-            ResetEvent(normalStop);
-            normalProcess =
-                LaunchBrokerNormalStreamer(gBrokerConfig, consoleSession);
+            if (interactiveReady && !sessionLocked) {
+                ResetEvent(normalStop);
+                normalProcess =
+                    LaunchBrokerNormalStreamer(
+                        gBrokerConfig, consoleSession);
+            }
         }
 
         if (secureProcess &&
@@ -1182,9 +1611,17 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
             CloseHandle(secureProcess);
             secureProcess = nullptr;
             secureStopRequestedAt = {};
+            if (!interactiveReady || sessionLocked) {
+                ResetEvent(secureStop);
+                secureProcess =
+                    LaunchBrokerSecureStreamer(
+                        gBrokerConfig, consoleSession);
+            }
         }
 
-        const bool uac = normalInput.GetUACActive();
+        const bool uac =
+            interactiveReady && !sessionLocked &&
+            normalInput.GetUACActive();
         if (uac != lastUac) {
             lastUac = uac;
             if (uac) {
@@ -1195,27 +1632,34 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
                     gBrokerConfig.sessionId);
             } else {
                 uacEnteredAt = {};
-                if (secureProcess) {
+                if (interactiveReady && !sessionLocked && secureProcess) {
                     SetEvent(secureStop);
                     secureStopRequestedAt = now;
                 }
             }
         }
 
-        // Mirror the managed Agent: give the LocalSystem dynamic-desktop
-        // streamer a short chance to switch itself, then warm a dedicated
-        // winsta0\Winlogon helper as the secure fallback.
-        if (uac && !secureProcess &&
+        // Mirror the installed Agent. Winlogon is immediate when no interactive
+        // user exists; UAC gives the dynamic LocalSystem streamer 220 ms before
+        // warming the dedicated winsta0\\Winlogon helper.
+        if ((!interactiveReady || sessionLocked) && !secureProcess) {
+            ResetEvent(secureStop);
+            secureProcess =
+                LaunchBrokerSecureStreamer(
+                    gBrokerConfig, consoleSession);
+        } else if (uac && !secureProcess &&
             uacEnteredAt.time_since_epoch().count() != 0 &&
             now - uacEnteredAt >= std::chrono::milliseconds(220)) {
             ResetEvent(secureStop);
             secureProcess =
-                LaunchBrokerSecureStreamer(gBrokerConfig, consoleSession);
+                LaunchBrokerSecureStreamer(
+                    gBrokerConfig, consoleSession);
         }
 
-        if (!uac && secureProcess &&
+        if (interactiveReady && !sessionLocked && !uac && secureProcess &&
             secureStopRequestedAt.time_since_epoch().count() != 0 &&
-            now - secureStopRequestedAt >= std::chrono::milliseconds(1200)) {
+            now - secureStopRequestedAt >= std::chrono::milliseconds(1200) &&
+            normalInput.GetMonitorCount() > 0) {
             CloseChildProcess(secureProcess, secureStop, "secure");
             secureStopRequestedAt = {};
         }
@@ -1235,6 +1679,10 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
     CloseHandle(brokerStop);
     CloseHandle(normalStop);
     CloseHandle(secureStop);
+    CloseHandle(loginDesktop);
+    CloseHandle(cadRequest);
+    CloseHandle(cadSuccess);
+    CloseHandle(cadFailure);
     CloseHandle(gBrokerScmStopEvent);
     gBrokerScmStopEvent = nullptr;
 
@@ -1276,6 +1724,14 @@ int RunConnectCaptureBrokerService(int argc, char** argv) {
         ArgValue(argc, argv, "--secure-stop");
     gBrokerConfig.brokerStop =
         ArgValue(argc, argv, "--broker-stop");
+    gBrokerConfig.loginDesktop =
+        ArgValue(argc, argv, "--login-desktop");
+    gBrokerConfig.cadRequest =
+        ArgValue(argc, argv, "--cad-request");
+    gBrokerConfig.cadSuccess =
+        ArgValue(argc, argv, "--cad-success");
+    gBrokerConfig.cadFailure =
+        ArgValue(argc, argv, "--cad-failure");
     gBrokerConfig.fps =
         std::clamp(ParseIntArg(argc, argv, "--fps", 30), 1, 60);
     gBrokerConfig.display =
@@ -1292,7 +1748,11 @@ int RunConnectCaptureBrokerService(int argc, char** argv) {
         gBrokerConfig.secureInput.empty() ||
         gBrokerConfig.normalStop.empty() ||
         gBrokerConfig.secureStop.empty() ||
-        gBrokerConfig.brokerStop.empty()) {
+        gBrokerConfig.brokerStop.empty() ||
+        gBrokerConfig.loginDesktop.empty() ||
+        gBrokerConfig.cadRequest.empty() ||
+        gBrokerConfig.cadSuccess.empty() ||
+        gBrokerConfig.cadFailure.empty()) {
         LogError("[connect-broker-service] missing required arguments");
         return 2;
     }

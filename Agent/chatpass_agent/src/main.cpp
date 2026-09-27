@@ -479,8 +479,35 @@ static int RunConnectHost(const std::string& ticket) {
 #ifdef _WIN32
                 if (useManagedCapturePath) {
                     sender->setInputEventHandler(
-                        [&connectCapture](const json& input) {
-                            connectCapture.HandleInputEvent(input);
+                        [&connectCapture, &signaling, sessionId](const json& input) {
+                            const bool ok = connectCapture.HandleInputEvent(input);
+                            const std::string type = input.value("type", std::string());
+                            const std::string kind = input.value("kind", std::string());
+                            const std::string action =
+                                input.value("action",
+                                    input.value("shortcut", std::string()));
+                            const bool cad =
+                                (type == "service_shortcut" ||
+                                 kind == "service_shortcut" ||
+                                 type == "service_command" ||
+                                 kind == "service_command") &&
+                                (action == "ctrl_alt_del" ||
+                                 action == "ctrl_alt_del_service" ||
+                                 action == "cad" ||
+                                 action == "sas" ||
+                                 action == "secure_attention");
+                            if (cad) {
+                                signaling.send(json{
+                                    {"type", "shortcut_result"},
+                                    {"session_id", sessionId},
+                                    {"action", "ctrl_alt_del"},
+                                    {"ok", ok},
+                                    {"code", ok ? "sent" : "sas_failed"},
+                                    {"message", ok
+                                        ? "Ctrl+Alt+Del sent"
+                                        : "Windows could not send Ctrl+Alt+Del using the temporary LocalSystem broker."}
+                                }.dump());
+                            }
                         });
                     sender->setDirectMouseMoveHandler(
                         [&connectCapture](
@@ -563,6 +590,41 @@ static int RunConnectHost(const std::string& ticket) {
                 }
                 return;
             }
+
+#ifdef _WIN32
+            if (type == "service_shortcut" || type == "service_command") {
+                const std::string action =
+                    msg.value("action",
+                        msg.value("shortcut", std::string()));
+                const bool cad =
+                    action == "ctrl_alt_del" ||
+                    action == "ctrl_alt_del_service" ||
+                    action == "cad" ||
+                    action == "sas" ||
+                    action == "secure_attention";
+                if (cad) {
+                    const bool ok =
+                        connectElevated &&
+                        connectCapture.IsRunning() &&
+                        connectCapture.HandleInputEvent(msg);
+                    signaling.send(json{
+                        {"type", "shortcut_result"},
+                        {"session_id", sessionId},
+                        {"action", "ctrl_alt_del"},
+                        {"ok", ok},
+                        {"code", ok
+                            ? "sent"
+                            : (connectElevated ? "sas_failed" : "admin_required")},
+                        {"message", ok
+                            ? "Ctrl+Alt+Del sent"
+                            : (connectElevated
+                                ? "Windows could not send Ctrl+Alt+Del using the temporary LocalSystem broker."
+                                : "Administrator access is required before Ctrl+Alt+Del can be sent.")}
+                    }.dump());
+                    return;
+                }
+            }
+#endif
 
             if (type == "input_event") {
                 std::lock_guard<std::mutex> lock(sessionsMu);
