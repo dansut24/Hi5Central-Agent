@@ -10,6 +10,7 @@
 #include "platform/input_provider.h"
 #include "platform/inventory_provider.h"
 #ifdef _WIN32
+#include "connect_capture_bridge.h"
 #include "ui/native_connect_window.h"
 #endif
 
@@ -310,6 +311,7 @@ static int RunConnectHost(const std::string& ticket) {
     std::atomic<bool> sessionExplicitlyEnded{ false };
     std::string connectSessionId;
     const bool connectElevated = hi5::getPlatformInfo().isElevated;
+    hi5::ConnectCaptureBridge connectCapture;
 #else
     const bool connectElevated = false;
 #endif
@@ -447,23 +449,91 @@ static int RunConnectHost(const std::string& ticket) {
                 if (sessionId.empty()) return;
                 std::cout << "[connect] Technician connected. Starting remote desktop...\n";
                 auto iceServers = parseIceServers(msg);
+
+#ifdef _WIN32
+                bool useManagedCapturePath = false;
+                if (connectElevated) {
+                    useManagedCapturePath =
+                        connectCapture.Start(sessionId, fps, 0);
+                    if (!useManagedCapturePath) {
+                        LogWarn(
+                            "[connect-broker] temporary LocalSystem capture broker unavailable; "
+                            "falling back to direct elevated capture session=" + sessionId);
+                    }
+                }
+#else
+                const bool useManagedCapturePath = false;
+#endif
+
                 auto sender = std::make_unique<WebRtcSender>(
                     sessionId, iceServers, sendFn,
                     width, height, fps, bitrateKbps,
-                    WebRtcSender::Mode::DirectCapture,
+                    useManagedCapturePath
+                        ? WebRtcSender::Mode::ExternalFeed
+                        : WebRtcSender::Mode::DirectCapture,
                     "auto",
                     false,
-                    connectElevated
+                    false
                 );
-                sender->start();
-                signaling.send(sender->buildMonitorInfoMessage().dump());
+
 #ifdef _WIN32
-                if (supportUiStarted.load()) supportWindow.SetConnectionState("Connected", true);
+                if (useManagedCapturePath) {
+                    sender->setInputEventHandler(
+                        [&connectCapture](const json& input) {
+                            connectCapture.HandleInputEvent(input);
+                        });
+                    sender->setDirectMouseMoveHandler(
+                        [&connectCapture](
+                            double xNorm,
+                            double yNorm,
+                            uint64_t seq,
+                            double clientTsMs) {
+                            return connectCapture.HandleFastMouse(
+                                xNorm, yNorm, seq, clientTsMs);
+                        });
+                }
 #endif
+
+                sender->start();
+
+#ifdef _WIN32
+                if (useManagedCapturePath) {
+                    signaling.send(
+                        connectCapture.BuildMonitorInfoMessage(sessionId).dump());
+                } else {
+                    signaling.send(sender->buildMonitorInfoMessage().dump());
+                }
+                if (supportUiStarted.load()) {
+                    supportWindow.SetConnectionState("Connected", true);
+                }
+#else
+                signaling.send(sender->buildMonitorInfoMessage().dump());
+#endif
+
                 std::lock_guard<std::mutex> lock(sessionsMu);
                 auto prior = sessions.find(sessionId);
-                if (prior != sessions.end()) prior->second->stop();
+                if (prior != sessions.end()) {
+#ifdef _WIN32
+                    connectCapture.StopPump();
+#endif
+                    prior->second->stop();
+                }
                 sessions[sessionId] = std::move(sender);
+
+#ifdef _WIN32
+                if (useManagedCapturePath) {
+                    WebRtcSender* current = sessions[sessionId].get();
+                    connectCapture.StartPump(
+                        current,
+                        [&signaling, sessionId](const std::string& state) {
+                            signaling.send(json{
+                                {"type", "session_state"},
+                                {"session_id", sessionId},
+                                {"state", state}
+                            }.dump());
+                        });
+                }
+#endif
                 return;
             }
 
@@ -477,6 +547,15 @@ static int RunConnectHost(const std::string& ticket) {
 
             if (type == "switch_monitor") {
                 const int requested = msg.value("monitor_index", 0);
+#ifdef _WIN32
+                if (connectElevated && connectCapture.IsRunning()) {
+                    if (connectCapture.SwitchMonitor(requested)) {
+                        signaling.send(
+                            connectCapture.BuildMonitorInfoMessage(sessionId).dump());
+                    }
+                    return;
+                }
+#endif
                 std::lock_guard<std::mutex> lock(sessionsMu);
                 auto it = sessions.find(sessionId);
                 if (it != sessions.end() && it->second->switchMonitor(requested)) {
@@ -585,6 +664,10 @@ static int RunConnectHost(const std::string& ticket) {
                 );
                 const bool restartRegistered = approved && ConnectSetRestartResume(true, ticket);
                 if (approved) {
+#ifdef _WIN32
+                    connectCapture.StopPump();
+                    connectCapture.Stop();
+#endif
                     std::lock_guard<std::mutex> lock(sessionsMu);
                     auto it = sessions.find(sessionId);
                     if (it != sessions.end()) {
@@ -646,6 +729,9 @@ static int RunConnectHost(const std::string& ticket) {
 
             if (type == "viewer_disconnected" || type == "viewer_closed" ||
                 type == "viewer_left" || type == "stop_webrtc") {
+#ifdef _WIN32
+                connectCapture.StopPump();
+#endif
                 std::lock_guard<std::mutex> lock(sessionsMu);
                 auto it = sessions.find(sessionId);
                 if (it != sessions.end()) {
@@ -675,6 +761,9 @@ static int RunConnectHost(const std::string& ticket) {
             signalingConnected.store(false);
             std::cout << "[connect] Secure support connection closed.\n";
 
+#ifdef _WIN32
+            connectCapture.StopPump();
+#endif
             {
                 std::lock_guard<std::mutex> lock(sessionsMu);
                 for (auto& [_, sender] : sessions) sender->stop();
@@ -724,6 +813,8 @@ static int RunConnectHost(const std::string& ticket) {
 
 #ifdef _WIN32
         connectFiles.CancelAll();
+        connectCapture.StopPump();
+        connectCapture.Stop();
         if (sessionExplicitlyEnded.load()) ConnectSetRestartResume(false, ticket);
         supportWindow.Stop();
 #endif
@@ -739,6 +830,8 @@ static int RunConnectHost(const std::string& ticket) {
     }
     catch (const std::exception& ex) {
 #ifdef _WIN32
+        connectCapture.StopPump();
+        connectCapture.Stop();
         supportWindow.Stop();
         const std::string detail = std::string("Unable to start the secure support session.\n\n") + ex.what() +
             "\n\nReturn to connect.hi5central.com and ask your technician for a new support code.";
@@ -912,6 +1005,13 @@ int main(int argc, char** argv) {
 
     std::cout << "[main] process start\n";
     LogInfo("[main] process start");
+
+#ifdef _WIN32
+    if (hasArg(argc, argv, "--connect-capture-broker")) {
+        LogInfo("[main] mode=connect-capture-broker");
+        return hi5::RunConnectCaptureBrokerService(argc, argv);
+    }
+#endif
 
     const std::string connectTicket = ConnectTicketFromArgs(argc, argv);
     if (!connectTicket.empty()) {

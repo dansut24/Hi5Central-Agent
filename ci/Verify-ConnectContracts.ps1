@@ -10,6 +10,7 @@ $senderSource = Get-Content 'Agent/chatpass_agent/src/webrtc_sender.cpp' -Raw
 $windowsInput = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_input.cpp' -Raw
 $connectWindow = Get-Content 'Agent/chatpass_agent/src/ui/native_connect_window.cpp' -Raw
 $connectFiles = Get-Content 'Agent/chatpass_agent/src/connect_file_browser.cpp' -Raw
+$connectCapture = Get-Content 'Agent/chatpass_agent/src/connect_capture_bridge.cpp' -Raw
 $signalingSource = Get-Content 'Agent/chatpass_agent/src/signaling_client.cpp' -Raw
 $cmake = Get-Content 'Agent/chatpass_agent/CMakeLists.txt' -Raw
 $workflow = Get-Content '.github/workflows/windows-installers.yml' -Raw
@@ -38,12 +39,19 @@ Require-Literal $main 'connectElevated' 'Connect must retain the elevated-host c
 Require-Literal $main 'connect_uac_customer_action_required' 'Connect must tell the Viewer when the first Windows UAC prompt requires local customer approval.'
 Require-Literal $main 'connect_uac_cancelled' 'Connect must tell the Viewer when Windows UAC is cancelled so the frozen-frame hold can be released.'
 Require-Literal $main 'fileAccessGranted.store(msg.value("files_granted", false))' 'Connect must preserve already-approved file access across host reconnect/elevation handoff.'
-Require-Literal $senderHeader 'bool followInputDesktop = false' 'WebRTC direct capture must expose opt-in secure/input desktop following.'
-Require-Literal $senderSource 'secure_desktop_entering' 'Elevated Connect capture must announce secure desktop entry to the Viewer.'
-Require-Literal $senderSource 'secure_desktop_ready' 'Elevated Connect capture must announce the first secure desktop frame.'
-Require-Literal $senderSource 'secure_desktop_exited' 'Elevated Connect capture must announce return to the normal desktop.'
-Require-Literal $senderSource 'syncCurrentThreadToInputDesktop' 'Elevated Connect capture must follow the active Windows input desktop.'
-Require-Literal $windowsInput 'FollowActiveInputDesktopForInjection' 'Elevated Connect input must follow the active Windows input desktop before SendInput.'
+Require-Literal $main 'hi5::ConnectCaptureBridge connectCapture' 'Elevated attended Connect must use the managed-Agent capture bridge rather than direct user-process capture.'
+Require-Literal $main 'WebRtcSender::Mode::ExternalFeed' 'Elevated attended Connect must keep WebRTC separate from the LocalSystem capture helpers.'
+Require-Literal $main 'RunConnectCaptureBrokerService' 'Portable Connect must dispatch its temporary LocalSystem capture broker before normal host startup.'
+Require-Literal $connectCapture 'LaunchInElevatedDefaultSessionForSession' 'Connect must launch its normal desktop helper with the same session-bound LocalSystem method as the managed Agent.'
+Require-Literal $connectCapture 'LaunchOnSecureDesktopForSession' 'Connect must use the managed Agent Winlogon secure-desktop helper for UAC.'
+Require-Literal $connectCapture '--dynamic-desktop' 'Connect normal capture helper must retain the managed Agent dynamic-desktop path.'
+Require-Literal $connectCapture 'std::chrono::milliseconds(220)' 'Connect must retain the managed Agent short secure-helper fallback window.'
+Require-Literal $connectCapture 'GetDesktopTransitionTickNs' 'Connect must fence pre-transition frames before exposing the UAC desktop.'
+Require-Literal $connectCapture 'secure_desktop_entering' 'Connect broker must announce secure desktop entry to the Viewer.'
+Require-Literal $connectCapture 'secure_desktop_ready' 'Connect broker must announce only a post-transition secure desktop frame as ready.'
+Require-Literal $connectCapture 'secure_desktop_exited' 'Connect broker must announce return to the normal desktop.'
+Require-Literal $connectCapture 'SERVICE_DEMAND_START' 'Connect capture broker must be temporary/on-demand rather than a permanent service.'
+Require-Literal $connectCapture 'DeleteService' 'Connect capture broker must remove its temporary service when the attended session ends.'
 Require-Literal $main 'ConnectSetRestartResume' 'Connect must support temporary restart-resume persistence only when approved.'
 Require-Literal $main 'CurrentVersion\\RunOnce' 'Connect restart persistence must be one-shot rather than a permanent service or startup entry.'
 Require-Literal $main 'type == "connect_hold_request"' 'Connect must expose customer-approved session hold.'
@@ -60,6 +68,7 @@ Require-Literal $senderSource 'm_injector.handleMessage(msg);' 'Portable fallbac
 Require-Literal $cmake 'src/platform/windows/windows_input.cpp' 'Windows builds must compile the platform input injector checked by this contract.'
 Require-Literal $cmake 'src/ui/native_connect_window.cpp' 'Windows builds must compile the dedicated Connect customer window.'
 Require-Literal $cmake 'src/connect_file_browser.cpp' 'Windows builds must compile the attended Connect file browser.'
+Require-Literal $cmake 'src/connect_capture_bridge.cpp' 'Windows builds must compile the temporary managed-Agent capture bridge used after attended elevation.'
 Require-Literal $connectFiles 'remote_file_list_request' 'Connect file browser must support consent-gated folder listing.'
 Require-Literal $connectFiles 'remote_file_download_request' 'Connect file browser must support downloads.'
 Require-Literal $connectFiles 'remote_file_upload_start' 'Connect file browser must support chunked uploads.'

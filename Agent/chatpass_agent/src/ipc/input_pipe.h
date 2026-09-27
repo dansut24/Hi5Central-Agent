@@ -267,6 +267,23 @@ public:
         return true;
     }
 
+    bool Open(const std::string& name) {
+        Close();
+        name_ = name;
+        hMap_ = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name.c_str());
+        if (!hMap_) return false;
+        base_ = MapViewOfFile(
+            hMap_, FILE_MAP_ALL_ACCESS, 0, 0, kInputShmTotalBytes);
+        if (!base_) {
+            CloseHandle(hMap_);
+            hMap_ = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    bool IsOpen() const { return base_ != nullptr && hMap_ != nullptr; }
+
     bool Write(const InputCmd& cmd) {
         if (!base_) return false;
         auto* hdr = header();
@@ -443,6 +460,15 @@ public:
         const uint8_t* clipBuf = reinterpret_cast<const uint8_t*>(base_) + kInputClipOffset;
         out.assign(reinterpret_cast<const char*>(clipBuf + offset), len);
         return true;
+    }
+
+    // Read UAC / Secure Desktop state published by this streamer.
+    // The temporary attended Connect broker uses the same handoff signal as
+    // the managed Agent service before deciding whether to warm the dedicated
+    // winsta0\Winlogon fallback helper.
+    bool GetUACActive() const {
+        if (!base_) return false;
+        return header()->uacActive.load(std::memory_order_acquire) != 0;
     }
 
     // Publish monitor info so the service can relay it to the viewer
