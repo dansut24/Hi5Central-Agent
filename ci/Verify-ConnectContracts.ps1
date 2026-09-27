@@ -37,6 +37,8 @@ Require-Literal $connectWindow 'WS_EX_APPWINDOW' 'Connect customer window must a
 Require-Literal $connectWindow 'CenterWindow()' 'Connect customer window must open centred on the customer screen.'
 Require-Literal $connectWindow 'L"End session"' 'Connect customer window must expose an obvious End session action.'
 Require-Literal $connectWindow 'L"Hi5Central Remote Support"' 'Connect customer window must clearly identify the active support application.'
+Require-Literal $connectWindow 'MAKEINTRESOURCEW(32512)' 'Connect customer window must use a wide Win32 cursor resource with the explicit W API.'
+Require-Literal $connectWindow 'MAKEINTRESOURCEW(32516)' 'Connect customer window must use a wide Win32 icon resource with the explicit W API.'
 Require-Literal $windowsInput 'kind == "mouse_click"' 'Compiled Windows input must support mobile tap/click events.'
 Require-Literal $windowsInput 'sendMouseClick(button, clickCount)' 'Compiled Windows input must inject complete mobile clicks.'
 Require-Literal $windowsInput 'kind == "text_input"' 'Compiled Windows input must support mobile text entry.'

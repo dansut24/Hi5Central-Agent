@@ -185,8 +185,8 @@ bool NativeConnectWindow::CreateUi() {
     wc.lpfnWndProc = &NativeConnectWindow::StaticWndProc;
     wc.hInstance = instance;
     wc.lpszClassName = kConnectWindowClass;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW
+    wc.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32516)); // IDI_INFORMATION
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         LogWarn("[connect-ui] failed to register customer window class");
