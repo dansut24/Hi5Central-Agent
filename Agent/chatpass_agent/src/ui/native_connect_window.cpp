@@ -142,7 +142,7 @@ int MeasureWrappedText(HDC dc, const std::wstring& text, HFONT font,
     DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &measure,
         DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
     if (oldFont) SelectObject(dc, oldFont);
-    return std::max(1, measure.bottom - measure.top);
+    return std::max(1, static_cast<int>(measure.bottom - measure.top));
 }
 
 void DrawLine(HDC dc, int x1, int y1, int x2, int y2,
@@ -608,8 +608,8 @@ void NativeConnectWindow::LayoutChildren() {
         }
     }
 
-    chatViewportHeight_ =
-        std::max(1, chatRect_.bottom - chatRect_.top - S(28));
+    chatViewportHeight_ = std::max(1,
+        static_cast<int>(chatRect_.bottom - chatRect_.top) - S(28));
 }
 
 void NativeConnectWindow::CenterWindow() {
@@ -1453,10 +1453,10 @@ LRESULT NativeConnectWindow::WndProc(
         RECT client{};
         GetClientRect(hwnd, &client);
         HDC memory = CreateCompatibleDC(dc);
+        const int paintWidth = std::max(1, static_cast<int>(client.right));
+        const int paintHeight = std::max(1, static_cast<int>(client.bottom));
         HBITMAP bitmap = CreateCompatibleBitmap(
-            dc,
-            std::max(1, client.right),
-            std::max(1, client.bottom));
+            dc, paintWidth, paintHeight);
         HGDIOBJ oldBitmap =
             SelectObject(memory, bitmap);
 
