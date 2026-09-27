@@ -1130,7 +1130,17 @@ namespace hi5 {
                     }
 
                     if (!handledByGpu) {
-                        source.nextFrameExInto(captured, false);
+                        if (isSecureHelper) {
+                            // DXGI duplication can return protected/near-black pixels
+                            // while Winlogon owns the console even though the desktop
+                            // is visible locally. The managed secure helper runs as
+                            // session-bound LocalSystem on winsta0\Winlogon, where
+                            // GDI/BitBlt is the reliable capture path for the Windows
+                            // sign-in screen and still works for UAC.
+                            source.nextFrameGdiExInto(captured);
+                        } else {
+                            source.nextFrameExInto(captured, false);
+                        }
                         if (captured.cursorOnly) {
                             ++cursorOnlyFrames;
                             ++skippedFrames;

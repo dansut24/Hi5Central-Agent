@@ -980,6 +980,26 @@ void DesktopFrameSource::nextFrameExInto(FrameCaptureResult& result, bool includ
     m_impl->captureOneLocked(result, includeUnchangedFrame);
 }
 
+FrameCaptureResult DesktopFrameSource::nextFrameGdiEx() {
+    FrameCaptureResult result;
+    nextFrameGdiExInto(result);
+    return result;
+}
+
+void DesktopFrameSource::nextFrameGdiExInto(FrameCaptureResult& result) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    result.hasFrame = false;
+    result.changed = false;
+    result.cursorOnly = false;
+    result.frameId = m_impl->frameId;
+    m_impl->refreshDisplaysLocked();
+    if (m_impl->currentIndex == -1) {
+        m_impl->captureAllMonitorsGdiLocked(result, false);
+    } else {
+        m_impl->captureCurrentDisplayGdiLocked(result, false);
+    }
+}
+
 GpuFrameCaptureResult DesktopFrameSource::nextSharedGpuFrameEx() {
     GpuFrameCaptureResult result;
     nextSharedGpuFrameExInto(result);

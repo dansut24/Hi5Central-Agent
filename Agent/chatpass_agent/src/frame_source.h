@@ -61,6 +61,8 @@ public:
     I420Frame nextFrame();
     FrameCaptureResult nextFrameEx(bool includeUnchangedFrame = true);
     void nextFrameExInto(FrameCaptureResult& result, bool includeUnchangedFrame = true);
+    FrameCaptureResult nextFrameGdiEx();
+    void nextFrameGdiExInto(FrameCaptureResult& result);
     GpuFrameCaptureResult nextSharedGpuFrameEx();
     void nextSharedGpuFrameExInto(GpuFrameCaptureResult& result);
 

@@ -8,6 +8,9 @@ $main = Get-Content 'Agent/chatpass_agent/src/main.cpp' -Raw
 $senderHeader = Get-Content 'Agent/chatpass_agent/src/webrtc_sender.h' -Raw
 $senderSource = Get-Content 'Agent/chatpass_agent/src/webrtc_sender.cpp' -Raw
 $windowsInput = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_input.cpp' -Raw
+$windowsScreen = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_screen.cpp' -Raw
+$streamerMain = Get-Content 'Agent/chatpass_agent/src/streamer_main.cpp' -Raw
+$frameSourceHeader = Get-Content 'Agent/chatpass_agent/src/frame_source.h' -Raw
 $connectWindow = Get-Content 'Agent/chatpass_agent/src/ui/native_connect_window.cpp' -Raw
 $connectFiles = Get-Content 'Agent/chatpass_agent/src/connect_file_browser.cpp' -Raw
 $connectCapture = Get-Content 'Agent/chatpass_agent/src/connect_capture_bridge.cpp' -Raw
@@ -62,6 +65,7 @@ Require-Literal $connectCapture 'InteractiveUserSessionReady' 'Connect must use 
 Require-Literal $connectCapture 'login_desktop_entering' 'Connect must announce Windows sign-in desktop entry to the Viewer.'
 Require-Literal $connectCapture 'login_desktop_ready' 'Connect must announce the first usable Windows sign-in frame.'
 Require-Literal $connectCapture '!loginDesktopActive' 'Windows sign-in mode must never fall back to a stale normal-desktop frame while Winlogon is authoritative.'
+Require-Literal $connectCapture '!(loginDesktopActive && secureNearBlack)' 'Windows sign-in mode must never publish a protected near-black secure frame as ready.'
 Require-Literal $connectCapture 'SetEvent(loginDesktop)' 'The temporary LocalSystem broker must make Winlogon authoritative when no interactive user token exists.'
 Require-Literal $connectCapture 'SERVICE_ACCEPT_SESSIONCHANGE' 'The temporary Connect broker must subscribe to Windows lock/unlock/logon lifecycle events.'
 Require-Literal $connectCapture 'WTS_SESSION_LOCK' 'Connect must switch immediately to Winlogon when Windows reports a locked console.'
@@ -88,6 +92,10 @@ Require-Literal $connectCapture 'normalInput.Create(gBrokerConfig.normalInput)' 
 Require-Literal $connectCapture 'OpenSharedObjects()' 'The elevated attended host must open broker-owned Global objects instead of creating them itself.'
 Require-Literal $connectCapture 'IsNearBlackTransitionFrame' 'Connect must retain the managed Agent near-black transition-frame guard.'
 Require-Literal $connectCapture 'DeleteService' 'Connect capture broker must remove its temporary service when the attended session ends.'
+Require-Literal $frameSourceHeader 'nextFrameGdiExInto' 'Windows capture must expose a direct GDI path for Winlogon/secure desktop capture.'
+Require-Literal $windowsScreen 'captureCurrentDisplayGdiLocked(result, false)' 'Windows secure capture must be able to bypass DXGI duplication and read Winlogon through GDI.'
+Require-Literal $streamerMain 'if (isSecureHelper)' 'The session-bound Winlogon helper must use its dedicated secure capture path.'
+Require-Literal $streamerMain 'source.nextFrameGdiExInto(captured)' 'Winlogon/UAC helpers must force GDI capture so protected DXGI black frames are not forwarded.'
 Require-Literal $main 'ConnectSetRestartResume' 'Connect must support temporary restart-resume persistence only when approved.'
 Require-Literal $main 'CurrentVersion\\RunOnce' 'Connect restart persistence must be one-shot rather than a permanent service or startup entry.'
 Require-Literal $main 'type == "connect_hold_request"' 'Connect must expose customer-approved session hold.'

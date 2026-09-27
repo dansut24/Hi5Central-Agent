@@ -798,6 +798,17 @@ FrameCaptureResult DesktopFrameSource::nextFrameEx(bool includeUnchangedFrame) {
     return m_impl->captureOneLocked(includeUnchangedFrame);
 }
 
+FrameCaptureResult DesktopFrameSource::nextFrameGdiEx() {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    return m_impl->currentIndex == -1
+        ? m_impl->captureAllMonitorsGdiLocked()
+        : m_impl->captureCurrentDisplayGdiLocked();
+}
+
+void DesktopFrameSource::nextFrameGdiExInto(FrameCaptureResult& result) {
+    result = nextFrameGdiEx();
+}
+
 std::vector<DisplayInfo> DesktopFrameSource::listDisplays() const {
     std::lock_guard<std::mutex> lock(m_impl->mu);
     m_impl->refreshDisplaysLocked();

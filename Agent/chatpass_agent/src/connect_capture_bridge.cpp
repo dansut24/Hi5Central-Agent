@@ -868,11 +868,17 @@ void ConnectCaptureBridge::PumpLoop() {
                 const bool transitionWindow =
                     secureEnteredAt.time_since_epoch().count() != 0 &&
                     now - secureEnteredAt < std::chrono::milliseconds(250);
+                const bool secureNearBlack =
+                    gotSecure && IsNearBlackTransitionFrame(secureFrame);
                 const bool secureUsable =
                     gotSecure &&
                     frameIsPostTransition(secureTs) &&
-                    !(transitionWindow &&
-                      IsNearBlackTransitionFrame(secureFrame));
+                    // Winlogon/login is a steady-state desktop, not a brief UAC
+                    // transition. Never publish a protected black capture as
+                    // "login_desktop_ready"; hold the last visible frame until
+                    // the secure GDI helper produces a real sign-in frame.
+                    !(loginDesktopActive && secureNearBlack) &&
+                    !(transitionWindow && secureNearBlack);
                 const bool normalUsable =
                     !loginDesktopActive &&
                     gotNormal &&
