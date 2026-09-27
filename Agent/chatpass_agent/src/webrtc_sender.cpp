@@ -74,6 +74,56 @@ namespace {
             || s.find("DXGI_ERROR_NOT_CURRENTLY_AVAILABLE") != std::string::npos;
     }
 
+#ifdef _WIN32
+    static std::string desktopName(HDESK desktop) {
+        if (!desktop) return {};
+        char name[256]{};
+        DWORD needed = 0;
+        if (!GetUserObjectInformationA(
+                desktop, UOI_NAME, name,
+                static_cast<DWORD>(sizeof(name)), &needed)) {
+            return {};
+        }
+        return std::string(name);
+    }
+
+    static bool isSecureDesktopName(const std::string& name) {
+        return !name.empty() && name != "Default" && name != "default";
+    }
+
+    static bool syncCurrentThreadToInputDesktop(
+        HDESK& ownedDesktop,
+        std::string& attachedDesktopName,
+        bool& secureOut,
+        bool& changedOut) {
+        changedOut = false;
+        HDESK inputDesktop = OpenInputDesktop(
+            0, FALSE, GENERIC_ALL);
+        if (!inputDesktop) {
+            return false;
+        }
+
+        const std::string inputName = desktopName(inputDesktop);
+        secureOut = isSecureDesktopName(inputName);
+        if (!inputName.empty() && inputName == attachedDesktopName) {
+            CloseDesktop(inputDesktop);
+            return true;
+        }
+
+        if (!SetThreadDesktop(inputDesktop)) {
+            CloseDesktop(inputDesktop);
+            return false;
+        }
+
+        HDESK previous = ownedDesktop;
+        ownedDesktop = inputDesktop;
+        attachedDesktopName = inputName;
+        changedOut = true;
+        if (previous) CloseDesktop(previous);
+        return true;
+    }
+#endif
+
     static int readEnvInt(const char* name, int fallbackValue, int minValue, int maxValue) {
         char buf[32]{};
         DWORD n = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
@@ -509,7 +559,8 @@ WebRtcSender::WebRtcSender(std::string sessionId,
     int bitrateKbps,
     Mode mode,
     std::string codecMode,
-    bool enableAudio)
+    bool enableAudio,
+    bool followInputDesktop)
     : m_sessionId(std::move(sessionId)),
     m_iceServers(std::move(iceServers)),
     m_signalSend(std::move(sendFn)),
@@ -523,9 +574,11 @@ WebRtcSender::WebRtcSender(std::string sessionId,
     m_audioSsrc(randomU32()),
 #endif
     m_mode(mode),
+    m_followInputDesktop(followInputDesktop),
     m_source(nullptr),
     m_encoder(nullptr) {
     m_codecMode = codecMode.empty() ? "auto" : std::move(codecMode);
+    m_injector.setFollowInputDesktop(m_followInputDesktop);
 
     std::transform(m_codecMode.begin(), m_codecMode.end(), m_codecMode.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -1999,8 +2052,88 @@ void WebRtcSender::streamingLoop() {
     std::string lastDisplaySig = makeDisplaySignature(m_source->listDisplays());
     int lastCurrentIndex = m_source->currentDisplayIndex();
 
+#ifdef _WIN32
+    HDESK ownedInputDesktop = nullptr;
+    std::string attachedDesktopName =
+        desktopName(GetThreadDesktop(GetCurrentThreadId()));
+    bool secureDesktopActive =
+        isSecureDesktopName(attachedDesktopName);
+    bool pendingSecureReady = false;
+    bool pendingSecureExit = false;
+    auto nextDesktopPoll = std::chrono::steady_clock::now();
+    auto nextDesktopErrorLog = std::chrono::steady_clock::time_point{};
+#endif
+
     while (m_running) {
         const auto start = std::chrono::steady_clock::now();
+
+#ifdef _WIN32
+        if (m_followInputDesktop && start >= nextDesktopPoll) {
+            bool switchedDesktop = false;
+            bool secureNow = secureDesktopActive;
+            if (syncCurrentThreadToInputDesktop(
+                    ownedInputDesktop,
+                    attachedDesktopName,
+                    secureNow,
+                    switchedDesktop)) {
+                if (switchedDesktop) {
+                    const bool wasSecure = secureDesktopActive;
+                    secureDesktopActive = secureNow;
+                    const int wantedDisplay =
+                        m_source ? m_source->currentDisplayIndex() : 0;
+
+                    if (secureNow && !wasSecure) {
+                        m_signalSend(json{
+                            {"type", "session_state"},
+                            {"session_id", m_sessionId},
+                            {"state", "secure_desktop_entering"}
+                        }.dump());
+                        pendingSecureReady = true;
+                        pendingSecureExit = false;
+                    } else if (!secureNow && wasSecure) {
+                        pendingSecureExit = true;
+                        pendingSecureReady = false;
+                    }
+
+                    try {
+                        auto newSource = std::make_unique<DesktopFrameSource>();
+                        newSource->setDisplayIndex(wantedDisplay);
+                        const auto d = newSource->currentDisplayInfo();
+                        m_injector.setTargetDisplayRect(
+                            d.x, d.y, d.width, d.height);
+                        m_source = std::move(newSource);
+                        m_encoder.reset();
+                        m_forceKeyframe = true;
+                        lastDisplaySig =
+                            makeDisplaySignature(m_source->listDisplays());
+                        lastCurrentIndex =
+                            m_source->currentDisplayIndex();
+                        LogInfo(
+                            "[connect-secure] capture thread followed input desktop session=" +
+                            m_sessionId +
+                            " desktop=" + attachedDesktopName +
+                            " secure=" + std::to_string(
+                                secureDesktopActive ? 1 : 0));
+                    } catch (const std::exception& ex) {
+                        LogWarn(
+                            "[connect-secure] capture reset after desktop switch failed session=" +
+                            m_sessionId + " error=" + ex.what());
+                    }
+                }
+            } else if (
+                nextDesktopErrorLog.time_since_epoch().count() == 0 ||
+                start >= nextDesktopErrorLog) {
+                LogWarn(
+                    "[connect-secure] unable to follow active input desktop session=" +
+                    m_sessionId +
+                    " err=" + std::to_string(GetLastError()));
+                nextDesktopErrorLog =
+                    start + std::chrono::seconds(1);
+            }
+            nextDesktopPoll =
+                start + std::chrono::milliseconds(25);
+        }
+#endif
 
         if (start >= nextMonitorPoll) {
             try {
@@ -2032,6 +2165,32 @@ void WebRtcSender::streamingLoop() {
         if (m_canSend && m_track && m_track->isOpen()) {
             try {
                 I420Frame raw = m_source->nextFrame();
+
+#ifdef _WIN32
+                if (m_followInputDesktop && raw.width > 0 && raw.height > 0) {
+                    if (pendingSecureReady) {
+                        pendingSecureReady = false;
+                        m_signalSend(json{
+                            {"type", "session_state"},
+                            {"session_id", m_sessionId},
+                            {"state", "secure_desktop_ready"}
+                        }.dump());
+                        LogInfo(
+                            "[connect-secure] secure desktop frame ready session=" +
+                            m_sessionId);
+                    } else if (pendingSecureExit) {
+                        pendingSecureExit = false;
+                        m_signalSend(json{
+                            {"type", "session_state"},
+                            {"session_id", m_sessionId},
+                            {"state", "secure_desktop_exited"}
+                        }.dump());
+                        LogInfo(
+                            "[connect-secure] default desktop frame restored session=" +
+                            m_sessionId);
+                    }
+                }
+#endif
 
                 if (!m_encoder || raw.width != m_width || raw.height != m_height) {
                     m_width = raw.width;

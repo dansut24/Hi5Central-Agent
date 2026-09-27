@@ -7,6 +7,51 @@
 
 using json = nlohmann::json;
 
+namespace {
+thread_local HDESK g_inputDesktopHandle = nullptr;
+thread_local std::string g_inputDesktopName;
+
+std::string CurrentDesktopName(HDESK desktop) {
+    if (!desktop) return {};
+    char name[256]{};
+    DWORD needed = 0;
+    if (!GetUserObjectInformationA(
+            desktop, UOI_NAME, name,
+            static_cast<DWORD>(sizeof(name)), &needed)) {
+        return {};
+    }
+    return std::string(name);
+}
+
+bool FollowActiveInputDesktopForInjection() {
+    if (g_inputDesktopName.empty()) {
+        g_inputDesktopName =
+            CurrentDesktopName(GetThreadDesktop(GetCurrentThreadId()));
+    }
+
+    HDESK active = OpenInputDesktop(
+        0, FALSE, GENERIC_ALL);
+    if (!active) return false;
+
+    const std::string activeName = CurrentDesktopName(active);
+    if (!activeName.empty() && activeName == g_inputDesktopName) {
+        CloseDesktop(active);
+        return true;
+    }
+
+    if (!SetThreadDesktop(active)) {
+        CloseDesktop(active);
+        return false;
+    }
+
+    HDESK previous = g_inputDesktopHandle;
+    g_inputDesktopHandle = active;
+    g_inputDesktopName = activeName;
+    if (previous) CloseDesktop(previous);
+    return true;
+}
+} // namespace
+
 void InputInjector::setTargetDisplayRect(int x, int y, int w, int h) {
     std::lock_guard<std::mutex> lock(m_targetMu);
     m_targetX = x;
@@ -16,6 +61,10 @@ void InputInjector::setTargetDisplayRect(int x, int y, int w, int h) {
 }
 
 void InputInjector::handleMessage(const json& msg) {
+    if (m_followInputDesktop.load(std::memory_order_acquire)) {
+        FollowActiveInputDesktopForInjection();
+    }
+
     const std::string kind = msg.value("kind", "");
 
     if (kind == "mouse_move") {

@@ -59,7 +59,8 @@ public:
         int bitrateKbps,
         Mode mode = Mode::DirectCapture,
         std::string codecMode = "auto",
-        bool enableAudio = false
+        bool enableAudio = false,
+        bool followInputDesktop = false
     );
 
     ~WebRtcSender();
@@ -164,6 +165,7 @@ private:
     int m_payloadType = 96;
 
     Mode m_mode = Mode::DirectCapture;
+    bool m_followInputDesktop = false;
 
     std::shared_ptr<rtc::PeerConnection> m_pc;
     std::shared_ptr<rtc::Track> m_track;

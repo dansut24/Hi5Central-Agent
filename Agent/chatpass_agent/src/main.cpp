@@ -310,6 +310,8 @@ static int RunConnectHost(const std::string& ticket) {
     std::atomic<bool> sessionExplicitlyEnded{ false };
     std::string connectSessionId;
     const bool connectElevated = hi5::getPlatformInfo().isElevated;
+#else
+    const bool connectElevated = false;
 #endif
 
     try {
@@ -444,7 +446,11 @@ static int RunConnectHost(const std::string& ticket) {
                 auto iceServers = parseIceServers(msg);
                 auto sender = std::make_unique<WebRtcSender>(
                     sessionId, iceServers, sendFn,
-                    width, height, fps, bitrateKbps
+                    width, height, fps, bitrateKbps,
+                    WebRtcSender::Mode::DirectCapture,
+                    "auto",
+                    false,
+                    connectElevated
                 );
                 sender->start();
                 signaling.send(sender->buildMonitorInfoMessage().dump());

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <atomic>
 #include <string>
 #include <mutex>
 
@@ -11,6 +12,9 @@ public:
     void handleMessage(const nlohmann::json& msg);
 
     void setTargetDisplayRect(int x, int y, int w, int h);
+    void setFollowInputDesktop(bool enabled) {
+        m_followInputDesktop.store(enabled, std::memory_order_release);
+    }
 
 private:
     bool sendAbsoluteMoveNorm(double xNorm, double yNorm);
@@ -29,4 +33,5 @@ private:
     int m_targetY = 0;
     int m_targetW = 0;
     int m_targetH = 0;
-};  
+    std::atomic<bool> m_followInputDesktop{ false };
+};
