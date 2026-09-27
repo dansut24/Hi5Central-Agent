@@ -758,16 +758,30 @@ void ConnectCaptureBridge::StopPump() {
 }
 
 InputPipeWriter& ConnectCaptureBridge::ActiveInputPipe() {
-    if (secureDesktopActive_.load(std::memory_order_acquire) &&
-        secureFallbackReady_.load(std::memory_order_acquire)) {
+    const bool loginDesktopActive =
+        loginDesktopEvent_ &&
+        WaitForSingleObject(loginDesktopEvent_, 0) == WAIT_OBJECT_0;
+
+    // Winlogon owns input as soon as Windows enters lock/sign-in mode. Do not
+    // wait for the first usable secure video frame before routing keyboard and
+    // mouse: the Windows lock wallpaper itself may not be capturable, and a
+    // remote key press is what dismisses it to the credential UI.
+    if (loginDesktopActive ||
+        (secureDesktopActive_.load(std::memory_order_acquire) &&
+         secureFallbackReady_.load(std::memory_order_acquire))) {
         return secureInput_;
     }
     return normalInput_;
 }
 
 const InputPipeWriter& ConnectCaptureBridge::ActiveInputPipe() const {
-    if (secureDesktopActive_.load(std::memory_order_acquire) &&
-        secureFallbackReady_.load(std::memory_order_acquire)) {
+    const bool loginDesktopActive =
+        loginDesktopEvent_ &&
+        WaitForSingleObject(loginDesktopEvent_, 0) == WAIT_OBJECT_0;
+
+    if (loginDesktopActive ||
+        (secureDesktopActive_.load(std::memory_order_acquire) &&
+         secureFallbackReady_.load(std::memory_order_acquire))) {
         return secureInput_;
     }
     return normalInput_;

@@ -488,27 +488,37 @@ static int RunConnectHost(
 #ifdef _WIN32
                 bool useManagedCapturePath = false;
                 if (continuityHost) {
-                    useManagedCapturePath = connectCapture.AttachExisting(
-                        sessionId,
-                        continuityServiceName,
-                        continuityNormalShmem,
-                        continuitySecureShmem,
-                        continuityNormalInput,
-                        continuitySecureInput,
-                        continuityNormalStop,
-                        continuitySecureStop,
-                        continuityBrokerStop,
-                        continuityLoginDesktop,
-                        continuityCadRequest,
-                        continuityCadSuccess,
-                        continuityCadFailure);
+                    if (connectCapture.IsRunning()) {
+                        useManagedCapturePath = true;
+                        LogInfo("[connect-broker] reusing continuity capture bridge session=" + sessionId);
+                    } else {
+                        useManagedCapturePath = connectCapture.AttachExisting(
+                            sessionId,
+                            continuityServiceName,
+                            continuityNormalShmem,
+                            continuitySecureShmem,
+                            continuityNormalInput,
+                            continuitySecureInput,
+                            continuityNormalStop,
+                            continuitySecureStop,
+                            continuityBrokerStop,
+                            continuityLoginDesktop,
+                            continuityCadRequest,
+                            continuityCadSuccess,
+                            continuityCadFailure);
+                    }
                     if (!useManagedCapturePath) {
                         LogError("[connect-broker] continuity host could not attach to the temporary broker session=" +
                             sessionId);
                     }
                 } else if (connectElevated) {
-                    useManagedCapturePath =
-                        connectCapture.Start(sessionId, fps, 0, ticket);
+                    if (connectCapture.IsRunning()) {
+                        useManagedCapturePath = true;
+                        LogInfo("[connect-broker] reusing existing capture broker session=" + sessionId);
+                    } else {
+                        useManagedCapturePath =
+                            connectCapture.Start(sessionId, fps, 0, ticket);
+                    }
                     if (!useManagedCapturePath) {
                         LogWarn(
                             "[connect-broker] temporary LocalSystem capture broker unavailable; "
