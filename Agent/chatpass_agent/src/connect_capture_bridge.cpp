@@ -824,6 +824,7 @@ void ConnectCaptureBridge::PumpLoop() {
                     !(transitionWindow &&
                       IsNearBlackTransitionFrame(secureFrame));
                 const bool normalUsable =
+                    !loginDesktopActive &&
                     gotNormal &&
                     frameIsPostTransition(normalTs) &&
                     !(transitionWindow &&

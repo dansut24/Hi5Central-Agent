@@ -61,6 +61,7 @@ Require-Literal $connectCapture 'secure_desktop_exited' 'Connect broker must ann
 Require-Literal $connectCapture 'InteractiveUserSessionReady' 'Connect must use the managed Agent WTS user-token boundary for the Windows sign-in desktop.'
 Require-Literal $connectCapture 'login_desktop_entering' 'Connect must announce Windows sign-in desktop entry to the Viewer.'
 Require-Literal $connectCapture 'login_desktop_ready' 'Connect must announce the first usable Windows sign-in frame.'
+Require-Literal $connectCapture '!loginDesktopActive' 'Windows sign-in mode must never fall back to a stale normal-desktop frame while Winlogon is authoritative.'
 Require-Literal $connectCapture 'SetEvent(loginDesktop)' 'The temporary LocalSystem broker must make Winlogon authoritative when no interactive user token exists.'
 Require-Literal $connectCapture 'SERVICE_ACCEPT_SESSIONCHANGE' 'The temporary Connect broker must subscribe to Windows lock/unlock/logon lifecycle events.'
 Require-Literal $connectCapture 'WTS_SESSION_LOCK' 'Connect must switch immediately to Winlogon when Windows reports a locked console.'
