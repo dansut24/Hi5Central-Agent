@@ -42,6 +42,14 @@ Require-Literal $main 'fileAccessGranted.store(msg.value("files_granted", false)
 Require-Literal $main 'hi5::ConnectCaptureBridge connectCapture' 'Elevated attended Connect must use the managed-Agent capture bridge rather than direct user-process capture.'
 Require-Literal $main 'WebRtcSender::Mode::ExternalFeed' 'Elevated attended Connect must keep WebRTC separate from the LocalSystem capture helpers.'
 Require-Literal $main 'RunConnectCaptureBrokerService' 'Portable Connect must dispatch its temporary LocalSystem capture broker before normal host startup.'
+Require-Literal $main 'const std::string helperMode = argValue(argc, argv, "--mode")' 'Portable Connect must detect explicit child/helper modes before filename ticket inference.'
+Require-Literal $main 'helperMode == "streamer"' 'Portable Connect must route LocalSystem/Winlogon streamer children directly to streamer mode.'
+Require-Literal $main 'helperMode == "sas-helper"' 'Portable Connect must route secure-attention helper children directly instead of treating the ticketed filename as a host.'
+$helperModePos = $main.IndexOf('const std::string helperMode = argValue(argc, argv, "--mode")')
+$connectTicketPos = $main.IndexOf('const std::string connectTicket = ConnectTicketFromArgs(argc, argv)')
+if ($helperModePos -lt 0 -or $connectTicketPos -lt 0 -or $helperModePos -gt $connectTicketPos) {
+  throw 'Portable Connect child/helper mode dispatch must occur before filename-based ticket inference.'
+}
 Require-Literal $connectCapture 'LaunchInElevatedDefaultSessionForSession' 'Connect must launch its normal desktop helper with the same session-bound LocalSystem method as the managed Agent.'
 Require-Literal $connectCapture 'LaunchOnSecureDesktopForSession' 'Connect must use the managed Agent Winlogon secure-desktop helper for UAC.'
 Require-Literal $connectCapture '--dynamic-desktop' 'Connect normal capture helper must retain the managed Agent dynamic-desktop path.'

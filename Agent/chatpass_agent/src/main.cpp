@@ -1013,6 +1013,45 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // The portable Connect filename contains its one-time ticket. Internal
+    // child processes reuse that same executable path, so explicit helper
+    // modes MUST be dispatched before filename-based ticket inference.
+    // Otherwise a LocalSystem/Winlogon streamer starts another Connect host,
+    // replaces the real host WebSocket, and produces the black/reconnect loop.
+    const std::string helperMode = argValue(argc, argv, "--mode");
+    if (helperMode == "streamer") {
+        LogInfo("[main] mode=streamer");
+        return hi5::RunStreamerMain(argc, argv);
+    }
+    if (helperMode == "chat-overlay") {
+        LogInfo("[main] mode=chat-overlay");
+        return hi5::RunChatOverlayMain(argc, argv);
+    }
+    if (helperMode == "native-chat") {
+        LogInfo("[main] mode=native-chat");
+        return hi5::RunNativeChatMain(argc, argv);
+    }
+    if (helperMode == "banner") {
+        LogInfo("[main] mode=banner");
+        return hi5::RunNativeBannerMain(argc, argv);
+    }
+    if (helperMode == "tray") {
+        LogInfo("[main] mode=tray");
+        return hi5::RunNativeTrayMain(argc, argv);
+    }
+    if (helperMode == "sas-helper") {
+        LogInfo("[main] mode=sas-helper");
+        return RunSasHelperMain(argc, argv);
+    }
+    if (helperMode == "backstage-host") {
+        LogInfo("[main] mode=backstage-host");
+        return hi5::RunBackstageHostMain(argc, argv);
+    }
+    if (helperMode == "backstage-browser") {
+        LogInfo("[main] mode=backstage-browser");
+        return hi5::RunBackstageBrowserMain(argc, argv);
+    }
+
     const std::string connectTicket = ConnectTicketFromArgs(argc, argv);
     if (!connectTicket.empty()) {
         std::cout << "[main] mode=connect-host\n";
