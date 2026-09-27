@@ -31,6 +31,7 @@ public:
         const std::string& serviceName,
         const std::string& normalShmem,
         const std::string& secureShmem,
+        const std::string& handoffShmem,
         const std::string& normalInput,
         const std::string& secureInput,
         const std::string& normalStop,
@@ -72,6 +73,7 @@ private:
     std::string serviceName_;
     std::string normalShmemName_;
     std::string secureShmemName_;
+    std::string handoffShmemName_;
     std::string normalInputName_;
     std::string secureInputName_;
     std::string normalStopName_;
@@ -83,9 +85,11 @@ private:
     std::string cadFailureName_;
     std::string connectTicket_;
     bool ownsBroker_{ false };
+    bool handoffWriter_{ false };
 
     ShmemRing normalShmem_;
     ShmemRing secureShmem_;
+    ShmemRing handoffShmem_;
     InputPipeWriter normalInput_;
     InputPipeWriter secureInput_;
 

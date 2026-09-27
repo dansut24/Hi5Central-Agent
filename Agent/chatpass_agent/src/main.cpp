@@ -322,6 +322,8 @@ static int RunConnectHost(
         continuityHost ? argValue(argc, argv, "--normal-shmem") : std::string();
     const std::string continuitySecureShmem =
         continuityHost ? argValue(argc, argv, "--secure-shmem") : std::string();
+    const std::string continuityHandoffShmem =
+        continuityHost ? argValue(argc, argv, "--handoff-shmem") : std::string();
     const std::string continuityNormalInput =
         continuityHost ? argValue(argc, argv, "--normal-input") : std::string();
     const std::string continuitySecureInput =
@@ -497,6 +499,7 @@ static int RunConnectHost(
                             continuityServiceName,
                             continuityNormalShmem,
                             continuitySecureShmem,
+                            continuityHandoffShmem,
                             continuityNormalInput,
                             continuitySecureInput,
                             continuityNormalStop,

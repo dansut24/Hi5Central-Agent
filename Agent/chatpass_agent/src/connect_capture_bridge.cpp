@@ -359,6 +359,7 @@ bool ConnectCaptureBridge::CreateSharedObjects(const std::string& prefix) {
     // admin token holding SeCreateGlobalPrivilege.
     normalShmemName_ = "Global\\Hi5ConnectStream_" + prefix;
     secureShmemName_ = "Global\\Hi5ConnectStream_UAC_" + prefix;
+    handoffShmemName_ = "Global\\Hi5ConnectHandoff_" + prefix;
     normalInputName_ = "Global\\Hi5ConnectInput_" + prefix;
     secureInputName_ = "Global\\Hi5ConnectInput_UAC_" + prefix;
     normalStopName_ = "Global\\Hi5ConnectStop_" + prefix;
@@ -379,6 +380,10 @@ bool ConnectCaptureBridge::OpenSharedObjects() {
         }
         if (!secureShmem_.IsOpen()) {
             secureShmem_.OpenConsumer(secureShmemName_);
+        }
+        if (!handoffShmem_.IsOpen()) {
+            if (handoffWriter_) handoffShmem_.OpenProducer(handoffShmemName_);
+            else handoffShmem_.OpenConsumer(handoffShmemName_);
         }
         if (!normalInput_.IsOpen()) {
             normalInput_.Open(normalInputName_);
@@ -425,6 +430,7 @@ bool ConnectCaptureBridge::OpenSharedObjects() {
         const bool ready =
             normalShmem_.IsOpen() &&
             secureShmem_.IsOpen() &&
+            handoffShmem_.IsOpen() &&
             normalInput_.IsOpen() &&
             secureInput_.IsOpen() &&
             normalStopEvent_ &&
@@ -471,6 +477,7 @@ bool ConnectCaptureBridge::InstallAndStartBroker() {
         << " --session " << QuoteArg(sessionId_)
         << " --normal-shmem " << QuoteArg(normalShmemName_)
         << " --secure-shmem " << QuoteArg(secureShmemName_)
+        << " --handoff-shmem " << QuoteArg(handoffShmemName_)
         << " --normal-input " << QuoteArg(normalInputName_)
         << " --secure-input " << QuoteArg(secureInputName_)
         << " --normal-stop " << QuoteArg(normalStopName_)
@@ -596,6 +603,7 @@ bool ConnectCaptureBridge::Start(
     sessionId_ = sessionId;
     connectTicket_ = connectTicket;
     ownsBroker_ = true;
+    handoffWriter_ = true;
     fps_ = std::clamp(fps, 1, 60);
     displayIndex_.store(std::max(0, displayIndex));
 
@@ -642,6 +650,7 @@ bool ConnectCaptureBridge::AttachExisting(
     const std::string& serviceName,
     const std::string& normalShmem,
     const std::string& secureShmem,
+    const std::string& handoffShmem,
     const std::string& normalInput,
     const std::string& secureInput,
     const std::string& normalStop,
@@ -657,6 +666,7 @@ bool ConnectCaptureBridge::AttachExisting(
     serviceName_ = serviceName;
     normalShmemName_ = normalShmem;
     secureShmemName_ = secureShmem;
+    handoffShmemName_ = handoffShmem;
     normalInputName_ = normalInput;
     secureInputName_ = secureInput;
     normalStopName_ = normalStop;
@@ -667,6 +677,7 @@ bool ConnectCaptureBridge::AttachExisting(
     cadSuccessName_ = cadSuccess;
     cadFailureName_ = cadFailure;
     ownsBroker_ = false;
+    handoffWriter_ = false;
 
     if (!OpenSharedObjects()) {
         Stop(false);
@@ -721,6 +732,7 @@ void ConnectCaptureBridge::Stop(bool stopBroker) {
 
     normalShmem_.Close();
     secureShmem_.Close();
+    handoffShmem_.Close();
     normalInput_.Close();
     secureInput_.Close();
 
@@ -728,8 +740,10 @@ void ConnectCaptureBridge::Stop(bool stopBroker) {
     secureFallbackReady_.store(false);
     sessionId_.clear();
     serviceName_.clear();
+    handoffShmemName_.clear();
     connectTicket_.clear();
     ownsBroker_ = false;
+    handoffWriter_ = false;
 
     if (stopBroker) {
         std::lock_guard<std::mutex> lock(frameCacheMu_);
@@ -764,6 +778,41 @@ bool ConnectCaptureBridge::StartPump(
             seedTimestampNs = cachedVisibleTimestampNs_;
         }
     }
+
+    // The attended user process is destroyed by Windows during a real sign-out.
+    // The unattended Agent does not lose its media frame because its service
+    // survives in LocalSystem. Mirror that behaviour with one broker-owned
+    // handoff ring: the attended host continuously writes proven-good frames
+    // and the LocalSystem continuity host drains the latest one after takeover.
+    if (seedFrame.y.empty() && !handoffWriter_ && handoffShmem_.IsOpen()) {
+        I420Frame persisted;
+        uint64_t persistedTs = 0;
+        bool persistedForce = false;
+        while (handoffShmem_.ReadRawI420Frame(
+            persisted, persistedTs, &persistedForce)) {
+            if (!persisted.y.empty() &&
+                persisted.width > 0 &&
+                persisted.height > 0) {
+                seedFrame = persisted;
+                seedTimestampNs = persistedTs;
+            }
+        }
+
+        if (!seedFrame.y.empty()) {
+            std::lock_guard<std::mutex> lock(frameCacheMu_);
+            cachedVisibleFrame_ = seedFrame;
+            cachedVisibleTimestampNs_ = seedTimestampNs;
+            LogInfo("[connect-broker] restored persisted handoff frame after sign-out session=" +
+                sessionId_);
+        }
+
+        // After takeover the LocalSystem continuity host becomes the new cache
+        // writer, so any later transport replacement retains the same service-
+        // style continuity rather than depending on the destroyed user process.
+        handoffShmem_.Close();
+        handoffWriter_ = handoffShmem_.OpenProducer(handoffShmemName_);
+    }
+
     if (!seedFrame.y.empty()) {
         sender->sendExternalRawI420(seedFrame, seedTimestampNs, true);
         LogInfo("[connect-broker] seeded Viewer reconnect with cached visible frame session=" +
@@ -820,9 +869,8 @@ void ConnectCaptureBridge::PumpLoop() {
     bool normalReturnPending = false;
     uint64_t desktopTransitionTickNs = 0;
     uint64_t lastStatsSeq = 0;
-    std::chrono::steady_clock::time_point secureEnteredAt{};
-    std::chrono::steady_clock::time_point normalReturnAt{};
     std::chrono::steady_clock::time_point lastFrameCacheAt{};
+    std::chrono::steady_clock::time_point lastHoldFrameSentAt{};
 
     const auto cacheVisibleFrame =
         [this, &lastFrameCacheAt](const I420Frame& frame, uint64_t tsNs, bool force) {
@@ -837,6 +885,9 @@ void ConnectCaptureBridge::PumpLoop() {
                 std::lock_guard<std::mutex> lock(frameCacheMu_);
                 cachedVisibleFrame_ = frame;
                 cachedVisibleTimestampNs_ = tsNs;
+            }
+            if (handoffWriter_ && handoffShmem_.IsOpen()) {
+                handoffShmem_.WriteRawI420Frame(frame, tsNs, force);
             }
             lastFrameCacheAt = now;
         };
@@ -863,8 +914,6 @@ void ConnectCaptureBridge::PumpLoop() {
 
             if (secureNow) {
                 normalReturnPending = false;
-                secureEnteredAt = std::chrono::steady_clock::now();
-                normalReturnAt = {};
                 if (state) {
                     state(loginDesktopActive
                         ? "login_desktop_entering"
@@ -875,8 +924,6 @@ void ConnectCaptureBridge::PumpLoop() {
                     " detected session=" + sessionId_);
             } else {
                 normalReturnPending = true;
-                normalReturnAt = std::chrono::steady_clock::now();
-                secureEnteredAt = {};
                 if (state) state("desktop_handoff_entering");
                 LogInfo("[connect-broker] default desktop return detected session=" +
                     sessionId_);
@@ -917,35 +964,55 @@ void ConnectCaptureBridge::PumpLoop() {
                         timestampNs >= desktopTransitionTickNs;
                 };
 
+            const uint64_t nowTickNs =
+                static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+            const auto frameFresh =
+                [nowTickNs](uint64_t timestampNs) {
+                    constexpr uint64_t kMaxFrameAgeNs = 250ull * 1000000ull;
+                    return timestampNs == 0 ||
+                        nowTickNs <= timestampNs ||
+                        nowTickNs - timestampNs <= kMaxFrameAgeNs;
+                };
+            bool forwardedFrame = false;
+
             if (secureNow) {
-                // Match the managed Agent's transition fence: never release the
-                // Viewer onto a frame captured before Windows actually switched
-                // desktops. Prefer the dedicated winsta0\Winlogon fallback once
-                // it has a usable frame, otherwise accept the LocalSystem
-                // dynamic-desktop stream after it follows the secure desktop.
-                const auto now = std::chrono::steady_clock::now();
-                const bool transitionWindow =
-                    secureEnteredAt.time_since_epoch().count() != 0 &&
-                    now - secureEnteredAt < std::chrono::milliseconds(250);
+                // Match the unattended Agent's unified-desktop model. An
+                // interactive LOCK/UAC stays on the dynamic normal worker first;
+                // the dedicated Winlogon process is fallback only. A true
+                // LOGOFF/login desktop is owned exclusively by Winlogon.
                 const bool secureNearBlack =
                     gotSecure && IsNearBlackTransitionFrame(secureFrame);
-                const bool secureUsable =
-                    gotSecure &&
-                    frameIsPostTransition(secureTs) &&
-                    // Winlogon/login is a steady-state desktop, not a brief UAC
-                    // transition. Never publish a protected black capture as
-                    // "login_desktop_ready"; hold the last visible frame until
-                    // the secure GDI helper produces a real sign-in frame.
-                    !(loginDesktopActive && secureNearBlack) &&
-                    !(transitionWindow && secureNearBlack);
+                const bool normalNearBlack =
+                    gotNormal && IsNearBlackTransitionFrame(normalFrame);
+
                 const bool normalUsable =
                     !loginDesktopActive &&
                     gotNormal &&
+                    frameFresh(normalTs) &&
                     frameIsPostTransition(normalTs) &&
-                    !(transitionWindow &&
-                      IsNearBlackTransitionFrame(normalFrame));
+                    !normalNearBlack;
+                const bool secureUsable =
+                    gotSecure &&
+                    frameFresh(secureTs) &&
+                    frameIsPostTransition(secureTs) &&
+                    !secureNearBlack;
 
-                if (secureUsable) {
+                if (normalUsable) {
+                    secureFallbackReady_.store(false, std::memory_order_release);
+                    sender->sendExternalRawI420(
+                        normalFrame, normalTs,
+                        normalForce || !secureReadyAnnounced);
+                    cacheVisibleFrame(
+                        normalFrame, normalTs,
+                        normalForce || !secureReadyAnnounced);
+                    forwardedFrame = true;
+                    lastHoldFrameSentAt = std::chrono::steady_clock::now();
+
+                    if (!secureReadyAnnounced) {
+                        secureReadyAnnounced = true;
+                        if (state) state("secure_desktop_ready");
+                    }
+                } else if (secureUsable) {
                     secureFallbackReady_.store(true, std::memory_order_release);
                     sender->sendExternalRawI420(
                         secureFrame, secureTs,
@@ -953,21 +1020,9 @@ void ConnectCaptureBridge::PumpLoop() {
                     cacheVisibleFrame(
                         secureFrame, secureTs,
                         secureForce || !secureReadyAnnounced);
-                    if (!secureReadyAnnounced) {
-                        secureReadyAnnounced = true;
-                        if (state) {
-                            state(loginDesktopActive
-                                ? "login_desktop_ready"
-                                : "secure_desktop_ready");
-                        }
-                    }
-                } else if (normalUsable) {
-                    sender->sendExternalRawI420(
-                        normalFrame, normalTs,
-                        normalForce || !secureReadyAnnounced);
-                    cacheVisibleFrame(
-                        normalFrame, normalTs,
-                        normalForce || !secureReadyAnnounced);
+                    forwardedFrame = true;
+                    lastHoldFrameSentAt = std::chrono::steady_clock::now();
+
                     if (!secureReadyAnnounced) {
                         secureReadyAnnounced = true;
                         if (state) {
@@ -977,25 +1032,56 @@ void ConnectCaptureBridge::PumpLoop() {
                         }
                     }
                 }
-            } else if (gotNormal && frameIsPostTransition(normalTs)) {
-                const auto now = std::chrono::steady_clock::now();
-                const bool transitionWindow =
-                    normalReturnAt.time_since_epoch().count() != 0 &&
-                    now - normalReturnAt < std::chrono::milliseconds(250);
-                if (!(transitionWindow &&
-                      IsNearBlackTransitionFrame(normalFrame))) {
+            } else if (gotNormal &&
+                       frameFresh(normalTs) &&
+                       frameIsPostTransition(normalTs)) {
+                const bool transitionBlank =
+                    normalReturnPending &&
+                    IsNearBlackTransitionFrame(normalFrame);
+
+                if (!transitionBlank) {
+                    secureFallbackReady_.store(false, std::memory_order_release);
                     sender->sendExternalRawI420(
                         normalFrame, normalTs,
                         normalForce || normalReturnPending);
                     cacheVisibleFrame(
                         normalFrame, normalTs,
                         normalForce || normalReturnPending);
+                    forwardedFrame = true;
+                    lastHoldFrameSentAt = std::chrono::steady_clock::now();
+
                     if (normalReturnPending) {
                         normalReturnPending = false;
                         if (state) {
                             state("desktop_handoff_ready");
                             state("secure_desktop_exited");
                         }
+                    }
+                }
+            }
+
+            // Never expose the Viewer to an empty/black transport during a
+            // desktop-worker migration. Repeat the last proven-good picture
+            // until the replacement desktop supplies a fresh non-black frame.
+            if (!forwardedFrame && (secureNow || normalReturnPending)) {
+                const auto holdNow = std::chrono::steady_clock::now();
+                if (lastHoldFrameSentAt.time_since_epoch().count() == 0 ||
+                    holdNow - lastHoldFrameSentAt >= std::chrono::milliseconds(250)) {
+                    I420Frame holdFrame;
+                    {
+                        std::lock_guard<std::mutex> lock(frameCacheMu_);
+                        if (!cachedVisibleFrame_.y.empty() &&
+                            cachedVisibleFrame_.width > 0 &&
+                            cachedVisibleFrame_.height > 0) {
+                            holdFrame = cachedVisibleFrame_;
+                        }
+                    }
+                    if (!holdFrame.y.empty()) {
+                        sender->sendExternalRawI420(
+                            holdFrame,
+                            static_cast<uint64_t>(GetTickCount64()) * 1000000ull,
+                            false);
+                        lastHoldFrameSentAt = holdNow;
                     }
                 }
             }
@@ -1299,6 +1385,7 @@ struct BrokerConfig {
     std::string sessionId;
     std::string normalShmem;
     std::string secureShmem;
+    std::string handoffShmem;
     std::string normalInput;
     std::string secureInput;
     std::string normalStop;
@@ -1446,6 +1533,7 @@ HANDLE LaunchContinuityHost(const BrokerConfig& config) {
         " --service-name " + QuoteArg(config.serviceName) +
         " --normal-shmem " + QuoteArg(config.normalShmem) +
         " --secure-shmem " + QuoteArg(config.secureShmem) +
+        " --handoff-shmem " + QuoteArg(config.handoffShmem) +
         " --normal-input " + QuoteArg(config.normalInput) +
         " --secure-input " + QuoteArg(config.secureInput) +
         " --normal-stop " + QuoteArg(config.normalStop) +
@@ -1516,6 +1604,7 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
     // the interactive Connect process only opens these mappings after creation.
     ShmemRing normalFrames;
     ShmemRing secureFrames;
+    ShmemRing handoffFrames;
     InputPipeWriter normalInput;
     InputPipeWriter secureInput;
     PermissiveSecurity sharedSecurity;
@@ -1524,6 +1613,8 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
         normalFrames.CreateProducer(gBrokerConfig.normalShmem);
     const bool secureFramesReady =
         secureFrames.CreateProducer(gBrokerConfig.secureShmem);
+    const bool handoffFramesReady =
+        handoffFrames.CreateProducer(gBrokerConfig.handoffShmem);
     const bool normalInputReady =
         normalInput.Create(gBrokerConfig.normalInput);
     const bool secureInputReady =
@@ -1554,7 +1645,7 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
         ? OpenProcess(SYNCHRONIZE, FALSE, gBrokerConfig.parentPid)
         : nullptr;
 
-    if (!normalFramesReady || !secureFramesReady ||
+    if (!normalFramesReady || !secureFramesReady || !handoffFramesReady ||
         !normalInputReady || !secureInputReady ||
         !brokerStop || !normalStop || !secureStop ||
         !loginDesktop || !cadRequest || !cadSuccess || !cadFailure) {
@@ -1573,6 +1664,7 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
         secureInput.Close();
         normalFrames.Close();
         secureFrames.Close();
+        handoffFrames.Close();
         CloseHandle(gBrokerScmStopEvent);
         gBrokerScmStopEvent = nullptr;
         SetBrokerServiceState(SERVICE_STOPPED, err, 0);
@@ -1592,9 +1684,20 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
     HANDLE normalProcess = nullptr;
     HANDLE secureProcess = nullptr;
     HANDLE continuityProcess = nullptr;
+    DWORD normalProcessSession = 0xFFFFFFFF;
+    DWORD secureProcessSession = 0xFFFFFFFF;
     bool continuityTakeover = false;
     bool parentExitPending = false;
+    bool sessionLocked = false;
+    bool logoffLatched = !interactiveReady;
+    bool loginDesktopMode = !interactiveReady;
+    bool consoleSwitchInProgress = false;
+    DWORD lastSeenConsoleSession = consoleSession;
+    DWORD pendingConsoleSession = consoleSession;
     std::chrono::steady_clock::time_point parentExitedAt{};
+    std::chrono::steady_clock::time_point lastConsoleSwitchDetected{};
+    std::chrono::steady_clock::time_point normalRetireRequestedAt{};
+    std::chrono::steady_clock::time_point secureRetireRequestedAt{};
     const auto brokerStartedAt = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastContinuityLaunchAt{};
 
@@ -1602,16 +1705,19 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
         ResetEvent(loginDesktop);
         normalProcess =
             LaunchBrokerNormalStreamer(gBrokerConfig, consoleSession);
+        if (normalProcess) normalProcessSession = consoleSession;
         if (!normalProcess) {
             LogError("[connect-broker-service] normal LocalSystem streamer failed");
             SetEvent(gBrokerScmStopEvent);
         }
     } else {
-        // Same Winlogon boundary used by the managed Agent: a real console id
-        // without a WTS user token means Windows is showing the sign-in screen.
+        // Match the managed Agent: no interactive token means the persistent
+        // session is already owned by Winlogon. Start on the secure worker and
+        // do not create a normal/default worker until a user token appears.
         SetEvent(loginDesktop);
         secureProcess =
             LaunchBrokerSecureStreamer(gBrokerConfig, consoleSession);
+        if (secureProcess) secureProcessSession = consoleSession;
         if (!secureProcess) {
             LogError("[connect-broker-service] Winlogon login streamer failed");
             SetEvent(gBrokerScmStopEvent);
@@ -1619,7 +1725,6 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
     }
 
     bool lastUac = false;
-    bool sessionLocked = false;
     uint64_t lastSessionChangeSeq =
         gBrokerSessionChangeSeq.load(std::memory_order_acquire);
     std::chrono::steady_clock::time_point uacEnteredAt{};
@@ -1652,42 +1757,69 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
                 gBrokerSessionChangeSessionId.load(std::memory_order_acquire);
             const bool relevant =
                 changeSession == consoleSession ||
+                changeSession == normalProcessSession ||
+                changeSession == secureProcessSession ||
+                consoleSession == 0xFFFFFFFF ||
                 changeSession == 0xFFFFFFFF;
 
-            if (relevant &&
-                (changeType == WTS_SESSION_LOCK ||
-                 changeType == WTS_SESSION_LOGOFF)) {
+            if (relevant && changeType == WTS_SESSION_LOCK) {
+                // This is the key managed-Agent behaviour: a lock is still the
+                // same interactive Windows session. Keep the dynamic LocalSystem
+                // normal worker alive and let it follow the active input desktop
+                // itself. Do NOT force loginDesktopMode or replace it with a
+                // separate Winlogon worker just because Windows became locked.
                 sessionLocked = true;
+                logoffLatched = false;
+                loginDesktopMode = false;
+                ResetEvent(loginDesktop);
+                LogInfo("[connect-broker-service] SCM lock observed; dynamic desktop remains authoritative session=" +
+                    gBrokerConfig.sessionId);
+            }
+            else if (relevant && changeType == WTS_SESSION_UNLOCK) {
+                sessionLocked = false;
+                logoffLatched = false;
+                loginDesktopMode = false;
+                ResetEvent(loginDesktop);
+                LogInfo("[connect-broker-service] SCM unlock observed session=" +
+                    gBrokerConfig.sessionId);
+            }
+            else if (relevant && changeType == WTS_SESSION_LOGOFF) {
+                // Mirror the unattended Agent's logoff latch. Windows may keep
+                // returning the dying user token briefly after this event, so
+                // SCM/WTS is authoritative and the secure Winlogon path wins.
+                logoffLatched = true;
+                sessionLocked = false;
+                loginDesktopMode = true;
+                interactiveReady = false;
                 SetEvent(loginDesktop);
                 ResetEvent(secureStop);
                 secureStopRequestedAt = {};
+
                 if (!secureProcess) {
                     secureProcess =
                         LaunchBrokerSecureStreamer(
                             gBrokerConfig, consoleSession);
+                    if (secureProcess) secureProcessSession = consoleSession;
                 }
-                LogInfo("[connect-broker-service] Winlogon/sign-in desktop entered session=" +
-                    gBrokerConfig.sessionId +
-                    " event=" + std::to_string(changeType));
+
+                // Retire the normal worker asynchronously. The frame bridge
+                // keeps the last good picture until Winlogon produces a real
+                // frame, exactly like the managed Agent.
+                if (normalProcess && normalRetireRequestedAt.time_since_epoch().count() == 0) {
+                    SetEvent(normalStop);
+                    normalRetireRequestedAt = now;
+                }
+
+                LogInfo("[connect-broker-service] SCM logoff latched; Winlogon authoritative session=" +
+                    gBrokerConfig.sessionId);
             }
-            else if (relevant &&
-                (changeType == WTS_SESSION_UNLOCK ||
-                 changeType == WTS_SESSION_LOGON)) {
+            else if (relevant && changeType == WTS_SESSION_LOGON) {
+                logoffLatched = false;
                 sessionLocked = false;
-                if (interactiveReady) ResetEvent(loginDesktop);
-                if (interactiveReady && !normalProcess) {
-                    ResetEvent(normalStop);
-                    normalProcess =
-                        LaunchBrokerNormalStreamer(
-                            gBrokerConfig, consoleSession);
-                }
-                if (secureProcess) {
-                    SetEvent(secureStop);
-                    secureStopRequestedAt = now;
-                }
-                LogInfo("[connect-broker-service] interactive desktop session event=" +
-                    std::to_string(changeType) +
-                    " session=" + gBrokerConfig.sessionId);
+                // Do not drop the secure feed here. WTSQueryUserToken + the
+                // first fresh normal frame complete the return handoff.
+                LogInfo("[connect-broker-service] SCM logon observed; warming interactive desktop session=" +
+                    gBrokerConfig.sessionId);
             }
         }
 
@@ -1705,7 +1837,7 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
             // user process by a few hundred milliseconds. Give Windows a short
             // grace window before deciding that a process exit was intentional.
             const bool loginBoundary =
-                sessionLocked || !InteractiveUserSessionReady(consoleSession);
+                logoffLatched || !InteractiveUserSessionReady(consoleSession);
             if (loginBoundary) {
                 parentExitPending = false;
                 continuityTakeover = true;
@@ -1754,39 +1886,64 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
         }
 
         const DWORD currentConsole = WTSGetActiveConsoleSessionId();
-        if (currentConsole != 0xFFFFFFFF &&
-            currentConsole != consoleSession) {
-            consoleSession = currentConsole;
-            CloseChildProcess(normalProcess, normalStop, "normal");
-            CloseChildProcess(secureProcess, secureStop, "secure");
-            ResetEvent(normalStop);
-            ResetEvent(secureStop);
-            normalInput.ResetConsumerState();
-            secureInput.ResetConsumerState();
 
-            interactiveReady =
-                InteractiveUserSessionReady(consoleSession);
-            sessionLocked = false;
-            if (interactiveReady) {
-                ResetEvent(loginDesktop);
-                normalProcess =
-                    LaunchBrokerNormalStreamer(gBrokerConfig, consoleSession);
-            } else {
-                SetEvent(loginDesktop);
-                secureProcess =
-                    LaunchBrokerSecureStreamer(gBrokerConfig, consoleSession);
-            }
-
-            lastUac = false;
-            uacEnteredAt = {};
-            secureStopRequestedAt = {};
-            LogInfo("[connect-broker-service] console handoff session=" +
+        // Copy the unattended Agent's console migration model: debounce console
+        // changes, retire workers asynchronously, and never tear down both
+        // capture sources before the replacement desktop is warm.
+        if (currentConsole != lastSeenConsoleSession) {
+            LogWarn("[connect-broker-service] console change observed session=" +
                 gBrokerConfig.sessionId +
-                " console=" + std::to_string(consoleSession) +
-                " interactive=" + std::string(interactiveReady ? "1" : "0"));
+                " old=" + std::to_string(lastSeenConsoleSession) +
+                " new=" + std::to_string(currentConsole));
+            lastSeenConsoleSession = currentConsole;
+            pendingConsoleSession = currentConsole;
+            lastConsoleSwitchDetected = now;
+            consoleSwitchInProgress = true;
+        }
+
+        if (consoleSwitchInProgress &&
+            now - lastConsoleSwitchDetected >= std::chrono::milliseconds(150) &&
+            currentConsole == pendingConsoleSession) {
+            consoleSwitchInProgress = false;
+
+            if (currentConsole != 0xFFFFFFFF &&
+                currentConsole != consoleSession) {
+                const DWORD previousConsole = consoleSession;
+                consoleSession = currentConsole;
+                lastUac = false;
+                uacEnteredAt = {};
+                secureStopRequestedAt = {};
+
+                if (normalProcess &&
+                    normalProcessSession != consoleSession &&
+                    normalRetireRequestedAt.time_since_epoch().count() == 0) {
+                    SetEvent(normalStop);
+                    normalRetireRequestedAt = now;
+                }
+                if (secureProcess &&
+                    secureProcessSession != consoleSession &&
+                    secureRetireRequestedAt.time_since_epoch().count() == 0) {
+                    SetEvent(secureStop);
+                    secureRetireRequestedAt = now;
+                }
+
+                interactiveReady =
+                    !logoffLatched &&
+                    InteractiveUserSessionReady(consoleSession);
+                loginDesktopMode = !interactiveReady;
+                if (loginDesktopMode) SetEvent(loginDesktop);
+                else ResetEvent(loginDesktop);
+
+                LogInfo("[connect-broker-service] console migration armed session=" +
+                    gBrokerConfig.sessionId +
+                    " from=" + std::to_string(previousConsole) +
+                    " to=" + std::to_string(consoleSession) +
+                    " interactive=" + std::string(interactiveReady ? "1" : "0"));
+            }
         }
 
         const bool interactiveNow =
+            !logoffLatched &&
             InteractiveUserSessionReady(consoleSession);
         if (interactiveNow != interactiveReady) {
             interactiveReady = interactiveNow;
@@ -1795,111 +1952,168 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
             secureStopRequestedAt = {};
 
             if (!interactiveReady) {
-                // Winlogon becomes authoritative. Retire the normal/default
-                // helper and keep the dedicated secure helper alive.
+                loginDesktopMode = true;
                 SetEvent(loginDesktop);
-                CloseChildProcess(normalProcess, normalStop, "normal");
-                ResetEvent(normalStop);
                 ResetEvent(secureStop);
-                normalInput.ResetConsumerState();
-                secureInput.ResetConsumerState();
-                if (!secureProcess) {
+
+                if (normalProcess &&
+                    normalRetireRequestedAt.time_since_epoch().count() == 0) {
+                    SetEvent(normalStop);
+                    normalRetireRequestedAt = now;
+                }
+
+                if (!secureProcess && consoleSession != 0xFFFFFFFF) {
                     secureProcess =
                         LaunchBrokerSecureStreamer(
                             gBrokerConfig, consoleSession);
+                    if (secureProcess) secureProcessSession = consoleSession;
                 }
-                LogInfo("[connect-broker-service] Windows sign-in desktop active session=" +
+
+                LogInfo("[connect-broker-service] Windows sign-in desktop authoritative session=" +
                     gBrokerConfig.sessionId);
             } else {
-                // A user token appeared. Warm the normal desktop while the
-                // Winlogon feed remains available for the handoff. If Windows
-                // still reports the console as locked, Winlogon remains the
-                // authoritative visible desktop until the UNLOCK event.
-                if (!sessionLocked) ResetEvent(loginDesktop);
+                // Exactly like the unattended Agent, keep the secure/login
+                // worker alive while the normal/default worker warms. Video
+                // switches only when a fresh normal frame is available.
+                loginDesktopMode = false;
+                ResetEvent(loginDesktop);
                 ResetEvent(normalStop);
-                normalInput.ResetConsumerState();
-                if (!normalProcess) {
+
+                if (!normalProcess && consoleSession != 0xFFFFFFFF) {
+                    normalInput.ResetConsumerState();
                     normalProcess =
                         LaunchBrokerNormalStreamer(
                             gBrokerConfig, consoleSession);
+                    if (normalProcess) normalProcessSession = consoleSession;
                 }
-                if (secureProcess) {
-                    SetEvent(secureStop);
-                    secureStopRequestedAt = now;
-                }
-                LogInfo("[connect-broker-service] interactive desktop restored session=" +
+
+                LogInfo("[connect-broker-service] interactive desktop available; normal worker warming session=" +
                     gBrokerConfig.sessionId);
             }
+        }
+
+        if (normalProcess &&
+            normalRetireRequestedAt.time_since_epoch().count() != 0 &&
+            now - normalRetireRequestedAt >= std::chrono::milliseconds(750) &&
+            WaitForSingleObject(normalProcess, 0) != WAIT_OBJECT_0) {
+            LogWarn("[connect-broker-service] forcing retiring normal worker exit session=" +
+                gBrokerConfig.sessionId);
+            TerminateProcess(normalProcess, 0);
+            WaitForSingleObject(normalProcess, 100);
+        }
+
+        if (secureProcess &&
+            secureRetireRequestedAt.time_since_epoch().count() != 0 &&
+            now - secureRetireRequestedAt >= std::chrono::milliseconds(750) &&
+            WaitForSingleObject(secureProcess, 0) != WAIT_OBJECT_0) {
+            LogWarn("[connect-broker-service] forcing retiring secure worker exit session=" +
+                gBrokerConfig.sessionId);
+            TerminateProcess(secureProcess, 0);
+            WaitForSingleObject(secureProcess, 100);
         }
 
         if (normalProcess &&
             WaitForSingleObject(normalProcess, 0) == WAIT_OBJECT_0) {
             CloseHandle(normalProcess);
             normalProcess = nullptr;
-            if (interactiveReady && !sessionLocked) {
-                ResetEvent(normalStop);
-                normalProcess =
-                    LaunchBrokerNormalStreamer(
-                        gBrokerConfig, consoleSession);
-            }
+            normalProcessSession = 0xFFFFFFFF;
+            normalRetireRequestedAt = {};
+            normalInput.ResetConsumerState();
+            LogInfo("[connect-broker-service] normal worker retired session=" +
+                gBrokerConfig.sessionId);
         }
 
         if (secureProcess &&
             WaitForSingleObject(secureProcess, 0) == WAIT_OBJECT_0) {
             CloseHandle(secureProcess);
             secureProcess = nullptr;
+            secureProcessSession = 0xFFFFFFFF;
+            secureRetireRequestedAt = {};
             secureStopRequestedAt = {};
-            if (!interactiveReady || sessionLocked) {
-                ResetEvent(secureStop);
-                secureProcess =
-                    LaunchBrokerSecureStreamer(
-                        gBrokerConfig, consoleSession);
-            }
+            secureInput.ResetConsumerState();
+            LogInfo("[connect-broker-service] secure worker retired session=" +
+                gBrokerConfig.sessionId);
         }
 
+        // Keep a normal dynamic-desktop worker alive for both unlocked and
+        // LOCKED interactive sessions. This is the same worker model used by
+        // the unattended Agent, and is what makes LockApp visible instead of
+        // replacing it with a black Winlogon-only capture.
+        if (!normalProcess &&
+            interactiveReady &&
+            !loginDesktopMode &&
+            !consoleSwitchInProgress &&
+            consoleSession != 0xFFFFFFFF) {
+            ResetEvent(normalStop);
+            normalInput.ResetConsumerState();
+            normalProcess =
+                LaunchBrokerNormalStreamer(
+                    gBrokerConfig, consoleSession);
+            if (normalProcess) normalProcessSession = consoleSession;
+        }
+
+        if (!secureProcess &&
+            loginDesktopMode &&
+            !consoleSwitchInProgress &&
+            consoleSession != 0xFFFFFFFF) {
+            ResetEvent(secureStop);
+            secureInput.ResetConsumerState();
+            secureProcess =
+                LaunchBrokerSecureStreamer(
+                    gBrokerConfig, consoleSession);
+            if (secureProcess) secureProcessSession = consoleSession;
+        }
+
+        // A lock/UAC remains an interactive-session secure-desktop transition.
+        // Let the dynamic normal worker follow the input desktop first. Only
+        // warm the dedicated Winlogon helper if it has not produced a usable
+        // secure path quickly, exactly like the unattended Agent.
         const bool uac =
-            interactiveReady && !sessionLocked &&
+            interactiveReady &&
+            !loginDesktopMode &&
             normalInput.GetUACActive();
         if (uac != lastUac) {
             lastUac = uac;
             if (uac) {
                 uacEnteredAt = now;
                 secureStopRequestedAt = {};
-                ResetEvent(secureStop);
-                LogInfo("[connect-broker-service] secure desktop requested session=" +
-                    gBrokerConfig.sessionId);
+                if (secureRetireRequestedAt.time_since_epoch().count() != 0) {
+                    secureRetireRequestedAt = {};
+                    ResetEvent(secureStop);
+                }
+                LogInfo("[connect-broker-service] dynamic worker entered secure desktop session=" +
+                    gBrokerConfig.sessionId +
+                    " locked=" + std::string(sessionLocked ? "1" : "0"));
             } else {
                 uacEnteredAt = {};
-                if (interactiveReady && !sessionLocked && secureProcess) {
-                    SetEvent(secureStop);
+                if (!loginDesktopMode && secureProcess) {
                     secureStopRequestedAt = now;
                 }
             }
         }
 
-        // Mirror the installed Agent. Winlogon is immediate when no interactive
-        // user exists; UAC gives the dynamic LocalSystem streamer 220 ms before
-        // warming the dedicated winsta0\\Winlogon helper.
-        if ((!interactiveReady || sessionLocked) && !secureProcess) {
-            ResetEvent(secureStop);
-            secureProcess =
-                LaunchBrokerSecureStreamer(
-                    gBrokerConfig, consoleSession);
-        } else if (uac && !secureProcess &&
+        if (uac && !secureProcess &&
             uacEnteredAt.time_since_epoch().count() != 0 &&
-            now - uacEnteredAt >= std::chrono::milliseconds(220)) {
+            now - uacEnteredAt >= std::chrono::milliseconds(220) &&
+            consoleSession != 0xFFFFFFFF) {
             ResetEvent(secureStop);
+            secureInput.ResetConsumerState();
             secureProcess =
                 LaunchBrokerSecureStreamer(
                     gBrokerConfig, consoleSession);
+            if (secureProcess) secureProcessSession = consoleSession;
         }
 
-        if (interactiveReady && !sessionLocked && !uac && secureProcess &&
+        // Do not synchronously kill the secure/login worker when returning to
+        // the user desktop. Give the normal dynamic worker time to publish a
+        // fresh monitor/frame, then retire secure in the background.
+        if (interactiveReady && !loginDesktopMode && !uac && secureProcess &&
             secureStopRequestedAt.time_since_epoch().count() != 0 &&
             now - secureStopRequestedAt >= std::chrono::milliseconds(1200) &&
-            normalInput.GetMonitorCount() > 0) {
-            CloseChildProcess(secureProcess, secureStop, "secure");
-            secureStopRequestedAt = {};
+            normalInput.GetMonitorCount() > 0 &&
+            secureRetireRequestedAt.time_since_epoch().count() == 0) {
+            SetEvent(secureStop);
+            secureRetireRequestedAt = now;
         }
 
         Sleep(25);
@@ -1921,6 +2135,7 @@ void WINAPI ConnectBrokerServiceMain(DWORD, LPWSTR*) {
     secureInput.Close();
     normalFrames.Close();
     secureFrames.Close();
+    handoffFrames.Close();
     if (parent) CloseHandle(parent);
     CloseHandle(brokerStop);
     CloseHandle(normalStop);
@@ -1960,6 +2175,8 @@ int RunConnectCaptureBrokerService(int argc, char** argv) {
         ArgValue(argc, argv, "--normal-shmem");
     gBrokerConfig.secureShmem =
         ArgValue(argc, argv, "--secure-shmem");
+    gBrokerConfig.handoffShmem =
+        ArgValue(argc, argv, "--handoff-shmem");
     gBrokerConfig.normalInput =
         ArgValue(argc, argv, "--normal-input");
     gBrokerConfig.secureInput =
@@ -1992,6 +2209,7 @@ int RunConnectCaptureBrokerService(int argc, char** argv) {
         gBrokerConfig.sessionId.empty() ||
         gBrokerConfig.normalShmem.empty() ||
         gBrokerConfig.secureShmem.empty() ||
+        gBrokerConfig.handoffShmem.empty() ||
         gBrokerConfig.normalInput.empty() ||
         gBrokerConfig.secureInput.empty() ||
         gBrokerConfig.normalStop.empty() ||
