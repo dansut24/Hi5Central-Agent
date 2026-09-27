@@ -174,6 +174,7 @@ add_executable(native_vp8_stream
   src/ipc/named_pipe.cpp
   src/ui/native_banner.cpp
   src/ui/native_chat_window.cpp
+  src/ui/native_connect_window.cpp
   src/ui/native_tray.cpp
   src/ui/agent_presence_controller.cpp
   src/ui/chat_controller.cpp
