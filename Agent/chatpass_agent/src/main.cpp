@@ -8,10 +8,15 @@
 #include "platform/screen_provider.h"
 #include "platform/input_provider.h"
 #include "platform/inventory_provider.h"
+#ifdef _WIN32
+#include "ui/native_banner.h"
+#include "ui/native_chat_window.h"
+#endif
 
 #include <rtc/rtc.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -175,6 +180,9 @@ static int RunConnectHost(const std::string& ticket) {
     }
 
     g_running = true;
+#ifdef _WIN32
+    if (HWND console = GetConsoleWindow()) ShowWindow(console, SW_HIDE);
+#endif
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
     rtc::InitLogger(rtc::LogLevel::Info);
@@ -198,6 +206,18 @@ static int RunConnectHost(const std::string& ticket) {
     const std::string wsUrl =
         "wss://rmm.hi5central.com/connect/host/ws?ticket=" + ticket;
 
+#ifdef _WIN32
+    const std::string uiEventSuffix = std::to_string(GetCurrentProcessId());
+    const std::string chatEventName = "Local\\Hi5Central.Connect.Chat." + uiEventSuffix;
+    const std::string endEventName = "Local\\Hi5Central.Connect.End." + uiEventSuffix;
+    HANDLE chatEvent = CreateEventA(nullptr, TRUE, FALSE, chatEventName.c_str());
+    HANDLE endEvent = CreateEventA(nullptr, TRUE, FALSE, endEventName.c_str());
+    hi5::NativeBanner supportPanel;
+    hi5::NativeChatWindow chatWindow;
+    std::atomic<bool> supportUiStarted{ false };
+    std::string connectSessionId;
+#endif
+
     try {
         SignalingClient signaling(wsUrl);
         std::mutex sessionsMu;
@@ -206,6 +226,40 @@ static int RunConnectHost(const std::string& ticket) {
         auto sendFn = [&signaling](const std::string& payload) {
             signaling.send(payload);
         };
+
+#ifdef _WIN32
+        auto startSupportUi = [&](const std::string& sessionId, const std::string& technician) {
+            connectSessionId = sessionId;
+            if (supportUiStarted.exchange(true)) {
+                supportPanel.SetTechnicianName(technician);
+                return;
+            }
+
+            if (!chatWindow.Start(sessionId, [&](const std::string& body) {
+                signaling.send(json{
+                    {"type", "chat_message"},
+                    {"session_id", connectSessionId},
+                    {"sender", "user"},
+                    {"display_name", "Customer"},
+                    {"body", body},
+                    {"message", body},
+                    {"text", body}
+                }.dump());
+            }, [&]() {
+                signaling.send(json{
+                    {"type", "chat_close"},
+                    {"session_id", connectSessionId},
+                    {"sender", "user"}
+                }.dump());
+            })) {
+                LogWarn("[connect-ui] failed to create customer chat window session=" + sessionId);
+            }
+
+            supportPanel.Start(technician, sessionId, chatEventName, endEventName, true,
+                "Waiting for technician", false);
+            LogInfo("[connect-ui] customer support panel started session=" + sessionId);
+        };
+#endif
 
         signaling.onOpen([&]() {
             std::cout << "[connect] Secure connection established. Waiting for technician...\n";
@@ -232,6 +286,9 @@ static int RunConnectHost(const std::string& ticket) {
                 std::cout << "[connect] Organisation: " << organisation << "\n";
                 std::cout << "[connect] Technician: " << technician << "\n";
                 std::cout << "[connect] Waiting for the technician to open the remote session...\n";
+#ifdef _WIN32
+                startSupportUi(sessionId, technician);
+#endif
                 return;
             }
 
@@ -245,6 +302,9 @@ static int RunConnectHost(const std::string& ticket) {
                 );
                 sender->start();
                 signaling.send(sender->buildMonitorInfoMessage().dump());
+#ifdef _WIN32
+                if (supportUiStarted.load()) supportPanel.SetConnectionState("Connected", true);
+#endif
                 std::lock_guard<std::mutex> lock(sessionsMu);
                 auto prior = sessions.find(sessionId);
                 if (prior != sessions.end()) prior->second->stop();
@@ -277,6 +337,26 @@ static int RunConnectHost(const std::string& ticket) {
                 return;
             }
 
+#ifdef _WIN32
+            if (type == "chat_message") {
+                hi5::ChatMessage chat{};
+                chat.sessionId = sessionId;
+                chat.sender = msg.value("sender", std::string("tech"));
+                chat.displayName = msg.value("display_name", msg.value("displayName", std::string("Technician")));
+                chat.body = msg.value("body", msg.value("message", msg.value("text", std::string())));
+                if (!chat.body.empty() && supportUiStarted.load()) {
+                    chatWindow.AppendMessage(chat);
+                    chatWindow.Show();
+                }
+                return;
+            }
+
+            if (type == "chat_close") {
+                if (supportUiStarted.load()) chatWindow.Hide();
+                return;
+            }
+#endif
+
             if (type == "viewer_disconnected" || type == "viewer_closed" ||
                 type == "viewer_left" || type == "stop_webrtc") {
                 std::lock_guard<std::mutex> lock(sessionsMu);
@@ -286,6 +366,9 @@ static int RunConnectHost(const std::string& ticket) {
                     sessions.erase(it);
                 }
                 std::cout << "[connect] Technician viewer disconnected. Support app remains ready.\n";
+#ifdef _WIN32
+                if (supportUiStarted.load()) supportPanel.SetConnectionState("Waiting for technician", false);
+#endif
                 return;
             }
 
@@ -304,8 +387,33 @@ static int RunConnectHost(const std::string& ticket) {
         signaling.connect();
 
         while (g_running) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+#ifdef _WIN32
+            if (chatEvent && WaitForSingleObject(chatEvent, 0) == WAIT_OBJECT_0) {
+                ResetEvent(chatEvent);
+                if (supportUiStarted.load()) chatWindow.Show();
+            }
+            if (endEvent && WaitForSingleObject(endEvent, 0) == WAIT_OBJECT_0) {
+                ResetEvent(endEvent);
+                if (!connectSessionId.empty()) {
+                    signaling.send(json{
+                        {"type", "session_ended"},
+                        {"session_id", connectSessionId},
+                        {"reason", "customer_ended_session"}
+                    }.dump());
+                }
+                g_running = false;
+                break;
+            }
+#endif
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+
+#ifdef _WIN32
+        supportPanel.Stop();
+        chatWindow.Stop();
+        if (chatEvent) { CloseHandle(chatEvent); chatEvent = nullptr; }
+        if (endEvent) { CloseHandle(endEvent); endEvent = nullptr; }
+#endif
 
         {
             std::lock_guard<std::mutex> lock(sessionsMu);
@@ -317,6 +425,18 @@ static int RunConnectHost(const std::string& ticket) {
         return 0;
     }
     catch (const std::exception& ex) {
+#ifdef _WIN32
+        supportPanel.Stop();
+        chatWindow.Stop();
+        if (chatEvent) { CloseHandle(chatEvent); chatEvent = nullptr; }
+        if (endEvent) { CloseHandle(endEvent); endEvent = nullptr; }
+        const std::string detail = std::string("Unable to start the secure support session.\n\n") + ex.what() +
+            "\n\nReturn to connect.hi5central.com and ask your technician for a new support code.";
+        const int wideLength = MultiByteToWideChar(CP_UTF8, 0, detail.c_str(), static_cast<int>(detail.size()), nullptr, 0);
+        std::wstring wideDetail(static_cast<size_t>(std::max(0, wideLength)), L'\0');
+        if (wideLength > 0) MultiByteToWideChar(CP_UTF8, 0, detail.c_str(), static_cast<int>(detail.size()), wideDetail.data(), wideLength);
+        MessageBoxW(nullptr, wideDetail.c_str(), L"Hi5Central Connect", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+#endif
         std::cerr << "[connect] Unable to start support session: " << ex.what() << "\n";
         std::cerr << "[connect] Return to https://connect.hi5central.com and ask your technician for a new code.\n";
         return 1;

@@ -99,6 +99,18 @@ jobs:
           Copy-Item $source $target -Force
           if (-not (Test-Path $target)) { throw 'Portable Hi5Central Connect output was not created.' }
 
+          # Connect is a customer-facing temporary support app, not a console tool.
+          # Patch only the copied Connect PE to the Windows GUI subsystem so the
+          # shared Agent/Service binary keeps its existing console/service behavior.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $editbin = (Get-Command editbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $editbin -and (Test-Path $vswhere)) {
+            $editbin = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\editbin.exe' | Select-Object -First 1)
+          }
+          if (-not $editbin -or -not (Test-Path $editbin)) { throw 'editbin.exe was not found for the Connect GUI subsystem conversion.' }
+          & $editbin /SUBSYSTEM:WINDOWS $target
+          if ($LASTEXITCODE -ne 0) { throw "editbin failed to convert Hi5CentralConnect.exe to the Windows GUI subsystem ($LASTEXITCODE)." }
+
       - name: Verify PatchHost qualification capability
         shell: pwsh
         run: |

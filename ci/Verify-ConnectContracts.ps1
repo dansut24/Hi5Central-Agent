@@ -21,6 +21,11 @@ Require-Literal $main '{"type", "connect_hello"}' 'Portable Connect must announc
 Require-Literal $main 'type == "switch_monitor"' 'Portable Connect must support monitor switching.'
 Require-Literal $main 'type == "input_event"' 'Portable Connect must preserve the Viewer WebSocket input fallback.'
 Require-Literal $main 'type == "end_session" || type == "session_terminated"' 'Portable Connect must terminate on server-side session end.'
+Require-Literal $main 'ShowWindow(console, SW_HIDE)' 'Portable Connect must hide the legacy console window.'
+Require-Literal $main 'hi5::NativeBanner supportPanel' 'Portable Connect must expose the local customer support panel.'
+Require-Literal $main 'hi5::NativeChatWindow chatWindow' 'Portable Connect must expose local customer chat.'
+Require-Literal $main '"customer_ended_session"' 'Portable Connect local End session must revoke technician access.'
+Require-Literal $main '{"type", "chat_message"}' 'Portable Connect customer chat must relay through the authenticated session.'
 Require-Literal $senderHeader 'void handleInputEvent(const nlohmann::json& msg);' 'WebRTC sender must expose the existing input injector for portable fallback input.'
 Require-Literal $senderSource 'm_injector.handleMessage(msg);' 'Portable fallback input must use the existing Windows input injector.'
 Require-Literal $cmake 'src/platform/windows/windows_input.cpp' 'Windows builds must compile the platform input injector checked by this contract.'
@@ -31,6 +36,7 @@ Require-Literal $windowsInput 'kind == "clipboard_paste"' 'Compiled Windows inpu
 Require-Literal $windowsInput 'sendUnicodeText' 'Compiled Windows text entry must use Windows Unicode input.'
 Require-Literal $windowsInput 'sendShortcut' 'Compiled Windows input must support common mobile Windows shortcuts.'
 Require-Literal $workflow 'Hi5CentralConnect.exe' 'Windows CI must publish the portable Connect executable.'
+Require-Literal $workflow '/SUBSYSTEM:WINDOWS' 'Portable Connect must be converted to the Windows GUI subsystem so no console window appears.'
 if ($main -match 'cout\s*<<\s*ticket' -or $main -match 'cerr\s*<<\s*ticket') {
   throw 'Portable Connect must never print its one-time host ticket.'
 }

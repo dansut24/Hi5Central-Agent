@@ -26,6 +26,7 @@ namespace {
 constexpr const wchar_t* kBannerClass = L"Hi5CentralSupportPanelWndV3";
 constexpr UINT kBannerUpdateText = WM_APP + 101;
 constexpr UINT kNotifyCallback = WM_APP + 102;
+constexpr UINT kBannerUpdateState = WM_APP + 103;
 constexpr UINT_PTR kUiTimer = 1;
 constexpr UINT_PTR kCollapseTimer = 2;
 constexpr UINT_PTR kSlideTimer = 3;
@@ -59,6 +60,8 @@ bool ArgBool(int argc, char** argv, const std::string& name, bool fallback) {
 struct BannerState {
     std::wstring technician;
     std::wstring sessionId;
+    std::wstring statusText = L"Connected";
+    bool remoteControlActive = true;
     HANDLE chatEvent = nullptr;
     HANDLE endEvent = nullptr;
     bool expanded = false;
@@ -76,6 +79,11 @@ struct BannerState {
 
     NOTIFYICONDATAW notifyIcon{};
     bool notifyIconAdded = false;
+};
+
+struct BannerStateUpdate {
+    std::wstring statusText;
+    bool remoteControlActive = true;
 };
 
 template <typename T>
@@ -257,7 +265,7 @@ void PaintCollapsed(BannerState& state) {
     rt->Clear(HexColor(0x0f172a));
     FillRounded(state, D2D1::RectF(0.0f, 0.0f, kCollapsedWidth, kCollapsedHeight), 13.0f, 0x111827);
 
-    SetBrush(state, 0x22c55e);
+    SetBrush(state, state.remoteControlActive ? 0x22c55e : 0xf59e0b);
     rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(20.0f, 18.0f), 5.0f, 5.0f), state.brush);
 
     DrawTextLine(state, L"\u2039", D2D1::RectF(0.0f, 27.0f, kCollapsedWidth, 58.0f),
@@ -280,10 +288,13 @@ void PaintHeader(BannerState& state) {
     DrawTextLine(state, L"\u00d7", D2D1::RectF(306.0f, 10.0f, 336.0f, 42.0f),
         19.0f, DWRITE_FONT_WEIGHT_NORMAL, 0x64748b, DWRITE_TEXT_ALIGNMENT_CENTER);
 
-    SetBrush(state, 0x22c55e);
+    const unsigned int statusDot = state.remoteControlActive ? 0x22c55e : 0xf59e0b;
+    const unsigned int statusTextColor = state.remoteControlActive ? 0x15803d : 0xb45309;
+    SetBrush(state, statusDot);
     state.renderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(24.0f, 61.0f), 4.5f, 4.5f), state.brush);
-    DrawTextLine(state, L"Connected", D2D1::RectF(34.0f, 50.0f, 150.0f, 72.0f),
-        13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, 0x15803d);
+    DrawTextLine(state, state.statusText.empty() ? L"Connected" : state.statusText,
+        D2D1::RectF(34.0f, 50.0f, 260.0f, 72.0f),
+        13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, statusTextColor);
 }
 void PaintExpanded(BannerState& state) {
     auto* rt = state.renderTarget;
@@ -318,7 +329,8 @@ void PaintExpanded(BannerState& state) {
 
     if (state.showInfo) {
         FillRounded(state, D2D1::RectF(16.0f, 342.0f, 328.0f, 388.0f), 9.0f, 0xf1f5f9);
-        DrawTextLine(state, L"Encrypted connection  •  Remote control active",
+        DrawTextLine(state,
+            state.remoteControlActive ? L"Encrypted connection  •  Remote control active" : L"Secure support app ready  •  Waiting for technician",
             D2D1::RectF(28.0f, 344.0f, 316.0f, 366.0f), 11.5f,
             DWRITE_FONT_WEIGHT_SEMI_BOLD, 0x334155);
         DrawTextLine(state, L"The local user can end this session at any time.",
@@ -327,7 +339,8 @@ void PaintExpanded(BannerState& state) {
     }
 
     const float footerTop = state.showInfo ? 392.0f : 340.0f;
-    DrawTextLine(state, L"Your screen may be viewed and controlled",
+    DrawTextLine(state,
+        state.remoteControlActive ? L"Your screen may be viewed and controlled" : L"Remote control has not started yet",
         D2D1::RectF(16.0f, footerTop, 328.0f, footerTop + 22.0f), 10.5f,
         DWRITE_FONT_WEIGHT_NORMAL, 0x64748b, DWRITE_TEXT_ALIGNMENT_CENTER);
 }
@@ -366,7 +379,7 @@ void RemoveNotificationIcon(BannerState& state) {
     state.notifyIconAdded = false;
 }
 void ShowConnectionNotification(HWND hwnd, BannerState& state) {
-    if (!state.notifyOnStart) return;
+    if (!state.notifyOnStart || !state.remoteControlActive) return;
 
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
@@ -426,6 +439,16 @@ LRESULT CALLBACK BannerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         auto* incoming = reinterpret_cast<std::wstring*>(lParam);
         if (state && incoming) {
             state->technician = *incoming;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        delete incoming;
+        return 0;
+    }
+    case kBannerUpdateState: {
+        auto* incoming = reinterpret_cast<BannerStateUpdate*>(lParam);
+        if (state && incoming) {
+            state->statusText = incoming->statusText;
+            state->remoteControlActive = incoming->remoteControlActive;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         delete incoming;
@@ -557,15 +580,24 @@ void NativeBanner::Start(const std::string& technicianName,
     const std::string& sessionId,
     const std::string& chatEventName,
     const std::string& endEventName,
-    bool notifyOnStart) {
-    technicianName_ = technicianName;
-    sessionId_ = sessionId;
-    chatEventName_ = chatEventName;
-    endEventName_ = endEventName;
-    notifyOnStart_ = notifyOnStart;
+    bool notifyOnStart,
+    const std::string& statusText,
+    bool remoteControlActive) {
+    const std::string normalizedStatus = statusText.empty() ? "Connected" : statusText;
+    {
+        std::lock_guard<std::mutex> lock(stateMu_);
+        technicianName_ = technicianName;
+        sessionId_ = sessionId;
+        chatEventName_ = chatEventName;
+        endEventName_ = endEventName;
+        notifyOnStart_ = notifyOnStart;
+        statusText_ = normalizedStatus;
+        remoteControlActive_ = remoteControlActive;
+    }
 
     if (running_.exchange(true)) {
         SetTechnicianName(technicianName);
+        SetConnectionState(normalizedStatus, remoteControlActive);
         return;
     }
     thread_ = std::thread([this]() { ThreadMain(); });
@@ -578,24 +610,55 @@ void NativeBanner::Stop() {
 }
 
 void NativeBanner::SetTechnicianName(const std::string& technicianName) {
-    technicianName_ = technicianName;
+    {
+        std::lock_guard<std::mutex> lock(stateMu_);
+        technicianName_ = technicianName;
+    }
+    if (HWND hwnd = hwnd_.load()) {
+        PostMessageW(hwnd, kBannerUpdateText, 0, reinterpret_cast<LPARAM>(new std::wstring(ToWide(technicianName))));
+    }
 }
+
+void NativeBanner::SetConnectionState(const std::string& statusText, bool remoteControlActive) {
+    const std::string normalizedStatus = statusText.empty() ? "Connected" : statusText;
+    {
+        std::lock_guard<std::mutex> lock(stateMu_);
+        statusText_ = normalizedStatus;
+        remoteControlActive_ = remoteControlActive;
+    }
+    if (HWND hwnd = hwnd_.load()) {
+        auto* update = new BannerStateUpdate{ ToWide(normalizedStatus), remoteControlActive };
+        PostMessageW(hwnd, kBannerUpdateState, 0, reinterpret_cast<LPARAM>(update));
+    }
+}
+
 void NativeBanner::ThreadMain() {
     threadId_ = GetCurrentThreadId();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     BannerState state;
-    state.technician = ToWide(technicianName_);
-    state.sessionId = ToWide(sessionId_);
-    state.notifyOnStart = notifyOnStart_;
+    std::string chatEventName;
+    std::string endEventName;
+    std::string technicianLog;
+    {
+        std::lock_guard<std::mutex> lock(stateMu_);
+        state.technician = ToWide(technicianName_);
+        state.sessionId = ToWide(sessionId_);
+        state.statusText = ToWide(statusText_);
+        state.remoteControlActive = remoteControlActive_;
+        state.notifyOnStart = notifyOnStart_;
+        chatEventName = chatEventName_;
+        endEventName = endEventName_;
+        technicianLog = technicianName_;
+    }
     state.started = std::chrono::steady_clock::now();
 
-    if (!chatEventName_.empty()) {
-        state.chatEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, chatEventName_.c_str());
+    if (!chatEventName.empty()) {
+        state.chatEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, chatEventName.c_str());
         if (!state.chatEvent) LogWarn("[banner] failed to open chat action event err=" + std::to_string(GetLastError()));
     }
-    if (!endEventName_.empty()) {
-        state.endEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, endEventName_.c_str());
+    if (!endEventName.empty()) {
+        state.endEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, endEventName.c_str());
         if (!state.endEvent) LogWarn("[banner] failed to open end-session action event err=" + std::to_string(GetLastError()));
     }
 
@@ -621,6 +684,7 @@ void NativeBanner::ThreadMain() {
         nullptr, nullptr, hInst, &state);
 
     if (!hwnd) {
+        hwnd_.store(nullptr);
         LogWarn("[banner] failed to create support panel window err=" + std::to_string(GetLastError()));
         SafeRelease(state.dwriteFactory);
         SafeRelease(state.d2dFactory);
@@ -631,17 +695,24 @@ void NativeBanner::ThreadMain() {
         return;
     }
 
+    hwnd_.store(hwnd);
+    {
+        std::lock_guard<std::mutex> lock(stateMu_);
+        state.technician = ToWide(technicianName_);
+        state.statusText = ToWide(statusText_);
+        state.remoteControlActive = remoteControlActive_;
+    }
     const UINT dpi = GetDpiForWindow(hwnd);
     state.scale = std::max(1.0f, static_cast<float>(dpi) / 96.0f);
-    state.expanded = notifyOnStart_;
+    state.expanded = state.notifyOnStart;
     PositionBanner(hwnd, state);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd);
     if (state.expanded) SetTimer(hwnd, kCollapseTimer, 5000, nullptr);
     ShowConnectionNotification(hwnd, state);
 
-    LogInfo("[banner] native edge support panel shown technician=" + technicianName_ +
-        " notify=" + std::string(notifyOnStart_ ? "true" : "false"));
+    LogInfo("[banner] native edge support panel shown technician=" + technicianLog +
+        " notify=" + std::string(state.notifyOnStart ? "true" : "false"));
 
     MSG msg{};
     while (running_.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -656,6 +727,7 @@ void NativeBanner::ThreadMain() {
     SafeRelease(state.d2dFactory);
     if (state.chatEvent) CloseHandle(state.chatEvent);
     if (state.endEvent) CloseHandle(state.endEvent);
+    hwnd_.store(nullptr);
     running_.store(false);
     threadId_ = 0;
     CoUninitialize();
