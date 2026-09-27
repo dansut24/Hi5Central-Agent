@@ -425,6 +425,9 @@ static int RunConnectHost(const std::string& ticket) {
                 const std::string technician = msg.value("technician_name", std::string("Hi5Central technician"));
                 const std::string organisation = msg.value("organisation_name", std::string("Hi5Central"));
                 const std::string heldUntil = msg.value("held_until", std::string());
+#ifdef _WIN32
+                fileAccessGranted.store(msg.value("files_granted", false));
+#endif
                 std::cout << "[connect] Support request verified.\n";
                 std::cout << "[connect] Organisation: " << organisation << "\n";
                 std::cout << "[connect] Technician: " << technician << "\n";
@@ -522,15 +525,37 @@ static int RunConnectHost(const std::string& ticket) {
                         );
                         if (!customerApproved) {
                             reason = "customer_denied";
-                        } else if (ConnectLaunchElevatedCopy(ticket)) {
-                            approved = true;
-                            reason = "elevation_started";
-                            elevationHandoffRequested.store(true);
-                            if (supportUiStarted.load()) {
-                                supportWindow.SetConnectionState("Elevating session...", false);
-                            }
                         } else {
-                            reason = "uac_cancelled_or_failed";
+                            signaling.send(json{
+                                {"type", "session_state"},
+                                {"session_id", sessionId},
+                                {"state", "connect_uac_customer_action_required"}
+                            }.dump());
+                            if (supportUiStarted.load()) {
+                                supportWindow.SetConnectionState(
+                                    "Waiting for Windows approval...", false);
+                            }
+
+                            if (ConnectLaunchElevatedCopy(ticket)) {
+                                approved = true;
+                                reason = "elevation_started";
+                                elevationHandoffRequested.store(true);
+                                if (supportUiStarted.load()) {
+                                    supportWindow.SetConnectionState(
+                                        "Elevating session...", false);
+                                }
+                            } else {
+                                reason = "uac_cancelled_or_failed";
+                                signaling.send(json{
+                                    {"type", "session_state"},
+                                    {"session_id", sessionId},
+                                    {"state", "connect_uac_cancelled"}
+                                }.dump());
+                                if (supportUiStarted.load()) {
+                                    supportWindow.SetConnectionState(
+                                        "Connected", true);
+                                }
+                            }
                         }
                     }
                 }
