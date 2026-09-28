@@ -2880,6 +2880,135 @@ if ($rollback.ResultCode -eq 4 -or $rollback.ResultCode -eq 5) { exit 1 }
 
 
 
+
+            std::string BuildWindowsUpdateManagementScript(const json& payload) {
+                const bool enabled = payload.value("enabled", false);
+                const std::string policyId = payload.value("policy_id", std::string());
+                const std::string policyName = payload.value("policy_name", std::string());
+                json managementPayload = {
+                    {"enabled", enabled},
+                    {"policy_id", policyId},
+                    {"policy_name", policyName}
+                };
+                const std::string payloadText = managementPayload.dump();
+                return R"HI5PS(
+$ErrorActionPreference = 'Stop'
+$payload = @'
+)HI5PS" + payloadText + R"HI5PS(
+'@ | ConvertFrom-Json
+$enabled = [bool]$payload.enabled
+$policyId = [string]$payload.policy_id
+$policyName = [string]$payload.policy_name
+$windowsUpdatePath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+$auPath = Join-Path $windowsUpdatePath 'AU'
+$markerPath = 'HKLM:\SOFTWARE\Hi5Central\WindowsUpdateManagement'
+$owner = 'Hi5Central'
+$markerOwned = $false
+try {
+    $markerOwned = ((Get-ItemProperty -LiteralPath $markerPath -Name Owner -ErrorAction Stop).Owner -eq $owner)
+} catch {}
+
+function Get-Hi5RegistryValue($path, $name) {
+    try {
+        $item = Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop
+        return [pscustomobject]@{ exists = $true; value = $item.$name }
+    } catch {
+        return [pscustomobject]@{ exists = $false; value = $null }
+    }
+}
+
+$noAutoUpdate = Get-Hi5RegistryValue $auPath 'NoAutoUpdate'
+$auOptions = Get-Hi5RegistryValue $auPath 'AUOptions'
+$useWuServer = Get-Hi5RegistryValue $auPath 'UseWUServer'
+$wuServer = Get-Hi5RegistryValue $windowsUpdatePath 'WUServer'
+$wuStatusServer = Get-Hi5RegistryValue $windowsUpdatePath 'WUStatusServer'
+$doNotConnect = Get-Hi5RegistryValue $windowsUpdatePath 'DoNotConnectToWindowsUpdateInternetLocations'
+
+$mdmPolicyPath = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update'
+$mdmSignals = @()
+foreach ($name in @(
+    'AllowAutoUpdate',
+    'DeferQualityUpdatesPeriodInDays',
+    'DeferFeatureUpdatesPeriodInDays',
+    'PauseQualityUpdatesStartTime',
+    'PauseFeatureUpdatesStartTime',
+    'ConfigureDeadlineForQualityUpdates',
+    'ConfigureDeadlineForFeatureUpdates'
+)) {
+    $value = Get-Hi5RegistryValue $mdmPolicyPath $name
+    if ($value.exists) { $mdmSignals += $name }
+}
+
+if ($enabled) {
+    $conflicts = @()
+    if (-not $markerOwned) {
+        if ($wuServer.exists -or $wuStatusServer.exists -or ($useWuServer.exists -and [int]$useWuServer.value -eq 1)) {
+            $conflicts += 'wsus_policy'
+        }
+        if ($noAutoUpdate.exists -or $auOptions.exists -or ($doNotConnect.exists -and [int]$doNotConnect.value -ne 0)) {
+            $conflicts += 'existing_windows_update_policy'
+        }
+        if ($mdmSignals.Count -gt 0) {
+            $conflicts += 'mdm_windows_update_policy'
+        }
+    }
+    if ($conflicts.Count -gt 0) {
+        [pscustomobject]@{
+            action = 'manage_windows_update'
+            status = 'conflict'
+            managed = $false
+            owner = ''
+            conflicts = $conflicts
+            mdm_signals = $mdmSignals
+            message = 'Hi5Central did not change Windows Update because another management policy is already present.'
+        } | ConvertTo-Json -Depth 8 -Compress
+        exit 0
+    }
+
+    New-Item -Path $auPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $auPath -Name NoAutoUpdate -PropertyType DWord -Value 1 -Force | Out-Null
+    New-Item -Path $markerPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $markerPath -Name Owner -PropertyType String -Value $owner -Force | Out-Null
+    New-ItemProperty -LiteralPath $markerPath -Name SchemaVersion -PropertyType DWord -Value 1 -Force | Out-Null
+    New-ItemProperty -LiteralPath $markerPath -Name PolicyId -PropertyType String -Value $policyId -Force | Out-Null
+    New-ItemProperty -LiteralPath $markerPath -Name PolicyName -PropertyType String -Value $policyName -Force | Out-Null
+    New-ItemProperty -LiteralPath $markerPath -Name AppliedAtUtc -PropertyType String -Value ((Get-Date).ToUniversalTime().ToString('o')) -Force | Out-Null
+
+    [pscustomobject]@{
+        action = 'manage_windows_update'
+        status = 'ok'
+        managed = $true
+        owner = $owner
+        automatic_updates_disabled = $true
+        update_source = 'Microsoft Update'
+        policy_id = $policyId
+        policy_name = $policyName
+        policy_path = $auPath
+        policy_value = 'NoAutoUpdate'
+        policy_data = 1
+    } | ConvertTo-Json -Depth 8 -Compress
+    exit 0
+}
+
+if ($markerOwned) {
+    $current = Get-Hi5RegistryValue $auPath 'NoAutoUpdate'
+    if ($current.exists -and [int]$current.value -eq 1) {
+        Remove-ItemProperty -LiteralPath $auPath -Name NoAutoUpdate -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $markerPath -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+[pscustomobject]@{
+    action = 'manage_windows_update'
+    status = 'ok'
+    managed = $false
+    owner = ''
+    automatic_updates_disabled = $false
+    message = if ($markerOwned) { 'Hi5Central Windows Update management policy removed.' } else { 'Hi5Central did not own a Windows Update policy on this device.' }
+} | ConvertTo-Json -Depth 8 -Compress
+)HI5PS";
+            }
+
             std::string PsSingleQuote(const std::string& value) {
                 std::string out = "'";
                 for (char ch : value) {
@@ -4255,6 +4384,17 @@ exit 1
                         if (ok) {
                             try { SendInventorySnapshotSafe(ident); } catch (...) {}
                         }
+                        return;
+                    }
+
+
+                    if (jobType == "windows_update.manage") {
+                        const int timeoutSeconds = std::max(30, std::min(600, payload.value("timeout_seconds", 120)));
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildWindowsUpdateManagementScript(payload), timeoutSeconds);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const std::string status = result.value("status", std::string("failed"));
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && status == "ok";
+                        PostJobResult(ident, jobId, ok, result, status == "conflict" ? result.value("message", std::string()) : cr.error);
                         return;
                     }
 
