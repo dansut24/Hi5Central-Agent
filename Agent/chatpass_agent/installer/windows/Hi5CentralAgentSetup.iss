@@ -128,6 +128,29 @@ begin
   Exec(ExpandConstant('{sys}\sc.exe'), 'stop ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+procedure StopExistingProcess(ImageName: String);
+var
+  ResultCode: Integer;
+begin
+  Exec(
+    ExpandConstant('{sys}\taskkill.exe'),
+    '/F /IM ' + ImageName,
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
+end;
+
+procedure StopExistingAgentProcesses;
+begin
+  StopExistingProcess('{#MyAppPortalExeName}');
+  StopExistingProcess('{#MyUserExeName}');
+  StopExistingProcess('{#MyRemoteHostExeName}');
+  StopExistingProcess('{#MyMediaHostExeName}');
+  StopExistingProcess('{#MyPatchHostExeName}');
+end;
+
 procedure WriteAgentConfig;
 var
   ConfigPath: String;
@@ -176,6 +199,7 @@ begin
   if CurStep = ssInstall then
   begin
     StopExistingService;
+    StopExistingAgentProcesses;
     ForceDirectories(ExpandConstant('{commonappdata}\Hi5Central\Agent'));
     ForceDirectories(ExpandConstant('{commonappdata}\Hi5Central\Agent\Logs'));
     ForceDirectories(ExpandConstant('{commonappdata}\Hi5Central\Agent\ChatLogs'));

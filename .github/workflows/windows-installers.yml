@@ -63,6 +63,16 @@ jobs:
           if ($agentBuild -match 'hi5central_app_portal') {
             throw 'Legacy C++ App Portal target is still part of the Agent CMake build.'
           }
+          if ($agentBuild -notmatch '/p:Version=\$AgentVersion') {
+            throw 'Self Service publish no longer stamps the Agent release version.'
+          }
+          $installer = Get-Content 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss' -Raw
+          if ($installer -notmatch 'StopExistingAgentProcesses') {
+            throw 'Installer no longer terminates running Self Service/Agent helper processes before replacement.'
+          }
+          if ($installer -notmatch 'MyAppPortalExeName') {
+            throw 'Installer no longer includes the Self Service executable.'
+          }
           $appPortalProject = Get-Content 'Agent/app_portal/Hi5Central.AppPortal/Hi5Central.AppPortal.csproj' -Raw
           if ($appPortalProject -notmatch 'Avalonia.Desktop') {
             throw 'Avalonia desktop dependency is missing from App Portal.'

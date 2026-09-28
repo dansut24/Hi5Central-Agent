@@ -323,6 +323,7 @@ if (-not $SkipBuild) {
         "/p:EnableCompressionInSingleFile=true",
         "/p:PublishTrimmed=true",
         "/p:TrimMode=partial",
+        "/p:Version=$AgentVersion",
         "/p:DebugType=None",
         "/p:DebugSymbols=false"
     )
@@ -337,12 +338,20 @@ if (-not $SkipBuild) {
         throw "Avalonia App Portal executable was not produced: $publishedAppPortal"
     }
 
-    $appPortalSize = (Get-Item $publishedAppPortal).Length
+    $appPortalFile = Get-Item $publishedAppPortal
+    $appPortalSize = $appPortalFile.Length
     $appPortalMaxSize = 25MB
     if ($appPortalSize -gt $appPortalMaxSize) {
         throw "Avalonia App Portal exceeded the 25 MiB self-contained size budget: $appPortalSize bytes"
     }
+
+    $appPortalFileVersion = [string]$appPortalFile.VersionInfo.FileVersion
+    if (-not $appPortalFileVersion.StartsWith($AgentVersion, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Avalonia App Portal version metadata mismatch. Expected $AgentVersion but got $appPortalFileVersion"
+    }
+
     Write-Host "Hi5 Self Service single-file size: $appPortalSize bytes"
+    Write-Host "Hi5 Self Service file version: $appPortalFileVersion"
 
     $unexpectedSidecars = Get-ChildItem -Path $appPortalPublishPath -File |
         Where-Object { $_.Extension -in @(".dll", ".json") }
