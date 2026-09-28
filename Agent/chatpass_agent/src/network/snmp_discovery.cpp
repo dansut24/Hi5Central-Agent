@@ -1316,8 +1316,194 @@ void ApplyMdnsTxt(
     }
 }
 
-std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
+bool IsValidDnsSdServiceType(const std::string& value) {
+    if (value.empty() || value.size() > 255) return false;
+    const std::string lower = LowerAscii(value);
+    if (lower == "_services._dns-sd._udp.local") return false;
+    if (lower.size() <= 6
+        || lower.front() != '_'
+        || lower.rfind(".local") != lower.size() - 6) return false;
+    if (lower.find("._tcp.local") == std::string::npos
+        && lower.find("._udp.local") == std::string::npos) {
+        return false;
+    }
+    for (unsigned char ch : lower) {
+        if (std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.') continue;
+        return false;
+    }
+    return true;
+}
+
+std::vector<std::uint8_t> BuildMdnsPtrQuery(
+    const std::vector<std::string>& serviceTypes) {
+    std::vector<std::uint8_t> query(12, 0);
+    const std::size_t count = std::min<std::size_t>(serviceTypes.size(), 64);
+    query[4] = static_cast<std::uint8_t>((count >> 8) & 0xff);
+    query[5] = static_cast<std::uint8_t>(count & 0xff);
+    for (std::size_t index = 0; index < count; ++index) {
+        AppendDnsName(query, serviceTypes[index]);
+        query.push_back(0);
+        query.push_back(12);  // PTR
+        query.push_back(0x80);
+        query.push_back(0x01);  // IN + unicast-response preference
+    }
+    return query;
+}
+
+std::vector<std::string> DiscoverDnsSdServiceTypes(
     const std::unordered_set<std::string>& targets) {
+    std::vector<std::string> discovered;
+#ifdef _WIN32
+    if (targets.empty()) return discovered;
+
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) return discovered;
+
+    DWORD timeoutMs = 200;
+    setsockopt(
+        sock,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&timeoutMs),
+        sizeof(timeoutMs));
+    unsigned char ttl = 1;
+    setsockopt(
+        sock,
+        IPPROTO_IP,
+        IP_MULTICAST_TTL,
+        reinterpret_cast<const char*>(&ttl),
+        sizeof(ttl));
+
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(0);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
+        closesocket(sock);
+        return discovered;
+    }
+
+    sockaddr_in destination{};
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(5353);
+    InetPtonA(AF_INET, "224.0.0.251", &destination.sin_addr);
+
+    const std::vector<std::string> enumeration = {
+        "_services._dns-sd._udp.local"
+    };
+    const auto query = BuildMdnsPtrQuery(enumeration);
+    sendto(
+        sock,
+        reinterpret_cast<const char*>(query.data()),
+        static_cast<int>(query.size()),
+        0,
+        reinterpret_cast<const sockaddr*>(&destination),
+        sizeof(destination));
+
+    std::unordered_set<std::string> unique;
+    std::vector<std::uint8_t> buffer(64 * 1024);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1400);
+
+    while (std::chrono::steady_clock::now() < deadline && unique.size() < 32) {
+        sockaddr_in source{};
+        int sourceLength = sizeof(source);
+        const int received = recvfrom(
+            sock,
+            reinterpret_cast<char*>(buffer.data()),
+            static_cast<int>(buffer.size()),
+            0,
+            reinterpret_cast<sockaddr*>(&source),
+            &sourceLength);
+        if (received <= 0) {
+            const int socketError = WSAGetLastError();
+            if (socketError == WSAETIMEDOUT || socketError == WSAEWOULDBLOCK) continue;
+            break;
+        }
+
+        if (ntohs(source.sin_port) != 5353) continue;
+
+        char ipBuffer[INET_ADDRSTRLEN]{};
+        if (!InetNtopA(AF_INET, &source.sin_addr, ipBuffer, sizeof(ipBuffer))) continue;
+        const std::string ipAddress = ipBuffer;
+        if (targets.find(ipAddress) == targets.end()) continue;
+
+        const std::size_t packetSize = static_cast<std::size_t>(received);
+        if (packetSize < 12) continue;
+        const std::uint16_t flags = ReadDnsU16(buffer.data(), 2);
+        if ((flags & 0x8000u) == 0) continue;
+
+        const std::uint16_t qdCount = ReadDnsU16(buffer.data(), 4);
+        const std::uint16_t anCount = ReadDnsU16(buffer.data(), 6);
+        const std::uint16_t nsCount = ReadDnsU16(buffer.data(), 8);
+        const std::uint16_t arCount = ReadDnsU16(buffer.data(), 10);
+        if (static_cast<std::uint32_t>(qdCount)
+                + static_cast<std::uint32_t>(anCount)
+                + static_cast<std::uint32_t>(nsCount)
+                + static_cast<std::uint32_t>(arCount) > 512) {
+            continue;
+        }
+
+        std::size_t offset = 12;
+        bool valid = true;
+        for (std::uint16_t index = 0; index < qdCount; ++index) {
+            std::string ignored;
+            if (!ReadDnsName(buffer.data(), packetSize, offset, ignored)
+                || offset + 4 > packetSize) {
+                valid = false;
+                break;
+            }
+            offset += 4;
+        }
+        if (!valid) continue;
+
+        const std::uint32_t recordCount =
+            static_cast<std::uint32_t>(anCount)
+            + static_cast<std::uint32_t>(nsCount)
+            + static_cast<std::uint32_t>(arCount);
+
+        for (std::uint32_t index = 0; index < recordCount; ++index) {
+            std::string owner;
+            if (!ReadDnsName(buffer.data(), packetSize, offset, owner)
+                || offset + 10 > packetSize) break;
+
+            const std::uint16_t type = ReadDnsU16(buffer.data(), offset);
+            offset += 2;
+            offset += 2;  // class
+            (void)ReadDnsU32(buffer.data(), offset);
+            offset += 4;
+            const std::uint16_t rdLength = ReadDnsU16(buffer.data(), offset);
+            offset += 2;
+            if (offset + rdLength > packetSize) break;
+
+            const std::size_t rdataOffset = offset;
+            if (type == 12 && LowerAscii(owner) == "_services._dns-sd._udp.local") {
+                std::size_t targetOffset = rdataOffset;
+                std::string target;
+                if (ReadDnsName(buffer.data(), packetSize, targetOffset, target)) {
+                    target = LowerAscii(TrimAscii(target));
+                    if (IsValidDnsSdServiceType(target)) {
+                        unique.insert(target);
+                    }
+                }
+            }
+            offset = rdataOffset + rdLength;
+        }
+    }
+
+    closesocket(sock);
+    discovered.assign(unique.begin(), unique.end());
+    std::sort(discovered.begin(), discovered.end());
+#else
+    (void)targets;
+#endif
+    return discovered;
+}
+
+std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
+    const std::unordered_set<std::string>& targets,
+    std::vector<std::string>& queriedServiceTypes,
+    std::vector<std::string>& dynamicServiceTypes) {
     std::unordered_map<std::string, MdnsRecord> records;
 #ifdef _WIN32
     if (targets.empty()) return records;
@@ -1340,15 +1526,24 @@ std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
         "_https._tcp.local"
     };
 
-    std::vector<std::uint8_t> query(12, 0);
-    query[4] = static_cast<std::uint8_t>((kServiceTypes.size() >> 8) & 0xff);
-    query[5] = static_cast<std::uint8_t>(kServiceTypes.size() & 0xff);
+    dynamicServiceTypes = DiscoverDnsSdServiceTypes(targets);
+
+    std::unordered_set<std::string> uniqueServiceTypes;
+    queriedServiceTypes.clear();
+    queriedServiceTypes.reserve(48);
     for (const auto& service : kServiceTypes) {
-        AppendDnsName(query, service);
-        query.push_back(0);
-        query.push_back(12);  // PTR
-        query.push_back(0x80);
-        query.push_back(0x01);  // IN + unicast-response preference
+        const std::string normalized = LowerAscii(service);
+        if (uniqueServiceTypes.insert(normalized).second) {
+            queriedServiceTypes.push_back(normalized);
+        }
+    }
+    for (const auto& service : dynamicServiceTypes) {
+        if (queriedServiceTypes.size() >= 48) break;
+        const std::string normalized = LowerAscii(service);
+        if (IsValidDnsSdServiceType(normalized)
+            && uniqueServiceTypes.insert(normalized).second) {
+            queriedServiceTypes.push_back(normalized);
+        }
     }
 
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1382,15 +1577,25 @@ std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
     destination.sin_family = AF_INET;
     destination.sin_port = htons(5353);
     InetPtonA(AF_INET, "224.0.0.251", &destination.sin_addr);
-    sendto(
-        sock,
-        reinterpret_cast<const char*>(query.data()),
-        static_cast<int>(query.size()),
-        0,
-        reinterpret_cast<const sockaddr*>(&destination),
-        sizeof(destination));
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2400);
+    static constexpr std::size_t kQueryBatchSize = 12;
+    for (std::size_t start = 0; start < queriedServiceTypes.size(); start += kQueryBatchSize) {
+        const std::size_t end =
+            std::min<std::size_t>(queriedServiceTypes.size(), start + kQueryBatchSize);
+        std::vector<std::string> batch(
+            queriedServiceTypes.begin() + static_cast<std::ptrdiff_t>(start),
+            queriedServiceTypes.begin() + static_cast<std::ptrdiff_t>(end));
+        const auto query = BuildMdnsPtrQuery(batch);
+        sendto(
+            sock,
+            reinterpret_cast<const char*>(query.data()),
+            static_cast<int>(query.size()),
+            0,
+            reinterpret_cast<const sockaddr*>(&destination),
+            sizeof(destination));
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2600);
     std::vector<std::uint8_t> buffer(64 * 1024);
 
     while (std::chrono::steady_clock::now() < deadline) {
@@ -1822,11 +2027,16 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
     std::unordered_set<std::string> targetSet(targets.begin(), targets.end());
     std::unordered_map<std::string, SsdpRecord> ssdpRecords;
     std::unordered_map<std::string, MdnsRecord> mdnsRecords;
+    std::vector<std::string> mdnsQueriedServiceTypes;
+    std::vector<std::string> mdnsDynamicServiceTypes;
     std::thread ssdpDiscovery([&]() {
         ssdpRecords = DiscoverSsdp(targetSet);
     });
     std::thread mdnsDiscovery([&]() {
-        mdnsRecords = DiscoverMdns(targetSet);
+        mdnsRecords = DiscoverMdns(
+            targetSet,
+            mdnsQueriedServiceTypes,
+            mdnsDynamicServiceTypes);
     });
 
     const std::size_t workerCount =
@@ -1910,14 +2120,23 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
     const auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - startedAt).count();
 
+    json queriedServices = json::array();
+    for (const auto& service : mdnsQueriedServiceTypes) queriedServices.push_back(service);
+    json dynamicServices = json::array();
+    for (const auto& service : mdnsDynamicServiceTypes) dynamicServices.push_back(service);
+
     return json{
         {"status", "ok"},
-        {"protocolVersion", 3},
+        {"protocolVersion", 4},
         {"targetsTotal", targets.size()},
         {"enrichedCount", enrichedIps.size()},
         {"resolvedCount", namedIps.size()},
         {"ssdpCount", ssdpRecords.size()},
         {"mdnsCount", mdnsRecords.size()},
+        {"mdnsServiceTypeCount", mdnsQueriedServiceTypes.size()},
+        {"mdnsDynamicServiceTypeCount", mdnsDynamicServiceTypes.size()},
+        {"mdnsServiceTypes", queriedServices},
+        {"mdnsDynamicServiceTypes", dynamicServices},
         {"durationMs", durationMs},
         {"devices", resolved}
     };
