@@ -208,8 +208,7 @@ std::string DecodeText(const std::uint8_t* data, std::size_t length) {
     std::string value(reinterpret_cast<const char*>(data), length);
     for (char& ch : value) {
         const unsigned char c = static_cast<unsigned char>(ch);
-        if (c == 0 || (c < 0x20 && c != '	' && c != '' && c != '
-')) ch = ' ';
+        if (c == 0 || (c < 0x20 && c != '\t' && c != '\r' && c != '\n')) ch = ' ';
     }
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
     std::size_t start = 0;
