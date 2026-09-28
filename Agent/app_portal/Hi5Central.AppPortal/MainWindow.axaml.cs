@@ -15,7 +15,9 @@ public sealed partial class MainWindow : Window
     private readonly IAppPortalBroker _broker;
     private readonly ObservableCollection<AppCard> _visibleApps = [];
     private readonly ObservableCollection<RequestSummaryItem> _recentRequests = [];
+    private readonly ObservableCollection<RequestSummaryItem> _allRequestItems = [];
     private readonly ObservableCollection<DashboardUpdateItem> _dashboardUpdates = [];
+    private readonly ObservableCollection<DashboardUpdateItem> _allUpdateItems = [];
     private readonly AppIconCache _iconCache = new();
     private readonly DispatcherTimer _pollTimer;
     private List<PortalApp> _apps = [];
@@ -34,7 +36,9 @@ public sealed partial class MainWindow : Window
         _broker = AppPortalBrokerFactory.Create();
         AppsItems.ItemsSource = _visibleApps;
         RecentRequestItems.ItemsSource = _recentRequests;
+        RequestsPageItems.ItemsSource = _allRequestItems;
         DashboardUpdateItems.ItemsSource = _dashboardUpdates;
+        UpdatesPageItems.ItemsSource = _allUpdateItems;
 
         _pollTimer = new DispatcherTimer
         {
@@ -204,10 +208,11 @@ public sealed partial class MainWindow : Window
         DeviceUserText.Text = displayUser;
 
         _recentRequests.Clear();
-        foreach (var request in _requests.Take(5))
+        _allRequestItems.Clear();
+        foreach (var request in _requests.OrderByDescending(item => item.CreatedAt))
         {
             var status = RequestDisplay(request.Status);
-            _recentRequests.Add(new RequestSummaryItem
+            var item = new RequestSummaryItem
             {
                 Name = _apps.FirstOrDefault(app =>
                     string.Equals(app.Id, request.AppId, StringComparison.OrdinalIgnoreCase))?.Name
@@ -216,9 +221,15 @@ public sealed partial class MainWindow : Window
                 DateText = request.CreatedAt?.ToLocalTime().ToString("dd MMM yyyy") ?? string.Empty,
                 StatusBackground = status.Background,
                 StatusForeground = status.Foreground,
-            });
+            };
+            _allRequestItems.Add(item);
+            if (_recentRequests.Count < 5)
+            {
+                _recentRequests.Add(item);
+            }
         }
         NoRequestsText.IsVisible = _recentRequests.Count == 0;
+        RequestsPageEmpty.IsVisible = _allRequestItems.Count == 0;
 
         var updateItems = new List<DashboardUpdateItem>();
         updateItems.AddRange(_updates.Windows.Select(update => new DashboardUpdateItem
@@ -249,13 +260,37 @@ public sealed partial class MainWindow : Window
         }));
 
         _dashboardUpdates.Clear();
-        foreach (var update in updateItems
-                     .OrderByDescending(item => item.UpdatedAt)
-                     .Take(5))
+        _allUpdateItems.Clear();
+        foreach (var update in updateItems.OrderByDescending(item => item.UpdatedAt))
         {
-            _dashboardUpdates.Add(update);
+            _allUpdateItems.Add(update);
+            if (_dashboardUpdates.Count < 5)
+            {
+                _dashboardUpdates.Add(update);
+            }
         }
         NoUpdatesText.IsVisible = _dashboardUpdates.Count == 0;
+        UpdatesPageEmpty.IsVisible = _allUpdateItems.Count == 0;
+        UpdatesPageWindowsCountText.Text = _updates.Windows.Count.ToString();
+        UpdatesPageSoftwareCountText.Text = _updates.Software.Count.ToString();
+
+        DevicePageNameText.Text = DeviceNameText.Text;
+        DevicePageModelText.Text = DeviceModelText.Text;
+        DevicePageOsText.Text = DeviceOsText.Text;
+        DevicePageHealthText.Text = DeviceHealthText.Text;
+        DevicePageEncryptionText.Text = DeviceEncryptionText.Text;
+        DevicePageLastSyncText.Text = DeviceLastSyncText.Text;
+        DevicePageStorageText.Text = DeviceStorageText.Text;
+        DevicePageUserText.Text = DeviceUserText.Text;
+        DevicePageAgentText.Text = string.IsNullOrWhiteSpace(_device.AgentVersion)
+            ? "Not reported"
+            : _device.AgentVersion;
+
+        SettingsAgentVersionText.Text = string.IsNullOrWhiteSpace(_device.AgentVersion)
+            ? "Not reported"
+            : _device.AgentVersion;
+        SettingsPortalVersionText.Text =
+            typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "Development";
     }
 
     private static (string Text, string Background, string Foreground) RequestDisplay(string value)
@@ -393,8 +428,34 @@ public sealed partial class MainWindow : Window
         }
 
         UpdateHeroText();
+        UpdatePageVisibility();
         UpdatePollState();
         _ = LoadVisibleIconsAsync();
+    }
+
+    private void UpdatePageVisibility()
+    {
+        var isHome = _view == "home";
+        var isApps = _view is "all" or "installed";
+
+        HomeSummaryPanel.IsVisible = isHome;
+        AppCataloguePanel.IsVisible = isHome || isApps;
+        HomeOverviewPanel.IsVisible = isHome;
+        HomeSupportPanel.IsVisible = isHome;
+
+        UpdatesPagePanel.IsVisible = _view == "updates";
+        RequestsPagePanel.IsVisible = _view == "requests";
+        DevicePagePanel.IsVisible = _view == "device";
+        SupportPagePanel.IsVisible = _view == "support";
+        SettingsPagePanel.IsVisible = _view == "settings";
+
+        AppsSectionTitle.Text = _view switch
+        {
+            "installed" => "Installed Applications",
+            "all" => "Applications",
+            _ => "Featured Apps",
+        };
+        AppTabsPanel.IsVisible = _view != "installed";
     }
 
     private async Task LoadVisibleIconsAsync()
