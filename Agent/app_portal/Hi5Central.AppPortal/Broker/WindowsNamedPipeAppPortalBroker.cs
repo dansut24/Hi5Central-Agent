@@ -6,15 +6,17 @@ namespace Hi5Central.AppPortal.Broker;
 public sealed class WindowsNamedPipeAppPortalBroker : IAppPortalBroker
 {
     private const string PipeName = "Hi5CentralAppPortal";
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     public Task<JsonDocument> GetCatalogueAsync(CancellationToken cancellationToken = default)
-        => SendAsync(new { type = "catalogue" }, cancellationToken);
+        => SendAsync("catalogue", appId: null, cancellationToken);
 
     public Task<JsonDocument> InstallAsync(string appId, CancellationToken cancellationToken = default)
-        => SendAsync(new { type = "install", appId }, cancellationToken);
+        => SendAsync("install", appId, cancellationToken);
 
-    private static async Task<JsonDocument> SendAsync(object request, CancellationToken cancellationToken)
+    private static async Task<JsonDocument> SendAsync(
+        string requestType,
+        string? appId,
+        CancellationToken cancellationToken)
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -33,7 +35,19 @@ public sealed class WindowsNamedPipeAppPortalBroker : IAppPortalBroker
         await pipe.ConnectAsync(connectTimeout.Token).ConfigureAwait(false);
         pipe.ReadMode = PipeTransmissionMode.Message;
 
-        var requestBytes = JsonSerializer.SerializeToUtf8Bytes(request, JsonOptions);
+        using var requestBuffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(requestBuffer))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("type", requestType);
+            if (!string.IsNullOrWhiteSpace(appId))
+            {
+                writer.WriteString("appId", appId);
+            }
+            writer.WriteEndObject();
+        }
+
+        var requestBytes = requestBuffer.ToArray();
         await pipe.WriteAsync(requestBytes, cancellationToken).ConfigureAwait(false);
         await pipe.FlushAsync(cancellationToken).ConfigureAwait(false);
 

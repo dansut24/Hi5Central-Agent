@@ -5,17 +5,13 @@ using Avalonia.Interactivity;
 using Avalonia.Threading;
 using Hi5Central.AppPortal.Broker;
 using Hi5Central.AppPortal.Models;
+using Hi5Central.AppPortal.Serialization;
 using Hi5Central.AppPortal.Services;
 
 namespace Hi5Central.AppPortal;
 
 public sealed partial class MainWindow : Window
 {
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
-    {
-        PropertyNameCaseInsensitive = true,
-    };
-
     private readonly IAppPortalBroker _broker;
     private readonly ObservableCollection<AppCard> _visibleApps = [];
     private readonly ObservableCollection<RequestSummaryItem> _recentRequests = [];
@@ -77,7 +73,7 @@ public sealed partial class MainWindow : Window
         try
         {
             using var payload = await _broker.GetCatalogueAsync();
-            var response = payload.RootElement.Deserialize<PortalCatalogueResponse>(JsonOptions)
+            var response = payload.RootElement.Deserialize(PortalJsonContext.Default.PortalCatalogueResponse)
                 ?? throw new InvalidDataException("Hi5Central returned an invalid App Portal response.");
 
             if (!response.Success)
@@ -510,7 +506,7 @@ public sealed partial class MainWindow : Window
         try
         {
             using var payload = await _broker.InstallAsync(card.Id);
-            var response = payload.RootElement.Deserialize<PortalInstallResponse>(JsonOptions)
+            var response = payload.RootElement.Deserialize(PortalJsonContext.Default.PortalInstallResponse)
                 ?? throw new InvalidDataException("Hi5Central returned an invalid install response.");
 
             if (!response.Success)
