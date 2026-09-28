@@ -77,7 +77,7 @@ jobs:
             /p:EnableCompressionInSingleFile=true `
             /p:PublishTrimmed=true `
             /p:TrimMode=partial `
-            /p:WarningsNotAsErrors="IL2026;IL2104" `
+            /p:WarningsNotAsErrors=IL2026%3BIL2104 `
             /p:DebugType=None `
             /p:DebugSymbols=false
           if ($LASTEXITCODE -ne 0) { throw 'Trim candidate publish failed.' }
