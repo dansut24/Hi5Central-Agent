@@ -587,6 +587,21 @@
                       </DataTemplate>
                     </ItemsControl.ItemTemplate>
                   </ItemsControl>
+                  <StackPanel x:Name="NoRequestsText"
+                              IsVisible="False"
+                              Margin="0,18,0,14"
+                              Spacing="4"
+                              HorizontalAlignment="Center">
+                    <TextBlock Text="No software requests yet"
+                               Foreground="#42546B"
+                               FontSize="10"
+                               FontWeight="SemiBold"
+                               HorizontalAlignment="Center" />
+                    <TextBlock Text="Approval requests will appear here."
+                               Foreground="#8A97A9"
+                               FontSize="8"
+                               HorizontalAlignment="Center" />
+                  </StackPanel>
                 </StackPanel>
               </Border>
 
@@ -638,6 +653,21 @@
                       </DataTemplate>
                     </ItemsControl.ItemTemplate>
                   </ItemsControl>
+                  <StackPanel x:Name="NoUpdatesText"
+                              IsVisible="False"
+                              Margin="0,18,0,14"
+                              Spacing="4"
+                              HorizontalAlignment="Center">
+                    <TextBlock Text="You're up to date"
+                               Foreground="#42546B"
+                               FontSize="10"
+                               FontWeight="SemiBold"
+                               HorizontalAlignment="Center" />
+                    <TextBlock Text="No Windows or application updates are pending."
+                               Foreground="#8A97A9"
+                               FontSize="8"
+                               HorizontalAlignment="Center" />
+                  </StackPanel>
                 </StackPanel>
               </Border>
 
@@ -696,7 +726,7 @@
               </Border>
             </Grid>
             <Border Classes="panel" Padding="13">
-              <Grid ColumnDefinitions="220,*,*,*,*" ColumnSpacing="9">
+              <Grid ColumnDefinitions="175,*,*,*,*" ColumnSpacing="8">
                 <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
                   <TextBlock Text="Help &amp; Support" Classes="sectionTitle" />
                   <TextBlock Text="Get help from the IT team or find useful resources."

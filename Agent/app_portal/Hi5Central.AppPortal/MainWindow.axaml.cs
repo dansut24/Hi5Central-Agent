@@ -26,6 +26,7 @@ public sealed partial class MainWindow : Window
     private string _view = "home";
     private string _appSection = "all";
     private bool _busy;
+    private bool _loadFailed;
 
     public MainWindow()
     {
@@ -57,7 +58,7 @@ public sealed partial class MainWindow : Window
 
     private async void PollTimer_Tick(object? sender, EventArgs e)
     {
-        if (_busy || !NeedsPolling()) return;
+        if (_busy || (!_loadFailed && !NeedsPolling())) return;
         await RefreshCatalogueAsync(showLoading: false, quiet: true);
     }
 
@@ -90,12 +91,19 @@ public sealed partial class MainWindow : Window
             _requests = response.Requests;
             _device = response.Device;
             _updates = response.Updates;
+            var recoveredFromLoadFailure = _loadFailed;
+            _loadFailed = false;
             RebuildCategories();
             RebuildDashboard();
             ApplyFilters();
 
             AgentStatusText.Text = "Connected through Hi5Central Agent";
             AgentStatusText.Foreground = Avalonia.Media.Brushes.MediumSeaGreen;
+
+            if (recoveredFromLoadFailure)
+            {
+                StatusBanner.IsVisible = false;
+            }
 
             if (!quiet)
             {
@@ -110,6 +118,7 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            _loadFailed = true;
             AgentStatusText.Text = "Unable to contact Hi5Central Agent";
             AgentStatusText.Foreground = Avalonia.Media.Brushes.IndianRed;
             ShowStatus(
@@ -209,6 +218,7 @@ public sealed partial class MainWindow : Window
                 StatusForeground = status.Foreground,
             });
         }
+        NoRequestsText.IsVisible = _recentRequests.Count == 0;
 
         var updateItems = new List<DashboardUpdateItem>();
         updateItems.AddRange(_updates.Windows.Select(update => new DashboardUpdateItem
@@ -245,6 +255,7 @@ public sealed partial class MainWindow : Window
         {
             _dashboardUpdates.Add(update);
         }
+        NoUpdatesText.IsVisible = _dashboardUpdates.Count == 0;
     }
 
     private static (string Text, string Background, string Foreground) RequestDisplay(string value)
@@ -674,7 +685,7 @@ public sealed partial class MainWindow : Window
 
     private void UpdatePollState()
     {
-        if (NeedsPolling())
+        if (_loadFailed || NeedsPolling())
         {
             if (!_pollTimer.IsEnabled) _pollTimer.Start();
         }
@@ -726,7 +737,10 @@ public sealed partial class MainWindow : Window
     {
         return exception switch
         {
-            OperationCanceledException => "The Hi5Central Agent did not respond in time. Please try again.",
+            OperationCanceledException =>
+                "Hi5Central did not respond in time. Self Service will retry automatically.",
+            JsonException =>
+                "Hi5Central returned device data in an unexpected format. Self Service will retry automatically.",
             PlatformNotSupportedException => exception.Message,
             _ when !string.IsNullOrWhiteSpace(exception.Message) => exception.Message,
             _ => "Please try again. If the problem continues, contact your IT team.",
