@@ -536,21 +536,20 @@ json ProbePresence(
     present = icmpReachable || !macAddress.empty();
     if (!present) return json();
 
-    const std::string hostname = ReverseDnsName(ipAddress);
     json methods = json::array();
     if (!macAddress.empty()) methods.push_back("arp");
     if (icmpReachable) methods.push_back("icmp");
-    if (!hostname.empty()) methods.push_back("reverse_dns");
 
     json device = {
         {"ipAddress", ipAddress},
         {"macAddress", macAddress},
-        {"hostname", hostname},
+        {"hostname", ""},
         {"icmpReachable", icmpReachable},
         {"discoveryMethods", methods},
         {"interfaces", json::array()},
         {"metadata", {
-            {"scanner", "hi5central-native-presence"}
+            {"scanner", "hi5central-native-presence"},
+            {"nameEnrichmentDeferred", true}
         }}
     };
     if (latencyMs >= 0) device["latencyMs"] = latencyMs;
@@ -746,6 +745,7 @@ json ProbeDevice(std::uint32_t hostAddress, int port, int timeoutMs, int retries
 
 nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& error) {
     error.clear();
+    const auto scanStartedAt = std::chrono::steady_clock::now();
 
     std::string winsockError;
     if (!EnsureWinsock(winsockError)) {
@@ -919,20 +919,19 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
 
             const std::string ipAddress = Ipv4ToString(hostAddress);
             if (ipAddress.empty()) continue;
-            const std::string hostname = ReverseDnsName(ipAddress);
 
             json methods = json::array({"arp"});
-            if (!hostname.empty()) methods.push_back("reverse_dns");
             json device = {
                 {"ipAddress", ipAddress},
                 {"macAddress", macAddress},
-                {"hostname", hostname},
+                {"hostname", ""},
                 {"icmpReachable", false},
                 {"discoveryMethods", methods},
                 {"interfaces", json::array()},
                 {"metadata", {
                     {"scanner", "hi5central-native-presence"},
-                    {"arpAfterProbe", true}
+                    {"arpAfterProbe", true},
+                    {"nameEnrichmentDeferred", true}
                 }}
             };
             devices.emplace_back(hostAddress, std::move(device));
@@ -946,6 +945,9 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
     json outputDevices = json::array();
     for (auto& item : devices) outputDevices.push_back(std::move(item.second));
 
+    const auto scanDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - scanStartedAt).count();
+
     return json{
         {"status", "ok"},
         {"protocolVersion", 2},
@@ -957,6 +959,8 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
         {"addressesResponded", outputDevices.size()},
         {"presenceDevices", presenceCount.load()},
         {"snmpEnrichedDevices", snmpCount.load()},
+        {"scanDurationMs", scanDurationMs},
+        {"nameEnrichmentDeferred", true},
         {"devices", std::move(outputDevices)}
     };
 }

@@ -111,7 +111,7 @@ jobs:
           if ($snmp -notmatch 'RunSnmpDiscovery' -or $snmp -notmatch 'sysObjectID') {
             throw 'Native SNMP discovery implementation is incomplete.'
           }
-          foreach ($presenceContract in @('IcmpSendEcho','GetIpNetTable','ReverseDnsName','presenceEnabled','discoveryMethods')) {
+          foreach ($presenceContract in @('IcmpSendEcho','GetIpNetTable','presenceEnabled','discoveryMethods','nameEnrichmentDeferred')) {
             if ($snmp -notmatch [regex]::Escape($presenceContract)) {
               throw "Native network presence discovery is missing required contract: $presenceContract"
             }
