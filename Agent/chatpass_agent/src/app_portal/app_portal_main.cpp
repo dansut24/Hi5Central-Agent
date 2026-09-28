@@ -62,6 +62,12 @@ std::wstring Utf8ToWide(const std::string& value) {
 void SetStatus(const std::wstring& value) {
     if (g_state.status) SetWindowTextW(g_state.status, value.c_str());
 }
+void SetListViewText(HWND list, int row, int subItem, const std::wstring& value) {
+    LVITEMW item{};
+    item.iSubItem = subItem;
+    item.pszText = const_cast<wchar_t*>(value.c_str());
+    SendMessageW(list, LVM_SETITEMTEXTW, static_cast<WPARAM>(row), reinterpret_cast<LPARAM>(&item));
+}
 void SetBusy(bool busy) {
     g_state.busy = busy;
     if (g_state.refresh) EnableWindow(g_state.refresh, busy ? FALSE : TRUE);
@@ -170,11 +176,11 @@ void PopulateApps(const json& payload) {
         listItem.lParam = row;
         ListView_InsertItem(g_state.list, &listItem);
         const std::wstring version = Utf8ToWide(app.version.empty() ? "—" : app.version);
-        ListView_SetItemTextW(g_state.list, row, 1, const_cast<wchar_t*>(version.c_str()));
+        SetListViewText(g_state.list, row, 1, version);
         const std::wstring publisher = Utf8ToWide(app.publisher.empty() ? "Company application" : app.publisher);
-        ListView_SetItemTextW(g_state.list, row, 2, const_cast<wchar_t*>(publisher.c_str()));
+        SetListViewText(g_state.list, row, 2, publisher);
         const std::wstring status = Utf8ToWide(app.status);
-        ListView_SetItemTextW(g_state.list, row, 3, const_cast<wchar_t*>(status.c_str()));
+        SetListViewText(g_state.list, row, 3, status);
     }
     if (g_state.apps.empty()) SetStatus(L"No applications are currently assigned to you or this device.");
     else SetStatus(std::to_wstring(g_state.apps.size()) + L" application" + (g_state.apps.size() == 1 ? L"" : L"s") + L" available");
