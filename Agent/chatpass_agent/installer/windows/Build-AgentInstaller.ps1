@@ -321,7 +321,8 @@ if (-not $SkipBuild) {
         "/p:PublishSingleFile=true",
         "/p:IncludeNativeLibrariesForSelfExtract=true",
         "/p:EnableCompressionInSingleFile=true",
-        "/p:PublishTrimmed=false",
+        "/p:PublishTrimmed=true",
+        "/p:TrimMode=partial",
         "/p:DebugType=None",
         "/p:DebugSymbols=false"
     )
@@ -335,6 +336,13 @@ if (-not $SkipBuild) {
     if (-not (Test-Path $publishedAppPortal)) {
         throw "Avalonia App Portal executable was not produced: $publishedAppPortal"
     }
+
+    $appPortalSize = (Get-Item $publishedAppPortal).Length
+    $appPortalMaxSize = 25MB
+    if ($appPortalSize -gt $appPortalMaxSize) {
+        throw "Avalonia App Portal exceeded the 25 MiB self-contained size budget: $appPortalSize bytes"
+    }
+    Write-Host "Hi5 Self Service single-file size: $appPortalSize bytes"
 
     $unexpectedSidecars = Get-ChildItem -Path $appPortalPublishPath -File |
         Where-Object { $_.Extension -in @(".dll", ".json") }
