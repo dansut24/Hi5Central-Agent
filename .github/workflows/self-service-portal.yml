@@ -63,3 +63,38 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           path: ${{ runner.temp }}/hi5-self-service/Hi5CentralAppPortal.exe
+
+      - name: Publish conservative trim candidate
+        id: trim
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $project = 'Agent/app_portal/Hi5Central.AppPortal/Hi5Central.AppPortal.csproj'
+          $output = Join-Path $env:RUNNER_TEMP 'hi5-self-service-trimmed'
+          dotnet publish $project -c Release -r win-x64 --self-contained true -o $output `
+            /p:PublishSingleFile=true `
+            /p:IncludeNativeLibrariesForSelfExtract=true `
+            /p:EnableCompressionInSingleFile=true `
+            /p:PublishTrimmed=true `
+            /p:TrimMode=partial `
+            /p:DebugType=None `
+            /p:DebugSymbols=false
+          if ($LASTEXITCODE -ne 0) { throw 'Trim candidate publish failed.' }
+
+          $exe = Join-Path $output 'Hi5CentralAppPortal.exe'
+          if (-not (Test-Path $exe)) { throw 'Trimmed Hi5CentralAppPortal.exe was not produced.' }
+
+          $size = (Get-Item $exe).Length
+          $sizeMiB = [math]::Round($size / 1MB, 2)
+          Write-Host "Trimmed candidate size: $size bytes ($sizeMiB MiB)"
+          "Trimmed candidate: **$sizeMiB MiB** ($size bytes)" |
+            Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload trim candidate
+        if: steps.trim.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hi5-Self-Service-Windows-Trimmed
+          if-no-files-found: error
+          retention-days: 3
+          path: ${{ runner.temp }}/hi5-self-service-trimmed/Hi5CentralAppPortal.exe
