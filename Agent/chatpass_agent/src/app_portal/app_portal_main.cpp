@@ -170,11 +170,11 @@ void PopulateApps(const json& payload) {
         listItem.lParam = row;
         ListView_InsertItem(g_state.list, &listItem);
         const std::wstring version = Utf8ToWide(app.version.empty() ? "—" : app.version);
-        ListView_SetItemText(g_state.list, row, 1, const_cast<wchar_t*>(version.c_str()));
+        ListView_SetItemTextW(g_state.list, row, 1, const_cast<wchar_t*>(version.c_str()));
         const std::wstring publisher = Utf8ToWide(app.publisher.empty() ? "Company application" : app.publisher);
-        ListView_SetItemText(g_state.list, row, 2, const_cast<wchar_t*>(publisher.c_str()));
+        ListView_SetItemTextW(g_state.list, row, 2, const_cast<wchar_t*>(publisher.c_str()));
         const std::wstring status = Utf8ToWide(app.status);
-        ListView_SetItemText(g_state.list, row, 3, const_cast<wchar_t*>(status.c_str()));
+        ListView_SetItemTextW(g_state.list, row, 3, const_cast<wchar_t*>(status.c_str()));
     }
     if (g_state.apps.empty()) SetStatus(L"No applications are currently assigned to you or this device.");
     else SetStatus(std::to_wstring(g_state.apps.size()) + L" application" + (g_state.apps.size() == 1 ? L"" : L"s") + L" available");
@@ -320,8 +320,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = instance;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     wc.lpszClassName = className;
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 2;
