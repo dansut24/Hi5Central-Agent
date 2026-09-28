@@ -1,4 +1,7 @@
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.Text.Json.Serialization;
+using Avalonia.Media.Imaging;
 
 namespace Hi5Central.AppPortal.Models;
 
@@ -264,14 +267,32 @@ public enum AppPortalStatus
     Failed,
 }
 
-public sealed class AppCard
+public sealed class AppCard : INotifyPropertyChanged
 {
+    private Bitmap? _iconImage;
+
     public required PortalApp App { get; init; }
     public required AppPortalStatus Status { get; init; }
     public PortalRequest? Request { get; init; }
 
+    public event PropertyChangedEventHandler? PropertyChanged;
+
     public string Id => App.Id;
     public bool HasRequest => Request is not null;
+    public Bitmap? IconImage
+    {
+        get => _iconImage;
+        set
+        {
+            if (ReferenceEquals(_iconImage, value)) return;
+            _iconImage = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(HasIcon));
+            OnPropertyChanged(nameof(ShowFallbackIcon));
+        }
+    }
+    public bool HasIcon => IconImage is not null;
+    public bool ShowFallbackIcon => IconImage is null;
     public string Name => string.IsNullOrWhiteSpace(App.Name) ? "Application" : App.Name;
     public string Publisher => string.IsNullOrWhiteSpace(App.Publisher)
         ? "Company application"
@@ -344,6 +365,9 @@ public sealed class AppCard
                  ? string.Empty
                  : $" - {App.Scope.Name}"),
     };
+
+    private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 
     private static string BuildInitials(string value)
     {

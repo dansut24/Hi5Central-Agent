@@ -384,13 +384,21 @@
                                         CornerRadius="10"
                                         Background="#EEF4FF"
                                         BorderBrush="#D7E5FA"
-                                        BorderThickness="1">
-                                  <TextBlock Text="{Binding Initials}"
-                                             Foreground="#245899"
-                                             FontSize="13"
-                                             FontWeight="Bold"
-                                             HorizontalAlignment="Center"
-                                             VerticalAlignment="Center" />
+                                        BorderThickness="1"
+                                        ClipToBounds="True">
+                                  <Grid>
+                                    <Image Source="{Binding IconImage}"
+                                           IsVisible="{Binding HasIcon}"
+                                           Stretch="Uniform"
+                                           Margin="5" />
+                                    <TextBlock Text="{Binding Initials}"
+                                               IsVisible="{Binding ShowFallbackIcon}"
+                                               Foreground="#245899"
+                                               FontSize="13"
+                                               FontWeight="Bold"
+                                               HorizontalAlignment="Center"
+                                               VerticalAlignment="Center" />
+                                  </Grid>
                                 </Border>
                                 <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center">
                                   <TextBlock Text="{Binding Name}"

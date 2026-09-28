@@ -5,6 +5,7 @@ using Avalonia.Interactivity;
 using Avalonia.Threading;
 using Hi5Central.AppPortal.Broker;
 using Hi5Central.AppPortal.Models;
+using Hi5Central.AppPortal.Services;
 
 namespace Hi5Central.AppPortal;
 
@@ -19,6 +20,7 @@ public sealed partial class MainWindow : Window
     private readonly ObservableCollection<AppCard> _visibleApps = [];
     private readonly ObservableCollection<RequestSummaryItem> _recentRequests = [];
     private readonly ObservableCollection<DashboardUpdateItem> _dashboardUpdates = [];
+    private readonly AppIconCache _iconCache = new();
     private readonly DispatcherTimer _pollTimer;
     private List<PortalApp> _apps = [];
     private List<PortalInstallation> _installations = [];
@@ -373,6 +375,28 @@ public sealed partial class MainWindow : Window
 
         UpdateHeroText();
         UpdatePollState();
+        _ = LoadVisibleIconsAsync();
+    }
+
+    private async Task LoadVisibleIconsAsync()
+    {
+        var candidates = _visibleApps
+            .Where(card => !string.IsNullOrWhiteSpace(card.App.IconUrl) && !card.HasIcon)
+            .ToArray();
+
+        await Task.WhenAll(candidates.Select(async card =>
+        {
+            var bitmap = await _iconCache.GetAsync(card.App.IconUrl).ConfigureAwait(false);
+            if (bitmap is null) return;
+
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (_visibleApps.Contains(card))
+                {
+                    card.IconImage = bitmap;
+                }
+            });
+        }));
     }
 
     private List<AppCard> BuildCards()
