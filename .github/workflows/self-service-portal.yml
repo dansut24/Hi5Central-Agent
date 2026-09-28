@@ -1,0 +1,65 @@
+name: Hi5 Self Service Portal
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [agent-hardening-v2]
+    paths:
+      - "Agent/app_portal/**"
+      - ".github/workflows/self-service-portal.yml"
+  pull_request:
+    paths:
+      - "Agent/app_portal/**"
+      - ".github/workflows/self-service-portal.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Publish self-contained portal
+        shell: pwsh
+        run: |
+          $project = 'Agent/app_portal/Hi5Central.AppPortal/Hi5Central.AppPortal.csproj'
+          $output = Join-Path $env:RUNNER_TEMP 'hi5-self-service'
+          dotnet publish $project -c Release -r win-x64 --self-contained true -o $output `
+            /p:PublishSingleFile=true `
+            /p:IncludeNativeLibrariesForSelfExtract=true `
+            /p:EnableCompressionInSingleFile=true `
+            /p:PublishTrimmed=false `
+            /p:DebugType=None `
+            /p:DebugSymbols=false
+          if ($LASTEXITCODE -ne 0) { throw 'Hi5 Self Service publish failed.' }
+
+          $exe = Join-Path $output 'Hi5CentralAppPortal.exe'
+          if (-not (Test-Path $exe)) { throw 'Hi5CentralAppPortal.exe was not produced.' }
+
+          $sidecars = Get-ChildItem $output -File |
+            Where-Object { $_.Extension -in @('.dll', '.json', '.pdb') }
+          if ($sidecars) {
+            throw "Self Service publish produced sidecars: $($sidecars.Name -join ', ')"
+          }
+
+          $size = (Get-Item $exe).Length
+          $sizeMiB = [math]::Round($size / 1MB, 2)
+          Write-Host "Hi5 Self Service size: $size bytes ($sizeMiB MiB)"
+          "### Hi5 Self Service`n`nSingle-file size: **$sizeMiB MiB** ($size bytes)" |
+            Add-Content $env:GITHUB_STEP_SUMMARY
+      - name: Upload portal
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hi5-Self-Service-Windows
+          if-no-files-found: error
+          retention-days: 7
+          path: ${{ runner.temp }}/hi5-self-service/Hi5CentralAppPortal.exe
