@@ -63,6 +63,9 @@ jobs:
           if ($identity -notmatch 'bootstrapToken') { throw 'Bootstrap enrollment override is missing.' }
           if ($service -notmatch 'signalingReconnectRequested_') { throw 'Signaling reconnect state is missing.' }
           if ($service -notmatch 'scheduling reconnect') { throw 'WebSocket close no longer schedules reconnect.' }
+          if ($service -notmatch 'jobType == \"windows_update.install\"') { throw 'Compiled Windows service is missing scheduled Windows Update install jobs.' }
+          if ($service -notmatch 'jobType == \"windows_update.rollback\"') { throw 'Compiled Windows service is missing Windows Update rollback jobs.' }
+          if ($service -notmatch 'BuildWindowsUpdateRollbackScript') { throw 'Compiled Windows service is missing rollback capability implementation.' }
 
       - name: Verify remote Viewer and input contracts
         shell: pwsh

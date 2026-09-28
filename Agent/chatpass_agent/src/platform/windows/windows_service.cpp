@@ -3996,12 +3996,26 @@ $installer.Updates = $selected
 try { $installer.ForceQuiet = $true } catch {}
 try { $installer.AllowSourcePrompts = $false } catch {}
 $installResult = $installer.Install()
+$rollbackSupport = @{}
+try {
+    $installedSearch = $searcher.Search("IsInstalled=1 and IsHidden=0 and Type='Software'")
+    for ($j = 0; $j -lt $installedSearch.Updates.Count; $j++) {
+        $installedUpdate = $installedSearch.Updates.Item($j)
+        $installedInfo = Get-Hi5UpdateInfo $installedUpdate
+        if (-not $installedInfo.update_id) { continue }
+        $supported = $false
+        try { $supported = (-not $installedInfo.is_driver) -and [bool]$installedUpdate.IsUninstallable } catch {}
+        $rollbackSupport[([string]$installedInfo.update_id).ToLowerInvariant()] = $supported
+    }
+} catch {}
 $results = @()
 for ($i = 0; $i -lt $selected.Count; $i++) {
     $u = $selected.Item($i)
     $ur = $installResult.GetUpdateResult($i)
     $info = Get-Hi5UpdateInfo $u
     $results += [pscustomobject]@{
+        update_id = $info.update_id
+        revision_number = $info.revision_number
         title = $info.title
         kb_articles = $info.kb_articles
         categories = $info.categories
@@ -4010,6 +4024,7 @@ for ($i = 0; $i -lt $selected.Count; $i++) {
         result = Convert-Hi5UpdateResultCode ([int]$ur.ResultCode)
         hresult = ('0x{0:X8}' -f ([uint32]$ur.HResult))
         reboot_required = $(try { [bool]$ur.RebootRequired } catch { $false })
+        rollback_supported = $(try { [bool]$rollbackSupport[([string]$info.update_id).ToLowerInvariant()] } catch { $false })
     }
 }
 $overall = Convert-Hi5UpdateResultCode ([int]$installResult.ResultCode)
@@ -4030,6 +4045,100 @@ $overall = Convert-Hi5UpdateResultCode ([int]$installResult.ResultCode)
     results = $results
 } | ConvertTo-Json -Depth 10 -Compress
 if ($installResult.ResultCode -eq 4 -or $installResult.ResultCode -eq 5) { exit 1 }
+)HI5PS";
+            }
+
+            std::string BuildWindowsUpdateRollbackScript(const json& payload) {
+                const std::string payloadText = payload.dump();
+                return WindowsUpdateCommonPowerShell() + R"HI5PS(
+$ErrorActionPreference = 'Stop'
+$payload = @'
+)HI5PS" + payloadText + R"HI5PS(
+'@ | ConvertFrom-Json
+$updateIds = @()
+try { if ($payload.update_ids) { foreach ($id in $payload.update_ids) { if ($id) { $updateIds += ([string]$id).ToLowerInvariant() } } } } catch {}
+$kbFilter = @()
+try { if ($payload.kb_articles) { foreach ($kb in $payload.kb_articles) { $kbFilter += ([string]$kb).ToUpperInvariant().Replace('KB','') } } } catch {}
+$titleFilter = @()
+try { if ($payload.titles) { foreach ($t in $payload.titles) { if ($t) { $titleFilter += [string]$t } } } } catch {}
+if (($updateIds.Count + $kbFilter.Count + $titleFilter.Count) -eq 0) { throw 'Rollback requires an update ID, KB, or title selector.' }
+
+$session = New-Object -ComObject Microsoft.Update.Session
+$searcher = $session.CreateUpdateSearcher()
+$search = $searcher.Search("IsInstalled=1 and IsHidden=0 and Type='Software'")
+$selected = New-Object -ComObject Microsoft.Update.UpdateColl
+$matched = @()
+for ($i = 0; $i -lt $search.Updates.Count; $i++) {
+    $u = $search.Updates.Item($i)
+    $info = Get-Hi5UpdateInfo $u
+    $matches = $false
+    if ($updateIds -contains ([string]$info.update_id).ToLowerInvariant()) { $matches = $true }
+    foreach ($kb in $info.kb_articles) {
+        if ($kbFilter -contains ([string]$kb).ToUpperInvariant().Replace('KB','')) { $matches = $true }
+    }
+    foreach ($t in $titleFilter) { if ($info.title -eq $t) { $matches = $true } }
+    if (-not $matches) { continue }
+
+    $supported = $false
+    try { $supported = (-not $info.is_driver) -and [bool]$u.IsUninstallable } catch {}
+    $matched += [pscustomobject]@{
+        update_id = $info.update_id
+        revision_number = $info.revision_number
+        title = $info.title
+        kb_articles = $info.kb_articles
+        categories = $info.categories
+        is_driver = $info.is_driver
+        rollback_supported = $supported
+    }
+    if ($supported) { [void]$selected.Add($u) }
+}
+if ($selected.Count -eq 0) {
+    [pscustomobject]@{
+        action = 'rollback_windows_updates'
+        status = 'unsupported'
+        message = 'Windows does not report the selected update as uninstallable.'
+        matched_count = $matched.Count
+        selected_count = 0
+        reboot_required = Get-Hi5RebootRequired
+        updates = $matched
+    } | ConvertTo-Json -Depth 10 -Compress
+    exit 2
+}
+
+$installer = $session.CreateUpdateInstaller()
+$installer.Updates = $selected
+try { $installer.ForceQuiet = $true } catch {}
+try { $installer.AllowSourcePrompts = $false } catch {}
+$rollback = $installer.Uninstall()
+$results = @()
+for ($i = 0; $i -lt $selected.Count; $i++) {
+    $u = $selected.Item($i)
+    $info = Get-Hi5UpdateInfo $u
+    $ur = $rollback.GetUpdateResult($i)
+    $results += [pscustomobject]@{
+        update_id = $info.update_id
+        revision_number = $info.revision_number
+        title = $info.title
+        kb_articles = $info.kb_articles
+        result_code = [int]$ur.ResultCode
+        result = Convert-Hi5UpdateResultCode ([int]$ur.ResultCode)
+        hresult = ('0x{0:X8}' -f ([uint32]$ur.HResult))
+        reboot_required = $(try { [bool]$ur.RebootRequired } catch { $false })
+    }
+}
+$overall = Convert-Hi5UpdateResultCode ([int]$rollback.ResultCode)
+[pscustomobject]@{
+    action = 'rollback_windows_updates'
+    status = if ($rollback.ResultCode -eq 2 -or $rollback.ResultCode -eq 3) { 'ok' } else { 'failed' }
+    matched_count = $matched.Count
+    selected_count = [int]$selected.Count
+    rollback_result_code = [int]$rollback.ResultCode
+    rollback_result = $overall
+    reboot_required = (Get-Hi5RebootRequired -or [bool]$rollback.RebootRequired)
+    completed_at = (Get-Date).ToUniversalTime().ToString('o')
+    results = $results
+} | ConvertTo-Json -Depth 10 -Compress
+if ($rollback.ResultCode -eq 4 -or $rollback.ResultCode -eq 5) { exit 1 }
 )HI5PS";
             }
 
@@ -5501,6 +5610,52 @@ exit 1
                         json result = BuildCommandActionResult(command, cr);
                         const bool ok = cr.error.empty() && cr.exitCode == 0;
                         PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "windows_update.scan") {
+                        const int timeoutSeconds = std::max(60, std::min(3600, payload.value("timeout_seconds", 1800)));
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildWindowsUpdateScanScript(), timeoutSeconds);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        if (ok) {
+                            try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                        }
+                        return;
+                    }
+
+                    if (jobType == "windows_update.history") {
+                        const int timeoutSeconds = std::max(30, std::min(1800, payload.value("timeout_seconds", 300)));
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildWindowsUpdateHistoryScript(payload), timeoutSeconds);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        return;
+                    }
+
+                    if (jobType == "windows_update.install") {
+                        const int timeoutSeconds = std::max(300, std::min(14400, payload.value("timeout_seconds", 7200)));
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildWindowsUpdateInstallScript(payload), timeoutSeconds);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && result.value("status", std::string("ok")) != "failed";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        if (ok) {
+                            try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                        }
+                        return;
+                    }
+
+                    if (jobType == "windows_update.rollback") {
+                        const int timeoutSeconds = std::max(300, std::min(14400, payload.value("timeout_seconds", 7200)));
+                        CommandResult cr = RunPowerShellCommand(jobId, BuildWindowsUpdateRollbackScript(payload), timeoutSeconds);
+                        json result = BuildCommandActionResult(std::string(), cr);
+                        const std::string status = result.value("status", std::string("failed"));
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && status == "ok";
+                        PostJobResult(ident, jobId, ok, result, cr.error);
+                        if (ok) {
+                            try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                        }
                         return;
                     }
 
