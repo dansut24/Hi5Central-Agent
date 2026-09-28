@@ -5820,6 +5820,15 @@ exit 1
                         return;
                     }
 
+                    if (jobType == "network.discovery.enrich") {
+                        std::string discoveryError;
+                        json result = hi5::network::RunNetworkDiscoveryEnrichment(payload, discoveryError);
+                        const bool ok = discoveryError.empty()
+                            && result.value("status", std::string("failed")) == "ok";
+                        PostJobResult(ident, jobId, ok, result, discoveryError);
+                        return;
+                    }
+
                     if (jobType == "custom.command") {
                         const std::string command = payload.value("command", std::string("whoami"));
                         const int timeoutSeconds = std::max(5, std::min(3600, payload.value("timeout_seconds", 120)));

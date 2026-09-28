@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -965,6 +966,103 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
         {"scanDurationMs", scanDurationMs},
         {"nameEnrichmentDeferred", true},
         {"devices", std::move(outputDevices)}
+    };
+}
+
+nlohmann::json RunNetworkDiscoveryEnrichment(
+    const nlohmann::json& payload,
+    std::string& error) {
+    error.clear();
+    const auto startedAt = std::chrono::steady_clock::now();
+
+    std::string winsockError;
+    if (!EnsureWinsock(winsockError)) {
+        error = winsockError;
+        return json{{"status", "failed"}, {"error", error}};
+    }
+
+    const json rawTargets = payload.value("targets", json::array());
+    if (!rawTargets.is_array()) {
+        error = "Network discovery enrichment targets are invalid.";
+        return json{{"status", "failed"}, {"error", error}};
+    }
+
+    std::vector<std::string> targets;
+    std::unordered_set<std::string> seen;
+    targets.reserve(std::min<std::size_t>(rawTargets.size(), 512));
+
+    for (const auto& raw : rawTargets) {
+        if (!raw.is_string()) continue;
+        const std::string ipAddress = raw.get<std::string>();
+        if (ipAddress.empty() || ipAddress.size() > 64) continue;
+
+        IN_ADDR address{};
+        if (InetPtonA(AF_INET, ipAddress.c_str(), &address) != 1) continue;
+        const std::uint32_t host = ntohl(address.S_un.S_addr);
+        const std::uint8_t firstOctet = static_cast<std::uint8_t>((host >> 24) & 0xff);
+        const std::uint8_t secondOctet = static_cast<std::uint8_t>((host >> 16) & 0xff);
+        const bool privateAddress =
+            firstOctet == 10
+            || (firstOctet == 172 && secondOctet >= 16 && secondOctet <= 31)
+            || (firstOctet == 192 && secondOctet == 168);
+        if (!privateAddress) continue;
+
+        if (seen.insert(ipAddress).second) {
+            targets.push_back(ipAddress);
+            if (targets.size() >= 512) break;
+        }
+    }
+
+    std::atomic<std::size_t> nextIndex{0};
+    std::mutex resultMutex;
+    std::vector<json> resolved;
+    resolved.reserve(targets.size());
+
+    const std::size_t workerCount =
+        std::max<std::size_t>(1, std::min<std::size_t>(16, targets.size()));
+    std::vector<std::thread> workers;
+    workers.reserve(workerCount);
+
+    for (std::size_t worker = 0; worker < workerCount; ++worker) {
+        workers.emplace_back([&]() {
+            for (;;) {
+                const std::size_t index = nextIndex.fetch_add(1);
+                if (index >= targets.size()) break;
+
+                const std::string& ipAddress = targets[index];
+                const std::string hostname = ReverseDnsName(ipAddress);
+                if (hostname.empty()) continue;
+
+                json item = {
+                    {"ipAddress", ipAddress},
+                    {"hostname", hostname},
+                    {"discoveryMethods", json::array({"reverse_dns"})}
+                };
+                std::lock_guard<std::mutex> lock(resultMutex);
+                resolved.push_back(std::move(item));
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+
+    std::sort(
+        resolved.begin(),
+        resolved.end(),
+        [](const json& left, const json& right) {
+            return left.value("ipAddress", std::string())
+                < right.value("ipAddress", std::string());
+        });
+
+    const auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - startedAt).count();
+
+    return json{
+        {"status", "ok"},
+        {"protocolVersion", 1},
+        {"targetsTotal", targets.size()},
+        {"resolvedCount", resolved.size()},
+        {"durationMs", durationMs},
+        {"devices", resolved}
     };
 }
 

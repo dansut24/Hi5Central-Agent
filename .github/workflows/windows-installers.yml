@@ -108,8 +108,14 @@ jobs:
           if ($service -notmatch 'jobType == \"network\.discovery\.scan\"') {
             throw 'Windows Agent no longer handles first-class network discovery scan jobs.'
           }
+          if ($service -notmatch 'jobType == \"network\.discovery\.enrich\"') {
+            throw 'Windows Agent no longer handles network discovery enrichment jobs.'
+          }
           if ($snmp -notmatch 'RunSnmpDiscovery' -or $snmp -notmatch 'sysObjectID') {
             throw 'Native SNMP discovery implementation is incomplete.'
+          }
+          if ($snmp -notmatch 'RunNetworkDiscoveryEnrichment' -or $snmp -notmatch 'reverse_dns') {
+            throw 'Native network discovery name enrichment implementation is incomplete.'
           }
           foreach ($presenceContract in @('IcmpSendEcho','GetIpNetTable','presenceEnabled','discoveryMethods','nameEnrichmentDeferred','MIB_IPNET_TYPE_INVALID','allZero','allBroadcast')) {
             if ($snmp -notmatch [regex]::Escape($presenceContract)) {
