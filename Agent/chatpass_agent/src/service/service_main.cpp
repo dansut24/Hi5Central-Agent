@@ -2956,13 +2956,14 @@ $wuStatusServer = Get-Hi5RegistryValue $windowsUpdatePath 'WUStatusServer'
 $doNotConnect = Get-Hi5RegistryValue $windowsUpdatePath 'DoNotConnectToWindowsUpdateInternetLocations'
 $disablePauseRaw = Get-Hi5RegistryValue $windowsUpdatePath 'SetDisablePauseUXAccess'
 $disableUxRaw = Get-Hi5RegistryValue $windowsUpdatePath 'SetDisableUXWUAccess'
-$policyManagerAuto = Get-Hi5RegistryValue $policyManagerPath 'AllowAutoUpdate'
-$policyManagerPause = Get-Hi5RegistryValue $policyManagerPath 'SetDisablePauseUXAccess'
 
 if ($enabled) {
     $conflicts = @()
     if (-not $markerOwned) {
-        if ($cspInstances.Count -gt 0 -or $policyManagerAuto.exists -or $policyManagerPause.exists) {
+        # PolicyManager's current-device keys contain Windows defaults even when no MDM
+        # provider owns Update policy. A real Policy CSP owner is represented by the
+        # Update WMI Bridge instance; only that instance is authoritative here.
+        if ($cspInstances.Count -gt 0) {
             $conflicts += 'csp_windows_update_policy'
         }
         if ($wuServer.exists -or $wuStatusServer.exists -or ($useWuServer.exists -and [int]$useWuServer.value -eq 1)) {
@@ -4463,7 +4464,8 @@ exit 1
                         CommandResult cr = RunPowerShellCommand(jobId, BuildWindowsUpdateManagementScript(payload), timeoutSeconds);
                         json result = BuildCommandActionResult(std::string(), cr);
                         const std::string status = result.value("status", std::string("failed"));
-                        const bool ok = cr.error.empty() && cr.exitCode == 0 && status == "ok";
+                        const bool evaluated = status == "ok" || status == "conflict" || status == "unsupported";
+                        const bool ok = cr.error.empty() && cr.exitCode == 0 && evaluated;
                         const std::string message = result.value("message", std::string());
                         PostJobResult(ident, jobId, ok, result, ok ? std::string() : (!message.empty() ? message : cr.error));
                         return;

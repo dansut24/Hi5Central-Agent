@@ -71,6 +71,8 @@ jobs:
           if ($service -notmatch 'MDM_Policy_Config01_Update02') { throw 'Compiled Windows service is missing Windows Update Policy CSP management.' }
           if ($service -notmatch 'SetDisablePauseUXAccess') { throw 'Compiled Windows service is missing managed Windows Update pause-UX control.' }
           if ($service -notmatch 'AllowAutoUpdate') { throw 'Compiled Windows service is missing managed Windows Update automatic-update control.' }
+          if ($service -match '\$policyManagerAuto\.exists|\$policyManagerPause\.exists') { throw 'Compiled Windows service still treats PolicyManager defaults as external MDM ownership.' }
+          if ($service -notmatch 'status == \"conflict\".*status == \"unsupported\"') { throw 'Compiled Windows service is missing non-failure management evaluation outcomes.' }
 
       - name: Verify remote Viewer and input contracts
         shell: pwsh
