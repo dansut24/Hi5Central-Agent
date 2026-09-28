@@ -5,6 +5,7 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <icmpapi.h>
+#include <winhttp.h>
 #include <windows.h>
 #endif
 
@@ -745,6 +746,405 @@ json ProbeDevice(std::uint32_t hostAddress, int port, int timeoutMs, int retries
     return device;
 }
 
+
+std::string TrimAscii(std::string value) {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    return value;
+}
+
+std::string LowerAscii(std::string value) {
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+std::string HeaderValue(const std::string& response, const std::string& wantedKey) {
+    const std::string wanted = LowerAscii(wantedKey);
+    std::istringstream stream(response);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string key = LowerAscii(TrimAscii(line.substr(0, colon)));
+        if (key == wanted) return TrimAscii(line.substr(colon + 1));
+    }
+    return {};
+}
+
+bool IsPrivateIpv4Address(const std::string& ipAddress) {
+    IN_ADDR address{};
+    if (InetPtonA(AF_INET, ipAddress.c_str(), &address) != 1) return false;
+    const std::uint32_t host = ntohl(address.S_un.S_addr);
+    const std::uint8_t first = static_cast<std::uint8_t>((host >> 24) & 0xff);
+    const std::uint8_t second = static_cast<std::uint8_t>((host >> 16) & 0xff);
+    return first == 10
+        || (first == 172 && second >= 16 && second <= 31)
+        || (first == 192 && second == 168);
+}
+
+std::wstring Utf8ToWide(const std::string& value) {
+    if (value.empty()) return {};
+    const int count = MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (count <= 0) return {};
+    std::wstring output(static_cast<std::size_t>(count), L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            output.data(),
+            count) != count) {
+        return {};
+    }
+    return output;
+}
+
+std::string WideToUtf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int count = WideCharToMultiByte(
+        CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (count <= 0) return {};
+    std::string output(static_cast<std::size_t>(count), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            value.data(),
+            static_cast<int>(value.size()),
+            output.data(),
+            count,
+            nullptr,
+            nullptr) != count) {
+        return {};
+    }
+    return output;
+}
+
+struct SsdpRecord {
+    std::string ipAddress;
+    std::string location;
+    std::string server;
+    std::string searchTarget;
+    std::string usn;
+};
+
+std::unordered_map<std::string, SsdpRecord> DiscoverSsdp(
+    const std::unordered_set<std::string>& targets) {
+    std::unordered_map<std::string, SsdpRecord> records;
+#ifdef _WIN32
+    if (targets.empty()) return records;
+
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) return records;
+
+    DWORD timeoutMs = 250;
+    setsockopt(
+        sock,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&timeoutMs),
+        sizeof(timeoutMs));
+
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(0);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
+        closesocket(sock);
+        return records;
+    }
+
+    sockaddr_in destination{};
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(1900);
+    InetPtonA(AF_INET, "239.255.255.250", &destination.sin_addr);
+
+    static constexpr char kSearch[] =
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        "MAN: \"ssdp:discover\"\r\n"
+        "MX: 1\r\n"
+        "ST: ssdp:all\r\n"
+        "\r\n";
+    sendto(
+        sock,
+        kSearch,
+        static_cast<int>(sizeof(kSearch) - 1),
+        0,
+        reinterpret_cast<const sockaddr*>(&destination),
+        sizeof(destination));
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2200);
+    std::vector<char> buffer(64 * 1024);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        sockaddr_in source{};
+        int sourceLength = sizeof(source);
+        const int received = recvfrom(
+            sock,
+            buffer.data(),
+            static_cast<int>(buffer.size() - 1),
+            0,
+            reinterpret_cast<sockaddr*>(&source),
+            &sourceLength);
+        if (received <= 0) {
+            const int error = WSAGetLastError();
+            if (error == WSAETIMEDOUT || error == WSAEWOULDBLOCK) continue;
+            break;
+        }
+
+        char ipBuffer[INET_ADDRSTRLEN]{};
+        if (!InetNtopA(AF_INET, &source.sin_addr, ipBuffer, sizeof(ipBuffer))) continue;
+        const std::string ipAddress = ipBuffer;
+        if (targets.find(ipAddress) == targets.end()) continue;
+
+        const std::string response(buffer.data(), static_cast<std::size_t>(received));
+        const std::string statusLine = LowerAscii(response.substr(0, std::min<std::size_t>(64, response.size())));
+        if (statusLine.find("200 ok") == std::string::npos) continue;
+
+        SsdpRecord candidate;
+        candidate.ipAddress = ipAddress;
+        candidate.location = HeaderValue(response, "location");
+        candidate.server = HeaderValue(response, "server");
+        candidate.searchTarget = HeaderValue(response, "st");
+        candidate.usn = HeaderValue(response, "usn");
+
+        auto it = records.find(ipAddress);
+        if (it == records.end()) {
+            records.emplace(ipAddress, std::move(candidate));
+        } else {
+            if (it->second.location.empty() && !candidate.location.empty()) it->second.location = candidate.location;
+            if (it->second.server.empty() && !candidate.server.empty()) it->second.server = candidate.server;
+            if (it->second.searchTarget.empty() && !candidate.searchTarget.empty()) it->second.searchTarget = candidate.searchTarget;
+            if (it->second.usn.empty() && !candidate.usn.empty()) it->second.usn = candidate.usn;
+        }
+    }
+
+    closesocket(sock);
+#else
+    (void)targets;
+#endif
+    return records;
+}
+
+std::string XmlDecode(std::string value) {
+    const std::pair<const char*, const char*> entities[] = {
+        {"&amp;", "&"},
+        {"&lt;", "<"},
+        {"&gt;", ">"},
+        {"&quot;", "\""},
+        {"&apos;", "'"},
+    };
+    for (const auto& [encoded, decoded] : entities) {
+        std::size_t position = 0;
+        while ((position = value.find(encoded, position)) != std::string::npos) {
+            value.replace(position, std::strlen(encoded), decoded);
+            position += std::strlen(decoded);
+        }
+    }
+    return TrimAscii(value);
+}
+
+std::string ExtractXmlTag(const std::string& xml, const std::string& tag) {
+    if (xml.empty() || tag.empty()) return {};
+    const std::string lower = LowerAscii(xml);
+    const std::string openNeedle = "<" + LowerAscii(tag);
+    const std::string closeNeedle = "</" + LowerAscii(tag) + ">";
+
+    const auto open = lower.find(openNeedle);
+    if (open == std::string::npos) return {};
+    const auto valueStart = lower.find('>', open + openNeedle.size());
+    if (valueStart == std::string::npos) return {};
+    const auto close = lower.find(closeNeedle, valueStart + 1);
+    if (close == std::string::npos || close <= valueStart + 1) return {};
+    return XmlDecode(xml.substr(valueStart + 1, close - valueStart - 1));
+}
+
+std::string InferSsdpDeviceType(
+    const std::string& friendlyName,
+    const std::string& manufacturer,
+    const std::string& modelName,
+    const std::string& deviceType,
+    const std::string& server,
+    const std::string& searchTarget) {
+    const std::string value = LowerAscii(
+        friendlyName + " " + manufacturer + " " + modelName + " "
+        + deviceType + " " + server + " " + searchTarget);
+    if (value.find("internetgatewaydevice") != std::string::npos
+        || value.find("wanconnectiondevice") != std::string::npos
+        || value.find("router") != std::string::npos
+        || value.find("gateway") != std::string::npos) return "router";
+    if (value.find("mediarenderer") != std::string::npos
+        || value.find("mediaserver") != std::string::npos
+        || value.find("smart tv") != std::string::npos
+        || value.find("fire tv") != std::string::npos
+        || value.find("roku") != std::string::npos) return "media_device";
+    if (value.find("printer") != std::string::npos) return "printer";
+    if (value.find("camera") != std::string::npos
+        || value.find("doorbell") != std::string::npos
+        || value.find("ring") != std::string::npos) return "camera";
+    if (value.find("nas") != std::string::npos
+        || value.find("storage") != std::string::npos) return "storage";
+    return "network_device";
+}
+
+json BuildSsdpEnrichment(const SsdpRecord& record) {
+    json item = {
+        {"ipAddress", record.ipAddress},
+        {"hostname", ""},
+        {"vendor", ""},
+        {"model", ""},
+        {"deviceType", InferSsdpDeviceType(
+            "", "", "", "", record.server, record.searchTarget)},
+        {"discoveryMethods", json::array({"ssdp"})},
+        {"metadata", {
+            {"ssdp", {
+                {"server", record.server},
+                {"st", record.searchTarget},
+                {"usn", record.usn},
+                {"location", record.location}
+            }}
+        }}
+    };
+
+#ifdef _WIN32
+    if (record.location.empty()) return item;
+
+    const std::wstring wideUrl = Utf8ToWide(record.location);
+    if (wideUrl.empty()) return item;
+
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwSchemeLength = static_cast<DWORD>(-1);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(wideUrl.c_str(), 0, 0, &parts)) return item;
+    if (parts.nScheme != INTERNET_SCHEME_HTTP) return item;
+
+    const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    const std::string hostUtf8 = WideToUtf8(host);
+    if (hostUtf8 != record.ipAddress || !IsPrivateIpv4Address(hostUtf8)) return item;
+
+    std::wstring path;
+    if (parts.lpszUrlPath && parts.dwUrlPathLength) {
+        path.assign(parts.lpszUrlPath, parts.dwUrlPathLength);
+    } else {
+        path = L"/";
+    }
+    if (parts.lpszExtraInfo && parts.dwExtraInfoLength) {
+        path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    }
+
+    HINTERNET session = WinHttpOpen(
+        L"Hi5Central-NetworkDiscovery/1.0",
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+    if (!session) return item;
+    WinHttpSetTimeouts(session, 1000, 1000, 1000, 1500);
+
+    HINTERNET connect = WinHttpConnect(session, host.c_str(), parts.nPort, 0);
+    if (!connect) {
+        WinHttpCloseHandle(session);
+        return item;
+    }
+
+    HINTERNET request = WinHttpOpenRequest(
+        connect,
+        L"GET",
+        path.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        0);
+    if (!request) {
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return item;
+    }
+
+    DWORD disable = WINHTTP_DISABLE_REDIRECTS;
+    WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &disable, sizeof(disable));
+
+    std::string xml;
+    bool ok = WinHttpSendRequest(
+        request,
+        WINHTTP_NO_ADDITIONAL_HEADERS,
+        0,
+        WINHTTP_NO_REQUEST_DATA,
+        0,
+        0,
+        0) != FALSE;
+    if (ok) ok = WinHttpReceiveResponse(request, nullptr) != FALSE;
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    if (ok) {
+        ok = WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &statusCode,
+            &statusSize,
+            WINHTTP_NO_HEADER_INDEX) != FALSE
+            && statusCode >= 200 && statusCode < 300;
+    }
+
+    static constexpr std::size_t kMaxXmlBytes = 256 * 1024;
+    while (ok && xml.size() < kMaxXmlBytes) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+        const DWORD allowed = static_cast<DWORD>(
+            std::min<std::size_t>(available, kMaxXmlBytes - xml.size()));
+        if (allowed == 0) break;
+        std::vector<char> chunk(allowed);
+        DWORD read = 0;
+        if (!WinHttpReadData(request, chunk.data(), allowed, &read) || read == 0) break;
+        xml.append(chunk.data(), static_cast<std::size_t>(read));
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+
+    if (!ok || xml.empty()) return item;
+
+    const std::string friendlyName = ExtractXmlTag(xml, "friendlyName");
+    const std::string manufacturer = ExtractXmlTag(xml, "manufacturer");
+    const std::string modelName = ExtractXmlTag(xml, "modelName");
+    const std::string deviceType = ExtractXmlTag(xml, "deviceType");
+
+    if (!friendlyName.empty()) item["hostname"] = friendlyName;
+    if (!manufacturer.empty()) item["vendor"] = manufacturer;
+    if (!modelName.empty()) item["model"] = modelName;
+    item["deviceType"] = InferSsdpDeviceType(
+        friendlyName,
+        manufacturer,
+        modelName,
+        deviceType,
+        record.server,
+        record.searchTarget);
+    item["metadata"]["ssdp"]["deviceType"] = deviceType;
+    item["metadata"]["ssdp"]["friendlyName"] = friendlyName;
+    item["metadata"]["ssdp"]["manufacturer"] = manufacturer;
+    item["metadata"]["ssdp"]["modelName"] = modelName;
+#else
+    (void)record;
+#endif
+    return item;
+}
+
 }  // namespace
 
 nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& error) {
@@ -1016,7 +1416,13 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
     std::atomic<std::size_t> nextIndex{0};
     std::mutex resultMutex;
     std::vector<json> resolved;
-    resolved.reserve(targets.size());
+    resolved.reserve(targets.size() * 2);
+
+    std::unordered_set<std::string> targetSet(targets.begin(), targets.end());
+    std::unordered_map<std::string, SsdpRecord> ssdpRecords;
+    std::thread ssdpDiscovery([&]() {
+        ssdpRecords = DiscoverSsdp(targetSet);
+    });
 
     const std::size_t workerCount =
         std::max<std::size_t>(1, std::min<std::size_t>(16, targets.size()));
@@ -1044,23 +1450,62 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
         });
     }
     for (auto& worker : workers) worker.join();
+    if (ssdpDiscovery.joinable()) ssdpDiscovery.join();
+
+    std::vector<SsdpRecord> ssdpList;
+    ssdpList.reserve(ssdpRecords.size());
+    for (const auto& [ipAddress, record] : ssdpRecords) {
+        (void)ipAddress;
+        ssdpList.push_back(record);
+    }
+
+    std::atomic<std::size_t> ssdpIndex{0};
+    const std::size_t ssdpWorkerCount =
+        std::max<std::size_t>(1, std::min<std::size_t>(8, ssdpList.size()));
+    std::vector<std::thread> ssdpWorkers;
+    ssdpWorkers.reserve(ssdpWorkerCount);
+    for (std::size_t worker = 0; worker < ssdpWorkerCount; ++worker) {
+        ssdpWorkers.emplace_back([&]() {
+            for (;;) {
+                const std::size_t index = ssdpIndex.fetch_add(1);
+                if (index >= ssdpList.size()) break;
+                json item = BuildSsdpEnrichment(ssdpList[index]);
+                std::lock_guard<std::mutex> lock(resultMutex);
+                resolved.push_back(std::move(item));
+            }
+        });
+    }
+    for (auto& worker : ssdpWorkers) worker.join();
 
     std::sort(
         resolved.begin(),
         resolved.end(),
         [](const json& left, const json& right) {
-            return left.value("ipAddress", std::string())
-                < right.value("ipAddress", std::string());
+            const std::string leftIp = left.value("ipAddress", std::string());
+            const std::string rightIp = right.value("ipAddress", std::string());
+            if (leftIp != rightIp) return leftIp < rightIp;
+            return left.value("hostname", std::string()).size()
+                > right.value("hostname", std::string()).size();
         });
+
+    std::unordered_set<std::string> enrichedIps;
+    std::unordered_set<std::string> namedIps;
+    for (const auto& item : resolved) {
+        const std::string ipAddress = item.value("ipAddress", std::string());
+        if (!ipAddress.empty()) enrichedIps.insert(ipAddress);
+        if (!item.value("hostname", std::string()).empty()) namedIps.insert(ipAddress);
+    }
 
     const auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - startedAt).count();
 
     return json{
         {"status", "ok"},
-        {"protocolVersion", 1},
+        {"protocolVersion", 2},
         {"targetsTotal", targets.size()},
-        {"resolvedCount", resolved.size()},
+        {"enrichedCount", enrichedIps.size()},
+        {"resolvedCount", namedIps.size()},
+        {"ssdpCount", ssdpRecords.size()},
         {"durationMs", durationMs},
         {"devices", resolved}
     };

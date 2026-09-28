@@ -117,6 +117,11 @@ jobs:
           if ($snmp -notmatch 'RunNetworkDiscoveryEnrichment' -or $snmp -notmatch 'reverse_dns') {
             throw 'Native network discovery name enrichment implementation is incomplete.'
           }
+          foreach ($ssdpContract in @('DiscoverSsdp','BuildSsdpEnrichment','WINHTTP_DISABLE_REDIRECTS','kMaxXmlBytes','hostUtf8 != record.ipAddress')) {
+            if ($snmp -notmatch [regex]::Escape($ssdpContract)) {
+              throw "Native SSDP/UPnP enrichment is missing required safety contract: $ssdpContract"
+            }
+          }
           foreach ($presenceContract in @('IcmpSendEcho','GetIpNetTable','presenceEnabled','discoveryMethods','nameEnrichmentDeferred','MIB_IPNET_TYPE_INVALID','allZero','allBroadcast')) {
             if ($snmp -notmatch [regex]::Escape($presenceContract)) {
               throw "Native network presence discovery is missing required contract: $presenceContract"
