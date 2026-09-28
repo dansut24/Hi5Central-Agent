@@ -15,4 +15,9 @@
     <PackageReference Include="Avalonia.Desktop" Version="11.3.2" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.2" />
   </ItemGroup>
+
+  <ItemGroup Condition="'$(PublishTrimmed)' == 'true'">
+    <TrimmerRootAssembly Include="Avalonia.Remote.Protocol" />
+    <TrimmerRootAssembly Include="Avalonia.DesignerSupport" />
+  </ItemGroup>
 </Project>
