@@ -68,7 +68,9 @@ jobs:
           if ($service -notmatch 'BuildWindowsUpdateRollbackScript') { throw 'Compiled Windows service is missing rollback capability implementation.' }
           if ($service -notmatch 'jobType == \"windows_update.manage\"') { throw 'Compiled Windows service is missing Windows Update managed-policy jobs.' }
           if ($service -notmatch 'BuildWindowsUpdateManagementScript') { throw 'Compiled Windows service is missing managed-policy implementation.' }
-          if ($service -notmatch 'NoAutoUpdate') { throw 'Compiled Windows service is missing the Hi5Central automatic-update policy guard.' }
+          if ($service -notmatch 'MDM_Policy_Config01_Update02') { throw 'Compiled Windows service is missing Windows Update Policy CSP management.' }
+          if ($service -notmatch 'SetDisablePauseUXAccess') { throw 'Compiled Windows service is missing managed Windows Update pause-UX control.' }
+          if ($service -notmatch 'AllowAutoUpdate') { throw 'Compiled Windows service is missing managed Windows Update automatic-update control.' }
 
       - name: Verify remote Viewer and input contracts
         shell: pwsh

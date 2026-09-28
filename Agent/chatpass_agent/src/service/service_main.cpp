@@ -2899,14 +2899,16 @@ $payload = @'
 $enabled = [bool]$payload.enabled
 $policyId = [string]$payload.policy_id
 $policyName = [string]$payload.policy_name
+
+$owner = 'Hi5Central'
+$markerPath = 'HKLM:\SOFTWARE\Hi5Central\WindowsUpdateManagement'
 $windowsUpdatePath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 $auPath = Join-Path $windowsUpdatePath 'AU'
-$markerPath = 'HKLM:\SOFTWARE\Hi5Central\WindowsUpdateManagement'
-$owner = 'Hi5Central'
-$markerOwned = $false
-try {
-    $markerOwned = ((Get-ItemProperty -LiteralPath $markerPath -Name Owner -ErrorAction Stop).Owner -eq $owner)
-} catch {}
+$policyManagerPath = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update'
+$cspNamespace = 'root\cimv2\mdm\dmmap'
+$cspClass = 'MDM_Policy_Config01_Update02'
+$cspParent = './Vendor/MSFT/Policy/Config'
+$cspInstanceId = 'Update'
 
 function Get-Hi5RegistryValue($path, $name) {
     try {
@@ -2917,85 +2919,150 @@ function Get-Hi5RegistryValue($path, $name) {
     }
 }
 
+function Get-Hi5UpdateCspInstances {
+    try {
+        return @(Get-CimInstance -Namespace $cspNamespace -ClassName $cspClass -ErrorAction Stop |
+            Where-Object { $_.ParentID -eq $cspParent -and $_.InstanceID -eq $cspInstanceId })
+    } catch {
+        return @()
+    }
+}
+
+$markerOwned = $false
+try {
+    $markerOwned = ((Get-ItemProperty -LiteralPath $markerPath -Name Owner -ErrorAction Stop).Owner -eq $owner)
+} catch {}
+
+try {
+    Get-CimClass -Namespace $cspNamespace -ClassName $cspClass -ErrorAction Stop | Out-Null
+} catch {
+    [pscustomobject]@{
+        action = 'manage_windows_update'
+        status = 'unsupported'
+        managed = $false
+        owner = ''
+        management_channel = 'PolicyCSP/WMI Bridge'
+        message = 'Windows Update Policy CSP is unavailable on this Windows edition or build.'
+    } | ConvertTo-Json -Depth 8 -Compress
+    exit 0
+}
+
+$cspInstances = @(Get-Hi5UpdateCspInstances)
 $noAutoUpdate = Get-Hi5RegistryValue $auPath 'NoAutoUpdate'
 $auOptions = Get-Hi5RegistryValue $auPath 'AUOptions'
 $useWuServer = Get-Hi5RegistryValue $auPath 'UseWUServer'
 $wuServer = Get-Hi5RegistryValue $windowsUpdatePath 'WUServer'
 $wuStatusServer = Get-Hi5RegistryValue $windowsUpdatePath 'WUStatusServer'
 $doNotConnect = Get-Hi5RegistryValue $windowsUpdatePath 'DoNotConnectToWindowsUpdateInternetLocations'
-
-$mdmPolicyPath = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update'
-$mdmSignals = @()
-foreach ($name in @(
-    'AllowAutoUpdate',
-    'DeferQualityUpdatesPeriodInDays',
-    'DeferFeatureUpdatesPeriodInDays',
-    'PauseQualityUpdatesStartTime',
-    'PauseFeatureUpdatesStartTime',
-    'ConfigureDeadlineForQualityUpdates',
-    'ConfigureDeadlineForFeatureUpdates'
-)) {
-    $value = Get-Hi5RegistryValue $mdmPolicyPath $name
-    if ($value.exists) { $mdmSignals += $name }
-}
+$disablePauseRaw = Get-Hi5RegistryValue $windowsUpdatePath 'SetDisablePauseUXAccess'
+$disableUxRaw = Get-Hi5RegistryValue $windowsUpdatePath 'SetDisableUXWUAccess'
+$policyManagerAuto = Get-Hi5RegistryValue $policyManagerPath 'AllowAutoUpdate'
+$policyManagerPause = Get-Hi5RegistryValue $policyManagerPath 'SetDisablePauseUXAccess'
 
 if ($enabled) {
     $conflicts = @()
     if (-not $markerOwned) {
+        if ($cspInstances.Count -gt 0 -or $policyManagerAuto.exists -or $policyManagerPause.exists) {
+            $conflicts += 'csp_windows_update_policy'
+        }
         if ($wuServer.exists -or $wuStatusServer.exists -or ($useWuServer.exists -and [int]$useWuServer.value -eq 1)) {
             $conflicts += 'wsus_policy'
         }
-        if ($noAutoUpdate.exists -or $auOptions.exists -or ($doNotConnect.exists -and [int]$doNotConnect.value -ne 0)) {
+        if ($noAutoUpdate.exists -or $auOptions.exists -or $disablePauseRaw.exists -or $disableUxRaw.exists -or
+            ($doNotConnect.exists -and [int]$doNotConnect.value -ne 0)) {
             $conflicts += 'existing_windows_update_policy'
         }
-        if ($mdmSignals.Count -gt 0) {
-            $conflicts += 'mdm_windows_update_policy'
-        }
     }
+
     if ($conflicts.Count -gt 0) {
         [pscustomobject]@{
             action = 'manage_windows_update'
             status = 'conflict'
             managed = $false
             owner = ''
-            conflicts = $conflicts
-            mdm_signals = $mdmSignals
+            conflicts = @($conflicts | Select-Object -Unique)
+            management_channel = 'PolicyCSP/WMI Bridge'
             message = 'Hi5Central did not change Windows Update because another management policy is already present.'
         } | ConvertTo-Json -Depth 8 -Compress
         exit 0
     }
 
-    New-Item -Path $auPath -Force | Out-Null
-    New-ItemProperty -LiteralPath $auPath -Name NoAutoUpdate -PropertyType DWord -Value 1 -Force | Out-Null
+    if ($cspInstances.Count -gt 1) {
+        [pscustomobject]@{
+            action = 'manage_windows_update'
+            status = 'conflict'
+            managed = $false
+            owner = ''
+            conflicts = @('multiple_update_csp_instances')
+            management_channel = 'PolicyCSP/WMI Bridge'
+            message = 'Multiple Windows Update CSP policy instances were found; Hi5Central refused to choose one.'
+        } | ConvertTo-Json -Depth 8 -Compress
+        exit 0
+    }
+
+    if ($cspInstances.Count -eq 0) {
+        New-CimInstance -Namespace $cspNamespace -ClassName $cspClass -Property @{
+            ParentID = $cspParent
+            InstanceID = $cspInstanceId
+            AllowAutoUpdate = 0
+            SetDisablePauseUXAccess = 1
+        } -ErrorAction Stop | Out-Null
+    } else {
+        $current = $cspInstances[0]
+        $current.AllowAutoUpdate = 0
+        $current.SetDisablePauseUXAccess = 1
+        Set-CimInstance -CimInstance $current -ErrorAction Stop | Out-Null
+    }
+
+    try { & "$env:SystemRoot\System32\UsoClient.exe" RefreshSettings | Out-Null } catch {}
+
     New-Item -Path $markerPath -Force | Out-Null
     New-ItemProperty -LiteralPath $markerPath -Name Owner -PropertyType String -Value $owner -Force | Out-Null
-    New-ItemProperty -LiteralPath $markerPath -Name SchemaVersion -PropertyType DWord -Value 1 -Force | Out-Null
+    New-ItemProperty -LiteralPath $markerPath -Name SchemaVersion -PropertyType DWord -Value 3 -Force | Out-Null
     New-ItemProperty -LiteralPath $markerPath -Name PolicyId -PropertyType String -Value $policyId -Force | Out-Null
     New-ItemProperty -LiteralPath $markerPath -Name PolicyName -PropertyType String -Value $policyName -Force | Out-Null
+    New-ItemProperty -LiteralPath $markerPath -Name ManagementChannel -PropertyType String -Value 'PolicyCSP/WMI Bridge' -Force | Out-Null
+    New-ItemProperty -LiteralPath $markerPath -Name AutomaticUpdateMode -PropertyType String -Value 'NotifyBeforeDownload' -Force | Out-Null
+    New-ItemProperty -LiteralPath $markerPath -Name PauseUxDisabled -PropertyType DWord -Value 1 -Force | Out-Null
     New-ItemProperty -LiteralPath $markerPath -Name AppliedAtUtc -PropertyType String -Value ((Get-Date).ToUniversalTime().ToString('o')) -Force | Out-Null
+
+    Start-Sleep -Milliseconds 500
+    $applied = @(Get-Hi5UpdateCspInstances)
+    $appliedAuto = if ($applied.Count -eq 1) { $applied[0].AllowAutoUpdate } else { $null }
+    $appliedPause = if ($applied.Count -eq 1) { $applied[0].SetDisablePauseUXAccess } else { $null }
 
     [pscustomobject]@{
         action = 'manage_windows_update'
         status = 'ok'
         managed = $true
         owner = $owner
-        automatic_updates_disabled = $true
+        management_channel = 'PolicyCSP/WMI Bridge'
+        automatic_update_mode = 'NotifyBeforeDownload'
+        allow_auto_update = $appliedAuto
+        pause_updates_disabled = ([int]$appliedPause -eq 1)
         update_source = 'Microsoft Update'
         policy_id = $policyId
         policy_name = $policyName
-        policy_path = $auPath
-        policy_value = 'NoAutoUpdate'
-        policy_data = 1
+        settings_ui_refresh_may_require_restart = $true
     } | ConvertTo-Json -Depth 8 -Compress
     exit 0
 }
 
 if ($markerOwned) {
-    $current = Get-Hi5RegistryValue $auPath 'NoAutoUpdate'
-    if ($current.exists -and [int]$current.value -eq 1) {
-        Remove-ItemProperty -LiteralPath $auPath -Name NoAutoUpdate -ErrorAction SilentlyContinue
+    foreach ($instance in @(Get-Hi5UpdateCspInstances)) {
+        Remove-CimInstance -CimInstance $instance -ErrorAction SilentlyContinue
     }
+
+    # Clean values written by earlier Hi5Central registry-based management versions.
+    foreach ($name in @('NoAutoUpdate','AUOptions')) {
+        Remove-ItemProperty -LiteralPath $auPath -Name $name -ErrorAction SilentlyContinue
+    }
+    foreach ($name in @('SetDisablePauseUXAccess','SetDisableUXWUAccess')) {
+        Remove-ItemProperty -LiteralPath $windowsUpdatePath -Name $name -ErrorAction SilentlyContinue
+    }
+
     Remove-Item -LiteralPath $markerPath -Recurse -Force -ErrorAction SilentlyContinue
+    try { & "$env:SystemRoot\System32\UsoClient.exe" RefreshSettings | Out-Null } catch {}
 }
 
 [pscustomobject]@{
@@ -3003,8 +3070,11 @@ if ($markerOwned) {
     status = 'ok'
     managed = $false
     owner = ''
-    automatic_updates_disabled = $false
-    message = if ($markerOwned) { 'Hi5Central Windows Update management policy removed.' } else { 'Hi5Central did not own a Windows Update policy on this device.' }
+    management_channel = 'PolicyCSP/WMI Bridge'
+    automatic_update_mode = 'WindowsDefault'
+    update_source = 'Microsoft Update'
+    settings_ui_refresh_may_require_restart = $markerOwned
+    message = if ($markerOwned) { 'Hi5Central Windows Update CSP policy removed.' } else { 'Hi5Central did not own a Windows Update policy on this device.' }
 } | ConvertTo-Json -Depth 8 -Compress
 )HI5PS";
             }
@@ -4394,7 +4464,8 @@ exit 1
                         json result = BuildCommandActionResult(std::string(), cr);
                         const std::string status = result.value("status", std::string("failed"));
                         const bool ok = cr.error.empty() && cr.exitCode == 0 && status == "ok";
-                        PostJobResult(ident, jobId, ok, result, status == "conflict" ? result.value("message", std::string()) : cr.error);
+                        const std::string message = result.value("message", std::string());
+                        PostJobResult(ident, jobId, ok, result, ok ? std::string() : (!message.empty() ? message : cr.error));
                         return;
                     }
 
