@@ -4,14 +4,17 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <icmpapi.h>
 #include <windows.h>
 #endif
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -370,6 +373,17 @@ bool ParseIpv4Cidr(const std::string& cidr, std::uint32_t& firstAddress, std::ui
     }
 
     const std::uint32_t host = ntohl(address.S_un.S_addr);
+    const std::uint8_t firstOctet = static_cast<std::uint8_t>((host >> 24) & 0xff);
+    const std::uint8_t secondOctet = static_cast<std::uint8_t>((host >> 16) & 0xff);
+    const bool privateAddress =
+        firstOctet == 10
+        || (firstOctet == 172 && secondOctet >= 16 && secondOctet <= 31)
+        || (firstOctet == 192 && secondOctet == 168);
+    if (!privateAddress) {
+        error = "Network discovery is limited to private RFC1918 IPv4 ranges.";
+        return false;
+    }
+
     const std::uint32_t hostBits = static_cast<std::uint32_t>(32 - prefix);
     const std::uint32_t size = hostBits == 32 ? 0 : (1u << hostBits);
     const std::uint32_t mask = prefix == 32 ? 0xffffffffu : (0xffffffffu << hostBits);
@@ -406,6 +420,141 @@ std::string Ipv4ToString(std::uint32_t hostAddress) {
 #else
     return {};
 #endif
+}
+
+std::string FormatMacAddress(const unsigned char* bytes, std::size_t length) {
+    if (!bytes || length == 0 || length > 32) return {};
+    char buffer[4]{};
+    std::string output;
+    for (std::size_t i = 0; i < length; ++i) {
+        std::snprintf(buffer, sizeof(buffer), "%02X", bytes[i]);
+        if (!output.empty()) output.push_back(':');
+        output += buffer;
+    }
+    return output;
+}
+
+std::unordered_map<std::uint32_t, std::string> SnapshotIpv4Neighbours() {
+    std::unordered_map<std::uint32_t, std::string> neighbours;
+#ifdef _WIN32
+    ULONG size = 0;
+    if (GetIpNetTable(nullptr, &size, FALSE) != ERROR_INSUFFICIENT_BUFFER || size == 0) {
+        return neighbours;
+    }
+    std::vector<std::uint8_t> storage(size);
+    auto* table = reinterpret_cast<MIB_IPNETTABLE*>(storage.data());
+    if (GetIpNetTable(table, &size, FALSE) != NO_ERROR) return neighbours;
+
+    for (DWORD index = 0; index < table->dwNumEntries; ++index) {
+        const auto& row = table->table[index];
+        if (row.dwPhysAddrLen == 0 || row.dwPhysAddrLen > sizeof(row.bPhysAddr)) continue;
+        const std::string mac = FormatMacAddress(row.bPhysAddr, row.dwPhysAddrLen);
+        if (mac.empty()) continue;
+        neighbours[ntohl(row.dwAddr)] = mac;
+    }
+#endif
+    return neighbours;
+}
+
+bool PingIpv4(const std::string& ipAddress, int timeoutMs, int& latencyMs) {
+    latencyMs = -1;
+#ifdef _WIN32
+    const IPAddr destination = inet_addr(ipAddress.c_str());
+    if (destination == INADDR_NONE) return false;
+
+    HANDLE handle = IcmpCreateFile();
+    if (handle == INVALID_HANDLE_VALUE) return false;
+
+    static constexpr char kPayload[] = "hi5central";
+    const DWORD replySize = sizeof(ICMP_ECHO_REPLY) + sizeof(kPayload) + 32;
+    std::vector<std::uint8_t> replyBuffer(replySize);
+    const DWORD replies = IcmpSendEcho(
+        handle,
+        destination,
+        const_cast<char*>(kPayload),
+        static_cast<WORD>(sizeof(kPayload) - 1),
+        nullptr,
+        replyBuffer.data(),
+        replySize,
+        static_cast<DWORD>(timeoutMs));
+    IcmpCloseHandle(handle);
+
+    if (replies == 0) return false;
+    const auto* reply = reinterpret_cast<const ICMP_ECHO_REPLY*>(replyBuffer.data());
+    if (reply->Status != IP_SUCCESS) return false;
+    latencyMs = static_cast<int>(reply->RoundTripTime);
+    return true;
+#else
+    (void)ipAddress;
+    (void)timeoutMs;
+    return false;
+#endif
+}
+
+std::string ReverseDnsName(const std::string& ipAddress) {
+#ifdef _WIN32
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    if (InetPtonA(AF_INET, ipAddress.c_str(), &address.sin_addr) != 1) return {};
+
+    char host[NI_MAXHOST]{};
+    const int result = getnameinfo(
+        reinterpret_cast<const sockaddr*>(&address),
+        sizeof(address),
+        host,
+        static_cast<DWORD>(sizeof(host)),
+        nullptr,
+        0,
+        NI_NAMEREQD);
+    if (result != 0) return {};
+    return DecodeText(reinterpret_cast<const std::uint8_t*>(host), std::strlen(host));
+#else
+    (void)ipAddress;
+    return {};
+#endif
+}
+
+std::string ResolveMacAddress(const std::string& ipAddress);
+
+json ProbePresence(
+    std::uint32_t hostAddress,
+    int timeoutMs,
+    const std::unordered_map<std::uint32_t, std::string>& neighbourSnapshot,
+    bool& present) {
+    present = false;
+    const std::string ipAddress = Ipv4ToString(hostAddress);
+    if (ipAddress.empty()) return json();
+
+    std::string macAddress;
+    const auto known = neighbourSnapshot.find(hostAddress);
+    if (known != neighbourSnapshot.end()) macAddress = known->second;
+
+    int latencyMs = -1;
+    const bool icmpReachable = PingIpv4(ipAddress, timeoutMs, latencyMs);
+    if (icmpReachable && macAddress.empty()) macAddress = ResolveMacAddress(ipAddress);
+
+    present = icmpReachable || !macAddress.empty();
+    if (!present) return json();
+
+    const std::string hostname = ReverseDnsName(ipAddress);
+    json methods = json::array();
+    if (!macAddress.empty()) methods.push_back("arp");
+    if (icmpReachable) methods.push_back("icmp");
+    if (!hostname.empty()) methods.push_back("reverse_dns");
+
+    json device = {
+        {"ipAddress", ipAddress},
+        {"macAddress", macAddress},
+        {"hostname", hostname},
+        {"icmpReachable", icmpReachable},
+        {"discoveryMethods", methods},
+        {"interfaces", json::array()},
+        {"metadata", {
+            {"scanner", "hi5central-native-presence"}
+        }}
+    };
+    if (latencyMs >= 0) device["latencyMs"] = latencyMs;
+    return device;
 }
 
 std::string ResolveMacAddress(const std::string& ipAddress) {
@@ -605,24 +754,38 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
     }
 
     const std::string cidr = payload.value("cidr", std::string());
+    const bool presenceEnabled = payload.value("presenceEnabled", false);
+    const bool snmpEnabled = payload.value("snmpEnabled", payload.contains("credential"));
+    if (!presenceEnabled && !snmpEnabled) {
+        error = "No network discovery methods are enabled.";
+        return json{{"status", "failed"}, {"error", error}};
+    }
+
+    const int presenceTimeoutMs =
+        std::max(50, std::min(5000, payload.value("presenceTimeoutMs", 350)));
     const int port = std::max(1, std::min(65535, payload.value("snmpPort", 161)));
     const int timeoutMs = std::max(100, std::min(10000, payload.value("timeoutMs", 800)));
     const int retries = std::max(0, std::min(5, payload.value("retries", 1)));
     const int concurrency = std::max(1, std::min(128, payload.value("concurrency", 32)));
-    const std::string versionLabel = payload.value("snmpVersion", std::string("v2c"));
-    const json credential = payload.value("credential", json::object());
-    const std::string community = credential.value("community", std::string());
 
+    std::string versionLabel;
+    std::string community;
     int snmpVersion = -1;
-    if (versionLabel == "v1") snmpVersion = 0;
-    else if (versionLabel == "v2c") snmpVersion = 1;
-    else {
-        error = "Only SNMPv1 and SNMPv2c are supported by this Agent build.";
-        return json{{"status", "failed"}, {"error", error}};
-    }
-    if (community.empty() || community.size() > 2048) {
-        error = "SNMP community is missing or invalid.";
-        return json{{"status", "failed"}, {"error", error}};
+    if (snmpEnabled) {
+        versionLabel = payload.value("snmpVersion", std::string("v2c"));
+        const json credential = payload.value("credential", json::object());
+        community = credential.value("community", std::string());
+
+        if (versionLabel == "v1") snmpVersion = 0;
+        else if (versionLabel == "v2c") snmpVersion = 1;
+        else {
+            error = "Only SNMPv1 and SNMPv2c are supported by this Agent build.";
+            return json{{"status", "failed"}, {"error", error}};
+        }
+        if (community.empty() || community.size() > 2048) {
+            error = "SNMP community is missing or invalid.";
+            return json{{"status", "failed"}, {"error", error}};
+        }
     }
 
     std::uint32_t firstAddress = 0;
@@ -631,11 +794,58 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
         return json{{"status", "failed"}, {"error", error}};
     }
 
+    const auto initialNeighbours =
+        presenceEnabled ? SnapshotIpv4Neighbours()
+                        : std::unordered_map<std::uint32_t, std::string>{};
+
     std::atomic<std::uint32_t> nextIndex{0};
-    std::atomic<std::uint32_t> respondedCount{0};
+    std::atomic<std::uint32_t> presenceCount{0};
+    std::atomic<std::uint32_t> snmpCount{0};
     std::mutex devicesMutex;
     std::vector<std::pair<std::uint32_t, json>> devices;
-    devices.reserve(std::min<std::uint32_t>(addressCount, 256));
+    devices.reserve(std::min<std::uint32_t>(addressCount, 512));
+
+    const auto mergeSnmp = [](json& device, json snmpDevice) {
+        if (device.is_null() || device.empty()) {
+            device = std::move(snmpDevice);
+        } else {
+            static const std::vector<std::string> kSnmpFields = {
+                "snmpVersion", "sysName", "sysDescr", "sysObjectId", "sysContact",
+                "sysLocation", "uptimeTicks", "interfaceCount", "interfaces"
+            };
+            for (const auto& field : kSnmpFields) {
+                if (snmpDevice.contains(field) && !snmpDevice[field].is_null()) {
+                    device[field] = snmpDevice[field];
+                }
+            }
+            const std::string snmpHostname = snmpDevice.value("hostname", std::string());
+            if (!snmpHostname.empty()) device["hostname"] = snmpHostname;
+            const std::string currentMac = device.value("macAddress", std::string());
+            const std::string snmpMac = snmpDevice.value("macAddress", std::string());
+            if (currentMac.empty() && !snmpMac.empty()) device["macAddress"] = snmpMac;
+        }
+
+        json methods = device.value("discoveryMethods", json::array());
+        bool hasSnmp = false;
+        if (methods.is_array()) {
+            for (const auto& method : methods) {
+                if (method.is_string() && method.get<std::string>() == "snmp") {
+                    hasSnmp = true;
+                    break;
+                }
+            }
+        } else {
+            methods = json::array();
+        }
+        if (!hasSnmp) methods.push_back("snmp");
+        device["discoveryMethods"] = std::move(methods);
+
+        json metadata = device.value("metadata", json::object());
+        if (!metadata.is_object()) metadata = json::object();
+        metadata["scanner"] = "hi5central-native-network-discovery";
+        metadata["snmpEnriched"] = true;
+        device["metadata"] = std::move(metadata);
+    };
 
     const std::uint32_t workerCount =
         std::max<std::uint32_t>(1, std::min<std::uint32_t>(
@@ -648,21 +858,87 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
             for (;;) {
                 const std::uint32_t index = nextIndex.fetch_add(1);
                 if (index >= addressCount) break;
+
                 const std::uint32_t hostAddress = firstAddress + index;
-                const std::uint32_t requestId =
-                    static_cast<std::uint32_t>((GetTickCount64() + hostAddress + (worker * 7919u)) & 0x7fffffffu);
-                bool responded = false;
-                json device = ProbeDevice(
-                    hostAddress, port, timeoutMs, retries, snmpVersion, versionLabel,
-                    community, requestId, responded);
-                if (!responded || device.is_null() || device.empty()) continue;
-                respondedCount.fetch_add(1);
+                json device;
+                bool presenceResponded = false;
+                bool snmpResponded = false;
+
+                if (presenceEnabled) {
+                    device = ProbePresence(
+                        hostAddress,
+                        presenceTimeoutMs,
+                        initialNeighbours,
+                        presenceResponded);
+                    if (presenceResponded) presenceCount.fetch_add(1);
+                }
+
+                if (snmpEnabled) {
+                    const std::uint32_t requestId =
+                        static_cast<std::uint32_t>(
+                            (GetTickCount64() + hostAddress + (worker * 7919u)) & 0x7fffffffu);
+                    json snmpDevice = ProbeDevice(
+                        hostAddress,
+                        port,
+                        timeoutMs,
+                        retries,
+                        snmpVersion,
+                        versionLabel,
+                        community,
+                        requestId,
+                        snmpResponded);
+                    if (snmpResponded && !snmpDevice.is_null() && !snmpDevice.empty()) {
+                        snmpCount.fetch_add(1);
+                        mergeSnmp(device, std::move(snmpDevice));
+                    }
+                }
+
+                if (device.is_null() || device.empty()) continue;
                 std::lock_guard<std::mutex> lock(devicesMutex);
                 devices.emplace_back(hostAddress, std::move(device));
             }
         });
     }
     for (auto& worker : workers) worker.join();
+
+    // An ICMP request to a local-L2 device can populate the Windows neighbour table
+    // even when that device blocks echo replies. Capture that table after the active
+    // probe so those hosts remain visible as ARP-discovered devices.
+    if (presenceEnabled) {
+        const auto finalNeighbours = SnapshotIpv4Neighbours();
+        std::unordered_map<std::uint32_t, bool> seen;
+        for (const auto& item : devices) seen[item.first] = true;
+
+        const std::uint64_t rangeEnd =
+            static_cast<std::uint64_t>(firstAddress) + static_cast<std::uint64_t>(addressCount);
+        for (const auto& [hostAddress, macAddress] : finalNeighbours) {
+            if (hostAddress < firstAddress || static_cast<std::uint64_t>(hostAddress) >= rangeEnd) {
+                continue;
+            }
+            if (seen.find(hostAddress) != seen.end() || macAddress.empty()) continue;
+
+            const std::string ipAddress = Ipv4ToString(hostAddress);
+            if (ipAddress.empty()) continue;
+            const std::string hostname = ReverseDnsName(ipAddress);
+
+            json methods = json::array({"arp"});
+            if (!hostname.empty()) methods.push_back("reverse_dns");
+            json device = {
+                {"ipAddress", ipAddress},
+                {"macAddress", macAddress},
+                {"hostname", hostname},
+                {"icmpReachable", false},
+                {"discoveryMethods", methods},
+                {"interfaces", json::array()},
+                {"metadata", {
+                    {"scanner", "hi5central-native-presence"},
+                    {"arpAfterProbe", true}
+                }}
+            };
+            devices.emplace_back(hostAddress, std::move(device));
+            presenceCount.fetch_add(1);
+        }
+    }
 
     std::sort(devices.begin(), devices.end(),
               [](const auto& left, const auto& right) { return left.first < right.first; });
@@ -672,11 +948,15 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
 
     return json{
         {"status", "ok"},
-        {"protocolVersion", 1},
+        {"protocolVersion", 2},
         {"cidr", cidr},
-        {"snmpVersion", versionLabel},
+        {"presenceEnabled", presenceEnabled},
+        {"snmpEnabled", snmpEnabled},
+        {"snmpVersion", snmpEnabled ? versionLabel : std::string()},
         {"addressesTotal", addressCount},
-        {"addressesResponded", respondedCount.load()},
+        {"addressesResponded", outputDevices.size()},
+        {"presenceDevices", presenceCount.load()},
+        {"snmpEnrichedDevices", snmpCount.load()},
         {"devices", std::move(outputDevices)}
     };
 }

@@ -111,8 +111,16 @@ jobs:
           if ($snmp -notmatch 'RunSnmpDiscovery' -or $snmp -notmatch 'sysObjectID') {
             throw 'Native SNMP discovery implementation is incomplete.'
           }
+          foreach ($presenceContract in @('IcmpSendEcho','GetIpNetTable','ReverseDnsName','presenceEnabled','discoveryMethods')) {
+            if ($snmp -notmatch [regex]::Escape($presenceContract)) {
+              throw "Native network presence discovery is missing required contract: $presenceContract"
+            }
+          }
+          if ($snmp -notmatch 'private RFC1918 IPv4 ranges') {
+            throw 'Native network discovery no longer enforces private RFC1918 target ranges.'
+          }
           if ($snmp -match 'powershell|pwsh|RunPowerShellCommand') {
-            throw 'SNMP discovery must remain native and must not invoke PowerShell.'
+            throw 'Network discovery must remain native and must not invoke PowerShell.'
           }
 
       - name: Verify enrollment and reconnect safeguards
