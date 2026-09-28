@@ -22,6 +22,7 @@
 #include "ui/agent_presence_controller.h"
 #include "ui/chat_controller.h"
 #include "inventory/inventory_snapshot.h"
+#include "network/snmp_discovery.h"
 
 #include <nlohmann/json.hpp>
 #include <zlib.h>
@@ -5807,6 +5808,15 @@ exit 1
                             {"inventory_sent", true},
                             {"job_type", jobType}
                         });
+                        return;
+                    }
+
+                    if (jobType == "network.discovery.scan") {
+                        std::string discoveryError;
+                        json result = hi5::network::RunSnmpDiscovery(payload, discoveryError);
+                        const bool ok = discoveryError.empty()
+                            && result.value("status", std::string("failed")) == "ok";
+                        PostJobResult(ident, jobId, ok, result, discoveryError);
                         return;
                     }
 

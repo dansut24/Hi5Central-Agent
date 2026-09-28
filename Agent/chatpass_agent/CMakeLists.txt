@@ -138,6 +138,7 @@ if(WIN32)
     src/platform/windows/windows_screen.cpp
     src/platform/windows/windows_inventory.cpp
     src/platform/windows/windows_identity.cpp
+    src/network/snmp_discovery.cpp
     src/platform/windows/windows_codec.cpp	
     src/platform/windows/wasapi_loopback.cpp
   )

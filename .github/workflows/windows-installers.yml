@@ -45,6 +45,8 @@ jobs:
             'Agent/app_portal/Hi5Central.AppPortal/Hi5Central.AppPortal.csproj',
             'Agent/app_portal/Hi5Central.AppPortal/MainWindow.axaml',
             'Agent/app_portal/Hi5Central.AppPortal/Broker/WindowsNamedPipeAppPortalBroker.cs',
+            'Agent/chatpass_agent/src/network/snmp_discovery.h',
+            'Agent/chatpass_agent/src/network/snmp_discovery.cpp',
             'Viewer/chatpass_viewer/CMakeLists.txt',
             'Viewer/chatpass_viewer/installer/windows/Build-ViewerInstaller.ps1',
             'Viewer/chatpass_viewer/installer/windows/Hi5CentralViewerSetup.iss'
@@ -96,6 +98,21 @@ jobs:
           $broker = Get-Content 'Agent/app_portal/Hi5Central.AppPortal/Broker/WindowsNamedPipeAppPortalBroker.cs' -Raw
           if ($broker -notmatch 'Hi5CentralAppPortal') {
             throw 'Avalonia App Portal no longer uses the secured local Agent broker.'
+          }
+          $cmake = Get-Content 'Agent/chatpass_agent/CMakeLists.txt' -Raw
+          $service = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
+          $snmp = Get-Content 'Agent/chatpass_agent/src/network/snmp_discovery.cpp' -Raw
+          if ($cmake -notmatch 'src/network/snmp_discovery\.cpp') {
+            throw 'Native SNMP discovery scanner is missing from the Windows Agent build.'
+          }
+          if ($service -notmatch 'jobType == \"network\.discovery\.scan\"') {
+            throw 'Windows Agent no longer handles first-class network discovery scan jobs.'
+          }
+          if ($snmp -notmatch 'RunSnmpDiscovery' -or $snmp -notmatch 'sysObjectID') {
+            throw 'Native SNMP discovery implementation is incomplete.'
+          }
+          if ($snmp -match 'powershell|pwsh|RunPowerShellCommand') {
+            throw 'SNMP discovery must remain native and must not invoke PowerShell.'
           }
 
       - name: Verify enrollment and reconnect safeguards
