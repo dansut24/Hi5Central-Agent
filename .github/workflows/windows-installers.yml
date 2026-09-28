@@ -98,6 +98,8 @@ jobs:
           if ($service -notmatch 'AllowAutoUpdate') { throw 'Compiled Windows service is missing managed Windows Update automatic-update control.' }
           if ($service -match '\$policyManagerAuto\.exists|\$policyManagerPause\.exists') { throw 'Compiled Windows service still treats PolicyManager defaults as external MDM ownership.' }
           if ($service -notmatch 'status == \"conflict\".*status == \"unsupported\"') { throw 'Compiled Windows service is missing non-failure management evaluation outcomes.' }
+          if ($service -notmatch 'errorPayload\.is_object') { throw 'App Portal broker no longer forwards structured API errors.' }
+          if ($service -match 'app portal HTTP status .* body=') { throw 'App Portal broker is exposing raw HTTP response bodies in exceptions.' }
 
       - name: Verify remote Viewer and input contracts
         shell: pwsh

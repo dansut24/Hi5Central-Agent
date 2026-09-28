@@ -472,7 +472,14 @@ namespace hi5 {
             WinHttpCloseHandle(connect);
             WinHttpCloseHandle(session);
             if (status < 200 || status >= 300) {
-                throw std::runtime_error("app portal HTTP status " + std::to_string(status) + " body=" + response);
+                const json errorPayload = json::parse(response, nullptr, false);
+                if (!errorPayload.is_discarded() && errorPayload.is_object()) {
+                    json forwarded = errorPayload;
+                    if (!forwarded.contains("success")) forwarded["success"] = false;
+                    return forwarded.dump();
+                }
+                throw std::runtime_error(
+                    "app portal HTTP status " + std::to_string(status) + " returned an invalid response");
             }
             return response;
         }
