@@ -30,6 +30,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup .NET for Avalonia App Portal
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
       - name: Verify local Windows build path is preserved
         shell: pwsh
         run: |
@@ -37,6 +42,9 @@ jobs:
             'Agent/chatpass_agent/CMakeLists.txt',
             'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1',
             'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss',
+            'Agent/app_portal/Hi5Central.AppPortal/Hi5Central.AppPortal.csproj',
+            'Agent/app_portal/Hi5Central.AppPortal/MainWindow.axaml',
+            'Agent/app_portal/Hi5Central.AppPortal/Broker/WindowsNamedPipeAppPortalBroker.cs',
             'Viewer/chatpass_viewer/CMakeLists.txt',
             'Viewer/chatpass_viewer/installer/windows/Build-ViewerInstaller.ps1',
             'Viewer/chatpass_viewer/installer/windows/Hi5CentralViewerSetup.iss'
@@ -48,6 +56,23 @@ jobs:
           if ($agentBuild -notmatch 'Visual Studio 18 2026') { throw 'Local VS 2026 generator default was removed.' }
           if ($agentBuild -notmatch 'C:\\Users\\Dan\\Desktop\\libdatachannel-install-static') {
             throw 'Local libdatachannel default path was removed.'
+          }
+          if ($agentBuild -notmatch 'dotnet SDK was not found') {
+            throw 'Avalonia App Portal publish guard is missing from the Agent installer build.'
+          }
+          if ($agentBuild -match 'hi5central_app_portal') {
+            throw 'Legacy C++ App Portal target is still part of the Agent CMake build.'
+          }
+          $appPortalProject = Get-Content 'Agent/app_portal/Hi5Central.AppPortal/Hi5Central.AppPortal.csproj' -Raw
+          if ($appPortalProject -notmatch 'Avalonia.Desktop') {
+            throw 'Avalonia desktop dependency is missing from App Portal.'
+          }
+          if ($appPortalProject -notmatch 'PublishSingleFile') {
+            Write-Host 'Single-file publishing is enforced by Build-AgentInstaller.ps1.'
+          }
+          $broker = Get-Content 'Agent/app_portal/Hi5Central.AppPortal/Broker/WindowsNamedPipeAppPortalBroker.cs' -Raw
+          if ($broker -notmatch 'Hi5CentralAppPortal') {
+            throw 'Avalonia App Portal no longer uses the secured local Agent broker.'
           }
 
       - name: Verify enrollment and reconnect safeguards

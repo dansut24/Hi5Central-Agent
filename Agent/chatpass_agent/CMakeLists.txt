@@ -304,22 +304,6 @@ if(WIN32)
   )
   set_target_properties(hi5central_user PROPERTIES OUTPUT_NAME "Hi5CentralUser")
 
-  add_executable(hi5central_app_portal WIN32
-    src/app_portal/app_portal_main.cpp
-  )
-  hi5_use_static_msvc_runtime(hi5central_app_portal)
-  target_include_directories(hi5central_app_portal PRIVATE
-    ${WEBVIEW2_INCLUDE_DIR}
-    src
-  )
-  target_compile_definitions(hi5central_app_portal PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
-  target_link_libraries(hi5central_app_portal PRIVATE
-    ${WEBVIEW2_LOADER_STATIC}
-    nlohmann_json::nlohmann_json Threads::Threads
-    advapi32 user32 gdi32 shell32 shlwapi
-    ole32 oleaut32 uuid dwmapi
-  )
-  set_target_properties(hi5central_app_portal PROPERTIES OUTPUT_NAME "Hi5CentralAppPortal")
 
   add_executable(hi5central_remote_host
     src/remote_host_main.cpp

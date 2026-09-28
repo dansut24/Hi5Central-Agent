@@ -25,6 +25,9 @@ $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
 $buildPath = Join-Path $repoRoot $BuildDir
 $distPath = Join-Path $repoRoot "dist\installer"
 $issPath = Join-Path $scriptDir "Hi5CentralAgentSetup.iss"
+$appPortalProject = (Resolve-Path (Join-Path $repoRoot "..\app_portal\Hi5Central.AppPortal\Hi5Central.AppPortal.csproj")).Path
+$appPortalPublishPath = Join-Path $buildPath "app-portal-publish"
+$appPortalStagedPath = Join-Path (Join-Path $buildPath $Configuration) "Hi5CentralAppPortal.exe"
 
 function Resolve-ToolPath {
     param(
@@ -284,7 +287,7 @@ if (-not $SkipBuild) {
     $buildArgs = @(
         "--build", $buildPath,
         "--config", $Configuration,
-        "--target", "native_vp8_stream", "hi5central_user", "hi5central_app_portal", "hi5central_remote_host", "hi5central_media_host", "hi5central_patch_host",
+        "--target", "native_vp8_stream", "hi5central_user", "hi5central_remote_host", "hi5central_media_host", "hi5central_patch_host",
         "-j"
     )
 
@@ -292,6 +295,55 @@ if (-not $SkipBuild) {
         -FilePath $cmakeExe `
         -Arguments $buildArgs `
         -ErrorMessage "CMake build failed."
+
+    Write-Host ""
+    Write-Host "== Publish Avalonia App Portal =="
+
+    $dotnetExe = Resolve-ToolPath "dotnet.exe"
+    if ([string]::IsNullOrWhiteSpace($dotnetExe)) {
+        $dotnetExe = Resolve-ToolPath "dotnet"
+    }
+    if ([string]::IsNullOrWhiteSpace($dotnetExe)) {
+        throw "dotnet SDK was not found. .NET 8 SDK is required to build Hi5Central App Portal."
+    }
+
+    if (Test-Path $appPortalPublishPath) {
+        Remove-Item $appPortalPublishPath -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $appPortalPublishPath | Out-Null
+
+    $appPortalArgs = @(
+        "publish", $appPortalProject,
+        "-c", "Release",
+        "-r", "win-x64",
+        "--self-contained", "true",
+        "-o", $appPortalPublishPath,
+        "/p:PublishSingleFile=true",
+        "/p:IncludeNativeLibrariesForSelfExtract=true",
+        "/p:EnableCompressionInSingleFile=true",
+        "/p:PublishTrimmed=false",
+        "/p:DebugType=None",
+        "/p:DebugSymbols=false"
+    )
+
+    Invoke-NativeChecked `
+        -FilePath $dotnetExe `
+        -Arguments $appPortalArgs `
+        -ErrorMessage "Avalonia App Portal publish failed."
+
+    $publishedAppPortal = Join-Path $appPortalPublishPath "Hi5CentralAppPortal.exe"
+    if (-not (Test-Path $publishedAppPortal)) {
+        throw "Avalonia App Portal executable was not produced: $publishedAppPortal"
+    }
+
+    $unexpectedSidecars = Get-ChildItem -Path $appPortalPublishPath -File |
+        Where-Object { $_.Extension -in @(".dll", ".json") }
+    if ($unexpectedSidecars) {
+        throw "Avalonia App Portal publish is not self-contained single-file: $($unexpectedSidecars.Name -join ', ')"
+    }
+
+    New-Item -ItemType Directory -Force -Path (Split-Path $appPortalStagedPath -Parent) | Out-Null
+    Copy-Item $publishedAppPortal $appPortalStagedPath -Force
 }
 
 $agentCandidates = @(
@@ -308,7 +360,7 @@ if (-not $agentExe -or -not (Test-Path $agentExe)) {
 }
 
 $userExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralUser.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-$appPortalExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralAppPortal.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+$appPortalExe = if (Test-Path $appPortalStagedPath) { Get-Item $appPortalStagedPath } else { $null }
 $remoteHostExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralRemoteHost.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 $mediaHostExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralMediaHost.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 $patchHostExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralPatchHost.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -320,7 +372,6 @@ if (-not $patchHostExe) { throw "Hi5CentralPatchHost.exe not found under build d
 
 Assert-NoDynamicVcRuntimeDependency -ExePath $agentExe
 Assert-NoDynamicVcRuntimeDependency -ExePath $userExe.FullName
-Assert-NoDynamicVcRuntimeDependency -ExePath $appPortalExe.FullName
 Assert-NoDynamicVcRuntimeDependency -ExePath $remoteHostExe.FullName
 Assert-NoDynamicVcRuntimeDependency -ExePath $mediaHostExe.FullName
 Assert-NoDynamicVcRuntimeDependency -ExePath $patchHostExe.FullName

@@ -1,0 +1,378 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Hi5Central.AppPortal.MainWindow"
+        Title="Hi5Central App Portal"
+        Width="1180"
+        Height="790"
+        MinWidth="900"
+        MinHeight="620"
+        WindowStartupLocation="CenterScreen"
+        Background="#F4F7FB">
+  <Window.Styles>
+    <Style Selector="Button.nav">
+      <Setter Property="HorizontalContentAlignment" Value="Left" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="Foreground" Value="#AEBBD2" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="CornerRadius" Value="10" />
+      <Setter Property="Padding" Value="14,11" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="FontSize" Value="13" />
+    </Style>
+    <Style Selector="Button.nav:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="#1D3560" />
+    </Style>
+    <Style Selector="Button.nav.active">
+      <Setter Property="Background" Value="#213A68" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="#2962FF" />
+      <Setter Property="Foreground" Value="White" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="CornerRadius" Value="9" />
+      <Setter Property="Padding" Value="15,9" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="FontSize" Value="12" />
+    </Style>
+    <Style Selector="Button.primary:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="#174FE0" />
+    </Style>
+    <Style Selector="Button.primary:disabled">
+      <Setter Property="Opacity" Value="0.48" />
+    </Style>
+  </Window.Styles>
+
+  <Grid ColumnDefinitions="224,*">
+    <Border Grid.Column="0" Background="#0B1730">
+      <Grid RowDefinitions="Auto,Auto,*,Auto" Margin="18">
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="11" Margin="4,8,4,30">
+          <Border Width="44" Height="44" CornerRadius="13" Background="#F0A315">
+            <TextBlock Text="H5"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"
+                       Foreground="#18233A"
+                       FontWeight="Black"
+                       FontSize="16" />
+          </Border>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Text="Hi5Central" Foreground="White" FontWeight="Bold" FontSize="15" />
+            <TextBlock Text="App Portal" Foreground="#8494B0" FontSize="11" />
+          </StackPanel>
+        </StackPanel>
+
+        <TextBlock Grid.Row="1"
+                   Text="SOFTWARE"
+                   Margin="12,0,0,9"
+                   Foreground="#637695"
+                   FontSize="9"
+                   FontWeight="Bold" />
+
+        <StackPanel Grid.Row="2" Spacing="5">
+          <Button x:Name="NavHome" Classes="nav active" Content="Home" Tag="home" Click="NavButton_Click" />
+          <Button x:Name="NavAll" Classes="nav" Content="All apps" Tag="all" Click="NavButton_Click" />
+          <Button x:Name="NavInstalled" Classes="nav" Content="Installed" Tag="installed" Click="NavButton_Click" />
+          <Button x:Name="NavRequests" Classes="nav" Content="Requests" Tag="requests" Click="NavButton_Click" />
+        </StackPanel>
+
+        <Border Grid.Row="3"
+                BorderBrush="#233A60"
+                BorderThickness="1"
+                CornerRadius="10"
+                Padding="12"
+                Background="#10213E">
+          <StackPanel Spacing="4">
+            <TextBlock Text="SECURE INSTALLATION" Foreground="#7F92B1" FontSize="8" FontWeight="Bold" />
+            <TextBlock Text="No administrator rights required"
+                       Foreground="#D2DCEB"
+                       FontSize="10"
+                       TextWrapping="Wrap" />
+            <TextBlock x:Name="AgentStatusText"
+                       Text="Connected through Hi5Central Agent"
+                       Foreground="#65D7A5"
+                       FontSize="9"
+                       TextWrapping="Wrap" />
+          </StackPanel>
+        </Border>
+      </Grid>
+    </Border>
+
+    <Grid Grid.Column="1" RowDefinitions="Auto,Auto,*,Auto">
+      <Border Grid.Row="0" Padding="30,25,30,23">
+        <Border.Background>
+          <LinearGradientBrush StartPoint="0%,0%" EndPoint="100%,100%">
+            <GradientStop Color="#102446" Offset="0" />
+            <GradientStop Color="#183765" Offset="1" />
+          </LinearGradientBrush>
+        </Border.Background>
+        <Grid ColumnDefinitions="*,Auto">
+          <StackPanel Grid.Column="0" MaxWidth="720" Spacing="5">
+            <TextBlock x:Name="HeroEyebrow"
+                       Text="COMPANY SOFTWARE"
+                       Foreground="#F0A315"
+                       FontSize="9"
+                       FontWeight="Bold" />
+            <TextBlock x:Name="HeroTitle"
+                       Text="Company software, ready when you need it."
+                       Foreground="White"
+                       FontSize="26"
+                       FontWeight="SemiBold" />
+            <TextBlock x:Name="HeroDescription"
+                       Text="Install applications approved for you or this device. Hi5Central handles elevation and installation securely in the background."
+                       Foreground="#C3CEE0"
+                       FontSize="12"
+                       TextWrapping="Wrap"
+                       MaxWidth="680" />
+          </StackPanel>
+          <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center" Spacing="8">
+            <TextBlock x:Name="AvailableCountText"
+                       Text="--"
+                       HorizontalAlignment="Right"
+                       Foreground="White"
+                       FontSize="28"
+                       FontWeight="Bold" />
+            <TextBlock Text="applications available"
+                       HorizontalAlignment="Right"
+                       Foreground="#AEBBD2"
+                       FontSize="10" />
+            <Button x:Name="RefreshButton"
+                    Content="Refresh"
+                    Click="RefreshButton_Click"
+                    Background="#263F6B"
+                    Foreground="White"
+                    BorderBrush="#3A5581"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Padding="13,7"
+                    HorizontalAlignment="Right" />
+          </StackPanel>
+        </Grid>
+      </Border>
+
+      <Border Grid.Row="1"
+              Background="White"
+              BorderBrush="#DFE6F1"
+              BorderThickness="0,0,0,1"
+              Padding="26,14">
+        <Grid ColumnDefinitions="*,210,Auto" ColumnSpacing="10">
+          <TextBox x:Name="SearchBox"
+                   Grid.Column="0"
+                   Watermark="Search applications or publishers..."
+                   TextChanged="SearchBox_TextChanged"
+                   Background="#F8FAFC"
+                   BorderBrush="#DCE4EF"
+                   BorderThickness="1"
+                   CornerRadius="9"
+                   Padding="12,9" />
+          <ComboBox x:Name="CategoryCombo"
+                    Grid.Column="1"
+                    SelectionChanged="CategoryCombo_SelectionChanged"
+                    Background="#F8FAFC"
+                    BorderBrush="#DCE4EF"
+                    CornerRadius="9"
+                    Padding="10,7" />
+          <TextBlock x:Name="ResultCountText"
+                     Grid.Column="2"
+                     VerticalAlignment="Center"
+                     Foreground="#718096"
+                     FontSize="10"
+                     MinWidth="110"
+                     TextAlignment="Right" />
+        </Grid>
+      </Border>
+
+      <Grid Grid.Row="2">
+        <ScrollViewer x:Name="AppsScroll"
+                      HorizontalScrollBarVisibility="Disabled"
+                      VerticalScrollBarVisibility="Auto"
+                      Padding="26,22,20,30">
+          <ItemsControl x:Name="AppsItems">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate>
+                <WrapPanel Orientation="Horizontal" />
+              </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border Width="305"
+                        MinHeight="236"
+                        Margin="0,0,14,14"
+                        Padding="16"
+                        Background="White"
+                        BorderBrush="#DFE6F1"
+                        BorderThickness="1"
+                        CornerRadius="14">
+                  <Grid RowDefinitions="Auto,*,Auto">
+                    <Grid Grid.Row="0" ColumnDefinitions="48,*,Auto" ColumnSpacing="11">
+                      <Border Grid.Column="0"
+                              Width="48"
+                              Height="48"
+                              CornerRadius="12"
+                              Background="#EEF3FF"
+                              BorderBrush="#DCE6FA"
+                              BorderThickness="1">
+                        <TextBlock Text="{Binding Initials}"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"
+                                   Foreground="#294D92"
+                                   FontSize="14"
+                                   FontWeight="Bold" />
+                      </Border>
+                      <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+                        <TextBlock Text="{Binding Name}"
+                                   Foreground="#122039"
+                                   FontWeight="Bold"
+                                   FontSize="13"
+                                   TextTrimming="CharacterEllipsis" />
+                        <TextBlock Text="{Binding Publisher}"
+                                   Foreground="#748198"
+                                   FontSize="9"
+                                   TextTrimming="CharacterEllipsis" />
+                      </StackPanel>
+                      <Border Grid.Column="2"
+                              Padding="8,5"
+                              CornerRadius="10"
+                              Background="#EEF4FF"
+                              VerticalAlignment="Top">
+                        <TextBlock Text="{Binding StatusText}"
+                                   Foreground="#2E5CCC"
+                                   FontSize="8"
+                                   FontWeight="Bold" />
+                      </Border>
+                    </Grid>
+
+                    <StackPanel Grid.Row="1" Margin="0,13,0,10" Spacing="10">
+                      <TextBlock Text="{Binding Description}"
+                                 Foreground="#53637B"
+                                 FontSize="10"
+                                 LineHeight="15"
+                                 TextWrapping="Wrap"
+                                 MaxHeight="48" />
+                      <StackPanel Orientation="Horizontal" Spacing="6">
+                        <Border Background="#F5F7FA" CornerRadius="6" Padding="7,4">
+                          <TextBlock Text="{Binding Version}" Foreground="#64748B" FontSize="8" />
+                        </Border>
+                        <Border Background="#F5F7FA" CornerRadius="6" Padding="7,4">
+                          <TextBlock Text="{Binding Category}" Foreground="#64748B" FontSize="8" />
+                        </Border>
+                      </StackPanel>
+                    </StackPanel>
+
+                    <Border Grid.Row="2"
+                            BorderBrush="#EDF1F6"
+                            BorderThickness="0,1,0,0"
+                            Padding="0,12,0,0">
+                      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                        <TextBlock Grid.Column="0"
+                                   Text="{Binding ScopeText}"
+                                   Foreground="#7B8799"
+                                   FontSize="8"
+                                   VerticalAlignment="Center"
+                                   TextTrimming="CharacterEllipsis" />
+                        <Button Grid.Column="1"
+                                Classes="primary"
+                                Content="{Binding ActionText}"
+                                IsEnabled="{Binding CanInstall}"
+                                Click="InstallButton_Click"
+                                MinWidth="92" />
+                      </Grid>
+                    </Border>
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </ScrollViewer>
+
+        <Border x:Name="EmptyState"
+                IsVisible="False"
+                Margin="26"
+                Background="#FBFCFE"
+                BorderBrush="#CCD7E6"
+                BorderThickness="1"
+                CornerRadius="16"
+                Padding="34">
+          <StackPanel HorizontalAlignment="Center"
+                      VerticalAlignment="Center"
+                      MaxWidth="460"
+                      Spacing="8">
+            <Border Width="64" Height="64" CornerRadius="19" Background="#EEF3FF" HorizontalAlignment="Center">
+              <TextBlock Text="H5"
+                         HorizontalAlignment="Center"
+                         VerticalAlignment="Center"
+                         Foreground="#294D92"
+                         FontWeight="Black"
+                         FontSize="20" />
+            </Border>
+            <TextBlock x:Name="EmptyTitle"
+                       Text="No software has been assigned yet"
+                       HorizontalAlignment="Center"
+                       TextAlignment="Center"
+                       Foreground="#122039"
+                       FontSize="16"
+                       FontWeight="SemiBold" />
+            <TextBlock x:Name="EmptyDescription"
+                       Text="Your IT team can publish approved applications to this portal."
+                       HorizontalAlignment="Center"
+                       TextAlignment="Center"
+                       Foreground="#6E7C91"
+                       FontSize="10"
+                       TextWrapping="Wrap" />
+            <Button Content="Check again"
+                    Click="RefreshButton_Click"
+                    HorizontalAlignment="Center"
+                    Margin="0,8,0,0"
+                    Padding="14,7"
+                    CornerRadius="8" />
+          </StackPanel>
+        </Border>
+
+        <Border x:Name="LoadingOverlay"
+                Background="#DDF4F7FB"
+                IsVisible="True">
+          <StackPanel HorizontalAlignment="Center"
+                      VerticalAlignment="Center"
+                      Width="230"
+                      Spacing="11">
+            <ProgressBar IsIndeterminate="True" Height="5" />
+            <TextBlock Text="Loading company software..."
+                       HorizontalAlignment="Center"
+                       Foreground="#64748B"
+                       FontSize="10" />
+          </StackPanel>
+        </Border>
+      </Grid>
+
+      <Border x:Name="StatusBanner"
+              Grid.Row="3"
+              IsVisible="False"
+              Margin="26,0,26,18"
+              Padding="12,10"
+              CornerRadius="9"
+              Background="#EAF8F2"
+              BorderBrush="#C5EBDD"
+              BorderThickness="1">
+        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="14">
+          <StackPanel Grid.Column="0" Spacing="2">
+            <TextBlock x:Name="StatusTitle"
+                       Text="Done"
+                       Foreground="#146B50"
+                       FontSize="10"
+                       FontWeight="Bold" />
+            <TextBlock x:Name="StatusMessage"
+                       Foreground="#5E6D7F"
+                       FontSize="9"
+                       TextWrapping="Wrap" />
+          </StackPanel>
+          <Button Grid.Column="1"
+                  Content="Dismiss"
+                  Click="DismissStatus_Click"
+                  Background="Transparent"
+                  BorderThickness="0"
+                  Foreground="#5E6D7F"
+                  FontSize="9" />
+        </Grid>
+      </Border>
+    </Grid>
+  </Grid>
+</Window>
