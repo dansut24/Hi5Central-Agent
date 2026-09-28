@@ -423,7 +423,16 @@ std::string Ipv4ToString(std::uint32_t hostAddress) {
 }
 
 std::string FormatMacAddress(const unsigned char* bytes, std::size_t length) {
-    if (!bytes || length == 0 || length > 32) return {};
+    if (!bytes || length != 6) return {};
+
+    bool allZero = true;
+    bool allBroadcast = true;
+    for (std::size_t i = 0; i < length; ++i) {
+        allZero = allZero && bytes[i] == 0x00;
+        allBroadcast = allBroadcast && bytes[i] == 0xff;
+    }
+    if (allZero || allBroadcast) return {};
+
     char buffer[4]{};
     std::string output;
     for (std::size_t i = 0; i < length; ++i) {
@@ -447,6 +456,7 @@ std::unordered_map<std::uint32_t, std::string> SnapshotIpv4Neighbours() {
 
     for (DWORD index = 0; index < table->dwNumEntries; ++index) {
         const auto& row = table->table[index];
+        if (row.dwType == MIB_IPNET_TYPE_INVALID) continue;
         if (row.dwPhysAddrLen == 0 || row.dwPhysAddrLen > sizeof(row.bPhysAddr)) continue;
         const std::string mac = FormatMacAddress(row.bPhysAddr, row.dwPhysAddrLen);
         if (mac.empty()) continue;
@@ -566,14 +576,7 @@ std::string ResolveMacAddress(const std::string& ipAddress) {
     if (result != NO_ERROR || macLength == 0 || macLength > 8) return {};
 
     const auto* bytes = reinterpret_cast<const unsigned char*>(macWords);
-    char buffer[3 * 8]{};
-    std::string output;
-    for (ULONG i = 0; i < macLength; ++i) {
-        std::snprintf(buffer, sizeof(buffer), "%02X", bytes[i]);
-        if (!output.empty()) output.push_back(':');
-        output += buffer;
-    }
-    return output;
+    return FormatMacAddress(bytes, macLength);
 #else
     (void)ipAddress;
     return {};
