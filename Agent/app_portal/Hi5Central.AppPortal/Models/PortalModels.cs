@@ -55,6 +55,9 @@ public sealed class PortalApp
     [JsonPropertyName("catalogueId")]
     public string CatalogueId { get; init; } = string.Empty;
 
+    [JsonPropertyName("installCount")]
+    public int InstallCount { get; init; }
+
     [JsonPropertyName("installed")]
     public bool Installed { get; init; }
 

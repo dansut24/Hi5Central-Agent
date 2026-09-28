@@ -16,6 +16,10 @@
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.2" />
   </ItemGroup>
 
+  <PropertyGroup Condition="'$(PublishTrimmed)' == 'true'">
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);IL2026;IL2104</WarningsNotAsErrors>
+  </PropertyGroup>
+
   <ItemGroup Condition="'$(PublishTrimmed)' == 'true'">
     <TrimmerRootAssembly Include="Avalonia.Remote.Protocol" />
     <TrimmerRootAssembly Include="Avalonia.DesignerSupport" />

@@ -24,6 +24,7 @@ public sealed partial class MainWindow : Window
     private PortalDevice _device = new();
     private PortalUpdates _updates = new();
     private string _view = "home";
+    private string _appSection = "all";
     private bool _busy;
 
     public MainWindow()
@@ -296,19 +297,19 @@ public sealed partial class MainWindow : Window
             .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        var selected = CategoryCombo.SelectedItem as string ?? "All categories";
-        var values = new List<string> { "All categories" };
+        var selected = CategoryCombo.SelectedItem as string ?? "Categories";
+        var values = new List<string> { "Categories" };
         values.AddRange(categories);
         CategoryCombo.ItemsSource = values;
         CategoryCombo.SelectedItem = values.Contains(selected, StringComparer.OrdinalIgnoreCase)
             ? values.First(value => string.Equals(value, selected, StringComparison.OrdinalIgnoreCase))
-            : "All categories";
+            : "Categories";
     }
 
     private void ApplyFilters()
     {
         var query = SearchBox.Text?.Trim() ?? string.Empty;
-        var category = CategoryCombo.SelectedItem as string ?? "All categories";
+        var category = CategoryCombo.SelectedItem as string ?? "Categories";
         var cards = BuildCards();
 
         IEnumerable<AppCard> filtered = cards;
@@ -321,10 +322,17 @@ public sealed partial class MainWindow : Window
                 || card.Description.Contains(query, StringComparison.OrdinalIgnoreCase));
         }
 
-        if (!string.Equals(category, "All categories", StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(category, "Categories", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(category, "All categories", StringComparison.OrdinalIgnoreCase))
         {
             filtered = filtered.Where(card =>
                 string.Equals(card.Category, category, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (_appSection == "company")
+        {
+            filtered = filtered.Where(card =>
+                string.Equals(card.App.SourceType, "custom", StringComparison.OrdinalIgnoreCase));
         }
 
         filtered = _view switch
@@ -334,7 +342,11 @@ public sealed partial class MainWindow : Window
             _ => filtered,
         };
 
-        var result = filtered.OrderBy(card => card.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        var result = (_appSection == "popular"
+                ? filtered.OrderByDescending(card => card.App.InstallCount)
+                    .ThenBy(card => card.Name, StringComparer.OrdinalIgnoreCase)
+                : filtered.OrderBy(card => card.Name, StringComparer.OrdinalIgnoreCase))
+            .ToList();
 
         _visibleApps.Clear();
         foreach (var card in result)
@@ -559,6 +571,35 @@ public sealed partial class MainWindow : Window
             }
         }
 
+        ApplyFilters();
+    }
+
+    private void AppSectionButton_Click(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button) return;
+
+        _appSection = button.Tag?.ToString() ?? "all";
+        foreach (var tab in new[] { AppTabAll, AppTabCompany, AppTabPopular })
+        {
+            tab.Classes.Remove("active");
+            if (ReferenceEquals(tab, button))
+            {
+                tab.Classes.Add("active");
+            }
+        }
+
+        ApplyFilters();
+    }
+
+    private void ViewAllApps_Click(object? sender, RoutedEventArgs e)
+    {
+        _view = "all";
+        foreach (var nav in new[]
+                 { NavHome, NavAll, NavUpdates, NavInstalled, NavRequests, NavDevice, NavSupport, NavSettings })
+        {
+            nav.Classes.Remove("active");
+        }
+        NavAll.Classes.Add("active");
         ApplyFilters();
     }
 
