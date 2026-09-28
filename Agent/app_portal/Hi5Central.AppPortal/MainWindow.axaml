@@ -1,5 +1,6 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:models="using:Hi5Central.AppPortal.Models"
         x:Class="Hi5Central.AppPortal.MainWindow"
         Title="Hi5 Self Service"
         Width="1450"
@@ -367,7 +368,7 @@
                         </ItemsPanelTemplate>
                       </ItemsControl.ItemsPanel>
                       <ItemsControl.ItemTemplate>
-                        <DataTemplate>
+                        <DataTemplate x:DataType="models:AppCard">
                           <Border Width="262"
                                   MinHeight="145"
                                   Margin="0,0,10,10"
@@ -503,7 +504,7 @@
                   </Grid>
                   <ItemsControl x:Name="RecentRequestItems">
                     <ItemsControl.ItemTemplate>
-                      <DataTemplate>
+                      <DataTemplate x:DataType="models:RequestSummaryItem">
                         <Grid ColumnDefinitions="*,Auto,Auto"
                               ColumnSpacing="8"
                               Margin="0,4">
@@ -548,7 +549,7 @@
                   </Grid>
                   <ItemsControl x:Name="DashboardUpdateItems">
                     <ItemsControl.ItemTemplate>
-                      <DataTemplate>
+                      <DataTemplate x:DataType="models:DashboardUpdateItem">
                         <Grid ColumnDefinitions="30,*,Auto"
                               ColumnSpacing="8"
                               Margin="0,4">
