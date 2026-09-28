@@ -18,6 +18,12 @@ public sealed class PortalCatalogueResponse
 
     [JsonPropertyName("requests")]
     public List<PortalRequest> Requests { get; init; } = [];
+
+    [JsonPropertyName("device")]
+    public PortalDevice Device { get; init; } = new();
+
+    [JsonPropertyName("updates")]
+    public PortalUpdates Updates { get; init; } = new();
 }
 
 public sealed class PortalApp
@@ -43,6 +49,12 @@ public sealed class PortalApp
     [JsonPropertyName("sourceType")]
     public string SourceType { get; init; } = string.Empty;
 
+    [JsonPropertyName("catalogueId")]
+    public string CatalogueId { get; init; } = string.Empty;
+
+    [JsonPropertyName("installed")]
+    public bool Installed { get; init; }
+
     [JsonPropertyName("version")]
     public string Version { get; init; } = string.Empty;
 
@@ -51,6 +63,125 @@ public sealed class PortalApp
 
     [JsonPropertyName("scope")]
     public PortalScope Scope { get; init; } = new();
+}
+
+public sealed class PortalDevice
+{
+    [JsonPropertyName("name")]
+    public string Name { get; init; } = string.Empty;
+
+    [JsonPropertyName("manufacturer")]
+    public string Manufacturer { get; init; } = string.Empty;
+
+    [JsonPropertyName("model")]
+    public string Model { get; init; } = string.Empty;
+
+    [JsonPropertyName("operating_system")]
+    public string OperatingSystem { get; init; } = string.Empty;
+
+    [JsonPropertyName("os_version")]
+    public string OsVersion { get; init; } = string.Empty;
+
+    [JsonPropertyName("is_encrypted")]
+    public bool? IsEncrypted { get; init; }
+
+    [JsonPropertyName("storage_total_bytes")]
+    public long? StorageTotalBytes { get; init; }
+
+    [JsonPropertyName("storage_free_bytes")]
+    public long? StorageFreeBytes { get; init; }
+
+    [JsonPropertyName("user_display_name")]
+    public string UserDisplayName { get; init; } = string.Empty;
+
+    [JsonPropertyName("user_principal_name")]
+    public string UserPrincipalName { get; init; } = string.Empty;
+
+    [JsonPropertyName("compliance_state")]
+    public string ComplianceState { get; init; } = string.Empty;
+
+    [JsonPropertyName("agent_version")]
+    public string AgentVersion { get; init; } = string.Empty;
+
+    [JsonPropertyName("websocket_status")]
+    public string WebsocketStatus { get; init; } = string.Empty;
+
+    [JsonPropertyName("active_user")]
+    public string ActiveUser { get; init; } = string.Empty;
+
+    [JsonPropertyName("last_telemetry_at")]
+    public DateTimeOffset? LastTelemetryAt { get; init; }
+}
+
+public sealed class PortalUpdates
+{
+    [JsonPropertyName("total")]
+    public int Total { get; init; }
+
+    [JsonPropertyName("software")]
+    public List<PortalSoftwareUpdate> Software { get; init; } = [];
+
+    [JsonPropertyName("windows")]
+    public List<PortalWindowsUpdate> Windows { get; init; } = [];
+}
+
+public sealed class PortalSoftwareUpdate
+{
+    [JsonPropertyName("title")]
+    public string Title { get; init; } = string.Empty;
+
+    [JsonPropertyName("installed_version")]
+    public string InstalledVersion { get; init; } = string.Empty;
+
+    [JsonPropertyName("available_version")]
+    public string AvailableVersion { get; init; } = string.Empty;
+
+    [JsonPropertyName("status")]
+    public string Status { get; init; } = string.Empty;
+
+    [JsonPropertyName("updated_at")]
+    public DateTimeOffset? UpdatedAt { get; init; }
+}
+
+public sealed class PortalWindowsUpdate
+{
+    [JsonPropertyName("title")]
+    public string Title { get; init; } = string.Empty;
+
+    [JsonPropertyName("update_class")]
+    public string UpdateClass { get; init; } = string.Empty;
+
+    [JsonPropertyName("severity")]
+    public string Severity { get; init; } = string.Empty;
+
+    [JsonPropertyName("downloaded")]
+    public bool Downloaded { get; init; }
+
+    [JsonPropertyName("reboot_required")]
+    public bool RebootRequired { get; init; }
+
+    [JsonPropertyName("updated_at")]
+    public DateTimeOffset? UpdatedAt { get; init; }
+}
+
+public sealed class RequestSummaryItem
+{
+    public required string Name { get; init; }
+    public required string StatusText { get; init; }
+    public required string DateText { get; init; }
+    public required string StatusBackground { get; init; }
+    public required string StatusForeground { get; init; }
+}
+
+public sealed class DashboardUpdateItem
+{
+    public required string IconText { get; init; }
+    public required string Title { get; init; }
+    public required string Detail { get; init; }
+    public required string StatusText { get; init; }
+    public required string StatusBackground { get; init; }
+    public required string StatusForeground { get; init; }
+    public DateTimeOffset? UpdatedAt { get; init; }
 }
 
 public sealed class PortalScope
