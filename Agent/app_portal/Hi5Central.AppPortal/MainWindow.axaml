@@ -232,10 +232,10 @@
                       <Border Grid.Column="2"
                               Padding="8,5"
                               CornerRadius="10"
-                              Background="#EEF4FF"
+                              Background="{Binding StatusBackground}"
                               VerticalAlignment="Top">
                         <TextBlock Text="{Binding StatusText}"
-                                   Foreground="#2E5CCC"
+                                   Foreground="{Binding StatusForeground}"
                                    FontSize="8"
                                    FontWeight="Bold" />
                       </Border>

@@ -20,6 +20,7 @@ public sealed partial class MainWindow : Window
     private readonly DispatcherTimer _pollTimer;
     private List<PortalApp> _apps = [];
     private List<PortalInstallation> _installations = [];
+    private List<PortalRequest> _requests = [];
     private string _view = "home";
     private bool _busy;
 
@@ -31,7 +32,7 @@ public sealed partial class MainWindow : Window
 
         _pollTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromSeconds(6),
+            Interval = TimeSpan.FromSeconds(10),
         };
         _pollTimer.Tick += PollTimer_Tick;
 
@@ -51,7 +52,7 @@ public sealed partial class MainWindow : Window
 
     private async void PollTimer_Tick(object? sender, EventArgs e)
     {
-        if (_busy || !HasInstallingApps()) return;
+        if (_busy || !NeedsPolling()) return;
         await RefreshCatalogueAsync(showLoading: false, quiet: true);
     }
 
@@ -81,6 +82,7 @@ public sealed partial class MainWindow : Window
 
             _apps = response.Apps;
             _installations = response.Installations;
+            _requests = response.Requests;
             RebuildCategories();
             ApplyFilters();
 
@@ -172,7 +174,7 @@ public sealed partial class MainWindow : Window
         filtered = _view switch
         {
             "installed" => filtered.Where(card => card.Status == AppPortalStatus.Installed),
-            "requests" => filtered.Where(card => card.Status == AppPortalStatus.ApprovalRequired),
+            "requests" => filtered.Where(card => card.HasRequest),
             _ => filtered,
         };
 
@@ -196,6 +198,12 @@ public sealed partial class MainWindow : Window
                 EmptyTitle.Text = "No software has been assigned yet";
                 EmptyDescription.Text =
                     "Your IT team can publish Hi5Central catalogue applications or company-specific software to this portal.";
+            }
+            else if (_view == "requests")
+            {
+                EmptyTitle.Text = "No software requests";
+                EmptyDescription.Text =
+                    "Applications you request for approval will appear here with their current decision and install status.";
             }
             else
             {
@@ -221,19 +229,61 @@ public sealed partial class MainWindow : Window
             }
         }
 
-        return _apps
-            .Select(app => new AppCard
+        var latestRequestByApp = new Dictionary<string, PortalRequest>(StringComparer.OrdinalIgnoreCase);
+        foreach (var request in _requests)
+        {
+            if (string.IsNullOrWhiteSpace(request.AppId)) continue;
+            if (!latestRequestByApp.ContainsKey(request.AppId))
             {
-                App = app,
-                Status = ResolveStatus(
-                    app,
-                    latestByApp.TryGetValue(app.Id, out var install) ? install : null),
+                latestRequestByApp[request.AppId] = request;
+            }
+        }
+
+        return _apps
+            .Select(app =>
+            {
+                latestByApp.TryGetValue(app.Id, out var installation);
+                latestRequestByApp.TryGetValue(app.Id, out var request);
+                return new AppCard
+                {
+                    App = app,
+                    Request = request,
+                    Status = ResolveStatus(app, installation, request),
+                };
             })
             .ToList();
     }
 
-    private static AppPortalStatus ResolveStatus(PortalApp app, PortalInstallation? installation)
+    private static AppPortalStatus ResolveStatus(
+        PortalApp app,
+        PortalInstallation? installation,
+        PortalRequest? request)
     {
+        var requestIsCurrent = request is not null
+            && (installation is null
+                || request.CreatedAt is null
+                || installation.CreatedAt is null
+                || request.CreatedAt >= installation.CreatedAt);
+
+        if (requestIsCurrent)
+        {
+            var requestStatus = request!.Status.Trim().ToLowerInvariant();
+            if (requestStatus == "pending")
+            {
+                return AppPortalStatus.ApprovalPending;
+            }
+
+            if (requestStatus == "rejected")
+            {
+                return AppPortalStatus.ApprovalRejected;
+            }
+
+            if (requestStatus == "fulfilled" && installation is null)
+            {
+                return AppPortalStatus.Installing;
+            }
+        }
+
         if (installation is not null)
         {
             var lifecycle = installation.InstallationStatus.Trim().ToLowerInvariant();
@@ -369,12 +419,13 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private bool HasInstallingApps()
-        => BuildCards().Any(card => card.Status == AppPortalStatus.Installing);
+    private bool NeedsPolling()
+        => BuildCards().Any(card => card.Status is AppPortalStatus.Installing
+            or AppPortalStatus.ApprovalPending);
 
     private void UpdatePollState()
     {
-        if (HasInstallingApps())
+        if (NeedsPolling())
         {
             if (!_pollTimer.IsEnabled) _pollTimer.Start();
         }

@@ -15,6 +15,9 @@ public sealed class PortalCatalogueResponse
 
     [JsonPropertyName("installations")]
     public List<PortalInstallation> Installations { get; init; } = [];
+
+    [JsonPropertyName("requests")]
+    public List<PortalRequest> Requests { get; init; } = [];
 }
 
 public sealed class PortalApp
@@ -83,6 +86,30 @@ public sealed class PortalInstallation
     public DateTimeOffset? CompletedAt { get; init; }
 }
 
+public sealed class PortalRequest
+{
+    [JsonPropertyName("id")]
+    public string Id { get; init; } = string.Empty;
+
+    [JsonPropertyName("app_id")]
+    public string AppId { get; init; } = string.Empty;
+
+    [JsonPropertyName("revision_id")]
+    public string RevisionId { get; init; } = string.Empty;
+
+    [JsonPropertyName("status")]
+    public string Status { get; init; } = string.Empty;
+
+    [JsonPropertyName("created_at")]
+    public DateTimeOffset? CreatedAt { get; init; }
+
+    [JsonPropertyName("decided_at")]
+    public DateTimeOffset? DecidedAt { get; init; }
+
+    [JsonPropertyName("decision_note")]
+    public string DecisionNote { get; init; } = string.Empty;
+}
+
 public sealed class PortalInstallResponse
 {
     [JsonPropertyName("success")]
@@ -99,6 +126,8 @@ public enum AppPortalStatus
 {
     Available,
     ApprovalRequired,
+    ApprovalPending,
+    ApprovalRejected,
     Installing,
     Installed,
     Failed,
@@ -108,8 +137,10 @@ public sealed class AppCard
 {
     public required PortalApp App { get; init; }
     public required AppPortalStatus Status { get; init; }
+    public PortalRequest? Request { get; init; }
 
     public string Id => App.Id;
+    public bool HasRequest => Request is not null;
     public string Name => string.IsNullOrWhiteSpace(App.Name) ? "Application" : App.Name;
     public string Publisher => string.IsNullOrWhiteSpace(App.Publisher)
         ? "Company application"
@@ -128,6 +159,8 @@ public sealed class AppCard
     public string StatusText => Status switch
     {
         AppPortalStatus.ApprovalRequired => "Approval required",
+        AppPortalStatus.ApprovalPending => "Awaiting approval",
+        AppPortalStatus.ApprovalRejected => "Request declined",
         AppPortalStatus.Installing => "Installing",
         AppPortalStatus.Installed => "Installed",
         AppPortalStatus.Failed => "Failed",
@@ -137,6 +170,8 @@ public sealed class AppCard
     public string ActionText => Status switch
     {
         AppPortalStatus.ApprovalRequired => "Request approval",
+        AppPortalStatus.ApprovalPending => "Awaiting approval",
+        AppPortalStatus.ApprovalRejected => "Request again",
         AppPortalStatus.Installing => "Installing...",
         AppPortalStatus.Installed => "Installed",
         AppPortalStatus.Failed => "Retry",
@@ -145,7 +180,29 @@ public sealed class AppCard
 
     public bool CanInstall => Status is AppPortalStatus.Available
         or AppPortalStatus.ApprovalRequired
+        or AppPortalStatus.ApprovalRejected
         or AppPortalStatus.Failed;
+
+    public string StatusBackground => Status switch
+    {
+        AppPortalStatus.Installed => "#E9F8F1",
+        AppPortalStatus.Installing => "#EEF4FF",
+        AppPortalStatus.ApprovalPending => "#FFF6E5",
+        AppPortalStatus.ApprovalRequired => "#FFF6E5",
+        AppPortalStatus.ApprovalRejected => "#FFF0F2",
+        AppPortalStatus.Failed => "#FFF0F2",
+        _ => "#EEF4FF",
+    };
+
+    public string StatusForeground => Status switch
+    {
+        AppPortalStatus.Installed => "#146B50",
+        AppPortalStatus.ApprovalPending => "#9A6400",
+        AppPortalStatus.ApprovalRequired => "#9A6400",
+        AppPortalStatus.ApprovalRejected => "#B63D4C",
+        AppPortalStatus.Failed => "#B63D4C",
+        _ => "#2E5CCC",
+    };
 
     public string ScopeText => App.Scope.Type switch
     {
