@@ -122,6 +122,11 @@ jobs:
               throw "Native SSDP/UPnP enrichment is missing required safety contract: $ssdpContract"
             }
           }
+          foreach ($mdnsContract in @('DiscoverMdns','BuildMdnsEnrichment','224.0.0.251','source.sin_port','targets.find(ipAddress)','recordCount')) {
+            if ($snmp -notmatch [regex]::Escape($mdnsContract)) {
+              throw "Native mDNS/DNS-SD enrichment is missing required safety contract: $mdnsContract"
+            }
+          }
           foreach ($presenceContract in @('IcmpSendEcho','GetIpNetTable','presenceEnabled','discoveryMethods','nameEnrichmentDeferred','MIB_IPNET_TYPE_INVALID','allZero','allBroadcast')) {
             if ($snmp -notmatch [regex]::Escape($presenceContract)) {
               throw "Native network presence discovery is missing required contract: $presenceContract"

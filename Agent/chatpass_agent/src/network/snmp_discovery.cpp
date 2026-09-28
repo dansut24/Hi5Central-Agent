@@ -1145,6 +1145,407 @@ json BuildSsdpEnrichment(const SsdpRecord& record) {
     return item;
 }
 
+
+void AppendDnsName(std::vector<std::uint8_t>& packet, const std::string& name) {
+    std::size_t start = 0;
+    while (start < name.size()) {
+        const std::size_t dot = name.find('.', start);
+        const std::size_t end = dot == std::string::npos ? name.size() : dot;
+        const std::size_t length = end - start;
+        if (length == 0 || length > 63) return;
+        packet.push_back(static_cast<std::uint8_t>(length));
+        packet.insert(packet.end(), name.begin() + static_cast<std::ptrdiff_t>(start),
+                      name.begin() + static_cast<std::ptrdiff_t>(end));
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    packet.push_back(0);
+}
+
+bool ReadDnsName(
+    const std::uint8_t* data,
+    std::size_t size,
+    std::size_t& offset,
+    std::string& output) {
+    output.clear();
+    if (!data || offset >= size) return false;
+
+    std::size_t cursor = offset;
+    bool jumped = false;
+    std::size_t jumps = 0;
+
+    for (;;) {
+        if (cursor >= size || jumps > 24) return false;
+        const std::uint8_t length = data[cursor];
+
+        if ((length & 0xc0) == 0xc0) {
+            if (cursor + 1 >= size) return false;
+            const std::size_t pointer =
+                (static_cast<std::size_t>(length & 0x3f) << 8)
+                | static_cast<std::size_t>(data[cursor + 1]);
+            if (pointer >= size) return false;
+            if (!jumped) offset = cursor + 2;
+            cursor = pointer;
+            jumped = true;
+            ++jumps;
+            continue;
+        }
+
+        if (length == 0) {
+            if (!jumped) offset = cursor + 1;
+            return true;
+        }
+
+        if ((length & 0xc0) != 0 || length > 63 || cursor + 1 + length > size) {
+            return false;
+        }
+
+        if (!output.empty()) output.push_back('.');
+        output.append(
+            reinterpret_cast<const char*>(data + cursor + 1),
+            static_cast<std::size_t>(length));
+        cursor += 1 + length;
+        if (!jumped) offset = cursor;
+    }
+}
+
+std::uint16_t ReadDnsU16(const std::uint8_t* data, std::size_t offset) {
+    return static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>(data[offset]) << 8)
+        | static_cast<std::uint16_t>(data[offset + 1]));
+}
+
+std::uint32_t ReadDnsU32(const std::uint8_t* data, std::size_t offset) {
+    return (static_cast<std::uint32_t>(data[offset]) << 24)
+        | (static_cast<std::uint32_t>(data[offset + 1]) << 16)
+        | (static_cast<std::uint32_t>(data[offset + 2]) << 8)
+        | static_cast<std::uint32_t>(data[offset + 3]);
+}
+
+std::string MdnsInstanceName(const std::string& value) {
+    const auto marker = value.find("._");
+    if (marker == std::string::npos || marker == 0) return {};
+    return TrimAscii(value.substr(0, marker));
+}
+
+std::string StripLocalSuffix(std::string value) {
+    const std::string lower = LowerAscii(value);
+    static constexpr char kSuffix[] = ".local";
+    if (lower.size() > sizeof(kSuffix) - 1
+        && lower.compare(
+            lower.size() - (sizeof(kSuffix) - 1),
+            sizeof(kSuffix) - 1,
+            kSuffix) == 0) {
+        value.resize(value.size() - (sizeof(kSuffix) - 1));
+    }
+    return TrimAscii(value);
+}
+
+struct MdnsRecord {
+    std::string ipAddress;
+    std::string friendlyName;
+    std::string hostname;
+    std::string vendor;
+    std::string model;
+    std::string deviceType;
+    std::vector<std::string> services;
+};
+
+void AddUniqueService(std::vector<std::string>& services, const std::string& value) {
+    if (value.empty() || value.size() > 256 || services.size() >= 32) return;
+    if (std::find(services.begin(), services.end(), value) == services.end()) {
+        services.push_back(value);
+    }
+}
+
+std::string InferMdnsDeviceType(const MdnsRecord& record) {
+    std::string value = LowerAscii(
+        record.friendlyName + " " + record.hostname + " "
+        + record.vendor + " " + record.model + " ");
+    for (const auto& service : record.services) {
+        value += LowerAscii(service);
+        value.push_back(' ');
+    }
+
+    if (value.find("_ipp._tcp") != std::string::npos
+        || value.find("_printer._tcp") != std::string::npos
+        || value.find("_pdl-datastream._tcp") != std::string::npos) return "printer";
+    if (value.find("_airplay._tcp") != std::string::npos
+        || value.find("_raop._tcp") != std::string::npos
+        || value.find("_googlecast._tcp") != std::string::npos
+        || value.find("_spotify-connect._tcp") != std::string::npos) return "media_device";
+    if (value.find("_hap._tcp") != std::string::npos
+        || value.find("_homekit._tcp") != std::string::npos) return "smart_home";
+    if (value.find("_workstation._tcp") != std::string::npos
+        || value.find("_smb._tcp") != std::string::npos
+        || value.find("_ssh._tcp") != std::string::npos) return "computer";
+    if (value.find("camera") != std::string::npos
+        || value.find("doorbell") != std::string::npos
+        || value.find("ring") != std::string::npos) return "camera";
+    return "network_device";
+}
+
+void ApplyMdnsTxt(
+    MdnsRecord& record,
+    const std::uint8_t* data,
+    std::size_t offset,
+    std::size_t length) {
+    const std::size_t end = offset + length;
+    while (offset < end) {
+        const std::uint8_t partLength = data[offset++];
+        if (partLength == 0 || offset + partLength > end) break;
+        std::string part(
+            reinterpret_cast<const char*>(data + offset),
+            static_cast<std::size_t>(partLength));
+        offset += partLength;
+
+        const auto equals = part.find('=');
+        if (equals == std::string::npos) continue;
+        const std::string key = LowerAscii(TrimAscii(part.substr(0, equals)));
+        const std::string value = TrimAscii(part.substr(equals + 1));
+        if (value.empty() || value.size() > 512) continue;
+
+        if ((key == "fn" || key == "name") && record.friendlyName.empty()) {
+            record.friendlyName = value;
+        } else if ((key == "md" || key == "model" || key == "ty") && record.model.empty()) {
+            record.model = value;
+        } else if ((key == "manufacturer" || key == "mf" || key == "vendor")
+                   && record.vendor.empty()) {
+            record.vendor = value;
+        }
+    }
+}
+
+std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
+    const std::unordered_set<std::string>& targets) {
+    std::unordered_map<std::string, MdnsRecord> records;
+#ifdef _WIN32
+    if (targets.empty()) return records;
+
+    static const std::vector<std::string> kServiceTypes = {
+        "_airplay._tcp.local",
+        "_raop._tcp.local",
+        "_googlecast._tcp.local",
+        "_ipp._tcp.local",
+        "_printer._tcp.local",
+        "_pdl-datastream._tcp.local",
+        "_workstation._tcp.local",
+        "_smb._tcp.local",
+        "_ssh._tcp.local",
+        "_hap._tcp.local",
+        "_homekit._tcp.local",
+        "_companion-link._tcp.local",
+        "_spotify-connect._tcp.local",
+        "_http._tcp.local",
+        "_https._tcp.local"
+    };
+
+    std::vector<std::uint8_t> query(12, 0);
+    query[4] = static_cast<std::uint8_t>((kServiceTypes.size() >> 8) & 0xff);
+    query[5] = static_cast<std::uint8_t>(kServiceTypes.size() & 0xff);
+    for (const auto& service : kServiceTypes) {
+        AppendDnsName(query, service);
+        query.push_back(0);
+        query.push_back(12);  // PTR
+        query.push_back(0x80);
+        query.push_back(0x01);  // IN + unicast-response preference
+    }
+
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) return records;
+
+    DWORD timeoutMs = 250;
+    setsockopt(
+        sock,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&timeoutMs),
+        sizeof(timeoutMs));
+    unsigned char ttl = 1;
+    setsockopt(
+        sock,
+        IPPROTO_IP,
+        IP_MULTICAST_TTL,
+        reinterpret_cast<const char*>(&ttl),
+        sizeof(ttl));
+
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(0);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
+        closesocket(sock);
+        return records;
+    }
+
+    sockaddr_in destination{};
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(5353);
+    InetPtonA(AF_INET, "224.0.0.251", &destination.sin_addr);
+    sendto(
+        sock,
+        reinterpret_cast<const char*>(query.data()),
+        static_cast<int>(query.size()),
+        0,
+        reinterpret_cast<const sockaddr*>(&destination),
+        sizeof(destination));
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2400);
+    std::vector<std::uint8_t> buffer(64 * 1024);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        sockaddr_in source{};
+        int sourceLength = sizeof(source);
+        const int received = recvfrom(
+            sock,
+            reinterpret_cast<char*>(buffer.data()),
+            static_cast<int>(buffer.size()),
+            0,
+            reinterpret_cast<sockaddr*>(&source),
+            &sourceLength);
+        if (received <= 0) {
+            const int socketError = WSAGetLastError();
+            if (socketError == WSAETIMEDOUT || socketError == WSAEWOULDBLOCK) continue;
+            break;
+        }
+
+        if (ntohs(source.sin_port) != 5353) continue;
+
+        char ipBuffer[INET_ADDRSTRLEN]{};
+        if (!InetNtopA(AF_INET, &source.sin_addr, ipBuffer, sizeof(ipBuffer))) continue;
+        const std::string ipAddress = ipBuffer;
+        if (targets.find(ipAddress) == targets.end()) continue;
+
+        const std::size_t packetSize = static_cast<std::size_t>(received);
+        if (packetSize < 12) continue;
+        const std::uint16_t flags = ReadDnsU16(buffer.data(), 2);
+        if ((flags & 0x8000u) == 0) continue;
+
+        MdnsRecord& record = records[ipAddress];
+        record.ipAddress = ipAddress;
+
+        const std::uint16_t qdCount = ReadDnsU16(buffer.data(), 4);
+        const std::uint16_t anCount = ReadDnsU16(buffer.data(), 6);
+        const std::uint16_t nsCount = ReadDnsU16(buffer.data(), 8);
+        const std::uint16_t arCount = ReadDnsU16(buffer.data(), 10);
+        if (static_cast<std::uint32_t>(qdCount)
+                + static_cast<std::uint32_t>(anCount)
+                + static_cast<std::uint32_t>(nsCount)
+                + static_cast<std::uint32_t>(arCount) > 512) {
+            continue;
+        }
+
+        std::size_t offset = 12;
+        bool valid = true;
+        for (std::uint16_t index = 0; index < qdCount; ++index) {
+            std::string ignored;
+            if (!ReadDnsName(buffer.data(), packetSize, offset, ignored)
+                || offset + 4 > packetSize) {
+                valid = false;
+                break;
+            }
+            offset += 4;
+        }
+        if (!valid) continue;
+
+        const std::uint32_t recordCount =
+            static_cast<std::uint32_t>(anCount)
+            + static_cast<std::uint32_t>(nsCount)
+            + static_cast<std::uint32_t>(arCount);
+
+        for (std::uint32_t index = 0; index < recordCount; ++index) {
+            std::string owner;
+            if (!ReadDnsName(buffer.data(), packetSize, offset, owner)
+                || offset + 10 > packetSize) break;
+
+            const std::uint16_t type = ReadDnsU16(buffer.data(), offset);
+            offset += 2;
+            offset += 2;  // class
+            (void)ReadDnsU32(buffer.data(), offset);
+            offset += 4;
+            const std::uint16_t rdLength = ReadDnsU16(buffer.data(), offset);
+            offset += 2;
+            if (offset + rdLength > packetSize) break;
+
+            const std::size_t rdataOffset = offset;
+            if (type == 12) {  // PTR
+                std::size_t nameOffset = rdataOffset;
+                std::string target;
+                if (ReadDnsName(buffer.data(), packetSize, nameOffset, target)) {
+                    AddUniqueService(record.services, owner);
+                    const std::string instance = MdnsInstanceName(target);
+                    if (record.friendlyName.empty() && !instance.empty()) {
+                        record.friendlyName = instance;
+                    }
+                }
+            } else if (type == 33 && rdLength >= 6) {  // SRV
+                std::size_t targetOffset = rdataOffset + 6;
+                std::string target;
+                if (ReadDnsName(buffer.data(), packetSize, targetOffset, target)) {
+                    const std::string hostname = StripLocalSuffix(target);
+                    if (record.hostname.empty() && !hostname.empty()) {
+                        record.hostname = hostname;
+                    }
+                }
+                const std::string instance = MdnsInstanceName(owner);
+                if (record.friendlyName.empty() && !instance.empty()) {
+                    record.friendlyName = instance;
+                }
+            } else if (type == 16) {  // TXT
+                ApplyMdnsTxt(record, buffer.data(), rdataOffset, rdLength);
+            }
+
+            offset = rdataOffset + rdLength;
+        }
+    }
+
+    closesocket(sock);
+
+    for (auto it = records.begin(); it != records.end();) {
+        auto& record = it->second;
+        const bool useful = !record.friendlyName.empty()
+            || !record.hostname.empty()
+            || !record.vendor.empty()
+            || !record.model.empty()
+            || !record.services.empty();
+        if (!useful) {
+            it = records.erase(it);
+            continue;
+        }
+        record.deviceType = InferMdnsDeviceType(record);
+        ++it;
+    }
+#else
+    (void)targets;
+#endif
+    return records;
+}
+
+json BuildMdnsEnrichment(const MdnsRecord& record) {
+    json services = json::array();
+    for (const auto& service : record.services) services.push_back(service);
+
+    const std::string name = !record.friendlyName.empty()
+        ? record.friendlyName
+        : record.hostname;
+
+    return json{
+        {"ipAddress", record.ipAddress},
+        {"hostname", name},
+        {"vendor", record.vendor},
+        {"model", record.model},
+        {"deviceType", record.deviceType},
+        {"discoveryMethods", json::array({"mdns"})},
+        {"metadata", {
+            {"mdns", {
+                {"hostname", record.hostname},
+                {"friendlyName", record.friendlyName},
+                {"services", services}
+            }}
+        }}
+    };
+}
+
 }  // namespace
 
 nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& error) {
@@ -1420,8 +1821,12 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
 
     std::unordered_set<std::string> targetSet(targets.begin(), targets.end());
     std::unordered_map<std::string, SsdpRecord> ssdpRecords;
+    std::unordered_map<std::string, MdnsRecord> mdnsRecords;
     std::thread ssdpDiscovery([&]() {
         ssdpRecords = DiscoverSsdp(targetSet);
+    });
+    std::thread mdnsDiscovery([&]() {
+        mdnsRecords = DiscoverMdns(targetSet);
     });
 
     const std::size_t workerCount =
@@ -1451,6 +1856,12 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
     }
     for (auto& worker : workers) worker.join();
     if (ssdpDiscovery.joinable()) ssdpDiscovery.join();
+    if (mdnsDiscovery.joinable()) mdnsDiscovery.join();
+
+    for (const auto& [ipAddress, record] : mdnsRecords) {
+        (void)ipAddress;
+        resolved.push_back(BuildMdnsEnrichment(record));
+    }
 
     std::vector<SsdpRecord> ssdpList;
     ssdpList.reserve(ssdpRecords.size());
@@ -1501,11 +1912,12 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
 
     return json{
         {"status", "ok"},
-        {"protocolVersion", 2},
+        {"protocolVersion", 3},
         {"targetsTotal", targets.size()},
         {"enrichedCount", enrichedIps.size()},
         {"resolvedCount", namedIps.size()},
         {"ssdpCount", ssdpRecords.size()},
+        {"mdnsCount", mdnsRecords.size()},
         {"durationMs", durationMs},
         {"devices", resolved}
     };
