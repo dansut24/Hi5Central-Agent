@@ -1244,18 +1244,121 @@ std::string StripLocalSuffix(std::string value) {
 struct MdnsRecord {
     std::string ipAddress;
     std::string friendlyName;
+    std::string friendlyNameSource;
+    int friendlyNameScore = -1;
     std::string hostname;
     std::string vendor;
     std::string model;
     std::string deviceType;
     std::vector<std::string> services;
+    std::vector<std::string> capabilities;
+    std::unordered_map<std::string, std::string> txt;
 };
 
-void AddUniqueService(std::vector<std::string>& services, const std::string& value) {
-    if (value.empty() || value.size() > 256 || services.size() >= 32) return;
-    if (std::find(services.begin(), services.end(), value) == services.end()) {
-        services.push_back(value);
+void AddUniqueValue(
+    std::vector<std::string>& values,
+    const std::string& value,
+    std::size_t limit,
+    std::size_t maxLength = 256) {
+    if (value.empty() || value.size() > maxLength || values.size() >= limit) return;
+    if (std::find(values.begin(), values.end(), value) == values.end()) {
+        values.push_back(value);
     }
+}
+
+void AddUniqueService(std::vector<std::string>& services, const std::string& value) {
+    AddUniqueValue(services, LowerAscii(TrimAscii(value)), 48);
+}
+
+int MdnsNameScore(const std::string& raw, bool explicitTxtName = false) {
+    const std::string value = TrimAscii(raw);
+    if (value.empty() || value.size() > 128) return -1;
+    const std::string lower = LowerAscii(value);
+    if (lower == "none" || lower == "none-2" || lower == "linux"
+        || lower == "localhost" || lower == "unknown" || lower == "device"
+        || lower == "network device") return 0;
+
+    int score = explicitTxtName ? 30 : 10;
+    if (lower == "spotifyconnect" || lower.rfind("spotifyconnect #", 0) == 0) score -= 7;
+
+    bool allHex = value.size() >= 10;
+    bool allIdentifier = value.size() >= 12;
+    bool hasSeparator = false;
+    bool hasLower = false;
+    bool hasUpper = false;
+    for (unsigned char ch : value) {
+        if (!std::isxdigit(ch)) allHex = false;
+        if (!std::isalnum(ch)) {
+            allIdentifier = false;
+            if (std::isspace(ch) || ch == '-' || ch == '_') hasSeparator = true;
+        }
+        if (std::islower(ch)) hasLower = true;
+        if (std::isupper(ch)) hasUpper = true;
+    }
+    if (allHex) score -= 6;
+    else if (allIdentifier && value.size() >= 14 && !(hasLower && hasUpper)) score -= 4;
+    if (hasSeparator) score += 2;
+    if (value.find(' ') != std::string::npos) score += 2;
+    return score;
+}
+
+void ConsiderMdnsFriendlyName(
+    MdnsRecord& record,
+    const std::string& candidate,
+    const std::string& source,
+    bool explicitTxtName = false) {
+    const std::string value = TrimAscii(candidate);
+    const int score = MdnsNameScore(value, explicitTxtName);
+    if (score < 0) return;
+    if (score > record.friendlyNameScore
+        || (score == record.friendlyNameScore
+            && !value.empty()
+            && (record.friendlyName.empty() || value.size() < record.friendlyName.size()))) {
+        record.friendlyName = value;
+        record.friendlyNameSource = source;
+        record.friendlyNameScore = score;
+    }
+}
+
+void AddMdnsCapability(MdnsRecord& record, const std::string& capability) {
+    AddUniqueValue(record.capabilities, capability, 32, 64);
+}
+
+void AddCapabilitiesForService(MdnsRecord& record, const std::string& rawService) {
+    const std::string service = LowerAscii(rawService);
+    if (service.find("_eerogw._tcp") != std::string::npos) {
+        AddMdnsCapability(record, "gateway");
+        AddMdnsCapability(record, "eero");
+    }
+    if (service.find("_airplay._tcp") != std::string::npos) AddMdnsCapability(record, "airplay");
+    if (service.find("_raop._tcp") != std::string::npos) AddMdnsCapability(record, "airplay_audio");
+    if (service.find("_googlecast._tcp") != std::string::npos) AddMdnsCapability(record, "google_cast");
+    if (service.find("_spotify-connect._tcp") != std::string::npos) AddMdnsCapability(record, "spotify_connect");
+    if (service.find("_ipp._tcp") != std::string::npos
+        || service.find("_printer._tcp") != std::string::npos
+        || service.find("_pdl-datastream._tcp") != std::string::npos) {
+        AddMdnsCapability(record, "printing");
+    }
+    if (service.find("_hap._tcp") != std::string::npos
+        || service.find("_homekit._tcp") != std::string::npos) {
+        AddMdnsCapability(record, "homekit");
+    }
+    if (service.find("_matter") != std::string::npos) AddMdnsCapability(record, "matter");
+    if (service.find("_smb._tcp") != std::string::npos) AddMdnsCapability(record, "smb");
+    if (service.find("_ssh._tcp") != std::string::npos) AddMdnsCapability(record, "ssh");
+    if (service.find("_http._tcp") != std::string::npos
+        || service.find("_https._tcp") != std::string::npos) {
+        AddMdnsCapability(record, "web_service");
+    }
+    if (service.find("_workstation._tcp") != std::string::npos) AddMdnsCapability(record, "workstation");
+    if (service.find("_companion-link._tcp") != std::string::npos) {
+        AddMdnsCapability(record, "companion_link");
+    }
+}
+
+void AddMdnsService(MdnsRecord& record, const std::string& service) {
+    AddUniqueService(record.services, service);
+    AddCapabilitiesForService(record, service);
 }
 
 std::string InferMdnsDeviceType(const MdnsRecord& record) {
@@ -1267,22 +1370,37 @@ std::string InferMdnsDeviceType(const MdnsRecord& record) {
         value.push_back(' ');
     }
 
+    if (value.find("_eerogw._tcp") != std::string::npos
+        || value.find(" eero ") != std::string::npos) return "router";
     if (value.find("_ipp._tcp") != std::string::npos
         || value.find("_printer._tcp") != std::string::npos
         || value.find("_pdl-datastream._tcp") != std::string::npos) return "printer";
+    if (value.find("camera") != std::string::npos
+        || value.find("doorbell") != std::string::npos
+        || value.find("ring") != std::string::npos) return "camera";
     if (value.find("_airplay._tcp") != std::string::npos
         || value.find("_raop._tcp") != std::string::npos
         || value.find("_googlecast._tcp") != std::string::npos
         || value.find("_spotify-connect._tcp") != std::string::npos) return "media_device";
     if (value.find("_hap._tcp") != std::string::npos
-        || value.find("_homekit._tcp") != std::string::npos) return "smart_home";
+        || value.find("_homekit._tcp") != std::string::npos
+        || value.find("_matter") != std::string::npos) return "smart_home";
     if (value.find("_workstation._tcp") != std::string::npos
         || value.find("_smb._tcp") != std::string::npos
         || value.find("_ssh._tcp") != std::string::npos) return "computer";
-    if (value.find("camera") != std::string::npos
-        || value.find("doorbell") != std::string::npos
-        || value.find("ring") != std::string::npos) return "camera";
     return "network_device";
+}
+
+bool IsSensitiveMdnsTxtKey(const std::string& key) {
+    const std::string lower = LowerAscii(key);
+    static const std::vector<std::string> blocked = {
+        "password", "passwd", "secret", "token", "credential",
+        "authorization", "authkey", "privatekey", "apikey", "api_key"
+    };
+    for (const auto& needle : blocked) {
+        if (lower.find(needle) != std::string::npos) return true;
+    }
+    return false;
 }
 
 void ApplyMdnsTxt(
@@ -1303,13 +1421,27 @@ void ApplyMdnsTxt(
         if (equals == std::string::npos) continue;
         const std::string key = LowerAscii(TrimAscii(part.substr(0, equals)));
         const std::string value = TrimAscii(part.substr(equals + 1));
-        if (value.empty() || value.size() > 512) continue;
+        if (key.empty() || key.size() > 64 || value.empty() || value.size() > 512) continue;
 
-        if ((key == "fn" || key == "name") && record.friendlyName.empty()) {
-            record.friendlyName = value;
-        } else if ((key == "md" || key == "model" || key == "ty") && record.model.empty()) {
+        if (!IsSensitiveMdnsTxtKey(key)
+            && record.txt.size() < 48
+            && record.txt.find(key) == record.txt.end()) {
+            record.txt.emplace(key, value);
+        }
+
+        if (key == "fn" || key == "name" || key == "dn"
+            || key == "room" || key == "roomname" || key == "room_name"
+            || key == "displayname" || key == "display_name"
+            || key == "devicename" || key == "device_name") {
+            ConsiderMdnsFriendlyName(record, value, "txt:" + key, true);
+        } else if ((key == "md" || key == "model" || key == "ty"
+                    || key == "am" || key == "product" || key == "productname"
+                    || key == "product_name" || key == "modelname"
+                    || key == "model_name")
+                   && record.model.empty()) {
             record.model = value;
-        } else if ((key == "manufacturer" || key == "mf" || key == "vendor")
+        } else if ((key == "manufacturer" || key == "mf" || key == "vendor"
+                    || key == "brand" || key == "make")
                    && record.vendor.empty()) {
             record.vendor = value;
         }
@@ -1522,6 +1654,9 @@ std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
         "_homekit._tcp.local",
         "_companion-link._tcp.local",
         "_spotify-connect._tcp.local",
+        "_matter._tcp.local",
+        "_matterd._udp.local",
+        "_eerogw._tcp.local",
         "_http._tcp.local",
         "_https._tcp.local"
     };
@@ -1677,11 +1812,9 @@ std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
                 std::size_t nameOffset = rdataOffset;
                 std::string target;
                 if (ReadDnsName(buffer.data(), packetSize, nameOffset, target)) {
-                    AddUniqueService(record.services, owner);
+                    AddMdnsService(record, owner);
                     const std::string instance = MdnsInstanceName(target);
-                    if (record.friendlyName.empty() && !instance.empty()) {
-                        record.friendlyName = instance;
-                    }
+                    ConsiderMdnsFriendlyName(record, instance, "ptr_instance");
                 }
             } else if (type == 33 && rdLength >= 6) {  // SRV
                 std::size_t targetOffset = rdataOffset + 6;
@@ -1693,10 +1826,10 @@ std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
                     }
                 }
                 const std::string instance = MdnsInstanceName(owner);
-                if (record.friendlyName.empty() && !instance.empty()) {
-                    record.friendlyName = instance;
-                }
+                ConsiderMdnsFriendlyName(record, instance, "srv_instance");
             } else if (type == 16) {  // TXT
+                const std::string instance = MdnsInstanceName(owner);
+                ConsiderMdnsFriendlyName(record, instance, "txt_instance");
                 ApplyMdnsTxt(record, buffer.data(), rdataOffset, rdLength);
             }
 
@@ -1730,9 +1863,21 @@ json BuildMdnsEnrichment(const MdnsRecord& record) {
     json services = json::array();
     for (const auto& service : record.services) services.push_back(service);
 
-    const std::string name = !record.friendlyName.empty()
-        ? record.friendlyName
-        : record.hostname;
+    json capabilities = json::array();
+    for (const auto& capability : record.capabilities) capabilities.push_back(capability);
+
+    json txt = json::object();
+    std::vector<std::pair<std::string, std::string>> txtEntries(
+        record.txt.begin(), record.txt.end());
+    std::sort(txtEntries.begin(), txtEntries.end());
+    for (const auto& [key, value] : txtEntries) txt[key] = value;
+
+    std::string name;
+    if (!record.friendlyName.empty() && record.friendlyNameScore > 0) {
+        name = record.friendlyName;
+    } else if (MdnsNameScore(record.hostname) > 0) {
+        name = record.hostname;
+    }
 
     return json{
         {"ipAddress", record.ipAddress},
@@ -1740,12 +1885,17 @@ json BuildMdnsEnrichment(const MdnsRecord& record) {
         {"vendor", record.vendor},
         {"model", record.model},
         {"deviceType", record.deviceType},
+        {"capabilities", capabilities},
         {"discoveryMethods", json::array({"mdns"})},
         {"metadata", {
             {"mdns", {
                 {"hostname", record.hostname},
                 {"friendlyName", record.friendlyName},
-                {"services", services}
+                {"friendlyNameSource", record.friendlyNameSource},
+                {"friendlyNameScore", record.friendlyNameScore},
+                {"services", services},
+                {"capabilities", capabilities},
+                {"txt", txt}
             }}
         }}
     };

@@ -122,7 +122,7 @@ jobs:
               throw "Native SSDP/UPnP enrichment is missing required safety contract: $ssdpContract"
             }
           }
-          foreach ($mdnsContract in @('DiscoverMdns','BuildMdnsEnrichment','DiscoverDnsSdServiceTypes','_services._dns-sd._udp.local','kQueryBatchSize','mdnsDynamicServiceTypeCount','224.0.0.251','source.sin_port','targets.find(ipAddress)','recordCount')) {
+          foreach ($mdnsContract in @('DiscoverMdns','BuildMdnsEnrichment','DiscoverDnsSdServiceTypes','_services._dns-sd._udp.local','kQueryBatchSize','mdnsDynamicServiceTypeCount','224.0.0.251','source.sin_port','targets.find(ipAddress)','recordCount','ConsiderMdnsFriendlyName','friendlyNameScore','IsSensitiveMdnsTxtKey','capabilities')) {
             if ($snmp -notmatch [regex]::Escape($mdnsContract)) {
               throw "Native mDNS/DNS-SD enrichment is missing required safety contract: $mdnsContract"
             }
