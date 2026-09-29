@@ -114,6 +114,11 @@ jobs:
           if ($snmp -notmatch 'RunSnmpDiscovery' -or $snmp -notmatch 'sysObjectID') {
             throw 'Native SNMP discovery implementation is incomplete.'
           }
+          foreach ($snmpV3Contract in @('QueryTargetV3','BuildSnmpV3Request','ParseSnmpV3Envelope','SnmpV3LocalizeKey','VerifySnmpV3Authentication','EVP_aes_128_cfb128','noAuthNoPriv','authNoPriv','authPriv')) {
+            if ($snmp -notmatch [regex]::Escape($snmpV3Contract)) {
+              throw "Native SNMPv3 USM discovery is missing required contract: $snmpV3Contract"
+            }
+          }
           if ($snmp -notmatch 'RunNetworkDiscoveryEnrichment' -or $snmp -notmatch 'reverse_dns') {
             throw 'Native network discovery name enrichment implementation is incomplete.'
           }

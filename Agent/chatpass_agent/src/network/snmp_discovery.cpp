@@ -7,9 +7,14 @@
 #include <icmpapi.h>
 #include <winhttp.h>
 #include <windows.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -80,6 +85,58 @@ Bytes EncodeOctetString(const std::string& value) {
     return Wrap(0x04, Bytes(value.begin(), value.end()));
 }
 
+Bytes EncodeOctetString(const Bytes& value) {
+    return Wrap(0x04, value);
+}
+
+struct SnmpV3Credential {
+    std::string username;
+    std::string securityLevel;
+    std::string authProtocol;
+    std::string authSecret;
+    std::string privacyProtocol;
+    std::string privacySecret;
+    std::string contextName;
+};
+
+struct SnmpV3Engine {
+    Bytes engineId;
+    std::uint32_t boots = 0;
+    std::uint32_t time = 0;
+};
+
+#ifdef _WIN32
+const EVP_MD* SnmpV3Digest(const std::string& protocol) {
+    std::string value = protocol;
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (value == "sha1") return EVP_sha1();
+    if (value == "sha256") return EVP_sha256();
+    return nullptr;
+}
+
+std::size_t SnmpV3AuthLength(const std::string& protocol) {
+    std::string value = protocol;
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (value == "sha1") return 12;
+    if (value == "sha256") return 24;
+    return 0;
+}
+
+bool SnmpV3NeedsAuth(const SnmpV3Credential& credential) {
+    return credential.securityLevel == "authNoPriv" || credential.securityLevel == "authPriv";
+}
+
+bool SnmpV3NeedsPrivacy(const SnmpV3Credential& credential) {
+    return credential.securityLevel == "authPriv";
+}
+
+bool SnmpV3PrivacySupported(const std::string& protocol) {
+    return protocol == "aes128";
+}
+#endif
+
 bool ParseOidComponents(const std::string& oid, std::vector<std::uint64_t>& parts) {
     parts.clear();
     std::stringstream stream(oid);
@@ -137,6 +194,163 @@ Bytes BuildGetRequest(int version, const std::string& community, std::uint32_t r
     Append(message, Wrap(0xA0, pduBody));
     return Wrap(0x30, message);
 }
+
+Bytes BuildGetPdu(std::uint32_t requestId, const std::vector<std::string>& oids) {
+    Bytes varBindList;
+    for (const auto& oid : oids) {
+        Bytes varBind;
+        Append(varBind, EncodeOid(oid));
+        Append(varBind, Wrap(0x05, {}));
+        Append(varBindList, Wrap(0x30, varBind));
+    }
+    Bytes pduBody;
+    Append(pduBody, EncodeInteger(requestId));
+    Append(pduBody, EncodeInteger(0));
+    Append(pduBody, EncodeInteger(0));
+    Append(pduBody, Wrap(0x30, varBindList));
+    return Wrap(0xA0, pduBody);
+}
+
+#ifdef _WIN32
+bool SnmpV3PasswordToKey(const std::string& password, const EVP_MD* digest, Bytes& key) {
+    key.clear();
+    if (!digest || password.size() < 8 || password.size() > 8192) return false;
+
+    EVP_MD_CTX* context = EVP_MD_CTX_new();
+    if (!context) return false;
+    bool ok = EVP_DigestInit_ex(context, digest, nullptr) == 1;
+    std::size_t cursor = 0;
+    std::size_t remaining = 1048576;
+    std::array<unsigned char, 64> chunk{};
+    while (ok && remaining > 0) {
+        const std::size_t count = std::min<std::size_t>(chunk.size(), remaining);
+        for (std::size_t i = 0; i < count; ++i) {
+            chunk[i] = static_cast<unsigned char>(password[cursor++ % password.size()]);
+        }
+        ok = EVP_DigestUpdate(context, chunk.data(), count) == 1;
+        remaining -= count;
+    }
+
+    unsigned int length = static_cast<unsigned int>(EVP_MD_size(digest));
+    key.resize(length);
+    if (ok) ok = EVP_DigestFinal_ex(context, key.data(), &length) == 1;
+    EVP_MD_CTX_free(context);
+    if (!ok) {
+        if (!key.empty()) OPENSSL_cleanse(key.data(), key.size());
+        key.clear();
+        return false;
+    }
+    key.resize(length);
+    return true;
+}
+
+bool SnmpV3LocalizeKey(const std::string& password, const EVP_MD* digest,
+                       const Bytes& engineId, Bytes& localized) {
+    Bytes master;
+    if (!SnmpV3PasswordToKey(password, digest, master)) return false;
+
+    EVP_MD_CTX* context = EVP_MD_CTX_new();
+    if (!context) {
+        OPENSSL_cleanse(master.data(), master.size());
+        return false;
+    }
+    bool ok = EVP_DigestInit_ex(context, digest, nullptr) == 1
+        && EVP_DigestUpdate(context, master.data(), master.size()) == 1
+        && EVP_DigestUpdate(context, engineId.data(), engineId.size()) == 1
+        && EVP_DigestUpdate(context, master.data(), master.size()) == 1;
+
+    unsigned int length = static_cast<unsigned int>(EVP_MD_size(digest));
+    localized.resize(length);
+    if (ok) ok = EVP_DigestFinal_ex(context, localized.data(), &length) == 1;
+    EVP_MD_CTX_free(context);
+    OPENSSL_cleanse(master.data(), master.size());
+    if (!ok) {
+        if (!localized.empty()) OPENSSL_cleanse(localized.data(), localized.size());
+        localized.clear();
+        return false;
+    }
+    localized.resize(length);
+    return true;
+}
+
+bool SnmpV3Hmac(const EVP_MD* digest, const Bytes& key,
+                const Bytes& message, Bytes& output) {
+    output.clear();
+    if (!digest || key.empty()) return false;
+    unsigned int length = EVP_MAX_MD_SIZE;
+    output.resize(length);
+    if (!HMAC(digest, key.data(), static_cast<int>(key.size()),
+              message.data(), message.size(), output.data(), &length)) {
+        output.clear();
+        return false;
+    }
+    output.resize(length);
+    return true;
+}
+
+Bytes SnmpV3Iv(std::uint32_t boots, std::uint32_t time, const Bytes& salt) {
+    if (salt.size() != 8) return {};
+    Bytes iv(16, 0);
+    for (int i = 0; i < 4; ++i) {
+        iv[i] = static_cast<std::uint8_t>((boots >> (24 - i * 8)) & 0xff);
+        iv[4 + i] = static_cast<std::uint8_t>((time >> (24 - i * 8)) & 0xff);
+    }
+    std::copy(salt.begin(), salt.end(), iv.begin() + 8);
+    return iv;
+}
+
+Bytes NextSnmpV3PrivacySalt() {
+    static std::atomic<std::uint64_t> counter{[]() {
+        std::uint64_t seed = 0;
+        if (RAND_bytes(reinterpret_cast<unsigned char*>(&seed), sizeof(seed)) != 1) {
+            seed = (static_cast<std::uint64_t>(GetTickCount64()) << 16)
+                ^ static_cast<std::uint64_t>(GetCurrentProcessId());
+        }
+        return seed;
+    }()};
+    const std::uint64_t value = counter.fetch_add(1, std::memory_order_relaxed);
+    Bytes salt(8, 0);
+    for (int index = 0; index < 8; ++index) {
+        salt[static_cast<std::size_t>(index)] =
+            static_cast<std::uint8_t>((value >> (56 - index * 8)) & 0xff);
+    }
+    return salt;
+}
+
+bool SnmpV3AesCrypt(const Bytes& input, const Bytes& key, const Bytes& iv,
+                    bool encrypt, Bytes& output) {
+    output.clear();
+    if (key.size() < 16 || iv.size() != 16) return false;
+
+    EVP_CIPHER_CTX* context = EVP_CIPHER_CTX_new();
+    if (!context) return false;
+    const EVP_CIPHER* cipher = EVP_aes_128_cfb128();
+    bool ok = (encrypt
+        ? EVP_EncryptInit_ex(context, cipher, nullptr, key.data(), iv.data())
+        : EVP_DecryptInit_ex(context, cipher, nullptr, key.data(), iv.data())) == 1;
+
+    output.resize(input.size() + 16);
+    int first = 0;
+    int final = 0;
+    if (ok) {
+        ok = (encrypt
+            ? EVP_EncryptUpdate(context, output.data(), &first, input.data(), static_cast<int>(input.size()))
+            : EVP_DecryptUpdate(context, output.data(), &first, input.data(), static_cast<int>(input.size()))) == 1;
+    }
+    if (ok) {
+        ok = (encrypt
+            ? EVP_EncryptFinal_ex(context, output.data() + first, &final)
+            : EVP_DecryptFinal_ex(context, output.data() + first, &final)) == 1;
+    }
+    EVP_CIPHER_CTX_free(context);
+    if (!ok) {
+        output.clear();
+        return false;
+    }
+    output.resize(static_cast<std::size_t>(first + final));
+    return true;
+}
+#endif
 
 class BerReader {
 public:
@@ -229,6 +443,403 @@ bool ReadInteger(BerReader& reader, std::uint64_t& value) {
     value = DecodeUnsigned(content, length);
     return true;
 }
+
+
+struct SnmpV3Envelope {
+    std::uint32_t messageId = 0;
+    SnmpV3Engine engine;
+    std::string username;
+    Bytes authParameters;
+    Bytes privacyParameters;
+    std::size_t authOffset = 0;
+    std::uint8_t msgFlags = 0;
+    std::uint8_t dataTag = 0;
+    const std::uint8_t* dataContent = nullptr;
+    std::size_t dataLength = 0;
+};
+
+bool ReadOctets(BerReader& reader, Bytes& value, const std::uint8_t* packet = nullptr,
+                std::size_t* valueOffset = nullptr) {
+    std::uint8_t tag = 0;
+    const std::uint8_t* content = nullptr;
+    std::size_t length = 0;
+    if (!reader.Read(tag, content, length) || tag != 0x04) return false;
+    value.assign(content, content + length);
+    if (packet && valueOffset) *valueOffset = static_cast<std::size_t>(content - packet);
+    return true;
+}
+
+bool ReadOctetText(BerReader& reader, std::string& value) {
+    Bytes bytes;
+    if (!ReadOctets(reader, bytes)) return false;
+    value.assign(bytes.begin(), bytes.end());
+    return true;
+}
+
+bool ParseSnmpV3Envelope(const std::uint8_t* packet, std::size_t packetLength,
+                         SnmpV3Envelope& envelope, std::string& error) {
+    envelope = SnmpV3Envelope{};
+    BerReader outer(packet, packetLength);
+    std::uint8_t tag = 0;
+    const std::uint8_t* messageContent = nullptr;
+    std::size_t messageLength = 0;
+    if (!outer.Read(tag, messageContent, messageLength) || tag != 0x30) {
+        error = "SNMPv3 response did not contain a valid message sequence.";
+        return false;
+    }
+
+    BerReader message(messageContent, messageLength);
+    std::uint64_t version = 0;
+    if (!ReadInteger(message, version) || version != 3) {
+        error = "SNMPv3 response version was invalid.";
+        return false;
+    }
+
+    const std::uint8_t* headerContent = nullptr;
+    std::size_t headerLength = 0;
+    if (!message.Read(tag, headerContent, headerLength) || tag != 0x30) {
+        error = "SNMPv3 response header was invalid.";
+        return false;
+    }
+    BerReader header(headerContent, headerLength);
+    std::uint64_t msgId = 0;
+    std::uint64_t maxSize = 0;
+    std::uint64_t securityModel = 0;
+    if (!ReadInteger(header, msgId) || !ReadInteger(header, maxSize)) {
+        error = "SNMPv3 response header integers were invalid.";
+        return false;
+    }
+    Bytes flags;
+    if (!ReadOctets(header, flags) || flags.size() != 1 || !ReadInteger(header, securityModel)
+        || securityModel != 3) {
+        error = "SNMPv3 response header flags/security model were invalid.";
+        return false;
+    }
+    envelope.messageId = static_cast<std::uint32_t>(msgId & 0xffffffffu);
+    envelope.msgFlags = flags.front();
+
+    Bytes securityBytes;
+    if (!ReadOctets(message, securityBytes)) {
+        error = "SNMPv3 security parameters were missing.";
+        return false;
+    }
+    BerReader securityOuter(securityBytes.data(), securityBytes.size());
+    const std::uint8_t* usmContent = nullptr;
+    std::size_t usmLength = 0;
+    if (!securityOuter.Read(tag, usmContent, usmLength) || tag != 0x30) {
+        error = "SNMPv3 USM parameters were invalid.";
+        return false;
+    }
+
+    // Re-parse against the original packet so authentication offsets refer to packet bytes.
+    const std::uint8_t* securityRaw = nullptr;
+    std::size_t securityRawLength = 0;
+    {
+        BerReader messageAgain(messageContent, messageLength);
+        std::uint64_t ignored = 0;
+        ReadInteger(messageAgain, ignored);
+        const std::uint8_t* ignoredHeader = nullptr;
+        std::size_t ignoredHeaderLength = 0;
+        messageAgain.Read(tag, ignoredHeader, ignoredHeaderLength);
+        if (!messageAgain.Read(tag, securityRaw, securityRawLength) || tag != 0x04) {
+            error = "SNMPv3 security parameter location was invalid.";
+            return false;
+        }
+    }
+    BerReader securityRawOuter(securityRaw, securityRawLength);
+    if (!securityRawOuter.Read(tag, usmContent, usmLength) || tag != 0x30) {
+        error = "SNMPv3 USM parameter location was invalid.";
+        return false;
+    }
+    BerReader usm(usmContent, usmLength);
+
+    if (!ReadOctets(usm, envelope.engine.engineId)) {
+        error = "SNMPv3 authoritative engine id was invalid.";
+        return false;
+    }
+    std::uint64_t boots = 0;
+    std::uint64_t engineTime = 0;
+    if (!ReadInteger(usm, boots) || !ReadInteger(usm, engineTime)) {
+        error = "SNMPv3 authoritative engine time was invalid.";
+        return false;
+    }
+    envelope.engine.boots = static_cast<std::uint32_t>(boots & 0xffffffffu);
+    envelope.engine.time = static_cast<std::uint32_t>(engineTime & 0xffffffffu);
+    if (!ReadOctetText(usm, envelope.username)
+        || !ReadOctets(usm, envelope.authParameters, packet, &envelope.authOffset)
+        || !ReadOctets(usm, envelope.privacyParameters)) {
+        error = "SNMPv3 USM user/auth/privacy parameters were invalid.";
+        return false;
+    }
+
+    if (!message.Read(envelope.dataTag, envelope.dataContent, envelope.dataLength)) {
+        error = "SNMPv3 scoped PDU was missing.";
+        return false;
+    }
+    return true;
+}
+
+bool ParseSnmpPduValues(std::uint8_t pduTag, const std::uint8_t* pduContent,
+                        std::size_t pduLength, std::uint32_t requestId,
+                        std::unordered_map<std::string, SnmpValue>& values,
+                        std::string& error) {
+    values.clear();
+    if (pduTag != 0xA2) {
+        error = pduTag == 0xA8
+            ? "SNMPv3 agent returned a Report PDU instead of a GetResponse."
+            : "SNMP response did not contain a GetResponse PDU.";
+        return false;
+    }
+
+    BerReader pdu(pduContent, pduLength);
+    std::uint64_t responseId = 0;
+    std::uint64_t errorStatus = 0;
+    std::uint64_t errorIndex = 0;
+    if (!ReadInteger(pdu, responseId) || !ReadInteger(pdu, errorStatus) || !ReadInteger(pdu, errorIndex)) {
+        error = "SNMP response PDU header was invalid.";
+        return false;
+    }
+    if (static_cast<std::uint32_t>(responseId) != requestId) {
+        error = "SNMP response request id did not match.";
+        return false;
+    }
+    if (errorStatus != 0) {
+        error = "SNMP agent returned error status " + std::to_string(errorStatus)
+            + " at index " + std::to_string(errorIndex) + ".";
+        return false;
+    }
+
+    std::uint8_t tag = 0;
+    const std::uint8_t* listContent = nullptr;
+    std::size_t listLength = 0;
+    if (!pdu.Read(tag, listContent, listLength) || tag != 0x30) {
+        error = "SNMP response varbind list was invalid.";
+        return false;
+    }
+
+    BerReader list(listContent, listLength);
+    while (!list.Empty()) {
+        const std::uint8_t* varBindContent = nullptr;
+        std::size_t varBindLength = 0;
+        if (!list.Read(tag, varBindContent, varBindLength) || tag != 0x30) break;
+        BerReader varBind(varBindContent, varBindLength);
+
+        const std::uint8_t* oidContent = nullptr;
+        std::size_t oidLength = 0;
+        if (!varBind.Read(tag, oidContent, oidLength) || tag != 0x06) continue;
+        const std::string oid = DecodeOid(oidContent, oidLength);
+        if (oid.empty()) continue;
+
+        const std::uint8_t* valueContent = nullptr;
+        std::size_t valueLength = 0;
+        std::uint8_t valueTag = 0;
+        if (!varBind.Read(valueTag, valueContent, valueLength)) continue;
+
+        SnmpValue value;
+        value.tag = valueTag;
+        if (valueTag == 0x04) value.text = DecodeText(valueContent, valueLength);
+        else if (valueTag == 0x06) value.text = DecodeOid(valueContent, valueLength);
+        else if (valueTag == 0x02 || valueTag == 0x41 || valueTag == 0x42
+                 || valueTag == 0x43 || valueTag == 0x46) {
+            value.number = DecodeUnsigned(valueContent, valueLength);
+            value.hasNumber = true;
+            value.text = std::to_string(value.number);
+        } else if (valueTag == 0x40 && valueLength == 4) {
+            value.text = std::to_string(valueContent[0]) + "."
+                + std::to_string(valueContent[1]) + "."
+                + std::to_string(valueContent[2]) + "."
+                + std::to_string(valueContent[3]);
+        }
+        values[oid] = std::move(value);
+    }
+    return true;
+}
+
+
+#ifdef _WIN32
+bool BuildSnmpV3Request(
+    const SnmpV3Engine& engine,
+    const SnmpV3Credential& credential,
+    const Bytes& authKey,
+    const Bytes& privacyKey,
+    bool discovery,
+    std::uint32_t messageId,
+    std::uint32_t requestId,
+    const std::vector<std::string>& oids,
+    Bytes& packet,
+    std::string& error) {
+    packet.clear();
+    const bool auth = !discovery && SnmpV3NeedsAuth(credential);
+    const bool privacy = !discovery && SnmpV3NeedsPrivacy(credential);
+    const std::size_t authLength = auth ? SnmpV3AuthLength(credential.authProtocol) : 0;
+    if (auth && (authLength == 0 || authKey.empty())) {
+        error = "SNMPv3 authentication key/protocol is invalid.";
+        return false;
+    }
+    if (privacy && (!SnmpV3PrivacySupported(credential.privacyProtocol) || privacyKey.size() < 16)) {
+        error = "SNMPv3 privacy protocol/key is invalid.";
+        return false;
+    }
+
+    Bytes scopedBody;
+    Append(scopedBody, EncodeOctetString(discovery ? Bytes{} : engine.engineId));
+    Append(scopedBody, EncodeOctetString(discovery ? std::string() : credential.contextName));
+    Append(scopedBody, BuildGetPdu(requestId, oids));
+    Bytes scopedPdu = Wrap(0x30, scopedBody);
+
+    Bytes privacyParameters;
+    Bytes msgData;
+    if (privacy) {
+        privacyParameters = NextSnmpV3PrivacySalt();
+        if (privacyParameters.size() != 8) {
+            error = "SNMPv3 privacy salt generation failed.";
+            return false;
+        }
+        const Bytes iv = SnmpV3Iv(engine.boots, engine.time, privacyParameters);
+        Bytes encrypted;
+        if (!SnmpV3AesCrypt(scopedPdu, privacyKey, iv, true, encrypted)) {
+            error = "SNMPv3 scoped PDU encryption failed.";
+            return false;
+        }
+        msgData = EncodeOctetString(encrypted);
+    } else {
+        msgData = scopedPdu;
+    }
+
+    const std::string username = discovery ? std::string() : credential.username;
+    Bytes usmBody;
+    Append(usmBody, EncodeOctetString(discovery ? Bytes{} : engine.engineId));
+    Append(usmBody, EncodeInteger(discovery ? 0 : engine.boots));
+    Append(usmBody, EncodeInteger(discovery ? 0 : engine.time));
+    Append(usmBody, EncodeOctetString(username));
+    Append(usmBody, EncodeOctetString(Bytes(authLength, 0)));
+    Append(usmBody, EncodeOctetString(privacyParameters));
+    const Bytes usmSequence = Wrap(0x30, usmBody);
+
+    std::uint8_t flags = 0x04;  // reportable
+    if (auth) flags |= 0x01;
+    if (privacy) flags |= 0x02;
+
+    Bytes headerBody;
+    Append(headerBody, EncodeInteger(messageId));
+    Append(headerBody, EncodeInteger(65507));
+    Append(headerBody, EncodeOctetString(Bytes{flags}));
+    Append(headerBody, EncodeInteger(3));
+
+    Bytes messageBody;
+    Append(messageBody, EncodeInteger(3));
+    Append(messageBody, Wrap(0x30, headerBody));
+    Append(messageBody, EncodeOctetString(usmSequence));
+    Append(messageBody, msgData);
+    packet = Wrap(0x30, messageBody);
+
+    if (auth) {
+        SnmpV3Envelope envelope;
+        std::string parseError;
+        if (!ParseSnmpV3Envelope(packet.data(), packet.size(), envelope, parseError)
+            || envelope.authParameters.size() != authLength
+            || envelope.authOffset + authLength > packet.size()) {
+            error = "SNMPv3 request authentication field could not be located.";
+            return false;
+        }
+        Bytes digest;
+        if (!SnmpV3Hmac(SnmpV3Digest(credential.authProtocol), authKey, packet, digest)
+            || digest.size() < authLength) {
+            error = "SNMPv3 request authentication digest failed.";
+            return false;
+        }
+        std::copy(digest.begin(), digest.begin() + static_cast<std::ptrdiff_t>(authLength),
+                  packet.begin() + static_cast<std::ptrdiff_t>(envelope.authOffset));
+        OPENSSL_cleanse(digest.data(), digest.size());
+    }
+    return true;
+}
+
+bool ParseSnmpV3ScopedPdu(
+    const SnmpV3Envelope& envelope,
+    const SnmpV3Credential& credential,
+    const Bytes& privacyKey,
+    std::uint8_t& pduTag,
+    const std::uint8_t*& pduContent,
+    std::size_t& pduLength,
+    Bytes& decryptedStorage,
+    std::string& error) {
+    const bool privacy = SnmpV3NeedsPrivacy(credential);
+    const std::uint8_t* scopedContent = nullptr;
+    std::size_t scopedLength = 0;
+
+    if (privacy) {
+        if (envelope.dataTag != 0x04 || envelope.privacyParameters.size() != 8) {
+            error = "SNMPv3 encrypted scoped PDU was invalid.";
+            return false;
+        }
+        const Bytes iv = SnmpV3Iv(
+            envelope.engine.boots,
+            envelope.engine.time,
+            envelope.privacyParameters);
+        Bytes ciphertext(envelope.dataContent, envelope.dataContent + envelope.dataLength);
+        if (!SnmpV3AesCrypt(ciphertext, privacyKey, iv, false, decryptedStorage)) {
+            error = "SNMPv3 scoped PDU decryption failed.";
+            return false;
+        }
+        BerReader scopedOuter(decryptedStorage.data(), decryptedStorage.size());
+        std::uint8_t tag = 0;
+        if (!scopedOuter.Read(tag, scopedContent, scopedLength) || tag != 0x30) {
+            error = "SNMPv3 decrypted scoped PDU sequence was invalid.";
+            return false;
+        }
+    } else {
+        if (envelope.dataTag != 0x30) {
+            error = "SNMPv3 plaintext scoped PDU sequence was invalid.";
+            return false;
+        }
+        scopedContent = envelope.dataContent;
+        scopedLength = envelope.dataLength;
+    }
+
+    BerReader scoped(scopedContent, scopedLength);
+    Bytes contextEngine;
+    std::string contextName;
+    if (!ReadOctets(scoped, contextEngine) || !ReadOctetText(scoped, contextName)
+        || !scoped.Read(pduTag, pduContent, pduLength)) {
+        error = "SNMPv3 scoped PDU context was invalid.";
+        return false;
+    }
+    return true;
+}
+
+bool VerifySnmpV3Authentication(
+    const std::uint8_t* packet,
+    std::size_t packetLength,
+    const SnmpV3Envelope& envelope,
+    const SnmpV3Credential& credential,
+    const Bytes& authKey,
+    std::string& error) {
+    if (!SnmpV3NeedsAuth(credential)) return true;
+    const std::size_t authLength = SnmpV3AuthLength(credential.authProtocol);
+    if (authLength == 0 || envelope.authParameters.size() != authLength
+        || envelope.authOffset + authLength > packetLength) {
+        error = "SNMPv3 response authentication parameters were invalid.";
+        return false;
+    }
+    Bytes copy(packet, packet + packetLength);
+    std::fill(copy.begin() + static_cast<std::ptrdiff_t>(envelope.authOffset),
+              copy.begin() + static_cast<std::ptrdiff_t>(envelope.authOffset + authLength), 0);
+    Bytes digest;
+    if (!SnmpV3Hmac(SnmpV3Digest(credential.authProtocol), authKey, copy, digest)
+        || digest.size() < authLength) {
+        error = "SNMPv3 response authentication digest failed.";
+        return false;
+    }
+    const bool ok = CRYPTO_memcmp(
+        envelope.authParameters.data(),
+        digest.data(),
+        authLength) == 0;
+    OPENSSL_cleanse(digest.data(), digest.size());
+    if (!ok) error = "SNMPv3 response authentication failed.";
+    return ok;
+}
+#endif
 
 bool ParseResponse(const std::uint8_t* packet, std::size_t packetLength, std::uint32_t requestId,
                    std::unordered_map<std::string, SnmpValue>& values, std::string& error) {
@@ -585,6 +1196,206 @@ std::string ResolveMacAddress(const std::string& ipAddress) {
 #endif
 }
 
+
+bool ExchangeSnmpPacket(const std::string& ipAddress, int port, int timeoutMs,
+                        const Bytes& request, Bytes& response, std::string& error) {
+#ifdef _WIN32
+    response.clear();
+    sockaddr_in target{};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(static_cast<u_short>(port));
+    if (InetPtonA(AF_INET, ipAddress.c_str(), &target.sin_addr) != 1) {
+        error = "Target address is invalid.";
+        return false;
+    }
+
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+        error = "Unable to create SNMP UDP socket.";
+        return false;
+    }
+    DWORD timeout = static_cast<DWORD>(timeoutMs);
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+
+    const int sent = sendto(
+        sock,
+        reinterpret_cast<const char*>(request.data()),
+        static_cast<int>(request.size()),
+        0,
+        reinterpret_cast<const sockaddr*>(&target),
+        sizeof(target));
+    if (sent == SOCKET_ERROR) {
+        closesocket(sock);
+        error = "SNMP request send failed.";
+        return false;
+    }
+
+    std::array<std::uint8_t, 65535> buffer{};
+    sockaddr_in source{};
+    int sourceLength = sizeof(source);
+    const int received = recvfrom(
+        sock,
+        reinterpret_cast<char*>(buffer.data()),
+        static_cast<int>(buffer.size()),
+        0,
+        reinterpret_cast<sockaddr*>(&source),
+        &sourceLength);
+    closesocket(sock);
+    if (received <= 0) {
+        error = "timeout";
+        return false;
+    }
+
+    char sourceIp[INET_ADDRSTRLEN]{};
+    if (!InetNtopA(AF_INET, &source.sin_addr, sourceIp, static_cast<DWORD>(sizeof(sourceIp)))
+        || ipAddress != sourceIp) {
+        error = "SNMP response source did not match target.";
+        return false;
+    }
+    response.assign(buffer.begin(), buffer.begin() + received);
+    error.clear();
+    return true;
+#else
+    (void)ipAddress;
+    (void)port;
+    (void)timeoutMs;
+    (void)request;
+    (void)response;
+    error = "SNMP network discovery is not implemented for this platform yet.";
+    return false;
+#endif
+}
+
+#ifdef _WIN32
+bool QueryTargetV3(const std::string& ipAddress, int port, int timeoutMs, int retries,
+                   const SnmpV3Credential& credential, std::uint32_t requestId,
+                   const std::vector<std::string>& oids,
+                   std::unordered_map<std::string, SnmpValue>& values,
+                   std::string& error) {
+    const std::uint32_t discoveryMessageId = requestId ^ 0x13572468u;
+    SnmpV3Engine emptyEngine;
+    Bytes emptyKey;
+    Bytes discoveryRequest;
+    if (!BuildSnmpV3Request(
+            emptyEngine, credential, emptyKey, emptyKey, true,
+            discoveryMessageId, requestId, oids, discoveryRequest, error)) {
+        return false;
+    }
+
+    SnmpV3Engine engine;
+    bool discovered = false;
+    for (int attempt = 0; attempt <= retries && !discovered; ++attempt) {
+        Bytes response;
+        std::string exchangeError;
+        if (!ExchangeSnmpPacket(ipAddress, port, timeoutMs, discoveryRequest, response, exchangeError)) {
+            if (attempt == retries) error = exchangeError;
+            continue;
+        }
+        SnmpV3Envelope envelope;
+        std::string parseError;
+        if (!ParseSnmpV3Envelope(response.data(), response.size(), envelope, parseError)
+            || envelope.messageId != discoveryMessageId
+            || envelope.engine.engineId.empty()) {
+            if (attempt == retries) error = parseError.empty()
+                ? "SNMPv3 engine discovery returned an invalid response."
+                : parseError;
+            continue;
+        }
+        engine = envelope.engine;
+        discovered = true;
+    }
+    if (!discovered) return false;
+
+    const EVP_MD* digest = SnmpV3NeedsAuth(credential)
+        ? SnmpV3Digest(credential.authProtocol)
+        : nullptr;
+    Bytes authKey;
+    Bytes privacyKey;
+    if (SnmpV3NeedsAuth(credential)) {
+        if (!digest || !SnmpV3LocalizeKey(credential.authSecret, digest, engine.engineId, authKey)) {
+            error = "SNMPv3 authentication key localization failed.";
+            return false;
+        }
+    }
+    if (SnmpV3NeedsPrivacy(credential)) {
+        if (!digest || !SnmpV3PrivacySupported(credential.privacyProtocol)
+            || !SnmpV3LocalizeKey(credential.privacySecret, digest, engine.engineId, privacyKey)) {
+            if (!authKey.empty()) OPENSSL_cleanse(authKey.data(), authKey.size());
+            error = "SNMPv3 privacy key localization failed.";
+            return false;
+        }
+    }
+
+    const std::uint32_t messageId = requestId ^ 0x24681357u;
+    Bytes request;
+    if (!BuildSnmpV3Request(
+            engine, credential, authKey, privacyKey, false,
+            messageId, requestId, oids, request, error)) {
+        if (!authKey.empty()) OPENSSL_cleanse(authKey.data(), authKey.size());
+        if (!privacyKey.empty()) OPENSSL_cleanse(privacyKey.data(), privacyKey.size());
+        return false;
+    }
+
+    bool success = false;
+    for (int attempt = 0; attempt <= retries && !success; ++attempt) {
+        Bytes response;
+        std::string exchangeError;
+        if (!ExchangeSnmpPacket(ipAddress, port, timeoutMs, request, response, exchangeError)) {
+            if (attempt == retries) error = exchangeError;
+            continue;
+        }
+
+        SnmpV3Envelope envelope;
+        std::string parseError;
+        if (!ParseSnmpV3Envelope(response.data(), response.size(), envelope, parseError)) {
+            if (attempt == retries) error = parseError;
+            continue;
+        }
+        if (envelope.messageId != messageId || envelope.engine.engineId != engine.engineId) {
+            if (attempt == retries) error = "SNMPv3 response message or authoritative engine id did not match.";
+            continue;
+        }
+        if (!credential.username.empty() && envelope.username != credential.username) {
+            if (attempt == retries) error = "SNMPv3 response user did not match configured user.";
+            continue;
+        }
+        if (SnmpV3NeedsAuth(credential) && (envelope.msgFlags & 0x01) == 0) {
+            if (attempt == retries) error = "SNMPv3 authenticated response was not marked authenticated.";
+            continue;
+        }
+        if (SnmpV3NeedsPrivacy(credential) && (envelope.msgFlags & 0x02) == 0) {
+            if (attempt == retries) error = "SNMPv3 private response was not marked encrypted.";
+            continue;
+        }
+        if (!VerifySnmpV3Authentication(
+                response.data(), response.size(), envelope, credential, authKey, parseError)) {
+            if (attempt == retries) error = parseError;
+            continue;
+        }
+
+        std::uint8_t pduTag = 0;
+        const std::uint8_t* pduContent = nullptr;
+        std::size_t pduLength = 0;
+        Bytes decrypted;
+        if (!ParseSnmpV3ScopedPdu(
+                envelope, credential, privacyKey, pduTag, pduContent, pduLength,
+                decrypted, parseError)
+            || !ParseSnmpPduValues(
+                pduTag, pduContent, pduLength, requestId, values, parseError)) {
+            if (attempt == retries) error = parseError;
+            continue;
+        }
+        error.clear();
+        success = true;
+    }
+
+    if (!authKey.empty()) OPENSSL_cleanse(authKey.data(), authKey.size());
+    if (!privacyKey.empty()) OPENSSL_cleanse(privacyKey.data(), privacyKey.size());
+    return success;
+}
+#endif
+
 bool QueryTarget(const std::string& ipAddress, int port, int timeoutMs, int retries,
                  int snmpVersion, const std::string& community, std::uint32_t requestId,
                  const std::vector<std::string>& oids,
@@ -745,6 +1556,67 @@ json ProbeDevice(std::uint32_t hostAddress, int port, int timeoutMs, int retries
     if (hasInterfaceCount) device["interfaceCount"] = interfaceCount;
     return device;
 }
+
+#ifdef _WIN32
+json ProbeDeviceV3(std::uint32_t hostAddress, int port, int timeoutMs, int retries,
+                   const SnmpV3Credential& credential, std::uint32_t requestId,
+                   bool& responded) {
+    responded = false;
+    const std::string ipAddress = Ipv4ToString(hostAddress);
+    if (ipAddress.empty()) return json();
+
+    static const std::vector<std::string> kOids = {
+        "1.3.6.1.2.1.1.1.0",
+        "1.3.6.1.2.1.1.2.0",
+        "1.3.6.1.2.1.1.3.0",
+        "1.3.6.1.2.1.1.4.0",
+        "1.3.6.1.2.1.1.5.0",
+        "1.3.6.1.2.1.1.6.0",
+        "1.3.6.1.2.1.2.1.0",
+    };
+
+    std::unordered_map<std::string, SnmpValue> values;
+    std::string queryError;
+    if (!QueryTargetV3(
+            ipAddress, port, timeoutMs, retries, credential,
+            requestId, kOids, values, queryError)) {
+        return json();
+    }
+    responded = true;
+
+    bool hasUptime = false;
+    bool hasInterfaceCount = false;
+    const auto uptime = ValueNumber(values, "1.3.6.1.2.1.1.3.0", hasUptime);
+    const auto interfaceCount = ValueNumber(values, "1.3.6.1.2.1.2.1.0", hasInterfaceCount);
+    const std::string sysName = ValueText(values, "1.3.6.1.2.1.1.5.0");
+
+    json device = {
+        {"ipAddress", ipAddress},
+        {"macAddress", ResolveMacAddress(ipAddress)},
+        {"hostname", sysName},
+        {"snmpVersion", "v3"},
+        {"sysName", sysName},
+        {"sysDescr", ValueText(values, "1.3.6.1.2.1.1.1.0")},
+        {"sysObjectId", ValueText(values, "1.3.6.1.2.1.1.2.0")},
+        {"sysContact", ValueText(values, "1.3.6.1.2.1.1.4.0")},
+        {"sysLocation", ValueText(values, "1.3.6.1.2.1.1.6.0")},
+        {"interfaces", json::array()},
+        {"metadata", {
+            {"scanner", "hi5central-native-snmp"},
+            {"standardOids", static_cast<int>(kOids.size())},
+            {"snmpV3", {
+                {"securityLevel", credential.securityLevel},
+                {"authProtocol", SnmpV3NeedsAuth(credential) ? credential.authProtocol : std::string()},
+                {"privacyProtocol", SnmpV3NeedsPrivacy(credential) ? credential.privacyProtocol : std::string()},
+                {"contextName", credential.contextName}
+            }}
+        }}
+    };
+    if (hasUptime) device["uptimeTicks"] = uptime;
+    if (hasInterfaceCount) device["interfaceCount"] = interfaceCount;
+    return device;
+}
+#endif
 
 
 std::string TrimAscii(std::string value) {
@@ -2177,19 +3049,75 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
     std::string versionLabel;
     std::string community;
     int snmpVersion = -1;
+    SnmpV3Credential snmpV3Credential;
     if (snmpEnabled) {
         versionLabel = payload.value("snmpVersion", std::string("v2c"));
         const json credential = payload.value("credential", json::object());
-        community = credential.value("community", std::string());
 
-        if (versionLabel == "v1") snmpVersion = 0;
-        else if (versionLabel == "v2c") snmpVersion = 1;
-        else {
-            error = "Only SNMPv1 and SNMPv2c are supported by this Agent build.";
-            return json{{"status", "failed"}, {"error", error}};
-        }
-        if (community.empty() || community.size() > 2048) {
-            error = "SNMP community is missing or invalid.";
+        if (versionLabel == "v1" || versionLabel == "v2c") {
+            snmpVersion = versionLabel == "v1" ? 0 : 1;
+            community = credential.value("community", std::string());
+            if (community.empty() || community.size() > 2048) {
+                error = "SNMP community is missing or invalid.";
+                return json{{"status", "failed"}, {"error", error}};
+            }
+        } else if (versionLabel == "v3") {
+            snmpVersion = 3;
+            snmpV3Credential.username = credential.value("username", std::string());
+            snmpV3Credential.securityLevel = credential.value(
+                "securityLevel", std::string("noAuthNoPriv"));
+            snmpV3Credential.authProtocol = credential.value("authProtocol", std::string());
+            snmpV3Credential.authSecret = credential.value("authSecret", std::string());
+            snmpV3Credential.privacyProtocol = credential.value("privacyProtocol", std::string());
+            snmpV3Credential.privacySecret = credential.value("privacySecret", std::string());
+            snmpV3Credential.contextName = credential.value("contextName", std::string());
+
+            if (snmpV3Credential.username.empty() || snmpV3Credential.username.size() > 32) {
+                error = "SNMPv3 username is missing or exceeds the 32-octet USM limit.";
+                return json{{"status", "failed"}, {"error", error}};
+            }
+            if (snmpV3Credential.securityLevel != "noAuthNoPriv"
+                && snmpV3Credential.securityLevel != "authNoPriv"
+                && snmpV3Credential.securityLevel != "authPriv") {
+                error = "SNMPv3 security level is invalid.";
+                return json{{"status", "failed"}, {"error", error}};
+            }
+            if (SnmpV3NeedsAuth(snmpV3Credential)) {
+#ifdef _WIN32
+                if ((snmpV3Credential.authProtocol != "sha1"
+                     && snmpV3Credential.authProtocol != "sha256")
+                    || !SnmpV3Digest(snmpV3Credential.authProtocol)
+                    || SnmpV3AuthLength(snmpV3Credential.authProtocol) == 0
+                    || snmpV3Credential.authSecret.size() < 8
+                    || snmpV3Credential.authSecret.size() > 8192) {
+                    error = "SNMPv3 authentication protocol/secret is invalid.";
+                    return json{{"status", "failed"}, {"error", error}};
+                }
+#else
+                error = "SNMPv3 is not implemented for this platform.";
+                return json{{"status", "failed"}, {"error", error}};
+#endif
+            }
+            if (SnmpV3NeedsPrivacy(snmpV3Credential)) {
+#ifdef _WIN32
+                if (snmpV3Credential.privacyProtocol != "aes128"
+                    || !SnmpV3PrivacySupported(snmpV3Credential.privacyProtocol)
+                    || snmpV3Credential.privacySecret.size() < 8
+                    || snmpV3Credential.privacySecret.size() > 8192) {
+                    error = "SNMPv3 privacy protocol/secret is invalid.";
+                    return json{{"status", "failed"}, {"error", error}};
+                }
+#else
+                error = "SNMPv3 is not implemented for this platform.";
+                return json{{"status", "failed"}, {"error", error}};
+#endif
+            }
+            if (snmpV3Credential.contextName.size() > 256) {
+                error = "SNMPv3 context name is invalid.";
+                return json{{"status", "failed"}, {"error", error}};
+            }
+        } else {
+            error = "Only SNMPv1, SNMPv2c and SNMPv3 are supported by this Agent build.";
             return json{{"status", "failed"}, {"error", error}};
         }
     }
@@ -2283,16 +3211,30 @@ nlohmann::json RunSnmpDiscovery(const nlohmann::json& payload, std::string& erro
                     const std::uint32_t requestId =
                         static_cast<std::uint32_t>(
                             (GetTickCount64() + hostAddress + (worker * 7919u)) & 0x7fffffffu);
-                    json snmpDevice = ProbeDevice(
-                        hostAddress,
-                        port,
-                        timeoutMs,
-                        retries,
-                        snmpVersion,
-                        versionLabel,
-                        community,
-                        requestId,
-                        snmpResponded);
+                    json snmpDevice;
+                    if (versionLabel == "v3") {
+#ifdef _WIN32
+                        snmpDevice = ProbeDeviceV3(
+                            hostAddress,
+                            port,
+                            timeoutMs,
+                            retries,
+                            snmpV3Credential,
+                            requestId,
+                            snmpResponded);
+#endif
+                    } else {
+                        snmpDevice = ProbeDevice(
+                            hostAddress,
+                            port,
+                            timeoutMs,
+                            retries,
+                            snmpVersion,
+                            versionLabel,
+                            community,
+                            requestId,
+                            snmpResponded);
+                    }
                     if (snmpResponded && !snmpDevice.is_null() && !snmpDevice.empty()) {
                         snmpCount.fetch_add(1);
                         mergeSnmp(device, std::move(snmpDevice));
