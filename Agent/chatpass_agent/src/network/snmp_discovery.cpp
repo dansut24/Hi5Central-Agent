@@ -1356,16 +1356,25 @@ bool QueryTargetV3(const std::string& ipAddress, int port, int timeoutMs, int re
             if (attempt == retries) error = "SNMPv3 response message or authoritative engine id did not match.";
             continue;
         }
+        const bool expectedAuth = SnmpV3NeedsAuth(credential);
+        const bool expectedPrivacy = SnmpV3NeedsPrivacy(credential);
+        const bool responseAuth = (envelope.msgFlags & 0x01) != 0;
+        const bool responsePrivacy = (envelope.msgFlags & 0x02) != 0;
+        if (responseAuth != expectedAuth || responsePrivacy != expectedPrivacy) {
+            if (attempt == retries) error = "SNMPv3 response security level did not match the requested USM level.";
+            continue;
+        }
+        if (expectedAuth) {
+            const std::int64_t timeDelta =
+                static_cast<std::int64_t>(envelope.engine.time)
+                - static_cast<std::int64_t>(engine.time);
+            if (envelope.engine.boots != engine.boots || timeDelta < -150 || timeDelta > 150) {
+                if (attempt == retries) error = "SNMPv3 response failed authoritative engine timeliness validation.";
+                continue;
+            }
+        }
         if (!credential.username.empty() && envelope.username != credential.username) {
             if (attempt == retries) error = "SNMPv3 response user did not match configured user.";
-            continue;
-        }
-        if (SnmpV3NeedsAuth(credential) && (envelope.msgFlags & 0x01) == 0) {
-            if (attempt == retries) error = "SNMPv3 authenticated response was not marked authenticated.";
-            continue;
-        }
-        if (SnmpV3NeedsPrivacy(credential) && (envelope.msgFlags & 0x02) == 0) {
-            if (attempt == retries) error = "SNMPv3 private response was not marked encrypted.";
             continue;
         }
         if (!VerifySnmpV3Authentication(
