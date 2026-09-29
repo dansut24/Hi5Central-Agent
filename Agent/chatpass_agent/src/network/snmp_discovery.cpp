@@ -1345,6 +1345,16 @@ void AddCapabilitiesForService(MdnsRecord& record, const std::string& rawService
     if (service.find("_raop._tcp") != std::string::npos) AddMdnsCapability(record, "airplay_audio");
     if (service.find("_googlecast._tcp") != std::string::npos) AddMdnsCapability(record, "google_cast");
     if (service.find("_spotify-connect._tcp") != std::string::npos) AddMdnsCapability(record, "spotify_connect");
+    if (service.find("_amazonecho-remote._tcp") != std::string::npos) {
+        AddMdnsCapability(record, "amazon_echo");
+        AddMdnsCapability(record, "amazon_echo_remote");
+        if (record.vendor.empty()) record.vendor = "Amazon";
+    }
+    if (service.find("_amzn-wplay._tcp") != std::string::npos) {
+        AddMdnsCapability(record, "amazon_fire_tv");
+        AddMdnsCapability(record, "amazon_wplay");
+        if (record.vendor.empty()) record.vendor = "Amazon";
+    }
     if (service.find("_ipp._tcp") != std::string::npos
         || service.find("_printer._tcp") != std::string::npos
         || service.find("_pdl-datastream._tcp") != std::string::npos) {
@@ -1389,7 +1399,9 @@ std::string InferMdnsDeviceType(const MdnsRecord& record) {
     if (value.find("camera") != std::string::npos
         || value.find("doorbell") != std::string::npos
         || value.find("ring") != std::string::npos) return "camera";
-    if (value.find("_airplay._tcp") != std::string::npos
+    if (value.find("_amazonecho-remote._tcp") != std::string::npos
+        || value.find("_amzn-wplay._tcp") != std::string::npos
+        || value.find("_airplay._tcp") != std::string::npos
         || value.find("_raop._tcp") != std::string::npos
         || value.find("_googlecast._tcp") != std::string::npos
         || value.find("_spotify-connect._tcp") != std::string::npos) return "media_device";
@@ -1832,6 +1844,8 @@ std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
         "_homekit._tcp.local",
         "_companion-link._tcp.local",
         "_spotify-connect._tcp.local",
+        "_amazonecho-remote._tcp.local",
+        "_amzn-wplay._tcp.local",
         "_matter._tcp.local",
         "_matterd._udp.local",
         "_eerogw._tcp.local",
