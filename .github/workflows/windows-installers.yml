@@ -127,7 +127,7 @@ jobs:
               throw "Native mDNS/DNS-SD enrichment is missing required safety contract: $mdnsContract"
             }
           }
-          foreach ($spotifyContract in @('ApplySpotifyConnectInfo','action=getInfo&version=2.10.0','IsSafeLocalServicePath','kMaxSpotifyInfoBytes','spotifyConnectProbeCount','spotifyConnectIdentityCount','spotify_getinfo:remoteName')) {
+          foreach ($spotifyContract in @('ApplySpotifyConnectInfo','action=getInfo&version=2.10.0','IsSafeLocalServicePath','kMaxSpotifyInfoBytes','spotifyConnectProbeCount','spotifyConnectIdentityCount','spotify_getinfo:remoteName','isGroup','spotifyDeviceAliases','spotifyGroupAliases','spotify_getinfo:deviceAlias')) {
             if ($snmp -notmatch [regex]::Escape($spotifyContract)) {
               throw "Spotify Connect read-only identity enrichment is missing required safety contract: $spotifyContract"
             }

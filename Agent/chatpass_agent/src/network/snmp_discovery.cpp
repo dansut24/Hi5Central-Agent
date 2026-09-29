@@ -1264,6 +1264,8 @@ struct MdnsRecord {
     std::string spotifyResponseSource;
     std::string spotifyVersion;
     std::vector<std::string> spotifyAliases;
+    std::vector<std::string> spotifyDeviceAliases;
+    std::vector<std::string> spotifyGroupAliases;
 };
 
 void AddUniqueValue(
@@ -1497,6 +1499,18 @@ std::string JsonStringValue(const json& value, const char* key, std::size_t maxL
     return text.size() <= maxLength ? text : text.substr(0, maxLength);
 }
 
+bool JsonBoolishValue(const json& value, const char* key, bool fallback = false) {
+    if (!value.is_object() || !value.contains(key)) return fallback;
+    const auto& item = value[key];
+    if (item.is_boolean()) return item.get<bool>();
+    if (item.is_number_integer()) return item.get<long long>() != 0;
+    if (!item.is_string()) return fallback;
+    const std::string text = LowerAscii(TrimAscii(item.get<std::string>()));
+    if (text == "true" || text == "1" || text == "yes") return true;
+    if (text == "false" || text == "0" || text == "no") return false;
+    return fallback;
+}
+
 void ApplySpotifyConnectInfo(MdnsRecord& record) {
 #ifdef _WIN32
     if (!IsPrivateIpv4Address(record.ipAddress)
@@ -1600,7 +1614,13 @@ void ApplySpotifyConnectInfo(MdnsRecord& record) {
         for (const auto& alias : info["aliases"]) {
             if (record.spotifyAliases.size() >= 8 || !alias.is_object()) break;
             const std::string name = JsonStringValue(alias, "name", 128);
-            if (!name.empty()) AddUniqueValue(record.spotifyAliases, name, 8, 128);
+            if (name.empty()) continue;
+            AddUniqueValue(record.spotifyAliases, name, 8, 128);
+            if (JsonBoolishValue(alias, "isGroup", false)) {
+                AddUniqueValue(record.spotifyGroupAliases, name, 8, 128);
+            } else {
+                AddUniqueValue(record.spotifyDeviceAliases, name, 8, 128);
+            }
         }
     }
 
@@ -1609,6 +1629,12 @@ void ApplySpotifyConnectInfo(MdnsRecord& record) {
             record,
             record.spotifyRemoteName,
             "spotify_getinfo:remoteName",
+            true);
+    } else if (!record.spotifyDeviceAliases.empty()) {
+        ConsiderMdnsFriendlyName(
+            record,
+            record.spotifyDeviceAliases.front(),
+            "spotify_getinfo:deviceAlias",
             true);
     } else if (record.spotifyAliases.size() == 1) {
         ConsiderMdnsFriendlyName(
@@ -2071,6 +2097,10 @@ json BuildMdnsEnrichment(const MdnsRecord& record) {
 
     json spotifyAliases = json::array();
     for (const auto& alias : record.spotifyAliases) spotifyAliases.push_back(alias);
+    json spotifyDeviceAliases = json::array();
+    for (const auto& alias : record.spotifyDeviceAliases) spotifyDeviceAliases.push_back(alias);
+    json spotifyGroupAliases = json::array();
+    for (const auto& alias : record.spotifyGroupAliases) spotifyGroupAliases.push_back(alias);
     json spotifyConnect = {
         {"probeAttempted", record.spotifyProbeAttempted},
         {"infoAvailable", record.spotifyInfoAvailable},
@@ -2082,7 +2112,9 @@ json BuildMdnsEnrichment(const MdnsRecord& record) {
         {"deviceType", record.spotifyDeviceType},
         {"responseSource", record.spotifyResponseSource},
         {"version", record.spotifyVersion},
-        {"aliases", spotifyAliases}
+        {"aliases", spotifyAliases},
+        {"deviceAliases", spotifyDeviceAliases},
+        {"groupAliases", spotifyGroupAliases}
     };
 
     std::string name;
