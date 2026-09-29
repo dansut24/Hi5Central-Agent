@@ -39,6 +39,7 @@ using Bytes = std::vector<std::uint8_t>;
 struct SnmpValue {
     std::uint8_t tag = 0;
     std::string text;
+    Bytes raw;
     std::uint64_t number = 0;
     bool hasNumber = false;
 };
@@ -172,8 +173,9 @@ Bytes EncodeOid(const std::string& oid) {
     return Wrap(0x06, body);
 }
 
-Bytes BuildGetRequest(int version, const std::string& community, std::uint32_t requestId,
-                      const std::vector<std::string>& oids) {
+Bytes BuildRequestPdu(std::uint32_t requestId, const std::vector<std::string>& oids,
+                      std::uint8_t pduTag = 0xA0, std::uint64_t second = 0,
+                      std::uint64_t third = 0) {
     Bytes varBindList;
     for (const auto& oid : oids) {
         Bytes varBind;
@@ -184,31 +186,30 @@ Bytes BuildGetRequest(int version, const std::string& community, std::uint32_t r
 
     Bytes pduBody;
     Append(pduBody, EncodeInteger(requestId));
-    Append(pduBody, EncodeInteger(0));
-    Append(pduBody, EncodeInteger(0));
+    Append(pduBody, EncodeInteger(second));
+    Append(pduBody, EncodeInteger(third));
     Append(pduBody, Wrap(0x30, varBindList));
+    return Wrap(pduTag, pduBody);
+}
 
+Bytes BuildSnmpRequest(int version, const std::string& community, std::uint32_t requestId,
+                       const std::vector<std::string>& oids,
+                       std::uint8_t pduTag = 0xA0, std::uint64_t second = 0,
+                       std::uint64_t third = 0) {
     Bytes message;
     Append(message, EncodeInteger(static_cast<std::uint64_t>(version)));
     Append(message, EncodeOctetString(community));
-    Append(message, Wrap(0xA0, pduBody));
+    Append(message, BuildRequestPdu(requestId, oids, pduTag, second, third));
     return Wrap(0x30, message);
 }
 
+Bytes BuildGetRequest(int version, const std::string& community, std::uint32_t requestId,
+                      const std::vector<std::string>& oids) {
+    return BuildSnmpRequest(version, community, requestId, oids);
+}
+
 Bytes BuildGetPdu(std::uint32_t requestId, const std::vector<std::string>& oids) {
-    Bytes varBindList;
-    for (const auto& oid : oids) {
-        Bytes varBind;
-        Append(varBind, EncodeOid(oid));
-        Append(varBind, Wrap(0x05, {}));
-        Append(varBindList, Wrap(0x30, varBind));
-    }
-    Bytes pduBody;
-    Append(pduBody, EncodeInteger(requestId));
-    Append(pduBody, EncodeInteger(0));
-    Append(pduBody, EncodeInteger(0));
-    Append(pduBody, Wrap(0x30, varBindList));
-    return Wrap(0xA0, pduBody);
+    return BuildRequestPdu(requestId, oids);
 }
 
 #ifdef _WIN32
@@ -637,8 +638,10 @@ bool ParseSnmpPduValues(std::uint8_t pduTag, const std::uint8_t* pduContent,
 
         SnmpValue value;
         value.tag = valueTag;
-        if (valueTag == 0x04) value.text = DecodeText(valueContent, valueLength);
-        else if (valueTag == 0x06) value.text = DecodeOid(valueContent, valueLength);
+        if (valueTag == 0x04) {
+            value.raw.assign(valueContent, valueContent + valueLength);
+            value.text = DecodeText(valueContent, valueLength);
+        } else if (valueTag == 0x06) value.text = DecodeOid(valueContent, valueLength);
         else if (valueTag == 0x02 || valueTag == 0x41 || valueTag == 0x42
                  || valueTag == 0x43 || valueTag == 0x46) {
             value.number = DecodeUnsigned(valueContent, valueLength);
@@ -667,7 +670,10 @@ bool BuildSnmpV3Request(
     std::uint32_t requestId,
     const std::vector<std::string>& oids,
     Bytes& packet,
-    std::string& error) {
+    std::string& error,
+    std::uint8_t pduTag = 0xA0,
+    std::uint64_t pduSecond = 0,
+    std::uint64_t pduThird = 0) {
     packet.clear();
     const bool auth = !discovery && SnmpV3NeedsAuth(credential);
     const bool privacy = !discovery && SnmpV3NeedsPrivacy(credential);
@@ -684,7 +690,7 @@ bool BuildSnmpV3Request(
     Bytes scopedBody;
     Append(scopedBody, EncodeOctetString(discovery ? Bytes{} : engine.engineId));
     Append(scopedBody, EncodeOctetString(discovery ? std::string() : credential.contextName));
-    Append(scopedBody, BuildGetPdu(requestId, oids));
+    Append(scopedBody, BuildRequestPdu(requestId, oids, pduTag, pduSecond, pduThird));
     Bytes scopedPdu = Wrap(0x30, scopedBody);
 
     Bytes privacyParameters;
@@ -920,6 +926,7 @@ bool ParseResponse(const std::uint8_t* packet, std::size_t packetLength, std::ui
         SnmpValue value;
         value.tag = valueTag;
         if (valueTag == 0x04) {
+            value.raw.assign(valueContent, valueContent + valueLength);
             value.text = DecodeText(valueContent, valueLength);
         } else if (valueTag == 0x06) {
             value.text = DecodeOid(valueContent, valueLength);
@@ -1272,7 +1279,10 @@ bool QueryTargetV3(const std::string& ipAddress, int port, int timeoutMs, int re
                    const SnmpV3Credential& credential, std::uint32_t requestId,
                    const std::vector<std::string>& oids,
                    std::unordered_map<std::string, SnmpValue>& values,
-                   std::string& error) {
+                   std::string& error,
+                   std::uint8_t pduTag = 0xA0,
+                   std::uint64_t pduSecond = 0,
+                   std::uint64_t pduThird = 0) {
     const std::uint32_t discoveryMessageId = requestId ^ 0x13572468u;
     SnmpV3Engine emptyEngine;
     Bytes emptyKey;
@@ -1331,7 +1341,8 @@ bool QueryTargetV3(const std::string& ipAddress, int port, int timeoutMs, int re
     Bytes request;
     if (!BuildSnmpV3Request(
             engine, credential, authKey, privacyKey, false,
-            messageId, requestId, oids, request, error)) {
+            messageId, requestId, oids, request, error,
+            pduTag, pduSecond, pduThird)) {
         if (!authKey.empty()) OPENSSL_cleanse(authKey.data(), authKey.size());
         if (!privacyKey.empty()) OPENSSL_cleanse(privacyKey.data(), privacyKey.size());
         return false;
@@ -1408,9 +1419,13 @@ bool QueryTargetV3(const std::string& ipAddress, int port, int timeoutMs, int re
 bool QueryTarget(const std::string& ipAddress, int port, int timeoutMs, int retries,
                  int snmpVersion, const std::string& community, std::uint32_t requestId,
                  const std::vector<std::string>& oids,
-                 std::unordered_map<std::string, SnmpValue>& values, std::string& error) {
+                 std::unordered_map<std::string, SnmpValue>& values, std::string& error,
+                 std::uint8_t pduTag = 0xA0,
+                 std::uint64_t pduSecond = 0,
+                 std::uint64_t pduThird = 0) {
 #ifdef _WIN32
-    const Bytes request = BuildGetRequest(snmpVersion, community, requestId, oids);
+    const Bytes request = BuildSnmpRequest(
+        snmpVersion, community, requestId, oids, pduTag, pduSecond, pduThird);
     if (request.empty()) {
         error = "Unable to build SNMP request.";
         return false;
@@ -1448,13 +1463,13 @@ bool QueryTarget(const std::string& ipAddress, int port, int timeoutMs, int retr
             continue;
         }
 
-        std::uint8_t response[8192]{};
+        std::array<std::uint8_t, 65535> response{};
         sockaddr_in source{};
         int sourceLength = sizeof(source);
         const int received = recvfrom(
             sock,
-            reinterpret_cast<char*>(response),
-            static_cast<int>(sizeof(response)),
+            reinterpret_cast<char*>(response.data()),
+            static_cast<int>(response.size()),
             0,
             reinterpret_cast<sockaddr*>(&source),
             &sourceLength);
@@ -1473,7 +1488,7 @@ bool QueryTarget(const std::string& ipAddress, int port, int timeoutMs, int retr
         }
 
         std::string parseError;
-        if (ParseResponse(response, static_cast<std::size_t>(received), requestId, values, parseError)) {
+        if (ParseResponse(response.data(), static_cast<std::size_t>(received), requestId, values, parseError)) {
             error.clear();
             return true;
         }
@@ -1490,6 +1505,9 @@ bool QueryTarget(const std::string& ipAddress, int port, int timeoutMs, int retr
     (void)requestId;
     (void)oids;
     (void)values;
+    (void)pduTag;
+    (void)pduSecond;
+    (void)pduThird;
     error = "SNMP network discovery is not implemented for this platform yet.";
     return false;
 #endif
@@ -1514,6 +1532,369 @@ std::uint64_t ValueNumber(const std::unordered_map<std::string, SnmpValue>& valu
     return present ? value->number : 0;
 }
 
+std::string FormatMacBytes(const Bytes& bytes) {
+    if (bytes.size() != 6) return {};
+    char buffer[18]{};
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "%02X:%02X:%02X:%02X:%02X:%02X",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
+    return buffer;
+}
+
+std::string InterfaceStatusName(std::uint64_t value) {
+    switch (value) {
+        case 1: return "up";
+        case 2: return "down";
+        case 3: return "testing";
+        case 4: return "unknown";
+        case 5: return "dormant";
+        case 6: return "not_present";
+        case 7: return "lower_layer_down";
+        default: return {};
+    }
+}
+
+std::string InterfaceTypeName(std::uint64_t value) {
+    switch (value) {
+        case 1: return "other";
+        case 6: return "ethernet";
+        case 23: return "ppp";
+        case 24: return "loopback";
+        case 53: return "virtual";
+        case 62: return "fast_ethernet";
+        case 69: return "fast_ethernet_fx";
+        case 71: return "wifi";
+        case 117: return "gigabit_ethernet";
+        case 131: return "tunnel";
+        case 135: return "vlan";
+        case 161: return "link_aggregation";
+        case 166: return "mpls";
+        case 209: return "bridge";
+        default: return {};
+    }
+}
+
+bool InterfaceIndexFromOid(const std::string& baseOid, const std::string& oid,
+                           std::uint32_t& index) {
+    const std::string prefix = baseOid + ".";
+    if (oid.rfind(prefix, 0) != 0) return false;
+    const std::string suffix = oid.substr(prefix.size());
+    if (suffix.empty()
+        || suffix.find('.') != std::string::npos
+        || !std::all_of(suffix.begin(), suffix.end(),
+                        [](unsigned char ch) { return std::isdigit(ch) != 0; })) {
+        return false;
+    }
+    try {
+        const unsigned long value = std::stoul(suffix);
+        if (value == 0 || value > 0xffffffffUL) return false;
+        index = static_cast<std::uint32_t>(value);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::vector<std::uint32_t> InterfaceIndexesFromValues(
+    const std::unordered_map<std::string, SnmpValue>& values,
+    const std::string& baseOid,
+    std::size_t limit) {
+    std::vector<std::uint32_t> indexes;
+    indexes.reserve(std::min<std::size_t>(values.size(), limit));
+    for (const auto& [oid, value] : values) {
+        (void)value;
+        std::uint32_t index = 0;
+        if (InterfaceIndexFromOid(baseOid, oid, index)) indexes.push_back(index);
+    }
+    std::sort(indexes.begin(), indexes.end());
+    indexes.erase(std::unique(indexes.begin(), indexes.end()), indexes.end());
+    if (indexes.size() > limit) indexes.resize(limit);
+    return indexes;
+}
+
+std::vector<std::uint32_t> DiscoverInterfaceIndexes(
+    const std::string& ipAddress,
+    int port,
+    int timeoutMs,
+    int retries,
+    int snmpVersion,
+    const std::string& community,
+    std::uint32_t& requestId,
+    std::size_t limit) {
+    static const std::string kIfIndexBase = "1.3.6.1.2.1.2.2.1.1";
+    std::unordered_map<std::string, SnmpValue> values;
+    std::string queryError;
+
+    if (snmpVersion != 0) {
+        if (QueryTarget(
+                ipAddress, port, timeoutMs, retries, snmpVersion, community,
+                ++requestId, {kIfIndexBase}, values, queryError,
+                0xA5, 0, static_cast<std::uint64_t>(limit))) {
+            auto indexes = InterfaceIndexesFromValues(values, kIfIndexBase, limit);
+            if (!indexes.empty()) return indexes;
+        }
+    }
+
+    std::vector<std::uint32_t> indexes;
+    std::unordered_set<std::uint32_t> seen;
+    std::string cursor = kIfIndexBase;
+    for (std::size_t count = 0; count < limit; ++count) {
+        values.clear();
+        queryError.clear();
+        if (!QueryTarget(
+                ipAddress, port, timeoutMs, retries, snmpVersion, community,
+                ++requestId, {cursor}, values, queryError, 0xA1)) {
+            break;
+        }
+        std::string nextOid;
+        std::uint32_t index = 0;
+        for (const auto& [oid, value] : values) {
+            if (value.tag == 0x82 || value.tag == 0x81 || value.tag == 0x80) continue;
+            if (InterfaceIndexFromOid(kIfIndexBase, oid, index)) {
+                nextOid = oid;
+                break;
+            }
+        }
+        if (nextOid.empty() || !seen.insert(index).second) break;
+        indexes.push_back(index);
+        cursor = nextOid;
+    }
+    return indexes;
+}
+
+#ifdef _WIN32
+std::vector<std::uint32_t> DiscoverInterfaceIndexesV3(
+    const std::string& ipAddress,
+    int port,
+    int timeoutMs,
+    int retries,
+    const SnmpV3Credential& credential,
+    std::uint32_t& requestId,
+    std::size_t limit) {
+    static const std::string kIfIndexBase = "1.3.6.1.2.1.2.2.1.1";
+    std::unordered_map<std::string, SnmpValue> values;
+    std::string queryError;
+
+    if (QueryTargetV3(
+            ipAddress, port, timeoutMs, retries, credential,
+            ++requestId, {kIfIndexBase}, values, queryError,
+            0xA5, 0, static_cast<std::uint64_t>(limit))) {
+        auto indexes = InterfaceIndexesFromValues(values, kIfIndexBase, limit);
+        if (!indexes.empty()) return indexes;
+    }
+
+    std::vector<std::uint32_t> indexes;
+    std::unordered_set<std::uint32_t> seen;
+    std::string cursor = kIfIndexBase;
+    for (std::size_t count = 0; count < limit; ++count) {
+        values.clear();
+        queryError.clear();
+        if (!QueryTargetV3(
+                ipAddress, port, timeoutMs, retries, credential,
+                ++requestId, {cursor}, values, queryError, 0xA1)) {
+            break;
+        }
+        std::string nextOid;
+        std::uint32_t index = 0;
+        for (const auto& [oid, value] : values) {
+            if (value.tag == 0x82 || value.tag == 0x81 || value.tag == 0x80) continue;
+            if (InterfaceIndexFromOid(kIfIndexBase, oid, index)) {
+                nextOid = oid;
+                break;
+            }
+        }
+        if (nextOid.empty() || !seen.insert(index).second) break;
+        indexes.push_back(index);
+        cursor = nextOid;
+    }
+    return indexes;
+}
+#endif
+
+json BuildInterfaceInventory(
+    const std::vector<std::uint32_t>& indexes,
+    const std::unordered_map<std::string, SnmpValue>& values) {
+    static const std::string kIfDescr = "1.3.6.1.2.1.2.2.1.2.";
+    static const std::string kIfType = "1.3.6.1.2.1.2.2.1.3.";
+    static const std::string kIfMtu = "1.3.6.1.2.1.2.2.1.4.";
+    static const std::string kIfSpeed = "1.3.6.1.2.1.2.2.1.5.";
+    static const std::string kIfPhysAddress = "1.3.6.1.2.1.2.2.1.6.";
+    static const std::string kIfAdminStatus = "1.3.6.1.2.1.2.2.1.7.";
+    static const std::string kIfOperStatus = "1.3.6.1.2.1.2.2.1.8.";
+    static const std::string kIfName = "1.3.6.1.2.1.31.1.1.1.1.";
+    static const std::string kIfHighSpeed = "1.3.6.1.2.1.31.1.1.1.15.";
+    static const std::string kIfAlias = "1.3.6.1.2.1.31.1.1.1.18.";
+
+    json interfaces = json::array();
+    for (const auto index : indexes) {
+        const std::string suffix = std::to_string(index);
+        const std::string description = ValueText(values, kIfDescr + suffix);
+        const std::string ifName = ValueText(values, kIfName + suffix);
+        const std::string alias = ValueText(values, kIfAlias + suffix);
+
+        bool hasType = false;
+        bool hasMtu = false;
+        bool hasSpeed = false;
+        bool hasHighSpeed = false;
+        bool hasAdmin = false;
+        bool hasOper = false;
+        const auto type = ValueNumber(values, kIfType + suffix, hasType);
+        const auto mtu = ValueNumber(values, kIfMtu + suffix, hasMtu);
+        const auto speed = ValueNumber(values, kIfSpeed + suffix, hasSpeed);
+        const auto highSpeed = ValueNumber(values, kIfHighSpeed + suffix, hasHighSpeed);
+        const auto admin = ValueNumber(values, kIfAdminStatus + suffix, hasAdmin);
+        const auto oper = ValueNumber(values, kIfOperStatus + suffix, hasOper);
+
+        std::uint64_t speedBps = hasSpeed ? speed : 0;
+        if (hasHighSpeed && highSpeed > 0) {
+            const std::uint64_t highSpeedBps = highSpeed * 1000000ULL;
+            if (speedBps == 0 || speedBps == 0xffffffffULL || highSpeedBps > speedBps) {
+                speedBps = highSpeedBps;
+            }
+        }
+
+        std::string macAddress;
+        if (const auto* macValue = FindValue(values, kIfPhysAddress + suffix)) {
+            macAddress = FormatMacBytes(macValue->raw);
+        }
+
+        json item = {
+            {"index", index},
+            {"name", !ifName.empty() ? ifName : (!description.empty()
+                ? description
+                : "Interface " + suffix)}
+        };
+        if (!description.empty()) item["description"] = description;
+        if (!alias.empty()) item["alias"] = alias;
+        if (hasType) {
+            item["typeCode"] = type;
+            const std::string typeName = InterfaceTypeName(type);
+            if (!typeName.empty()) item["type"] = typeName;
+        }
+        if (hasMtu) item["mtu"] = mtu;
+        if (speedBps > 0) item["speedBps"] = speedBps;
+        if (!macAddress.empty()) item["macAddress"] = macAddress;
+        if (hasAdmin) item["adminStatus"] = InterfaceStatusName(admin);
+        if (hasOper) {
+            item["operStatus"] = InterfaceStatusName(oper);
+            item["up"] = oper == 1;
+        }
+        interfaces.push_back(std::move(item));
+    }
+    return interfaces;
+}
+
+std::vector<std::string> InterfaceAttributeOids(
+    const std::vector<std::uint32_t>& indexes,
+    bool includeIfX) {
+    static const std::array<const char*, 7> kIfMibColumns = {
+        "1.3.6.1.2.1.2.2.1.2.",
+        "1.3.6.1.2.1.2.2.1.3.",
+        "1.3.6.1.2.1.2.2.1.4.",
+        "1.3.6.1.2.1.2.2.1.5.",
+        "1.3.6.1.2.1.2.2.1.6.",
+        "1.3.6.1.2.1.2.2.1.7.",
+        "1.3.6.1.2.1.2.2.1.8."
+    };
+    static const std::array<const char*, 3> kIfXMibColumns = {
+        "1.3.6.1.2.1.31.1.1.1.1.",
+        "1.3.6.1.2.1.31.1.1.1.15.",
+        "1.3.6.1.2.1.31.1.1.1.18."
+    };
+
+    std::vector<std::string> oids;
+    oids.reserve(indexes.size() * (includeIfX ? 10 : 7));
+    for (const auto index : indexes) {
+        const std::string suffix = std::to_string(index);
+        for (const char* base : kIfMibColumns) oids.emplace_back(std::string(base) + suffix);
+        if (includeIfX) {
+            for (const char* base : kIfXMibColumns) oids.emplace_back(std::string(base) + suffix);
+        }
+    }
+    return oids;
+}
+
+json CollectInterfaceInventory(
+    const std::string& ipAddress,
+    int port,
+    int timeoutMs,
+    int retries,
+    int snmpVersion,
+    const std::string& community,
+    std::uint32_t& requestId,
+    std::size_t countHint,
+    bool& truncated) {
+    static constexpr std::size_t kMaxInterfaces = 128;
+    static constexpr std::size_t kBatchInterfaces = 8;
+    const std::size_t limit = std::min<std::size_t>(
+        kMaxInterfaces,
+        countHint > 0 ? std::max<std::size_t>(countHint, 1) : kMaxInterfaces);
+    truncated = countHint > kMaxInterfaces;
+
+    auto indexes = DiscoverInterfaceIndexes(
+        ipAddress, port, timeoutMs, retries, snmpVersion, community, requestId, limit);
+    if (indexes.size() >= kMaxInterfaces) truncated = true;
+
+    std::unordered_map<std::string, SnmpValue> allValues;
+    for (std::size_t start = 0; start < indexes.size(); start += kBatchInterfaces) {
+        const std::size_t end = std::min(indexes.size(), start + kBatchInterfaces);
+        std::vector<std::uint32_t> batch(indexes.begin() + static_cast<std::ptrdiff_t>(start),
+                                         indexes.begin() + static_cast<std::ptrdiff_t>(end));
+        const auto oids = InterfaceAttributeOids(batch, snmpVersion != 0);
+        std::unordered_map<std::string, SnmpValue> values;
+        std::string queryError;
+        if (!QueryTarget(
+                ipAddress, port, timeoutMs, retries, snmpVersion, community,
+                ++requestId, oids, values, queryError)) {
+            continue;
+        }
+        allValues.insert(values.begin(), values.end());
+    }
+    return BuildInterfaceInventory(indexes, allValues);
+}
+
+#ifdef _WIN32
+json CollectInterfaceInventoryV3(
+    const std::string& ipAddress,
+    int port,
+    int timeoutMs,
+    int retries,
+    const SnmpV3Credential& credential,
+    std::uint32_t& requestId,
+    std::size_t countHint,
+    bool& truncated) {
+    static constexpr std::size_t kMaxInterfaces = 128;
+    static constexpr std::size_t kBatchInterfaces = 8;
+    const std::size_t limit = std::min<std::size_t>(
+        kMaxInterfaces,
+        countHint > 0 ? std::max<std::size_t>(countHint, 1) : kMaxInterfaces);
+    truncated = countHint > kMaxInterfaces;
+
+    auto indexes = DiscoverInterfaceIndexesV3(
+        ipAddress, port, timeoutMs, retries, credential, requestId, limit);
+    if (indexes.size() >= kMaxInterfaces) truncated = true;
+
+    std::unordered_map<std::string, SnmpValue> allValues;
+    for (std::size_t start = 0; start < indexes.size(); start += kBatchInterfaces) {
+        const std::size_t end = std::min(indexes.size(), start + kBatchInterfaces);
+        std::vector<std::uint32_t> batch(indexes.begin() + static_cast<std::ptrdiff_t>(start),
+                                         indexes.begin() + static_cast<std::ptrdiff_t>(end));
+        const auto oids = InterfaceAttributeOids(batch, true);
+        std::unordered_map<std::string, SnmpValue> values;
+        std::string queryError;
+        if (!QueryTargetV3(
+                ipAddress, port, timeoutMs, retries, credential,
+                ++requestId, oids, values, queryError)) {
+            continue;
+        }
+        allValues.insert(values.begin(), values.end());
+    }
+    return BuildInterfaceInventory(indexes, allValues);
+}
+#endif
+
 json ProbeDevice(std::uint32_t hostAddress, int port, int timeoutMs, int retries,
                  int snmpVersion, const std::string& versionLabel, const std::string& community,
                  std::uint32_t requestId, bool& responded) {
@@ -1528,6 +1909,7 @@ json ProbeDevice(std::uint32_t hostAddress, int port, int timeoutMs, int retries
         "1.3.6.1.2.1.1.4.0",  // sysContact
         "1.3.6.1.2.1.1.5.0",  // sysName
         "1.3.6.1.2.1.1.6.0",  // sysLocation
+        "1.3.6.1.2.1.1.7.0",  // sysServices
         "1.3.6.1.2.1.2.1.0",  // ifNumber
     };
 
@@ -1541,9 +1923,24 @@ json ProbeDevice(std::uint32_t hostAddress, int port, int timeoutMs, int retries
 
     bool hasUptime = false;
     bool hasInterfaceCount = false;
+    bool hasSysServices = false;
     const auto uptime = ValueNumber(values, "1.3.6.1.2.1.1.3.0", hasUptime);
     const auto interfaceCount = ValueNumber(values, "1.3.6.1.2.1.2.1.0", hasInterfaceCount);
+    const auto sysServices = ValueNumber(values, "1.3.6.1.2.1.1.7.0", hasSysServices);
     const std::string sysName = ValueText(values, "1.3.6.1.2.1.1.5.0");
+
+    bool interfacesTruncated = false;
+    std::uint32_t inventoryRequestId = requestId + 0x1000u;
+    const json interfaces = CollectInterfaceInventory(
+        ipAddress,
+        port,
+        timeoutMs,
+        retries,
+        snmpVersion,
+        community,
+        inventoryRequestId,
+        hasInterfaceCount ? static_cast<std::size_t>(interfaceCount) : 0,
+        interfacesTruncated);
 
     json device = {
         {"ipAddress", ipAddress},
@@ -1555,14 +1952,19 @@ json ProbeDevice(std::uint32_t hostAddress, int port, int timeoutMs, int retries
         {"sysObjectId", ValueText(values, "1.3.6.1.2.1.1.2.0")},
         {"sysContact", ValueText(values, "1.3.6.1.2.1.1.4.0")},
         {"sysLocation", ValueText(values, "1.3.6.1.2.1.1.6.0")},
-        {"interfaces", json::array()},
+        {"interfaces", interfaces},
         {"metadata", {
             {"scanner", "hi5central-native-snmp"},
-            {"standardOids", static_cast<int>(kOids.size())}
+            {"standardOids", static_cast<int>(kOids.size())},
+            {"snmp", {
+                {"interfacesCollected", static_cast<int>(interfaces.size())},
+                {"interfacesTruncated", interfacesTruncated}
+            }}
         }}
     };
     if (hasUptime) device["uptimeTicks"] = uptime;
     if (hasInterfaceCount) device["interfaceCount"] = interfaceCount;
+    if (hasSysServices) device["metadata"]["snmp"]["sysServices"] = sysServices;
     return device;
 }
 
@@ -1581,6 +1983,7 @@ json ProbeDeviceV3(std::uint32_t hostAddress, int port, int timeoutMs, int retri
         "1.3.6.1.2.1.1.4.0",
         "1.3.6.1.2.1.1.5.0",
         "1.3.6.1.2.1.1.6.0",
+        "1.3.6.1.2.1.1.7.0",
         "1.3.6.1.2.1.2.1.0",
     };
 
@@ -1595,9 +1998,23 @@ json ProbeDeviceV3(std::uint32_t hostAddress, int port, int timeoutMs, int retri
 
     bool hasUptime = false;
     bool hasInterfaceCount = false;
+    bool hasSysServices = false;
     const auto uptime = ValueNumber(values, "1.3.6.1.2.1.1.3.0", hasUptime);
     const auto interfaceCount = ValueNumber(values, "1.3.6.1.2.1.2.1.0", hasInterfaceCount);
+    const auto sysServices = ValueNumber(values, "1.3.6.1.2.1.1.7.0", hasSysServices);
     const std::string sysName = ValueText(values, "1.3.6.1.2.1.1.5.0");
+
+    bool interfacesTruncated = false;
+    std::uint32_t inventoryRequestId = requestId + 0x2000u;
+    const json interfaces = CollectInterfaceInventoryV3(
+        ipAddress,
+        port,
+        timeoutMs,
+        retries,
+        credential,
+        inventoryRequestId,
+        hasInterfaceCount ? static_cast<std::size_t>(interfaceCount) : 0,
+        interfacesTruncated);
 
     json device = {
         {"ipAddress", ipAddress},
@@ -1609,10 +2026,14 @@ json ProbeDeviceV3(std::uint32_t hostAddress, int port, int timeoutMs, int retri
         {"sysObjectId", ValueText(values, "1.3.6.1.2.1.1.2.0")},
         {"sysContact", ValueText(values, "1.3.6.1.2.1.1.4.0")},
         {"sysLocation", ValueText(values, "1.3.6.1.2.1.1.6.0")},
-        {"interfaces", json::array()},
+        {"interfaces", interfaces},
         {"metadata", {
             {"scanner", "hi5central-native-snmp"},
             {"standardOids", static_cast<int>(kOids.size())},
+            {"snmp", {
+                {"interfacesCollected", static_cast<int>(interfaces.size())},
+                {"interfacesTruncated", interfacesTruncated}
+            }},
             {"snmpV3", {
                 {"securityLevel", credential.securityLevel},
                 {"authProtocol", SnmpV3NeedsAuth(credential) ? credential.authProtocol : std::string()},
@@ -1623,6 +2044,7 @@ json ProbeDeviceV3(std::uint32_t hostAddress, int port, int timeoutMs, int retri
     };
     if (hasUptime) device["uptimeTicks"] = uptime;
     if (hasInterfaceCount) device["interfaceCount"] = interfaceCount;
+    if (hasSysServices) device["metadata"]["snmp"]["sysServices"] = sysServices;
     return device;
 }
 #endif
