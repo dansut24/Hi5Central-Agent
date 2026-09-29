@@ -127,6 +127,14 @@ jobs:
               throw "Native mDNS/DNS-SD enrichment is missing required safety contract: $mdnsContract"
             }
           }
+          foreach ($spotifyContract in @('ApplySpotifyConnectInfo','action=getInfo&version=2.10.0','IsSafeLocalServicePath','kMaxSpotifyInfoBytes','spotifyConnectProbeCount','spotifyConnectIdentityCount','spotify_getinfo:remoteName')) {
+            if ($snmp -notmatch [regex]::Escape($spotifyContract)) {
+              throw "Spotify Connect read-only identity enrichment is missing required safety contract: $spotifyContract"
+            }
+          }
+          if ($snmp -match 'action=addUser|userName=|clientKey=|blob=') {
+            throw 'Spotify Connect discovery must remain read-only and must never submit login credentials.'
+          }
           foreach ($presenceContract in @('IcmpSendEcho','GetIpNetTable','presenceEnabled','discoveryMethods','nameEnrichmentDeferred','MIB_IPNET_TYPE_INVALID','allZero','allBroadcast')) {
             if ($snmp -notmatch [regex]::Escape($presenceContract)) {
               throw "Native network presence discovery is missing required contract: $presenceContract"

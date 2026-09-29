@@ -1253,6 +1253,17 @@ struct MdnsRecord {
     std::vector<std::string> services;
     std::vector<std::string> capabilities;
     std::unordered_map<std::string, std::string> txt;
+    std::uint16_t spotifyPort = 0;
+    std::string spotifyPath;
+    bool spotifyProbeAttempted = false;
+    bool spotifyInfoAvailable = false;
+    std::string spotifyRemoteName;
+    std::string spotifyBrand;
+    std::string spotifyModel;
+    std::string spotifyDeviceType;
+    std::string spotifyResponseSource;
+    std::string spotifyVersion;
+    std::vector<std::string> spotifyAliases;
 };
 
 void AddUniqueValue(
@@ -1403,8 +1414,23 @@ bool IsSensitiveMdnsTxtKey(const std::string& key) {
     return false;
 }
 
+bool IsSpotifyServiceOwner(const std::string& owner) {
+    return LowerAscii(owner).find("._spotify-connect._tcp.") != std::string::npos;
+}
+
+bool IsSafeLocalServicePath(const std::string& value) {
+    if (value.empty() || value.size() > 256 || value.front() != '/') return false;
+    for (unsigned char ch : value) {
+        if (ch == '?' || ch == '#' || ch == '\\' || ch == '\r' || ch == '\n' || ch < 0x20) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ApplyMdnsTxt(
     MdnsRecord& record,
+    const std::string& owner,
     const std::uint8_t* data,
     std::size_t offset,
     std::size_t length) {
@@ -1428,6 +1454,11 @@ void ApplyMdnsTxt(
             && record.txt.find(key) == record.txt.end()) {
             record.txt.emplace(key, value);
         }
+        if (key == "cpath"
+            && IsSpotifyServiceOwner(owner)
+            && IsSafeLocalServicePath(value)) {
+            record.spotifyPath = value;
+        }
 
         if (key == "fn" || key == "name" || key == "dn"
             || key == "room" || key == "roomname" || key == "room_name"
@@ -1446,6 +1477,153 @@ void ApplyMdnsTxt(
             record.vendor = value;
         }
     }
+}
+
+std::string JsonStringValue(const json& value, const char* key, std::size_t maxLength) {
+    if (!value.is_object() || !value.contains(key) || !value[key].is_string()) return {};
+    const std::string text = TrimAscii(value[key].get<std::string>());
+    return text.size() <= maxLength ? text : text.substr(0, maxLength);
+}
+
+void ApplySpotifyConnectInfo(MdnsRecord& record) {
+#ifdef _WIN32
+    if (!IsPrivateIpv4Address(record.ipAddress)
+        || record.spotifyPort == 0
+        || !IsSafeLocalServicePath(record.spotifyPath)) {
+        return;
+    }
+
+    record.spotifyProbeAttempted = true;
+    const std::wstring host = Utf8ToWide(record.ipAddress);
+    const std::wstring path = Utf8ToWide(
+        record.spotifyPath + "?action=getInfo&version=2.10.0");
+    if (host.empty() || path.empty()) return;
+
+    HINTERNET session = WinHttpOpen(
+        L"Hi5Central-NetworkDiscovery/1.0",
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+    if (!session) return;
+    WinHttpSetTimeouts(session, 700, 700, 700, 1200);
+
+    HINTERNET connect = WinHttpConnect(session, host.c_str(), record.spotifyPort, 0);
+    if (!connect) {
+        WinHttpCloseHandle(session);
+        return;
+    }
+
+    HINTERNET request = WinHttpOpenRequest(
+        connect,
+        L"GET",
+        path.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        0);
+    if (!request) {
+        WinHttpCloseHandle(connect);
+        WinHttpCloseHandle(session);
+        return;
+    }
+
+    DWORD disable = WINHTTP_DISABLE_REDIRECTS;
+    WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &disable, sizeof(disable));
+
+    bool ok = WinHttpSendRequest(
+        request,
+        WINHTTP_NO_ADDITIONAL_HEADERS,
+        0,
+        WINHTTP_NO_REQUEST_DATA,
+        0,
+        0,
+        0) != FALSE;
+    if (ok) ok = WinHttpReceiveResponse(request, nullptr) != FALSE;
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    if (ok) {
+        ok = WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &statusCode,
+            &statusSize,
+            WINHTTP_NO_HEADER_INDEX) != FALSE
+            && statusCode >= 200 && statusCode < 300;
+    }
+
+    std::string body;
+    static constexpr std::size_t kMaxSpotifyInfoBytes = 64 * 1024;
+    while (ok && body.size() < kMaxSpotifyInfoBytes) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+        const DWORD allowed = static_cast<DWORD>(
+            std::min<std::size_t>(available, kMaxSpotifyInfoBytes - body.size()));
+        if (allowed == 0) break;
+        std::vector<char> chunk(allowed);
+        DWORD read = 0;
+        if (!WinHttpReadData(request, chunk.data(), allowed, &read) || read == 0) break;
+        body.append(chunk.data(), static_cast<std::size_t>(read));
+    }
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+
+    if (!ok || body.empty()) return;
+    const json info = json::parse(body, nullptr, false);
+    if (info.is_discarded() || !info.is_object()) return;
+    if (info.value("status", 0) != 101) return;
+
+    record.spotifyRemoteName = JsonStringValue(info, "remoteName", 128);
+    record.spotifyBrand = JsonStringValue(info, "brandDisplayName", 128);
+    record.spotifyModel = JsonStringValue(info, "modelDisplayName", 256);
+    record.spotifyDeviceType = JsonStringValue(info, "deviceType", 64);
+    record.spotifyResponseSource = JsonStringValue(info, "responseSource", 64);
+    record.spotifyVersion = JsonStringValue(info, "version", 32);
+
+    if (info.contains("aliases") && info["aliases"].is_array()) {
+        for (const auto& alias : info["aliases"]) {
+            if (record.spotifyAliases.size() >= 8 || !alias.is_object()) break;
+            const std::string name = JsonStringValue(alias, "name", 128);
+            if (!name.empty()) AddUniqueValue(record.spotifyAliases, name, 8, 128);
+        }
+    }
+
+    if (!record.spotifyRemoteName.empty()) {
+        ConsiderMdnsFriendlyName(
+            record,
+            record.spotifyRemoteName,
+            "spotify_getinfo:remoteName",
+            true);
+    } else if (record.spotifyAliases.size() == 1) {
+        ConsiderMdnsFriendlyName(
+            record,
+            record.spotifyAliases.front(),
+            "spotify_getinfo:alias",
+            true);
+    }
+    if (record.vendor.empty() && !record.spotifyBrand.empty()) {
+        record.vendor = record.spotifyBrand;
+    }
+    if (record.model.empty() && !record.spotifyModel.empty()) {
+        record.model = record.spotifyModel;
+    }
+
+    record.spotifyInfoAvailable =
+        !record.spotifyRemoteName.empty()
+        || !record.spotifyBrand.empty()
+        || !record.spotifyModel.empty()
+        || !record.spotifyDeviceType.empty()
+        || !record.spotifyAliases.empty();
+    if (record.spotifyInfoAvailable) {
+        AddMdnsCapability(record, "spotify_zeroconf");
+    }
+#else
+    (void)record;
+#endif
 }
 
 bool IsValidDnsSdServiceType(const std::string& value) {
@@ -1817,6 +1995,10 @@ std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
                     ConsiderMdnsFriendlyName(record, instance, "ptr_instance");
                 }
             } else if (type == 33 && rdLength >= 6) {  // SRV
+                if (IsSpotifyServiceOwner(owner)) {
+                    const std::uint16_t port = ReadDnsU16(buffer.data(), rdataOffset + 4);
+                    if (port != 0) record.spotifyPort = port;
+                }
                 std::size_t targetOffset = rdataOffset + 6;
                 std::string target;
                 if (ReadDnsName(buffer.data(), packetSize, targetOffset, target)) {
@@ -1830,7 +2012,7 @@ std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
             } else if (type == 16) {  // TXT
                 const std::string instance = MdnsInstanceName(owner);
                 ConsiderMdnsFriendlyName(record, instance, "txt_instance");
-                ApplyMdnsTxt(record, buffer.data(), rdataOffset, rdLength);
+                ApplyMdnsTxt(record, owner, buffer.data(), rdataOffset, rdLength);
             }
 
             offset = rdataOffset + rdLength;
@@ -1850,6 +2032,7 @@ std::unordered_map<std::string, MdnsRecord> DiscoverMdns(
             it = records.erase(it);
             continue;
         }
+        ApplySpotifyConnectInfo(record);
         record.deviceType = InferMdnsDeviceType(record);
         ++it;
     }
@@ -1871,6 +2054,22 @@ json BuildMdnsEnrichment(const MdnsRecord& record) {
         record.txt.begin(), record.txt.end());
     std::sort(txtEntries.begin(), txtEntries.end());
     for (const auto& [key, value] : txtEntries) txt[key] = value;
+
+    json spotifyAliases = json::array();
+    for (const auto& alias : record.spotifyAliases) spotifyAliases.push_back(alias);
+    json spotifyConnect = {
+        {"probeAttempted", record.spotifyProbeAttempted},
+        {"infoAvailable", record.spotifyInfoAvailable},
+        {"port", record.spotifyPort},
+        {"path", record.spotifyPath},
+        {"remoteName", record.spotifyRemoteName},
+        {"brandDisplayName", record.spotifyBrand},
+        {"modelDisplayName", record.spotifyModel},
+        {"deviceType", record.spotifyDeviceType},
+        {"responseSource", record.spotifyResponseSource},
+        {"version", record.spotifyVersion},
+        {"aliases", spotifyAliases}
+    };
 
     std::string name;
     if (!record.friendlyName.empty() && record.friendlyNameScore > 0) {
@@ -1895,7 +2094,8 @@ json BuildMdnsEnrichment(const MdnsRecord& record) {
                 {"friendlyNameScore", record.friendlyNameScore},
                 {"services", services},
                 {"capabilities", capabilities},
-                {"txt", txt}
+                {"txt", txt},
+                {"spotifyConnect", spotifyConnect}
             }}
         }}
     };
@@ -2267,6 +2467,14 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
         if (!item.value("hostname", std::string()).empty()) namedIps.insert(ipAddress);
     }
 
+    std::size_t spotifyConnectProbeCount = 0;
+    std::size_t spotifyConnectIdentityCount = 0;
+    for (const auto& [ipAddress, record] : mdnsRecords) {
+        (void)ipAddress;
+        if (record.spotifyProbeAttempted) ++spotifyConnectProbeCount;
+        if (record.spotifyInfoAvailable) ++spotifyConnectIdentityCount;
+    }
+
     const auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - startedAt).count();
 
@@ -2277,7 +2485,7 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
 
     return json{
         {"status", "ok"},
-        {"protocolVersion", 4},
+        {"protocolVersion", 5},
         {"targetsTotal", targets.size()},
         {"enrichedCount", enrichedIps.size()},
         {"resolvedCount", namedIps.size()},
@@ -2285,6 +2493,8 @@ nlohmann::json RunNetworkDiscoveryEnrichment(
         {"mdnsCount", mdnsRecords.size()},
         {"mdnsServiceTypeCount", mdnsQueriedServiceTypes.size()},
         {"mdnsDynamicServiceTypeCount", mdnsDynamicServiceTypes.size()},
+        {"spotifyConnectProbeCount", spotifyConnectProbeCount},
+        {"spotifyConnectIdentityCount", spotifyConnectIdentityCount},
         {"mdnsServiceTypes", queriedServices},
         {"mdnsDynamicServiceTypes", dynamicServices},
         {"durationMs", durationMs},
