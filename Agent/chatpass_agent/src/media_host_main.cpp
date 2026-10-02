@@ -206,6 +206,13 @@ int RunMediaHostMain(int argc, char** argv) {
     bool gpuZeroCopyLogged = false;
     bool gpuTransportFailureReported = false;
     auto nextMemoryLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    uint64_t gpuReadbackAttempts = 0;
+    double gpuReadbackMsTotal = 0.0;
+    double gpuReadbackMsMax = 0.0;
+    double gpuFrameAgePreMsTotal = 0.0;
+    double gpuFrameAgePreMsMax = 0.0;
+    double gpuFrameAgePostMsTotal = 0.0;
+    double gpuFrameAgePostMsMax = 0.0;
     I420Frame frame;
     SharedGpuFrame gpuFrame;
     SharedGpuFrameReader gpuReader;
@@ -246,8 +253,29 @@ int RunMediaHostMain(int argc, char** argv) {
             // active (VP8/forced software) or explicitly asks for fallback.
             gpuH264Consumed = sender.trySendExternalGpuH264(gpuFrame, frameTsNs, forceKeyframe);
             if (!gpuH264Consumed) {
+                const uint64_t preReadTickNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                const double preReadAgeMs = frameTsNs > 0 && preReadTickNs >= frameTsNs
+                    ? static_cast<double>(preReadTickNs - frameTsNs) / 1000000.0
+                    : 0.0;
+                const auto readStart = std::chrono::steady_clock::now();
                 std::string gpuError;
-                if (gpuReader.ReadI420(gpuFrame, frame, &gpuError)) {
+                const bool readOk = gpuReader.ReadI420(gpuFrame, frame, &gpuError);
+                const auto readEnd = std::chrono::steady_clock::now();
+                const double readbackMs = std::chrono::duration<double, std::milli>(readEnd - readStart).count();
+                const uint64_t postReadTickNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                const double postReadAgeMs = frameTsNs > 0 && postReadTickNs >= frameTsNs
+                    ? static_cast<double>(postReadTickNs - frameTsNs) / 1000000.0
+                    : preReadAgeMs + readbackMs;
+
+                ++gpuReadbackAttempts;
+                gpuReadbackMsTotal += readbackMs;
+                gpuReadbackMsMax = std::max(gpuReadbackMsMax, readbackMs);
+                gpuFrameAgePreMsTotal += preReadAgeMs;
+                gpuFrameAgePreMsMax = std::max(gpuFrameAgePreMsMax, preReadAgeMs);
+                gpuFrameAgePostMsTotal += postReadAgeMs;
+                gpuFrameAgePostMsMax = std::max(gpuFrameAgePostMsMax, postReadAgeMs);
+
+                if (readOk) {
                     gotFrame = true;
                 } else {
                     LogWarn("[gpu-transport] shared frame readback failed session=" + sessionId +
@@ -284,6 +312,24 @@ int RunMediaHostMain(int argc, char** argv) {
         const auto memoryNow = std::chrono::steady_clock::now();
         if (memoryNow >= nextMemoryLog) {
             LogMediaMemory(sessionId, "steady");
+            if (gpuReadbackAttempts > 0) {
+                const double count = static_cast<double>(gpuReadbackAttempts);
+                LogInfo("[gpu-transport] readback health session=" + sessionId +
+                    " frames=" + std::to_string(gpuReadbackAttempts) +
+                    " readback_avg_ms=" + std::to_string(gpuReadbackMsTotal / count) +
+                    " readback_max_ms=" + std::to_string(gpuReadbackMsMax) +
+                    " frame_age_pre_avg_ms=" + std::to_string(gpuFrameAgePreMsTotal / count) +
+                    " frame_age_pre_max_ms=" + std::to_string(gpuFrameAgePreMsMax) +
+                    " frame_age_post_avg_ms=" + std::to_string(gpuFrameAgePostMsTotal / count) +
+                    " frame_age_post_max_ms=" + std::to_string(gpuFrameAgePostMsMax));
+                gpuReadbackAttempts = 0;
+                gpuReadbackMsTotal = 0.0;
+                gpuReadbackMsMax = 0.0;
+                gpuFrameAgePreMsTotal = 0.0;
+                gpuFrameAgePreMsMax = 0.0;
+                gpuFrameAgePostMsTotal = 0.0;
+                gpuFrameAgePostMsMax = 0.0;
+            }
             nextMemoryLog = memoryNow + std::chrono::seconds(5);
         }
     }

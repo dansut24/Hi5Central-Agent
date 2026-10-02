@@ -9,6 +9,8 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <libyuv/convert_from_argb.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <sstream>
@@ -19,11 +21,7 @@ using Microsoft::WRL::ComPtr;
 namespace hi5 {
 namespace {
 
-uint8_t ClampByte(int v) {
-    return static_cast<uint8_t>(std::max(0, std::min(255, v)));
-}
-
-void BgraToI420(const uint8_t* src, int stride, int width, int height, I420Frame& out) {
+bool BgraToI420(const uint8_t* src, int stride, int width, int height, I420Frame& out) {
     out.width = width;
     out.height = height;
     out.y.resize(static_cast<size_t>(width) * height);
@@ -32,40 +30,15 @@ void BgraToI420(const uint8_t* src, int stride, int width, int height, I420Frame
     out.u.resize(static_cast<size_t>(uvWidth) * uvHeight);
     out.v.resize(static_cast<size_t>(uvWidth) * uvHeight);
 
-    for (int y = 0; y < height; ++y) {
-        const uint8_t* row = src + static_cast<size_t>(y) * stride;
-        for (int x = 0; x < width; ++x) {
-            const uint8_t b = row[x * 4 + 0];
-            const uint8_t g = row[x * 4 + 1];
-            const uint8_t r = row[x * 4 + 2];
-            const int value = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            out.y[static_cast<size_t>(y) * width + x] = ClampByte(value);
-        }
-    }
-
-    for (int by = 0; by < uvHeight; ++by) {
-        for (int bx = 0; bx < uvWidth; ++bx) {
-            int sumU = 0;
-            int sumV = 0;
-            int count = 0;
-            for (int dy = 0; dy < 2; ++dy) {
-                for (int dx = 0; dx < 2; ++dx) {
-                    const int x = bx * 2 + dx;
-                    const int y = by * 2 + dy;
-                    if (x >= width || y >= height) continue;
-                    const uint8_t* px = src + static_cast<size_t>(y) * stride + x * 4;
-                    const uint8_t b = px[0];
-                    const uint8_t g = px[1];
-                    const uint8_t r = px[2];
-                    sumU += ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                    sumV += ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                    ++count;
-                }
-            }
-            out.u[static_cast<size_t>(by) * uvWidth + bx] = ClampByte(sumU / std::max(1, count));
-            out.v[static_cast<size_t>(by) * uvWidth + bx] = ClampByte(sumV / std::max(1, count));
-        }
-    }
+    // DXGI Desktop Duplication publishes DXGI_FORMAT_B8G8R8A8_UNORM.
+    // libyuv's ARGB API consumes that byte order on little-endian Windows and
+    // dispatches to SSSE3/AVX2 instead of walking every pixel in scalar C++.
+    return libyuv::ARGBToI420(
+        src, stride,
+        out.y.data(), width,
+        out.u.data(), uvWidth,
+        out.v.data(), uvWidth,
+        width, height) == 0;
 }
 
 std::string HrString(HRESULT hr) {
@@ -219,6 +192,10 @@ bool SharedGpuFrameReader::ReadI420(const SharedGpuFrame& frame, I420Frame& out,
         if (error) *error = "invalid shared GPU frame descriptor";
         return false;
     }
+    if (static_cast<DXGI_FORMAT>(frame.dxgiFormat) != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        if (error) *error = "unsupported shared GPU pixel format " + std::to_string(frame.dxgiFormat);
+        return false;
+    }
     if (!impl_->EnsureDevice(frame, error) || !impl_->EnsureStaging(frame, error)) return false;
 
     Impl::OpenedFrame* openedFrame = nullptr;
@@ -235,10 +212,10 @@ bool SharedGpuFrameReader::ReadI420(const SharedGpuFrame& frame, I420Frame& out,
     D3D11_MAPPED_SUBRESOURCE mapped{};
     const HRESULT mapHr = impl_->context->Map(impl_->staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (SUCCEEDED(mapHr) && mapped.pData) {
-        BgraToI420(static_cast<const uint8_t*>(mapped.pData), static_cast<int>(mapped.RowPitch),
+        ok = BgraToI420(static_cast<const uint8_t*>(mapped.pData), static_cast<int>(mapped.RowPitch),
             frame.width, frame.height, out);
         impl_->context->Unmap(impl_->staging.Get(), 0);
-        ok = true;
+        if (!ok && error) *error = "libyuv ARGBToI420 failed";
     } else if (error) {
         *error = "Map shared GPU staging failed " + HrString(mapHr);
     }

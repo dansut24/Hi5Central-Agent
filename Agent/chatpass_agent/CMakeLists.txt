@@ -45,6 +45,8 @@ find_library(VPX_LIBRARIES NAMES vpx libvpx)
 if(WIN32)
   find_path(OPUS_INCLUDE_DIR NAMES opus/opus.h)
   find_library(OPUS_LIBRARY NAMES opus)
+  find_path(LIBYUV_INCLUDE_DIR NAMES libyuv/convert_from_argb.h)
+  find_library(LIBYUV_LIBRARY NAMES yuv libyuv)
 endif()
 
 if(NOT VPX_INCLUDE_DIRS OR NOT VPX_LIBRARIES)
@@ -52,6 +54,9 @@ if(NOT VPX_INCLUDE_DIRS OR NOT VPX_LIBRARIES)
 endif()
 if(WIN32 AND (NOT OPUS_INCLUDE_DIR OR NOT OPUS_LIBRARY))
   message(FATAL_ERROR "libopus not found")
+endif()
+if(WIN32 AND (NOT LIBYUV_INCLUDE_DIR OR NOT LIBYUV_LIBRARY))
+  message(FATAL_ERROR "libyuv not found")
 endif()
 
 set(HI5_LIBDATACHANNEL_LINK_LIBS)
@@ -355,6 +360,7 @@ if(WIN32)
     ${HI5_LIBDATACHANNEL_INCLUDE_DIRS}
     ${VPX_INCLUDE_DIRS}
     ${OPUS_INCLUDE_DIR}
+    ${LIBYUV_INCLUDE_DIR}
     src
   )
   target_compile_definitions(hi5central_media_host PRIVATE
@@ -364,7 +370,7 @@ if(WIN32)
   target_link_libraries(hi5central_media_host PRIVATE
     ${HI5_LIBDATACHANNEL_LINK_LIBS}
     nlohmann_json::nlohmann_json Threads::Threads
-    OpenSSL::SSL OpenSSL::Crypto ${VPX_LIBRARIES} ${OPUS_LIBRARY}
+    OpenSSL::SSL OpenSSL::Crypto ${VPX_LIBRARIES} ${OPUS_LIBRARY} ${LIBYUV_LIBRARY}
     d3d11 dxgi windowscodecs mf mfplat mfuuid strmiids
     ws2_32 crypt32 winhttp urlmon bcrypt advapi32 user32 gdi32 shell32 shlwapi
     ole32 oleaut32 uuid wtsapi32 userenv psapi dwmapi iphlpapi
