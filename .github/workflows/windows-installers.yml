@@ -24,6 +24,11 @@ jobs:
     env:
       VCPKG_FEATURE_FLAGS: manifests,binarycaching
       VCPKG_DEFAULT_TRIPLET: x64-windows-static
+      # GitHub's Windows image already provides CMake/Ninja. Force vcpkg to use
+      # those system tools so builds do not depend on a secondary tool download
+      # from GitHub releases (which can fail before our project is configured).
+      VCPKG_FORCE_SYSTEM_BINARIES: "1"
+      VCPKG_KEEP_ENV_VARS: "PATH"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
