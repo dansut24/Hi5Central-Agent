@@ -440,15 +440,15 @@ void H264MfEncoder::shutdown() {
     m_gpuMode = false;
 }
 
-bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error) {
-    return initInternal(width, height, fps, bitrateKbps, preferHardware, nullptr, error);
+bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool preferHardware, int h264LevelIdc, std::string* error) {
+    return initInternal(width, height, fps, bitrateKbps, preferHardware, h264LevelIdc, nullptr, error);
 }
 
-bool H264MfEncoder::initGpu(const SharedGpuFrame& frame, int fps, int bitrateKbps, std::string* error) {
-    return initInternal(frame.width, frame.height, fps, bitrateKbps, true, &frame, error);
+bool H264MfEncoder::initGpu(const SharedGpuFrame& frame, int fps, int bitrateKbps, int h264LevelIdc, std::string* error) {
+    return initInternal(frame.width, frame.height, fps, bitrateKbps, true, h264LevelIdc, &frame, error);
 }
 
-bool H264MfEncoder::initInternal(int width, int height, int fps, int bitrateKbps, bool preferHardware, const SharedGpuFrame* gpuFrame, std::string* error) {
+bool H264MfEncoder::initInternal(int width, int height, int fps, int bitrateKbps, bool preferHardware, int h264LevelIdc, const SharedGpuFrame* gpuFrame, std::string* error) {
     shutdown();
 
     if (width <= 0 || height <= 0) {
@@ -469,6 +469,7 @@ bool H264MfEncoder::initInternal(int width, int height, int fps, int bitrateKbps
     m_height = height;
     m_fps = std::max(1, fps);
     m_bitrateKbps = std::max(300, bitrateKbps);
+    m_h264LevelIdc = std::clamp(h264LevelIdc > 0 ? h264LevelIdc : 31, 10, 62);
     m_frameIndex = 0;
 
     MFT_REGISTER_TYPE_INFO inInfo{};
@@ -552,6 +553,7 @@ bool H264MfEncoder::initInternal(int width, int height, int fps, int bitrateKbps
         << " size=" << m_width << "x" << m_height
         << " fps=" << m_fps
         << " bitrate=" << m_bitrateKbps
+        << " level_idc=" << m_h264LevelIdc
         << " prefer_hw=" << (preferHardware ? 1 : 0)
         << " codecapi=" << (HI5_H264_HAS_CODECAPI ? "available" : "sdk-unavailable") << "\n";
 
@@ -564,8 +566,11 @@ bool H264MfEncoder::initInternal(int width, int height, int fps, int bitrateKbps
     SetAttrSize(outType.Get(), MF_MT_FRAME_SIZE, static_cast<UINT32>(m_width), static_cast<UINT32>(m_height));
     SetAttrRatio(outType.Get(), MF_MT_FRAME_RATE, static_cast<UINT32>(m_fps), 1);
     SetAttrRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-    // Baseline profile_idc (66) without codecapi.h enum dependency.
+    // Baseline profile_idc (66). Keep the Media Foundation bitstream
+    // level aligned with the level advertised in SDP so the generated SPS and
+    // negotiated desktop geometry describe the same H.264 capability.
     outType->SetUINT32(MF_MT_MPEG2_PROFILE, 66);
+    outType->SetUINT32(MF_MT_MPEG2_LEVEL, static_cast<UINT32>(m_h264LevelIdc));
 
     hr = m_impl->transform->SetOutputType(0, outType.Get(), 0);
     if (FAILED(hr)) {

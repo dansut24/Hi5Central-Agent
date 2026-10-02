@@ -2436,10 +2436,11 @@ async function handleOffer(msg) {
     const codecs = caps?.codecs || [];
 
     if (transceiver && transceiver.setCodecPreferences && codecs.length) {
-      // Mirror the Agent's stable production order. VP9 preserves native
-      // desktop resolution where Chromium's H.264 level negotiation can cap
-      // a standards-compliant sender at 720p. H.264 remains the next fallback.
-      const primaryOrder = ["video/vp9", "video/h264", "video/vp8", "video/av1", "video/h265", "video/hevc"];
+      // Mirror the Agent's adaptive production order. H.264 is preferred
+      // when the Agent can advertise a level that carries the selected desktop
+      // natively; answer parsing falls through to VP9 if the returned H.264
+      // level would require downscaling.
+      const primaryOrder = ["video/h264", "video/vp9", "video/vp8", "video/av1", "video/h265", "video/hevc"];
       const primary = [];
       for (const wanted of primaryOrder) {
         primary.push(...codecs.filter(c => String(c.mimeType).toLowerCase() === wanted));

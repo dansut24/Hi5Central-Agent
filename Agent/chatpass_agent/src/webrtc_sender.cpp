@@ -399,6 +399,7 @@ namespace {
         std::string codecName;
         std::string fmtp;
         std::string h264ProfileLevelId = "42e01f";
+        std::string h264ReceiveProfileLevelId = "42e01f";
         int h264PacketizationMode = 0;
         bool h264LevelAsymmetryAllowed = false;
         int h264MaxWidth = 1280;
@@ -434,25 +435,79 @@ namespace {
         return {};
     }
 
-    static void h264LevelDimensions(const std::string& profileLevelId, int& maxWidth, int& maxHeight) {
-        // Hi5Central's H.264 sender is Baseline/Constrained-Baseline. Keep the
-        // encoded frame inside the negotiated H.264 level. In particular, level
-        // 3.1 (..1f) permits 3600 macroblocks/frame: 1280x720, not 1920x1080.
-        maxWidth = 1280;
-        maxHeight = 720;
-        if (profileLevelId.size() < 6) return;
+    struct H264LevelLimit {
+        int levelIdc;
+        int maxMacroblocksPerSecond;
+        int maxMacroblocksPerFrame;
+        int practicalMaxWidth;
+        int practicalMaxHeight;
+        const char* profileLevelId;
+    };
+
+    static constexpr H264LevelLimit kH264DesktopLevels[] = {
+        { 0x1f,  108000,  3600, 1280,  720, "42e01f" }, // Level 3.1
+        { 0x20,  216000,  5120, 1280, 1024, "42e020" }, // Level 3.2
+        { 0x28,  245760,  8192, 1920, 1080, "42e028" }, // Level 4.0
+        { 0x29,  245760,  8192, 1920, 1080, "42e029" }, // Level 4.1
+        { 0x2a,  522240,  8704, 1920, 1080, "42e02a" }, // Level 4.2
+        { 0x32,  589824, 22080, 2560, 1440, "42e032" }, // Level 5.0
+        { 0x33,  983040, 36864, 3840, 2160, "42e033" }, // Level 5.1
+        { 0x34, 2073600, 36864, 3840, 2160, "42e034" }  // Level 5.2
+    };
+
+    static int h264LevelIdc(const std::string& profileLevelId) {
+        if (profileLevelId.size() < 6) return 0;
         try {
-            const int levelIdc = std::stoi(profileLevelId.substr(profileLevelId.size() - 2), nullptr, 16);
-            if (levelIdc <= 0x0b) { maxWidth = 352; maxHeight = 288; }
-            else if (levelIdc <= 0x15) { maxWidth = 720; maxHeight = 480; }
-            else if (levelIdc <= 0x1e) { maxWidth = 720; maxHeight = 576; }
-            else if (levelIdc == 0x1f) { maxWidth = 1280; maxHeight = 720; }
-            else if (levelIdc == 0x20) { maxWidth = 1280; maxHeight = 1024; }
-            else { maxWidth = 1920; maxHeight = 1080; }
+            return std::stoi(profileLevelId.substr(profileLevelId.size() - 2), nullptr, 16);
         } catch (...) {
+            return 0;
+        }
+    }
+
+    static const H264LevelLimit* h264LevelLimit(const std::string& profileLevelId) {
+        const int levelIdc = h264LevelIdc(profileLevelId);
+        const H264LevelLimit* best = nullptr;
+        for (const auto& limit : kH264DesktopLevels) {
+            if (levelIdc < limit.levelIdc) break;
+            best = &limit;
+            if (levelIdc == limit.levelIdc) break;
+        }
+        return best;
+    }
+
+    static bool h264LevelSupportsFrame(const std::string& profileLevelId, int width, int height, int fps) {
+        if (width <= 0 || height <= 0 || fps <= 0) return true;
+        const auto* limit = h264LevelLimit(profileLevelId);
+        if (!limit) return false;
+        const int64_t mbWidth = (static_cast<int64_t>(width) + 15) / 16;
+        const int64_t mbHeight = (static_cast<int64_t>(height) + 15) / 16;
+        const int64_t macroblocksPerFrame = mbWidth * mbHeight;
+        const int64_t macroblocksPerSecond = macroblocksPerFrame * std::max(1, fps);
+        return macroblocksPerFrame <= limit->maxMacroblocksPerFrame &&
+            macroblocksPerSecond <= limit->maxMacroblocksPerSecond;
+    }
+
+    static std::string h264ProfileLevelForDesktop(int width, int height, int fps) {
+        if (width <= 0 || height <= 0) return "42e01f";
+        for (const auto& limit : kH264DesktopLevels) {
+            if (h264LevelSupportsFrame(limit.profileLevelId, width, height, fps)) {
+                return limit.profileLevelId;
+            }
+        }
+        // Keep the offer standards-bounded. If the desktop exceeds Level 5.2,
+        // answer parsing will reject H.264 for native Auto and fall through to VP9.
+        return "42e034";
+    }
+
+    static void h264LevelDimensions(const std::string& profileLevelId, int& maxWidth, int& maxHeight) {
+        const auto* limit = h264LevelLimit(profileLevelId);
+        if (!limit) {
             maxWidth = 1280;
             maxHeight = 720;
+            return;
         }
+        maxWidth = limit->practicalMaxWidth;
+        maxHeight = limit->practicalMaxHeight;
     }
 
     static bool parseCodecName(const std::string& codecNameRaw, WebRtcSender::VideoCodec& codec) {
@@ -465,7 +520,12 @@ namespace {
         return false;
     }
 
-    static NegotiatedVideoFormat parseNegotiatedVideoFormat(const std::string& sdp) {
+    static NegotiatedVideoFormat parseNegotiatedVideoFormat(
+        const std::string& sdp,
+        int requiredWidth = 0,
+        int requiredHeight = 0,
+        int requiredFps = 0,
+        bool requireNativeH264 = false) {
         struct RtpMap { int pt = -1; std::string codecName; std::string fmtp; };
         std::vector<std::string> lines;
         std::istringstream input(sdp);
@@ -547,7 +607,14 @@ namespace {
                 const std::string packetMode = sdpAttributeValue(map->fmtp, "packetization-mode");
                 candidate.h264PacketizationMode = packetMode.empty() ? 0 : std::atoi(packetMode.c_str());
                 candidate.h264LevelAsymmetryAllowed = sdpAttributeValue(map->fmtp, "level-asymmetry-allowed") == "1";
-                h264LevelDimensions(candidate.h264ProfileLevelId, candidate.h264MaxWidth, candidate.h264MaxHeight);
+                candidate.h264ReceiveProfileLevelId = candidate.h264ProfileLevelId;
+                const std::string maxRecvLevel = lowerAscii(sdpAttributeValue(map->fmtp, "max-recv-level"));
+                if (candidate.h264LevelAsymmetryAllowed && maxRecvLevel.size() == 4 &&
+                    candidate.h264ProfileLevelId.size() >= 2) {
+                    candidate.h264ReceiveProfileLevelId =
+                        candidate.h264ProfileLevelId.substr(0, 2) + maxRecvLevel;
+                }
+                h264LevelDimensions(candidate.h264ReceiveProfileLevelId, candidate.h264MaxWidth, candidate.h264MaxHeight);
 
                 if (candidate.h264PacketizationMode != 1) {
                     candidate.compatible = false;
@@ -555,6 +622,13 @@ namespace {
                 } else if (candidate.h264ProfileLevelId.size() >= 2 && lowerAscii(candidate.h264ProfileLevelId.substr(0, 2)) != "42") {
                     candidate.compatible = false;
                     candidate.rejectionReason = "H.264 profile is not Baseline/Constrained-Baseline";
+                } else if (requireNativeH264 &&
+                    !h264LevelSupportsFrame(candidate.h264ReceiveProfileLevelId, requiredWidth, requiredHeight, requiredFps)) {
+                    candidate.compatible = false;
+                    candidate.rejectionReason =
+                        "H.264 negotiated level cannot carry native " +
+                        std::to_string(requiredWidth) + "x" + std::to_string(requiredHeight) +
+                        "@" + std::to_string(requiredFps);
                 }
             }
 
@@ -766,7 +840,9 @@ bool WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
         " h264=" + std::string(m_peerAcceptsH264 ? "1" : "0") +
         " vp8=" + std::string(m_peerAcceptsVp8 ? "1" : "0"));
 
-    const NegotiatedVideoFormat selected = parseNegotiatedVideoFormat(sdp);
+    const bool requireNativeH264 = m_autoCodec && m_swVp9Allowed;
+    const NegotiatedVideoFormat selected = parseNegotiatedVideoFormat(
+        sdp, m_width, m_height, m_fps, requireNativeH264);
     if (!selected.found) {
         LogWarn("[codec] SDP answer has no supported primary video payload session=" + m_sessionId);
         return false;
@@ -783,11 +859,21 @@ bool WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
     m_negotiatedPayloadType = selected.payloadType;
     if (selected.codec == VideoCodec::H264) {
         m_negotiatedH264Fmtp = selected.fmtp;
-        m_negotiatedH264ProfileLevelId = selected.h264ProfileLevelId;
         m_negotiatedH264PacketizationMode = selected.h264PacketizationMode;
         m_negotiatedH264LevelAsymmetryAllowed = selected.h264LevelAsymmetryAllowed;
-        m_negotiatedH264MaxWidth = selected.h264MaxWidth;
-        m_negotiatedH264MaxHeight = selected.h264MaxHeight;
+        if (m_autoCodec &&
+            h264LevelSupportsFrame(selected.h264ReceiveProfileLevelId, m_width, m_height, m_fps)) {
+            // The answerer can receive the exact desktop at the offered level.
+            // Keep our sender level equal to the level chosen from the capture
+            // dimensions; max-recv-level may be higher than its default level.
+            m_negotiatedH264ProfileLevelId = m_h264OfferProfileLevelId;
+            m_negotiatedH264MaxWidth = m_width;
+            m_negotiatedH264MaxHeight = m_height;
+        } else {
+            m_negotiatedH264ProfileLevelId = selected.h264ProfileLevelId;
+            m_negotiatedH264MaxWidth = selected.h264MaxWidth;
+            m_negotiatedH264MaxHeight = selected.h264MaxHeight;
+        }
     }
 
     LogInfo("[codec] SDP answer selected session=" + m_sessionId +
@@ -795,6 +881,7 @@ bool WebRtcSender::selectAutoCodecFromAnswer(const std::string& sdp) {
         " codec=" + selected.codecName +
         (selected.codec == VideoCodec::H264
             ? " fmtp=\"" + selected.fmtp + "\" profile_level_id=" + m_negotiatedH264ProfileLevelId +
+              " receive_profile_level_id=" + selected.h264ReceiveProfileLevelId +
               " packetization_mode=" + std::to_string(m_negotiatedH264PacketizationMode) +
               " level_asymmetry_allowed=" + std::string(m_negotiatedH264LevelAsymmetryAllowed ? "1" : "0") +
               " max_frame=" + std::to_string(m_negotiatedH264MaxWidth) + "x" + std::to_string(m_negotiatedH264MaxHeight)
@@ -1167,6 +1254,42 @@ void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, do
     selectBestAutoCodec("health fallback after sustained encode latency");
 }
 
+void WebRtcSender::observeH264CaptureGeometry(int width, int height, const char* source) {
+    if (!m_autoCodec || m_videoCodec != VideoCodec::H264 ||
+        !m_negotiationLocked || width <= 0 || height <= 0) {
+        return;
+    }
+
+    if (width == m_lastH264CaptureWidth && height == m_lastH264CaptureHeight) {
+        return;
+    }
+    m_lastH264CaptureWidth = width;
+    m_lastH264CaptureHeight = height;
+
+    const std::string sourceName = source ? source : "unknown";
+    if (h264LevelSupportsFrame(m_negotiatedH264ProfileLevelId, width, height, m_fps)) {
+        m_width = width;
+        m_height = height;
+        m_negotiatedH264MaxWidth = width;
+        m_negotiatedH264MaxHeight = height;
+        m_forceKeyframe = true;
+        LogInfo("[codec] H.264 capture geometry changed session=" + m_sessionId +
+            " source=" + sourceName +
+            " native=" + std::to_string(width) + "x" + std::to_string(height) +
+            " profile_level_id=" + m_negotiatedH264ProfileLevelId +
+            " action=resize_native_in_place");
+        return;
+    }
+
+    LogWarn("[codec] H.264 capture geometry exceeds negotiated level session=" + m_sessionId +
+        " source=" + sourceName +
+        " requested=" + std::to_string(width) + "x" + std::to_string(height) +
+        " negotiated_profile_level_id=" + m_negotiatedH264ProfileLevelId +
+        " negotiated_max=" + std::to_string(m_negotiatedH264MaxWidth) + "x" +
+            std::to_string(m_negotiatedH264MaxHeight) +
+        " action=retain_negotiated_bounds renegotiation_required=1");
+}
+
 void WebRtcSender::ensureDirectCaptureInitialized() {
     if (m_mode != Mode::DirectCapture) {
         return;
@@ -1176,11 +1299,27 @@ void WebRtcSender::ensureDirectCaptureInitialized() {
         m_source = std::make_unique<DesktopFrameSource>();
         const auto d = m_source->currentDisplayInfo();
         m_injector.setTargetDisplayRect(d.x, d.y, d.width, d.height);
+        if (d.width > 0 && d.height > 0) {
+            m_width = d.width;
+            m_height = d.height;
+        }
     }
 }
 
 void WebRtcSender::start() {
     m_offerSignalSent = false;
+    if (m_mode == Mode::DirectCapture) {
+        ensureDirectCaptureInitialized();
+    }
+    if (m_width <= 0) m_width = 1920;
+    if (m_height <= 0) m_height = 1080;
+    m_h264OfferProfileLevelId = h264ProfileLevelForDesktop(m_width, m_height, m_fps);
+    LogInfo("[codec] H.264 adaptive offer preflight session=" + m_sessionId +
+        " native=" + std::to_string(m_width) + "x" + std::to_string(m_height) +
+        " fps=" + std::to_string(m_fps) +
+        " profile_level_id=" + m_h264OfferProfileLevelId +
+        " native_supported=" + std::string(
+            h264LevelSupportsFrame(m_h264OfferProfileLevelId, m_width, m_height, m_fps) ? "1" : "0"));
     createPeerConnection();
 
     if (!m_offerSent.exchange(true)) {
@@ -1676,18 +1815,48 @@ static void replaceAllInPlace(std::string& s, const std::string& from, const std
     }
 }
 
-static std::string normalizeOutgoingH264SdpForDesktop(std::string sdp, int bitrateKbps) {
-    // Keep the SDP at Constrained Baseline level 3.1 (42e01f) and cap the
-    // encoded H.264 resolution to 720p in the sender. Chromium/WebView was
-    // answering with 42e01f even when the offer advertised a higher level, so
-    // sending oversized desktop frames produced a connected black video track.
-    replaceAllInPlace(sdp, "profile-level-id=42e034", "profile-level-id=42e01f");
-    replaceAllInPlace(sdp, "profile-level-id=420034", "profile-level-id=42e01f");
-    replaceAllInPlace(sdp, "profile-level-id=42C034", "profile-level-id=42e01f");
-    replaceAllInPlace(sdp, "profile-level-id=42c034", "profile-level-id=42e01f");
+static std::string normalizeOutgoingH264SdpForDesktop(
+    std::string sdp,
+    int bitrateKbps,
+    const std::string& profileLevelId) {
+    // Advertise the minimum Constrained-Baseline level that can carry the
+    // actual selected desktop at the configured capture FPS. Do not silently
+    // force Level 3.1: that turns native 1080p/1440p/4K desktops into 720p.
+    size_t profilePos = 0;
+    while ((profilePos = sdp.find("profile-level-id=", profilePos)) != std::string::npos) {
+        const size_t valuePos = profilePos + std::strlen("profile-level-id=");
+        if (valuePos + 6 <= sdp.size()) {
+            sdp.replace(valuePos, 6, profileLevelId);
+            profilePos = valuePos + profileLevelId.size();
+        } else {
+            break;
+        }
+    }
+    replaceAllInPlace(sdp, "level-asymmetry-allowed=0", "level-asymmetry-allowed=1");
 
-    // If a previous pass accidentally produced an enormous AS value, normalise
-    // it to the configured kbps. b=AS is in kbps in SDP.
+    // libdatachannel currently uses payload 102 for our H.264 offer. Ensure the
+    // parameters required by the Hi5Central packetizer are explicit even if a
+    // platform SDP generator omitted one of them.
+    const std::string fmtpPrefix = "a=fmtp:102 ";
+    const size_t fmtpPos = sdp.find(fmtpPrefix);
+    if (fmtpPos != std::string::npos) {
+        const size_t lineEnd = sdp.find("\r\n", fmtpPos);
+        const size_t end = lineEnd == std::string::npos ? sdp.size() : lineEnd;
+        std::string line = sdp.substr(fmtpPos, end - fmtpPos);
+        if (line.find("profile-level-id=") == std::string::npos) {
+            line += ";profile-level-id=" + profileLevelId;
+        }
+        if (line.find("packetization-mode=") == std::string::npos) {
+            line += ";packetization-mode=1";
+        }
+        if (line.find("level-asymmetry-allowed=") == std::string::npos) {
+            line += ";level-asymmetry-allowed=1";
+        }
+        sdp.replace(fmtpPos, end - fmtpPos, line);
+    }
+
+    // b=AS is expressed in kbps. Keep it aligned with the configured desktop
+    // ceiling while the Viewer can still request lower live targets later.
     const std::string desired = "b=AS:" + std::to_string(std::max(500, bitrateKbps));
     const size_t mVideo = sdp.find("m=video");
     if (mVideo != std::string::npos) {
@@ -1719,9 +1888,13 @@ void WebRtcSender::signalLocalOfferIfReady() {
     std::string sdp = std::string(desc.value());
 
     if (m_videoCodec == VideoCodec::H264 || m_autoCodec) {
-        sdp = normalizeOutgoingH264SdpForDesktop(sdp, m_bitrateKbps);
-        std::cout << "[codec] outgoing H.264 SDP normalized session=" << m_sessionId
-            << " profile_level_id=42e01f"
+        sdp = normalizeOutgoingH264SdpForDesktop(
+            sdp, m_bitrateKbps, m_h264OfferProfileLevelId);
+        std::cout << "[codec] outgoing H.264 SDP adaptive session=" << m_sessionId
+            << " native=" << m_width << "x" << m_height
+            << " fps=" << m_fps
+            << " profile_level_id=" << m_h264OfferProfileLevelId
+            << " level_asymmetry_allowed=1"
             << " bitrate_kbps=" << m_bitrateKbps << "\n";
     }
 
@@ -1795,33 +1968,38 @@ void WebRtcSender::createPeerConnection() {
         } else {
             const bool preferVp9 = m_swVp9Allowed &&
                 readEnvInt("HI5_AUTO_PREFER_VP9", 1, 0, 1) == 1;
-            if (preferVp9) {
-                // Native desktop quality wins over the zero-copy H.264 path in
-                // stable Auto. Chromium commonly answers H.264 at level 3.1
-                // (42e01f), which constrains a standards-compliant sender to
-                // 1280x720 and visibly softens higher-resolution desktops.
-                // Keep hardware H.264 negotiated as the next fallback.
-                m_videoCodec = VideoCodec::VP9;
-                m_payloadType = 98;
-                media.addVP9Codec(98);
-                if (m_hwH264Available && !g_hwH264Failed.load(std::memory_order_acquire)) {
-                    media.addH264Codec(102);
-                }
-                media.addVP8Codec(96);
-                LogInfo("[codec] SDP stable auto offer VP9=98 preferred" +
-                    std::string(m_hwH264Available ? " H264=102 fallback" : "") +
-                    " VP8=96 fallback session=" + m_sessionId);
-            } else if (m_hwH264Available && !g_hwH264Failed.load(std::memory_order_acquire)) {
+            const bool nativeH264Offer =
+                m_hwH264Available &&
+                !g_hwH264Failed.load(std::memory_order_acquire) &&
+                h264LevelSupportsFrame(m_h264OfferProfileLevelId, m_width, m_height, m_fps);
+            if (nativeH264Offer) {
+                // Prefer the zero-copy H.264 path only when the advertised level
+                // can carry the actual selected desktop at the requested FPS.
+                // If the Viewer answers with a lower H.264 level, answer parsing
+                // rejects that payload before negotiation lock and selects VP9.
                 m_videoCodec = VideoCodec::H264;
                 m_payloadType = 102;
                 media.addH264Codec(102);
+                if (preferVp9) media.addVP9Codec(98);
                 media.addVP8Codec(96);
-                LogInfo("[codec] SDP stable auto offer H264=102 preferred VP8=96 fallback reason=vp9_resource_gate session=" + m_sessionId);
+                LogInfo("[codec] SDP stable auto offer H264=102 adaptive-native preferred" +
+                    std::string(preferVp9 ? " VP9=98 native-fallback" : "") +
+                    " VP8=96 compatibility-fallback profile_level_id=" +
+                    m_h264OfferProfileLevelId +
+                    " native=" + std::to_string(m_width) + "x" + std::to_string(m_height) +
+                    " fps=" + std::to_string(m_fps) +
+                    " session=" + m_sessionId);
+            } else if (preferVp9) {
+                m_videoCodec = VideoCodec::VP9;
+                m_payloadType = 98;
+                media.addVP9Codec(98);
+                media.addVP8Codec(96);
+                LogInfo("[codec] SDP stable auto offer VP9=98 preferred VP8=96 fallback reason=h264_native_level_or_hw_unavailable session=" + m_sessionId);
             } else {
                 m_videoCodec = VideoCodec::VP8;
                 m_payloadType = 96;
                 media.addVP8Codec(m_payloadType);
-                LogInfo("[codec] SDP stable auto offer VP8=96 only reason=no_vp9_or_h264 session=" + m_sessionId);
+                LogInfo("[codec] SDP stable auto offer VP8=96 only reason=no_native_h264_or_vp9 session=" + m_sessionId);
             }
         }
     }
@@ -2725,10 +2903,20 @@ bool WebRtcSender::trySendExternalGpuH264(const SharedGpuFrame& frame, uint64_t 
         return false;
     }
 
-    const int configuredH264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 1920, 0, 7680);
-    const int configuredH264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 1080, 0, 4320);
-    const int h264MaxW = configuredH264MaxW > 0 ? std::min(configuredH264MaxW, m_negotiatedH264MaxWidth) : m_negotiatedH264MaxWidth;
-    const int h264MaxH = configuredH264MaxH > 0 ? std::min(configuredH264MaxH, m_negotiatedH264MaxHeight) : m_negotiatedH264MaxHeight;
+    observeH264CaptureGeometry(frame.width, frame.height, "gpu");
+
+    const int configuredH264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 0, 0, 7680);
+    const int configuredH264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 0, 0, 4320);
+    const int viewerMaxW = m_viewerMaxWidth.load(std::memory_order_acquire);
+    const int viewerMaxH = m_viewerMaxHeight.load(std::memory_order_acquire);
+    int h264MaxW = configuredH264MaxW > 0
+        ? std::min(configuredH264MaxW, m_negotiatedH264MaxWidth)
+        : m_negotiatedH264MaxWidth;
+    int h264MaxH = configuredH264MaxH > 0
+        ? std::min(configuredH264MaxH, m_negotiatedH264MaxHeight)
+        : m_negotiatedH264MaxHeight;
+    if (viewerMaxW > 0) h264MaxW = h264MaxW > 0 ? std::min(h264MaxW, viewerMaxW) : viewerMaxW;
+    if (viewerMaxH > 0) h264MaxH = h264MaxH > 0 ? std::min(h264MaxH, viewerMaxH) : viewerMaxH;
     if ((h264MaxW > 0 && frame.width > h264MaxW) || (h264MaxH > 0 && frame.height > h264MaxH)) {
         return false;
     }
@@ -2770,7 +2958,8 @@ bool WebRtcSender::trySendExternalGpuH264(const SharedGpuFrame& frame, uint64_t 
         m_h264GpuEncoder.reset();
         auto enc = std::make_unique<H264MfEncoder>();
         std::string err;
-        if (!enc->initGpu(frame, h264Fps, h264Kbps, &err)) return failGpuPath("init: " + err);
+        const int h264Level = h264LevelIdc(m_negotiatedH264ProfileLevelId);
+        if (!enc->initGpu(frame, h264Fps, h264Kbps, h264Level, &err)) return failGpuPath("init: " + err);
         m_h264GpuEncoder = std::move(enc);
         m_externalEncoderWidth = frame.width;
         m_externalEncoderHeight = frame.height;
@@ -3487,11 +3676,20 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
     }
 
     if (m_videoCodec == VideoCodec::H264 && !m_h264Failed) {
+        observeH264CaptureGeometry(frame.width, frame.height, "i420");
         bool h264Scaled = false;
-        const int configuredH264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 1920, 0, 7680);
-        const int configuredH264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 1080, 0, 4320);
-        const int h264MaxW = configuredH264MaxW > 0 ? std::min(configuredH264MaxW, m_negotiatedH264MaxWidth) : m_negotiatedH264MaxWidth;
-        const int h264MaxH = configuredH264MaxH > 0 ? std::min(configuredH264MaxH, m_negotiatedH264MaxHeight) : m_negotiatedH264MaxHeight;
+        const int configuredH264MaxW = readEnvInt("HI5_H264_MAX_WIDTH", 0, 0, 7680);
+        const int configuredH264MaxH = readEnvInt("HI5_H264_MAX_HEIGHT", 0, 0, 4320);
+        const int viewerMaxW = m_viewerMaxWidth.load(std::memory_order_acquire);
+        const int viewerMaxH = m_viewerMaxHeight.load(std::memory_order_acquire);
+        int h264MaxW = configuredH264MaxW > 0
+            ? std::min(configuredH264MaxW, m_negotiatedH264MaxWidth)
+            : m_negotiatedH264MaxWidth;
+        int h264MaxH = configuredH264MaxH > 0
+            ? std::min(configuredH264MaxH, m_negotiatedH264MaxHeight)
+            : m_negotiatedH264MaxHeight;
+        if (viewerMaxW > 0) h264MaxW = h264MaxW > 0 ? std::min(h264MaxW, viewerMaxW) : viewerMaxW;
+        if (viewerMaxH > 0) h264MaxH = h264MaxH > 0 ? std::min(h264MaxH, viewerMaxH) : viewerMaxH;
         const I420Frame& h264Frame = scaleI420ForWebRtc(frame, m_h264ScaleScratch, h264MaxW, h264MaxH, &h264Scaled);
         const int h264Fps = readEnvInt("HI5_H264_ENCODER_FPS", std::min(30, std::max(1, m_fps)), 1, 60);
         const int h264DesktopFloorKbps = h264Frame.width >= 1600 ? 8000 : (h264Frame.width >= 1200 ? 6000 : 4000);
@@ -3510,7 +3708,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             auto enc = std::make_unique<H264MfEncoder>();
             std::string h264Err;
             const bool preferHardware = (m_codecMode != "h264_sw") && !g_hwH264Failed.load(std::memory_order_acquire);
-            if (!enc->init(h264Frame.width, h264Frame.height, h264Fps, h264Kbps, preferHardware, &h264Err)) {
+            const int h264Level = h264LevelIdc(m_negotiatedH264ProfileLevelId);
+            if (!enc->init(h264Frame.width, h264Frame.height, h264Fps, h264Kbps, preferHardware, h264Level, &h264Err)) {
                 std::cerr << "[h264] init failed session=" << m_sessionId
                     << " error=" << h264Err
                     << " note=staying on negotiated track; set HI5_CODEC=vp8 to return to VP8\n";
@@ -3559,7 +3758,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                         LogInfo("[h264] forced H.264 hardware encode failed; retrying same frame with software H.264 session=" + m_sessionId);
                         auto swEnc = std::make_unique<H264MfEncoder>();
                         std::string swErr;
-                        if (swEnc->init(h264Frame.width, h264Frame.height, h264Fps, h264Kbps, false, &swErr)) {
+                        const int h264Level = h264LevelIdc(m_negotiatedH264ProfileLevelId);
+                        if (swEnc->init(h264Frame.width, h264Frame.height, h264Fps, h264Kbps, false, h264Level, &swErr)) {
                             H264EncodedFrame swEncoded{};
                             if (swEnc->encode(h264Frame, true, swEncoded, &swErr)) {
                                 const std::string swName = swEnc->encoderName();

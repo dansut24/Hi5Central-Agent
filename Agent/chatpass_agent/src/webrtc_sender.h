@@ -121,6 +121,7 @@ private:
     bool switchVideoCodec(VideoCodec codec, const std::string& reason, int negotiatedPayloadType = -1);
     void configureVideoMediaHandler(VideoCodec codec);
     void observeCodecHealth(double encodeAvgMs, double encodeMaxMs, double sendAvgMs);
+    void observeH264CaptureGeometry(int width, int height, const char* source);
 #ifdef _WIN32
     void startAudioLoopback();
     void stopAudioLoopback();
@@ -159,6 +160,7 @@ private:
     int m_height = 0;
     int m_fps = 30;
     int m_bitrateKbps = 6000;
+    std::string m_h264OfferProfileLevelId = "42e01f";
 
     uint32_t m_ssrc = 0;
     uint16_t m_sequence = 0;
@@ -291,6 +293,8 @@ private:
 
     int m_externalConfiguredFps = 0;
     int m_externalConfiguredBitrateKbps = 0;
+    int m_lastH264CaptureWidth = 0;
+    int m_lastH264CaptureHeight = 0;
     int m_externalConfiguredCpuUsed = 0;
     int m_externalConfiguredMaxQuantizer = 0;
     std::string m_externalProfileName = "software-vp8-lowcpu";

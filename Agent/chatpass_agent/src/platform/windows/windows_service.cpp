@@ -9622,7 +9622,20 @@ exit 1
                         }
                     });
 
-                if (!LaunchMediaHost(*ctx, iceServers, width, height, fps, bitrateKbps,
+                const int negotiationWidth = width > 0
+                    ? width
+                    : (ctx->displayGeometryAtStart.primaryWidth > 0
+                        ? ctx->displayGeometryAtStart.primaryWidth : 1920);
+                const int negotiationHeight = height > 0
+                    ? height
+                    : (ctx->displayGeometryAtStart.primaryHeight > 0
+                        ? ctx->displayGeometryAtStart.primaryHeight : 1080);
+                LogI("[codec] media negotiation geometry session=" + sessionId +
+                    " display=" + std::to_string(ctx->displayIndex) +
+                    " size=" + std::to_string(negotiationWidth) + "x" + std::to_string(negotiationHeight) +
+                    " fps=" + std::to_string(fps));
+
+                if (!LaunchMediaHost(*ctx, iceServers, negotiationWidth, negotiationHeight, fps, bitrateKbps,
                     requestedCodec, sessionMode == SessionMode::Console)) {
                     LogE("media host startup failed session=" + sessionId);
                     if (ctx->mediaStopEvent) SetEvent(ctx->mediaStopEvent);
