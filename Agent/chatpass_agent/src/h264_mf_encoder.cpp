@@ -14,6 +14,14 @@
 #include <mferror.h>
 #include <wrl/client.h>
 
+#if __has_include(<icodecapi.h>) && __has_include(<codecapi.h>)
+#include <icodecapi.h>
+#include <codecapi.h>
+#define HI5_H264_HAS_CODECAPI 1
+#else
+#define HI5_H264_HAS_CODECAPI 0
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -57,6 +65,26 @@ namespace {
 
     static bool SetAttrRatio(IMFAttributes* attrs, REFGUID key, UINT32 n, UINT32 d) {
         return SUCCEEDED(MFSetAttributeRatio(attrs, key, n, d));
+    }
+
+    static bool RequestNextKeyframe(IMFTransform* transform) {
+#if HI5_H264_HAS_CODECAPI
+        if (!transform) return false;
+        ComPtr<ICodecAPI> codecApi;
+        if (FAILED(transform->QueryInterface(IID_PPV_ARGS(codecApi.GetAddressOf()))) || !codecApi) {
+            return false;
+        }
+        if (codecApi->IsSupported(&CODECAPI_AVEncVideoForceKeyFrame) != S_OK) {
+            return false;
+        }
+        VARIANT value{};
+        value.vt = VT_UI4;
+        value.ulVal = 1;
+        return SUCCEEDED(codecApi->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value));
+#else
+        (void)transform;
+        return false;
+#endif
     }
 
     static void I420ToNV12(const I420Frame& frame, std::vector<uint8_t>& out) {
@@ -284,7 +312,6 @@ namespace {
 
 struct H264MfEncoder::Impl {
     struct PendingInputMeta {
-        bool forceKeyframe = false;
         uint32_t timestamp90k = 0;
         int gpuSurfaceSlot = -1;
     };
@@ -308,6 +335,7 @@ struct H264MfEncoder::Impl {
     int consecutiveGpuPoolBusy = 0;
     bool asyncMode = false;
     bool sequenceHeaderLogged = false;
+    bool keyframeControlUnsupportedLogged = false;
     bool mfStarted = false;
     struct GpuOpenedFrame { ComPtr<ID3D11Texture2D> texture; ComPtr<IDXGIKeyedMutex> mutex; };
     ComPtr<ID3D11Device> gpuDevice;
@@ -516,17 +544,16 @@ bool H264MfEncoder::initInternal(int width, int height, int fps, int bitrateKbps
         std::cout << "[h264-gpu] D3D11 device manager attached before media types\n";
     }
 
-    // CodecAPI is intentionally disabled in this build because some Windows SDK/MSVC
-    // combinations do not expose ICodecAPI/CODECAPI_* cleanly. The encoder still
-    // uses Media Foundation output/input media types, low-latency MFT attributes,
-    // SPS/PPS extraction, AVCC->Annex-B normalization, and VP8 fallback.
+    // CodecAPI keyframe control is used opportunistically when the Windows SDK
+    // and active encoder expose it. Media types, low-latency MFT attributes,
+    // SPS/PPS extraction and AVCC->Annex-B normalization remain independent of it.
 
     std::cout << "[h264] MFT activated encoder=" << m_encoderName
         << " size=" << m_width << "x" << m_height
         << " fps=" << m_fps
         << " bitrate=" << m_bitrateKbps
         << " prefer_hw=" << (preferHardware ? 1 : 0)
-        << " codecapi=disabled" << "\n";
+        << " codecapi=" << (HI5_H264_HAS_CODECAPI ? "available" : "sdk-unavailable") << "\n";
 
     ComPtr<IMFMediaType> outType;
     MFCreateMediaType(&outType);
@@ -692,7 +719,7 @@ bool H264MfEncoder::encodeInternal(const I420Frame* frame, const SharedGpuFrame*
         }
 
         encoded.data = ConvertAvccLengthPrefixedToAnnexB(encoded.data);
-        encoded.keyframe = ContainsH264Idr(encoded.data) || meta.forceKeyframe;
+        encoded.keyframe = ContainsH264Idr(encoded.data);
         encoded.timestamp90k = meta.timestamp90k;
 
         if (encoded.keyframe && !m_impl->sequenceHeaderAnnexB.empty() &&
@@ -912,6 +939,13 @@ bool H264MfEncoder::encodeInternal(const I420Frame* frame, const SharedGpuFrame*
     sample->SetSampleTime(frameTime);
     sample->SetSampleDuration(frameDuration);
 
+    if (forceKeyframe && !RequestNextKeyframe(m_impl->transform.Get()) &&
+        !m_impl->keyframeControlUnsupportedLogged) {
+        m_impl->keyframeControlUnsupportedLogged = true;
+        std::cout << "[h264] encoder does not expose force-keyframe CodecAPI; "
+                     "using natural encoder keyframes\n";
+    }
+
     if (gpuSurfaceSlot >= 0) m_impl->surfaceInUse[gpuSurfaceSlot] = true;
     hr = m_impl->transform->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) {
@@ -925,7 +959,6 @@ bool H264MfEncoder::encodeInternal(const I420Frame* frame, const SharedGpuFrame*
         m_impl->consecutiveNoCreditDrops = 0;
     }
     Impl::PendingInputMeta meta{};
-    meta.forceKeyframe = forceKeyframe;
     meta.timestamp90k = static_cast<uint32_t>((inputIndex * 90000ULL) / static_cast<uint64_t>(m_fps));
     meta.gpuSurfaceSlot = gpuSurfaceSlot;
     m_impl->pendingInputs.push_back(meta);

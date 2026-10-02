@@ -12,8 +12,18 @@
 #include <mferror.h>
 #include <wrl/client.h>
 
+#if __has_include(<icodecapi.h>) && __has_include(<codecapi.h>)
+#include <icodecapi.h>
+#include <codecapi.h>
+#define HI5_VP9_HAS_CODECAPI 1
+#else
+#define HI5_VP9_HAS_CODECAPI 0
+#endif
+
 #include <algorithm>
 #include <cstring>
+#include <deque>
+#include <iostream>
 #include <sstream>
 #include <comdef.h>
 
@@ -47,6 +57,26 @@ namespace {
 
     static bool SetAttrRatio(IMFAttributes* attrs, REFGUID key, UINT32 n, UINT32 d) {
         return SUCCEEDED(MFSetAttributeRatio(attrs, key, n, d));
+    }
+
+    static bool RequestNextKeyframe(IMFTransform* transform) {
+#if HI5_VP9_HAS_CODECAPI
+        if (!transform) return false;
+        ComPtr<ICodecAPI> codecApi;
+        if (FAILED(transform->QueryInterface(IID_PPV_ARGS(codecApi.GetAddressOf()))) || !codecApi) {
+            return false;
+        }
+        if (codecApi->IsSupported(&CODECAPI_AVEncVideoForceKeyFrame) != S_OK) {
+            return false;
+        }
+        VARIANT value{};
+        value.vt = VT_UI4;
+        value.ulVal = 1;
+        return SUCCEEDED(codecApi->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value));
+#else
+        (void)transform;
+        return false;
+#endif
     }
 
     static bool CopyI420ToNV12Buffer(const I420Frame& frame, BYTE* dst, DWORD maxLen, DWORD* written) {
@@ -99,12 +129,18 @@ namespace {
 } // namespace
 
 struct Vp9MfEncoder::Impl {
+    struct PendingInputMeta {
+        uint32_t timestamp90k = 0;
+    };
+
     ComPtr<IMFTransform> transform;
     MFT_OUTPUT_STREAM_INFO outputInfo{};
     ComPtr<IMFSample> outputSample;
     ComPtr<IMFMediaBuffer> outputBuffer;
+    std::deque<PendingInputMeta> pendingInputs;
     DWORD outputBufferSize = 0;
     bool mfStarted = false;
+    bool keyframeControlUnsupportedLogged = false;
 };
 
 Vp9MfEncoder::Vp9MfEncoder() = default;
@@ -284,8 +320,6 @@ bool Vp9MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool pr
 }
 
 bool Vp9MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Vp9EncodedFrame& out, std::string* error) {
-    (void)forceKeyframe;
-
     out = {};
 
     if (!m_open || !m_impl || !m_impl->transform) {
@@ -346,8 +380,9 @@ bool Vp9MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Vp9Encoded
     buffer->SetCurrentLength(written);
     sample->AddBuffer(buffer.Get());
 
+    const uint64_t inputIndex = m_frameIndex;
     const LONGLONG frameTime =
-        static_cast<LONGLONG>((10'000'000.0 * static_cast<double>(m_frameIndex)) / static_cast<double>(m_fps));
+        static_cast<LONGLONG>((10'000'000.0 * static_cast<double>(inputIndex)) / static_cast<double>(m_fps));
 
     const LONGLONG frameDuration =
         static_cast<LONGLONG>(10'000'000.0 / static_cast<double>(m_fps));
@@ -355,12 +390,23 @@ bool Vp9MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Vp9Encoded
     sample->SetSampleTime(frameTime);
     sample->SetSampleDuration(frameDuration);
 
+    if (forceKeyframe && !RequestNextKeyframe(m_impl->transform.Get()) &&
+        !m_impl->keyframeControlUnsupportedLogged) {
+        m_impl->keyframeControlUnsupportedLogged = true;
+        std::cout << "[vp9] encoder does not expose force-keyframe CodecAPI; "
+                     "using natural encoder keyframes\n";
+    }
+
     hr = m_impl->transform->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) {
         if (error) *error = "ProcessInput failed " + HrToString(hr);
         return false;
     }
 
+    Impl::PendingInputMeta meta{};
+    meta.timestamp90k =
+        static_cast<uint32_t>((inputIndex * 90000ULL) / static_cast<uint64_t>(m_fps));
+    m_impl->pendingInputs.push_back(meta);
     ++m_frameIndex;
 
     for (;;) {
@@ -426,6 +472,17 @@ bool Vp9MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Vp9Encoded
             continue;
         }
 
+        Impl::PendingInputMeta outputMeta{};
+        const bool hasPendingMeta = !m_impl->pendingInputs.empty();
+        if (hasPendingMeta) {
+            outputMeta = m_impl->pendingInputs.front();
+        } else {
+            outputMeta.timestamp90k =
+                static_cast<uint32_t>((m_frameIndex * 90000ULL) / static_cast<uint64_t>(m_fps));
+        }
+        const bool cleanPoint =
+            MFGetAttributeUINT32(got.Get(), MFSampleExtension_CleanPoint, FALSE) != FALSE;
+
         ComPtr<IMFMediaBuffer> contiguous;
         hr = got->ConvertToContiguousBuffer(&contiguous);
         if (FAILED(hr) || !contiguous) {
@@ -458,10 +515,11 @@ bool Vp9MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Vp9Encoded
         }
 
         if (!out.data.empty()) {
-            out.timestamp90k =
-                static_cast<uint32_t>((m_frameIndex * 90000ULL) / static_cast<uint64_t>(m_fps));
-
-            out.keyframe = forceKeyframe || m_frameIndex <= 2;
+            if (hasPendingMeta) {
+                m_impl->pendingInputs.pop_front();
+            }
+            out.timestamp90k = outputMeta.timestamp90k;
+            out.keyframe = cleanPoint;
             return true;
         }
     }
