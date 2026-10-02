@@ -115,11 +115,11 @@ let lastStats = {
   jitterEmitted: 0
 };
 const DESKTOP_ADAPTIVE_TIERS = [
-  { bitrate: 8000, fps: 30, label: 'Native · 8 Mbps · 30 fps' },
-  { bitrate: 6000, fps: 30, label: 'Native · 6 Mbps · 30 fps' },
-  { bitrate: 4500, fps: 24, label: 'Native · 4.5 Mbps · 24 fps' },
-  { bitrate: 3200, fps: 20, label: 'Native · 3.2 Mbps · 20 fps' },
-  { bitrate: 2200, fps: 15, label: 'Native · 2.2 Mbps · 15 fps' }
+  { bitrate: 16000, fps: 30, label: 'Native · 16 Mbps · 30 fps' },
+  { bitrate: 12000, fps: 30, label: 'Native · 12 Mbps · 30 fps' },
+  { bitrate: 9000, fps: 30, label: 'Native · 9 Mbps · 30 fps' },
+  { bitrate: 6000, fps: 24, label: 'Native · 6 Mbps · 24 fps' },
+  { bitrate: 4000, fps: 20, label: 'Native · 4 Mbps · 20 fps' }
 ];
 let desktopAdaptiveState = { tier: 0, bad: 0, good: 0, lastChangeAt: Date.now(), ...DESKTOP_ADAPTIVE_TIERS[0] };
 let desktopQualityState = { current: 'good', candidate: null, count: 0, changedAt: Date.now(), samples: [] };
@@ -2436,10 +2436,10 @@ async function handleOffer(msg) {
     const codecs = caps?.codecs || [];
 
     if (transceiver && transceiver.setCodecPreferences && codecs.length) {
-      // Mirror the Agent's stable production order. Hardware-qualified H.264
-      // is first because its Agent path is D3D11 zero-copy; VP9 is the next
-      // screen-content choice and VP8 remains the compatibility fallback.
-      const primaryOrder = ["video/h264", "video/vp9", "video/vp8", "video/av1", "video/h265", "video/hevc"];
+      // Mirror the Agent's stable production order. VP9 preserves native
+      // desktop resolution where Chromium's H.264 level negotiation can cap
+      // a standards-compliant sender at 720p. H.264 remains the next fallback.
+      const primaryOrder = ["video/vp9", "video/h264", "video/vp8", "video/av1", "video/h265", "video/hevc"];
       const primary = [];
       for (const wanted of primaryOrder) {
         primary.push(...codecs.filter(c => String(c.mimeType).toLowerCase() === wanted));

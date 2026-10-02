@@ -1795,28 +1795,33 @@ void WebRtcSender::createPeerConnection() {
         } else {
             const bool preferVp9 = m_swVp9Allowed &&
                 readEnvInt("HI5_AUTO_PREFER_VP9", 1, 0, 1) == 1;
-            if (m_hwH264Available && !g_hwH264Failed.load(std::memory_order_acquire)) {
-                // H.264 is the implemented D3D11 zero-copy hardware path.
-                // Advertise it first only after the local hardware probe succeeds.
-                m_videoCodec = VideoCodec::H264;
-                m_payloadType = 102;
-                media.addH264Codec(102);
-                if (preferVp9) media.addVP9Codec(98);
-                media.addVP8Codec(96);
-                LogInfo("[codec] SDP stable auto offer H264=102 preferred" +
-                    std::string(preferVp9 ? " VP9=98 fallback" : "") +
-                    " VP8=96 fallback session=" + m_sessionId);
-            } else if (preferVp9) {
+            if (preferVp9) {
+                // Native desktop quality wins over the zero-copy H.264 path in
+                // stable Auto. Chromium commonly answers H.264 at level 3.1
+                // (42e01f), which constrains a standards-compliant sender to
+                // 1280x720 and visibly softens higher-resolution desktops.
+                // Keep hardware H.264 negotiated as the next fallback.
                 m_videoCodec = VideoCodec::VP9;
                 m_payloadType = 98;
                 media.addVP9Codec(98);
+                if (m_hwH264Available && !g_hwH264Failed.load(std::memory_order_acquire)) {
+                    media.addH264Codec(102);
+                }
                 media.addVP8Codec(96);
-                LogInfo("[codec] SDP stable auto offer VP9=98 preferred VP8=96 fallback reason=no_h264_hw session=" + m_sessionId);
+                LogInfo("[codec] SDP stable auto offer VP9=98 preferred" +
+                    std::string(m_hwH264Available ? " H264=102 fallback" : "") +
+                    " VP8=96 fallback session=" + m_sessionId);
+            } else if (m_hwH264Available && !g_hwH264Failed.load(std::memory_order_acquire)) {
+                m_videoCodec = VideoCodec::H264;
+                m_payloadType = 102;
+                media.addH264Codec(102);
+                media.addVP8Codec(96);
+                LogInfo("[codec] SDP stable auto offer H264=102 preferred VP8=96 fallback reason=vp9_resource_gate session=" + m_sessionId);
             } else {
                 m_videoCodec = VideoCodec::VP8;
                 m_payloadType = 96;
                 media.addVP8Codec(m_payloadType);
-                LogInfo("[codec] SDP stable auto offer VP8=96 only reason=no_h264_hw_and_resource_gate_or_override session=" + m_sessionId);
+                LogInfo("[codec] SDP stable auto offer VP8=96 only reason=no_vp9_or_h264 session=" + m_sessionId);
             }
         }
     }
