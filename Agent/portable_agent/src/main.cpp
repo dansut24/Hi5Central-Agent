@@ -1,19 +1,27 @@
+#include "agent_websocket.h"
 #include "http_client.h"
+#include "job_executor.h"
 #include "platform_info.h"
 
 #include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
 #include <sys/stat.h>
 
@@ -32,6 +40,13 @@ struct Identity {
     std::string deviceKey;
     std::string tenantId;
     std::string apiBase;
+};
+
+struct JobQueue {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<json> jobs;
+    std::unordered_set<std::string> knownIds;
 };
 
 void signalHandler(int) {
@@ -64,6 +79,36 @@ bool hasArg(int argc, char* argv[], const std::string& name) {
         if (argv[i] && name == argv[i]) return true;
     }
     return false;
+}
+
+std::string urlEncode(const std::string& value) {
+    std::ostringstream out;
+    out << std::uppercase << std::hex;
+    for (const unsigned char ch : value) {
+        if ((ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            out << static_cast<char>(ch);
+        } else {
+            out << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(ch);
+        }
+    }
+    return out.str();
+}
+
+std::string websocketUrl(const Identity& identity) {
+    std::string base = trimSlash(identity.apiBase);
+    if (base.rfind("https://", 0) == 0) {
+        base.replace(0, 8, "wss://");
+    } else if (base.rfind("http://", 0) == 0) {
+        base.replace(0, 7, "ws://");
+    } else {
+        throw std::runtime_error("Unsupported API URL scheme for WebSocket");
+    }
+
+    return base + "/agent/ws?device_id=" + urlEncode(identity.deviceId) +
+        "&device_key=" + urlEncode(identity.deviceKey);
 }
 
 std::filesystem::path stateFile(const std::filesystem::path& dir) {
@@ -166,7 +211,32 @@ std::map<std::string, std::string> authHeaders(const Identity& identity) {
     };
 }
 
-json buildTelemetry() {
+json agentCapabilities() {
+    return {
+        {"telemetry", true},
+        {"inventory", true},
+        {"websocket", true},
+        {"jobs", true},
+        {"custom_command", true},
+        {"terminal", false},
+        {"files", false},
+        {"remote_desktop", false}
+    };
+}
+
+json buildHello(const Identity& identity) {
+    return {
+        {"type", "hello"},
+        {"device_id", identity.deviceId},
+        {"agent_version", HI5CENTRAL_AGENT_VERSION},
+        {"platform", hi5::platformId()},
+        {"architecture", hi5::architecture()},
+        {"hostname", hi5::hostname()},
+        {"capabilities", agentCapabilities()}
+    };
+}
+
+json buildTelemetry(bool websocketConnected) {
     const auto memory = hi5::memoryStats();
     const auto disk = hi5::rootDiskStats();
 
@@ -179,7 +249,7 @@ json buildTelemetry() {
         {"uptimeSeconds", hi5::uptimeSeconds()},
         {"activeUser", hi5::activeUser()},
         {"serviceStatus", "Running"},
-        {"websocketStatus", "TelemetryOnly"},
+        {"websocketStatus", websocketConnected ? "Connected" : "TelemetryOnly"},
         {"platform", hi5::platformId()},
         {"agentVersion", HI5CENTRAL_AGENT_VERSION}
     };
@@ -257,24 +327,21 @@ json buildInventory(const Identity& identity) {
             {"version", HI5CENTRAL_AGENT_VERSION},
             {"platform", hi5::platformId()},
             {"architecture", arch},
-            {"transport", "https-polling"},
-            {"capabilities", {
-                {"telemetry", true},
-                {"inventory", true},
-                {"jobs", false},
-                {"terminal", false},
-                {"files", false},
-                {"remote_desktop", false}
-            }}
+            {"transport", "websocket+https"},
+            {"capabilities", agentCapabilities()}
         }},
         {"deep_inventory_included", false}
     };
 }
 
-void postTelemetry(const hi5::HttpClient& http, const Identity& identity) {
+void postTelemetry(
+    const hi5::HttpClient& http,
+    const Identity& identity,
+    bool websocketConnected) {
+
     const auto response = http.postJson(
         identity.apiBase + "/api/v1/agent/devices/telemetry",
-        buildTelemetry().dump(),
+        buildTelemetry(websocketConnected).dump(),
         authHeaders(identity));
 
     if (!response.ok()) {
@@ -296,6 +363,198 @@ void postInventory(const hi5::HttpClient& http, const Identity& identity) {
             "Inventory HTTP " + std::to_string(response.status) +
             (response.error.empty() ? "" : " " + response.error) +
             (response.body.empty() ? "" : " body=" + response.body));
+    }
+}
+
+void postJobResult(
+    const hi5::HttpClient& http,
+    const Identity& identity,
+    const std::string& jobId,
+    bool success,
+    const json& result,
+    const std::string& error = {}) {
+
+    if (jobId.empty()) return;
+
+    json body = {
+        {"success", success},
+        {"result", result}
+    };
+    if (!error.empty()) body["error"] = error;
+
+    const auto response = http.postJson(
+        identity.apiBase + "/api/v1/agent/devices/jobs/" + jobId + "/result",
+        body.dump(),
+        authHeaders(identity));
+
+    if (!response.ok()) {
+        throw std::runtime_error(
+            "Job result HTTP " + std::to_string(response.status) +
+            (response.error.empty() ? "" : " " + response.error) +
+            (response.body.empty() ? "" : " body=" + response.body));
+    }
+}
+
+bool enqueueJob(JobQueue& queue, const json& job) {
+    const std::string jobId = job.value("id", "");
+    const std::string jobType = job.value("job_type", "");
+    if (jobId.empty() || jobType.empty()) return false;
+
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    if (!queue.knownIds.insert(jobId).second) return false;
+    queue.jobs.push_back(job);
+    queue.cv.notify_one();
+    return true;
+}
+
+void finishJob(JobQueue& queue, const std::string& jobId) {
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    queue.knownIds.erase(jobId);
+}
+
+void executeJob(
+    const hi5::HttpClient& http,
+    const Identity& identity,
+    const json& job) {
+
+    const std::string jobId = job.value("id", "");
+    const std::string jobType = job.value("job_type", "");
+    const json payload = job.value("payload", json::object());
+
+    if (jobId.empty() || jobType.empty()) return;
+
+    logLine("INFO", "Executing job id=" + jobId + " type=" + jobType);
+
+    try {
+        if (jobType == "inventory.scan" || jobType == "policy.refresh") {
+            postInventory(http, identity);
+            postJobResult(
+                http,
+                identity,
+                jobId,
+                true,
+                {
+                    {"inventory_sent", true},
+                    {"job_type", jobType},
+                    {"platform", hi5::platformId()}
+                });
+            logLine("INFO", "Completed job id=" + jobId + " type=" + jobType);
+            return;
+        }
+
+        if (jobType == "custom.command") {
+            const std::string command = payload.value("command", "");
+            const int timeoutSeconds = std::max(
+                5,
+                std::min(3600, payload.value("timeout_seconds", 120)));
+
+            const auto commandResult = hi5::runShellCommand(
+                command,
+                timeoutSeconds,
+                256 * 1024);
+
+            const auto result = hi5::buildCommandResultJson(command, commandResult);
+            const bool success =
+                commandResult.error.empty() &&
+                commandResult.exitCode == 0;
+
+            postJobResult(
+                http,
+                identity,
+                jobId,
+                success,
+                result,
+                commandResult.error);
+
+            logLine(
+                success ? "INFO" : "WARN",
+                "Completed custom.command id=" + jobId +
+                " exit_code=" + std::to_string(commandResult.exitCode) +
+                " duration_ms=" + std::to_string(commandResult.durationMs));
+            return;
+        }
+
+        postJobResult(
+            http,
+            identity,
+            jobId,
+            false,
+            {{"job_type", jobType}, {"platform", hi5::platformId()}},
+            "Unsupported job type on " + hi5::platformDisplayName() + ": " + jobType);
+        logLine("WARN", "Rejected unsupported job id=" + jobId + " type=" + jobType);
+    } catch (const std::exception& error) {
+        logLine("WARN", "Job id=" + jobId + " failed: " + error.what());
+        try {
+            postJobResult(
+                http,
+                identity,
+                jobId,
+                false,
+                json::object(),
+                error.what());
+        } catch (const std::exception& postError) {
+            logLine("WARN", "Failed to post job failure id=" + jobId + ": " + postError.what());
+        }
+    }
+}
+
+void jobWorkerLoop(
+    const hi5::HttpClient& http,
+    const Identity& identity,
+    JobQueue& queue) {
+
+    while (g_running) {
+        json job;
+        {
+            std::unique_lock<std::mutex> lock(queue.mutex);
+            queue.cv.wait_for(
+                lock,
+                std::chrono::seconds(1),
+                [&queue]() { return !queue.jobs.empty() || !g_running.load(); });
+
+            if (!g_running && queue.jobs.empty()) break;
+            if (queue.jobs.empty()) continue;
+
+            job = std::move(queue.jobs.front());
+            queue.jobs.pop_front();
+        }
+
+        const std::string jobId = job.value("id", "");
+        executeJob(http, identity, job);
+        finishJob(queue, jobId);
+    }
+}
+
+void pollJobs(
+    const hi5::HttpClient& http,
+    const Identity& identity,
+    JobQueue& queue) {
+
+    const auto response = http.getJson(
+        identity.apiBase + "/api/v1/agent/devices/jobs",
+        authHeaders(identity));
+
+    if (!response.ok()) {
+        throw std::runtime_error(
+            "Job poll HTTP " + std::to_string(response.status) +
+            (response.error.empty() ? "" : " " + response.error));
+    }
+
+    const auto body = json::parse(response.body, nullptr, false);
+    if (!body.is_object() || !body.value("success", false)) {
+        throw std::runtime_error("Job poll returned an invalid response");
+    }
+
+    const auto jobs = body.value("jobs", json::array());
+    if (!jobs.is_array()) return;
+
+    std::size_t accepted = 0;
+    for (const auto& job : jobs) {
+        if (enqueueJob(queue, job)) ++accepted;
+    }
+
+    if (accepted) {
+        logLine("INFO", "Queued " + std::to_string(accepted) + " polled job(s)");
     }
 }
 
@@ -336,7 +595,7 @@ int main(int argc, char* argv[]) {
                     {"totalBytes", disk.totalBytes},
                     {"usedPercent", disk.usedPercent}
                 }},
-                {"network", hi5::networkInfo()}
+                {"capabilities", agentCapabilities()}
             };
             std::cout << output.dump(2) << std::endl;
             return 0;
@@ -377,9 +636,53 @@ int main(int argc, char* argv[]) {
         if (hasArg(argc, argv, "--enroll-only")) return 0;
 
         const bool once = hasArg(argc, argv, "--once");
+        JobQueue jobQueue;
+        std::thread jobWorker;
+
+        hi5::AgentWebSocket websocket;
+        if (!once) {
+            jobWorker = std::thread(
+                [&http, &identity, &jobQueue]() {
+                    jobWorkerLoop(http, identity, jobQueue);
+                });
+
+            websocket.start(
+                websocketUrl(identity),
+                [&jobQueue](const std::string& text) {
+                    const auto message = json::parse(text, nullptr, false);
+                    if (!message.is_object()) return;
+
+                    const std::string type = message.value("type", "");
+                    if (type == "job_execute" && message.contains("job") && message["job"].is_object()) {
+                        if (enqueueJob(jobQueue, message["job"])) {
+                            logLine(
+                                "INFO",
+                                "Received live job id=" +
+                                message["job"].value("id", "") +
+                                " type=" +
+                                message["job"].value("job_type", ""));
+                        }
+                    } else if (type == "hello_ack") {
+                        logLine("INFO", "Agent WebSocket hello acknowledged");
+                    }
+                },
+                [&websocket, &identity](bool connected, const std::string& detail) {
+                    if (connected) {
+                        logLine("INFO", "Agent WebSocket connected");
+                        websocket.sendText(buildHello(identity).dump());
+                    } else {
+                        logLine("WARN", "Agent WebSocket " + detail);
+                    }
+                });
+        }
+
         const auto telemetryInterval = std::chrono::seconds(30);
         const auto inventoryInterval = std::chrono::minutes(15);
+        const auto jobPollInterval = std::chrono::seconds(10);
+
+        auto nextTelemetry = std::chrono::steady_clock::now();
         auto nextInventory = std::chrono::steady_clock::now();
+        auto nextJobPoll = std::chrono::steady_clock::now();
 
         logLine(
             "INFO",
@@ -387,15 +690,22 @@ int main(int argc, char* argv[]) {
             " started platform=" + hi5::platformId() +
             " device_id=" + identity.deviceId);
 
-        while (g_running) {
-            try {
-                postTelemetry(http, identity);
-                logLine("INFO", "Telemetry uploaded");
-            } catch (const std::exception& error) {
-                logLine("WARN", error.what());
+        do {
+            const auto now = std::chrono::steady_clock::now();
+
+            if (now >= nextTelemetry) {
+                try {
+                    postTelemetry(http, identity, websocket.connected());
+                    logLine(
+                        "INFO",
+                        std::string("Telemetry uploaded transport=") +
+                        (websocket.connected() ? "websocket+https" : "https"));
+                } catch (const std::exception& error) {
+                    logLine("WARN", error.what());
+                }
+                nextTelemetry = now + telemetryInterval;
             }
 
-            const auto now = std::chrono::steady_clock::now();
             if (now >= nextInventory) {
                 try {
                     postInventory(http, identity);
@@ -407,14 +717,22 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (once) break;
-
-            for (int elapsed = 0;
-                 elapsed < telemetryInterval.count() && g_running;
-                 ++elapsed) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!once && now >= nextJobPoll) {
+                try {
+                    pollJobs(http, identity, jobQueue);
+                } catch (const std::exception& error) {
+                    logLine("WARN", error.what());
+                }
+                nextJobPoll = now + jobPollInterval;
             }
-        }
+
+            if (once) break;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        } while (g_running);
+
+        websocket.stop();
+        jobQueue.cv.notify_all();
+        if (jobWorker.joinable()) jobWorker.join();
 
         logLine("INFO", "Hi5Central portable Agent stopped");
         return 0;
