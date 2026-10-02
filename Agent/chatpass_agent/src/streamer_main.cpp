@@ -580,7 +580,7 @@ namespace {
 
     bool EnableSoftwareSasForServicesFromStreamer() {
         HKEY key = nullptr;
-        constexpr const wchar_t* kPath = L"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+        constexpr const wchar_t* kPath = LR"(SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System)";
         DWORD disp = 0;
         LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kPath, 0, nullptr, 0, KEY_READ | KEY_SET_VALUE, nullptr, &key, &disp);
         if (rc != ERROR_SUCCESS) return false;
