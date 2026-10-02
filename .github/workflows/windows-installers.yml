@@ -246,11 +246,32 @@ jobs:
             Where-Object { $_.FullName -notmatch '\\debug\\' } |
             Select-Object -First 1
           if (-not $yuvLib) { throw 'Built yuv.lib was not found.' }
-          $symbols = (& dumpbin.exe /symbols $yuvLib.FullName 2>&1 | Out-String)
-          if ($symbols -notmatch 'ARGBToYRow_AVX2' -and $symbols -notmatch 'ARGBToYRow_SSSE3') {
-            throw 'libyuv was built without the expected x86 SIMD conversion symbols.'
+
+          $symbols = ''
+          $symbolTool = ''
+          $llvmNm = (Get-Command llvm-nm.exe -ErrorAction SilentlyContinue).Source
+          if (-not $llvmNm) {
+            $llvmNmFallback = 'C:\Program Files\LLVM\bin\llvm-nm.exe'
+            if (Test-Path $llvmNmFallback) { $llvmNm = $llvmNmFallback }
           }
-          Write-Host "Accelerated libyuv verified: $($yuvLib.FullName)"
+          if ($llvmNm) {
+            $symbolTool = $llvmNm
+            $symbols = (& $llvmNm --defined-only $yuvLib.FullName 2>&1 | Out-String)
+          } else {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (-not (Test-Path $vswhere)) { throw 'Neither llvm-nm nor vswhere is available for libyuv SIMD verification.' }
+            $dumpbin = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1)
+            if (-not $dumpbin -or -not (Test-Path $dumpbin)) { throw 'Unable to locate dumpbin.exe for libyuv SIMD verification.' }
+            $symbolTool = $dumpbin
+            $symbols = (& $dumpbin /symbols $yuvLib.FullName 2>&1 | Out-String)
+          }
+
+          $matches = @($symbols -split '\r?\n' | Where-Object { $_ -match 'ARGBToYRow_(AVX2|SSSE3)' })
+          if (-not $matches) {
+            throw "libyuv was built without the expected x86 SIMD conversion symbols. Inspector: $symbolTool"
+          }
+          Write-Host "Accelerated libyuv verified with $symbolTool"
+          $matches | Select-Object -First 12 | ForEach-Object { Write-Host $_ }
 
       - name: Prepare portable Hi5Central Connect host
         shell: pwsh
