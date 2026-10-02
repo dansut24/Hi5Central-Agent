@@ -30,6 +30,7 @@ jobs:
       - name: Runtime self-test
         run: |
           build/portable-linux/Hi5CentralAgent --version
+          build/portable-linux/Hi5CentralAgent --self-test-command
           build/portable-linux/Hi5CentralAgent --self-test | tee /tmp/hi5-agent-self-test.json
           python3 - <<'PY'
           import json
@@ -69,6 +70,7 @@ jobs:
         run: |
           build/portable-macos/Hi5CentralAgent --version
           file build/portable-macos/Hi5CentralAgent
+          build/portable-macos/Hi5CentralAgent --self-test-command
           build/portable-macos/Hi5CentralAgent --self-test | tee /tmp/hi5-agent-self-test.json
           python3 - <<'PY'
           import json
