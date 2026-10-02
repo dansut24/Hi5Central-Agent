@@ -23,6 +23,10 @@ public:
         const std::string& body,
         const std::map<std::string, std::string>& headers = {}) const;
 
+    HttpResponse getJson(
+        const std::string& url,
+        const std::map<std::string, std::string>& headers = {}) const;
+
 private:
     static size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata);
 };

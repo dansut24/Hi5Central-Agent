@@ -8,18 +8,31 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(HI5CENTRAL_AGENT_VERSION "0.3.0-alpha" CACHE STRING "Hi5Central portable Agent version")
 
 find_package(CURL REQUIRED)
+find_package(Threads REQUIRED)
 
 include(FetchContent)
 FetchContent_Declare(
   nlohmann_json
   URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
 )
-FetchContent_MakeAvailable(nlohmann_json)
+
+set(USE_TLS ON CACHE BOOL "" FORCE)
+set(USE_ZLIB OFF CACHE BOOL "" FORCE)
+set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  ixwebsocket
+  GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
+  GIT_TAG v12.0.1
+)
+
+FetchContent_MakeAvailable(nlohmann_json ixwebsocket)
 
 add_executable(Hi5CentralAgent
   src/main.cpp
   src/http_client.cpp
   src/platform_info.cpp
+  src/agent_websocket.cpp
+  src/job_executor.cpp
 )
 
 target_include_directories(Hi5CentralAgent PRIVATE src)
@@ -31,6 +44,8 @@ target_compile_definitions(Hi5CentralAgent PRIVATE
 target_link_libraries(Hi5CentralAgent PRIVATE
   CURL::libcurl
   nlohmann_json::nlohmann_json
+  ixwebsocket::ixwebsocket
+  Threads::Threads
 )
 
 if(APPLE)
