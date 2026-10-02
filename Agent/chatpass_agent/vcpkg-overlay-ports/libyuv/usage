@@ -1,0 +1,7 @@
+libyuv provides CMake targets:
+
+  find_package(libyuv CONFIG REQUIRED)
+  target_link_libraries(main PRIVATE yuv)
+
+Hi5Central's Windows overlay compiles libyuv with clang-cl so SSE/AVX
+runtime dispatch remains enabled while the application itself stays MSVC.

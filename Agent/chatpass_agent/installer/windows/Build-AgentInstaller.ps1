@@ -266,6 +266,12 @@ if (-not [string]::IsNullOrWhiteSpace($VcpkgRoot)) {
     if (Test-Path $toolchainFile) {
         $cmakeArgs += "-DCMAKE_TOOLCHAIN_FILE=$toolchainFile"
         Write-Host "VcpkgRoot: $VcpkgRoot"
+
+        $overlayPorts = Join-Path $repoRoot "vcpkg-overlay-ports"
+        if (Test-Path $overlayPorts) {
+            $cmakeArgs += "-DVCPKG_OVERLAY_PORTS=$overlayPorts"
+            Write-Host "VcpkgOverlayPorts: $overlayPorts"
+        }
     } else {
         Write-Warning "VCPKG_ROOT was set but toolchain file was not found: $toolchainFile"
     }

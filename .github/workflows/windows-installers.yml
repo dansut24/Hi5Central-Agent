@@ -45,6 +45,7 @@ jobs:
             'Agent/chatpass_agent/CMakeLists.txt',
             'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1',
             'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss',
+            'Agent/chatpass_agent/vcpkg-overlay-ports/libyuv/portfile.cmake',
             'Agent/app_portal/Hi5Central.AppPortal/Hi5Central.AppPortal.csproj',
             'Agent/app_portal/Hi5Central.AppPortal/MainWindow.axaml',
             'Agent/app_portal/Hi5Central.AppPortal/Broker/WindowsNamedPipeAppPortalBroker.cs',
@@ -67,6 +68,13 @@ jobs:
           }
           if ($agentBuild -notmatch '/p:Version=\$AgentVersion') {
             throw 'Self Service publish no longer stamps the Agent release version.'
+          }
+          if ($agentBuild -notmatch 'VCPKG_OVERLAY_PORTS') {
+            throw 'Agent build no longer enables the local vcpkg overlay ports.'
+          }
+          $libyuvOverlay = Get-Content 'Agent/chatpass_agent/vcpkg-overlay-ports/libyuv/portfile.cmake' -Raw
+          if ($libyuvOverlay -notmatch 'building libyuv with clang-cl SIMD support') {
+            throw 'Accelerated clang-cl libyuv overlay is missing.'
           }
           $installer = Get-Content 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss' -Raw
           if ($installer -notmatch 'StopExistingAgentProcesses') {
@@ -209,10 +217,40 @@ jobs:
           }
           if (-not (Test-Path $iscc)) { throw 'Inno Setup compiler not found.' }
 
+      - name: Ensure accelerated libyuv toolchain
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl.exe -ErrorAction SilentlyContinue).Source
+          if (-not $clang) {
+            $fallback = 'C:\Program Files\LLVM\bin\clang-cl.exe'
+            if (Test-Path $fallback) {
+              $clang = $fallback
+              'C:\Program Files\LLVM\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            }
+          }
+          if (-not $clang -or -not (Test-Path $clang)) {
+            throw 'clang-cl is required so Windows libyuv retains SSE/AVX acceleration.'
+          }
+          Write-Host "clang-cl: $clang"
+          & $clang --version
+
       - name: Build unsigned Windows installers
         shell: pwsh
         run: |
           ./ci/Build-WindowsInstallers.ps1 -Version "0.1.${{ github.run_number }}" -SkipViewer
+
+      - name: Verify accelerated libyuv symbols
+        shell: pwsh
+        run: |
+          $yuvLib = Get-ChildItem 'Agent/chatpass_agent/build/vcpkg_installed' -Filter 'yuv.lib' -Recurse -File |
+            Where-Object { $_.FullName -notmatch '\\debug\\' } |
+            Select-Object -First 1
+          if (-not $yuvLib) { throw 'Built yuv.lib was not found.' }
+          $symbols = (& dumpbin.exe /symbols $yuvLib.FullName 2>&1 | Out-String)
+          if ($symbols -notmatch 'ARGBToYRow_AVX2' -and $symbols -notmatch 'ARGBToYRow_SSSE3') {
+            throw 'libyuv was built without the expected x86 SIMD conversion symbols.'
+          }
+          Write-Host "Accelerated libyuv verified: $($yuvLib.FullName)"
 
       - name: Prepare portable Hi5Central Connect host
         shell: pwsh
