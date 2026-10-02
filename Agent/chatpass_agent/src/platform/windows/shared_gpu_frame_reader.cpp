@@ -209,6 +209,17 @@ bool SharedGpuFrameReader::ReadI420(const SharedGpuFrame& frame, I420Frame& out,
 
     bool ok = false;
     impl_->context->CopyResource(impl_->staging.Get(), openedFrame->texture.Get());
+
+    // The shared texture is no longer needed once its pixels have been queued
+    // into our private staging texture. Release it before the blocking Map and
+    // CPU colour conversion so the capture worker can reuse this slot while
+    // MediaHost finishes the current frame.
+    const HRESULT releaseHr = openedFrame->mutex->ReleaseSync(0);
+    if (releaseHr != S_OK) {
+        if (error) *error = "ReleaseSync failed " + HrString(releaseHr);
+        return false;
+    }
+
     D3D11_MAPPED_SUBRESOURCE mapped{};
     const HRESULT mapHr = impl_->context->Map(impl_->staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (SUCCEEDED(mapHr) && mapped.pData) {
@@ -218,12 +229,6 @@ bool SharedGpuFrameReader::ReadI420(const SharedGpuFrame& frame, I420Frame& out,
         if (!ok && error) *error = "libyuv ARGBToI420 failed";
     } else if (error) {
         *error = "Map shared GPU staging failed " + HrString(mapHr);
-    }
-
-    const HRESULT releaseHr = openedFrame->mutex->ReleaseSync(0);
-    if (releaseHr != S_OK && ok) {
-        ok = false;
-        if (error) *error = "ReleaseSync failed " + HrString(releaseHr);
     }
     return ok;
 }
