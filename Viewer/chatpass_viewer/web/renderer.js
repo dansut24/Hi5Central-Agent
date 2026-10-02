@@ -2436,11 +2436,10 @@ async function handleOffer(msg) {
     const codecs = caps?.codecs || [];
 
     if (transceiver && transceiver.setCodecPreferences && codecs.length) {
-      // Mirror the Agent's stable production order instead of overriding it with
-      // the legacy VP8-first viewer preference. VP9 is the primary screen-content
-      // codec; H.264 remains next for explicitly offered hardware-qualified sessions,
-      // and VP8 stays available as the compatibility/low-resource fallback.
-      const primaryOrder = ["video/vp9", "video/h264", "video/vp8", "video/av1", "video/h265", "video/hevc"];
+      // Mirror the Agent's stable production order. Hardware-qualified H.264
+      // is first because its Agent path is D3D11 zero-copy; VP9 is the next
+      // screen-content choice and VP8 remains the compatibility fallback.
+      const primaryOrder = ["video/h264", "video/vp9", "video/vp8", "video/av1", "video/h265", "video/hevc"];
       const primary = [];
       for (const wanted of primaryOrder) {
         primary.push(...codecs.filter(c => String(c.mimeType).toLowerCase() === wanted));

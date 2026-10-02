@@ -602,30 +602,42 @@ WebRtcSender::WebRtcSender(std::string sessionId,
     LogInfo("[codec] WebRtcSender codec mode=" + m_codecMode);
 
     // Do not enumerate every Media Foundation encoder at session startup.
-    // Stable Auto is deliberately resource-aware: capable endpoints may prefer
-    // software VP9, while VP8 remains the low-resource/compatibility fallback.
-    // Explicit hardware/experimental codecs are still instantiated lazily.
+    // Stable Auto performs only the one hardware probe that matters to the
+    // implemented zero-copy path: H.264. VP9 remains resource-aware software
+    // fallback and VP8 remains the low-resource/compatibility fallback.
     if (g_hwAv1Failed.load(std::memory_order_acquire)) m_hwAv1Available = false;
     if (g_hwVp9Failed.load(std::memory_order_acquire)) m_hwVp9Available = false;
     if (g_hwH265Failed.load(std::memory_order_acquire)) m_hwH265Available = false;
     if (g_hwH264Failed.load(std::memory_order_acquire)) m_hwH264Available = false;
     std::string swVp9Reason;
     m_swVp9Allowed = autoSoftwareVp9Allowed(&swVp9Reason);
-    LogInfo("[codec] eager Media Foundation capability probe disabled session=" + m_sessionId +
-        " policy=adaptive-lazy-init vp9_sw_allowed=" +
-        std::string(m_swVp9Allowed ? "1" : "0") +
-        " " + swVp9Reason);
 
     m_autoCodec = (m_codecMode == "auto");
     if (m_autoCodec) {
-        // Stable Auto is negotiated later. Start with VP8 state so every session
-        // has a universally decodable fallback before the SDP offer is built.
-        // Capable endpoints advertise VP9 first and VP8 second; constrained
-        // endpoints advertise VP8 only.
-        m_videoCodec = VideoCodec::VP8;
-        m_payloadType = 96;
-        LogInfo("[codec] adaptive auto mode enabled vp9_preferred=" +
-            std::string(m_swVp9Allowed ? "1" : "0") +
+        std::string h264EncoderName;
+        if (!g_hwH264Failed.load(std::memory_order_acquire)) {
+            m_hwH264Available = hi5::ProbeHardwareCodecAvailable("h264", &h264EncoderName);
+            m_hwH264ProbeDone = true;
+        }
+        LogInfo("[codec] adaptive auto preflight session=" + m_sessionId +
+            " h264_hw_available=" + std::string(m_hwH264Available ? "1" : "0") +
+            (h264EncoderName.empty() ? std::string() : " h264_encoder=" + h264EncoderName) +
+            " vp9_sw_allowed=" + std::string(m_swVp9Allowed ? "1" : "0") +
+            " " + swVp9Reason);
+
+        if (m_hwH264Available) {
+            m_videoCodec = VideoCodec::H264;
+            m_payloadType = 102;
+        } else if (m_swVp9Allowed) {
+            m_videoCodec = VideoCodec::VP9;
+            m_payloadType = 98;
+        } else {
+            m_videoCodec = VideoCodec::VP8;
+            m_payloadType = 96;
+        }
+        LogInfo("[codec] adaptive auto mode enabled h264_hw_preferred=" +
+            std::string(m_hwH264Available ? "1" : "0") +
+            " vp9_fallback=" + std::string(m_swVp9Allowed ? "1" : "0") +
             " vp8_fallback=1 session=" + m_sessionId);
     }
     else if (m_codecMode == "av1_hw" || m_codecMode == "av1" || m_codecMode == "av1_sw") {
@@ -1783,20 +1795,28 @@ void WebRtcSender::createPeerConnection() {
         } else {
             const bool preferVp9 = m_swVp9Allowed &&
                 readEnvInt("HI5_AUTO_PREFER_VP9", 1, 0, 1) == 1;
-            if (preferVp9) {
-                // Put VP9 first so the browser's answer selects the modern
-                // screen-content path, but keep VP8 in the same offer as a
-                // compatibility fallback. No live codec switch is required.
+            if (m_hwH264Available && !g_hwH264Failed.load(std::memory_order_acquire)) {
+                // H.264 is the implemented D3D11 zero-copy hardware path.
+                // Advertise it first only after the local hardware probe succeeds.
+                m_videoCodec = VideoCodec::H264;
+                m_payloadType = 102;
+                media.addH264Codec(102);
+                if (preferVp9) media.addVP9Codec(98);
+                media.addVP8Codec(96);
+                LogInfo("[codec] SDP stable auto offer H264=102 preferred" +
+                    std::string(preferVp9 ? " VP9=98 fallback" : "") +
+                    " VP8=96 fallback session=" + m_sessionId);
+            } else if (preferVp9) {
                 m_videoCodec = VideoCodec::VP9;
                 m_payloadType = 98;
                 media.addVP9Codec(98);
                 media.addVP8Codec(96);
-                LogInfo("[codec] SDP stable auto offer VP9=98 preferred VP8=96 fallback session=" + m_sessionId);
+                LogInfo("[codec] SDP stable auto offer VP9=98 preferred VP8=96 fallback reason=no_h264_hw session=" + m_sessionId);
             } else {
                 m_videoCodec = VideoCodec::VP8;
                 m_payloadType = 96;
                 media.addVP8Codec(m_payloadType);
-                LogInfo("[codec] SDP stable auto offer VP8=96 only reason=resource_gate_or_override session=" + m_sessionId);
+                LogInfo("[codec] SDP stable auto offer VP8=96 only reason=no_h264_hw_and_resource_gate_or_override session=" + m_sessionId);
             }
         }
     }
