@@ -229,6 +229,8 @@ private:
     bool m_hwH264ProbeDone = false;
     bool m_swVp9Allowed = false;
     int m_codecUnhealthyWindows = 0;
+    int m_codecHealthyWindows = 0;
+    std::atomic<int> m_codecPressureLevel{ 0 };
     int m_av1EmptyOutputFrames = 0;
     std::chrono::steady_clock::time_point m_lastCodecSwitchAt{};
     VideoCodec m_videoCodec = VideoCodec::VP8;

@@ -49,6 +49,8 @@ Require-Literal $service 'VK_F13' 'Windows key map must support F13-F24.'
 
 # Adaptive profile / transfer cleanup contracts
 Require-Literal $sender 'target_bitrate_kbps' 'Viewer-requested bitrate target support is missing.'
+Require-Literal $sender 'action=reduce_vp9_fps_in_place' 'Negotiated VP9 no longer degrades in-place under sustained encoder pressure.'
+Require-Literal $sender 'm_codecPressureLevel' 'VP9 encoder-pressure recovery state is missing.'
 Require-Literal $service 'HandleRemoteFileUploadCancel' 'Endpoint upload cancellation is missing.'
 Require-Literal $streamer 'cmd.key.vk == VK_PAUSE || cmd.key.vk == VK_SNAPSHOT' 'Pause/Print Screen special Windows injection path is missing.'
 Require-Literal $streamer 'in.ki.wVk = cmd.key.vk' 'Pause/Print Screen must use Windows virtual-key synthesis.'

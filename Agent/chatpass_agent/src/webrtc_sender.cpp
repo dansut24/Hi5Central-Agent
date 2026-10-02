@@ -979,6 +979,8 @@ bool WebRtcSender::switchVideoCodec(VideoCodec codec, const std::string& reason,
     m_externalConfiguredBitrateKbps = 0;
     m_externalFrameCounter = 0;
     m_codecUnhealthyWindows = 0;
+    m_codecHealthyWindows = 0;
+    m_codecPressureLevel.store(0, std::memory_order_release);
     m_av1EmptyOutputFrames = 0;
     m_forceKeyframe = true;
     m_lastCodecSwitchAt = std::chrono::steady_clock::now();
@@ -1072,7 +1074,11 @@ void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, do
     // with. VP9 stays interaction-ready while idle, so its configured FPS can
     // intentionally be higher than the 2 FPS idle capture cadence.
     const int hintedFps = m_externalHintFps.load();
-    const int healthFps = std::max(1, hintedFps > 0 ? hintedFps : m_externalConfiguredFps);
+    int healthFps = std::max(1, hintedFps > 0 ? hintedFps : m_externalConfiguredFps);
+    const int pressureLevel = m_codecPressureLevel.load(std::memory_order_acquire);
+    if (m_videoCodec == VideoCodec::VP9 && pressureLevel > 0 && m_externalConfiguredFps > 0) {
+        healthFps = std::min(healthFps, m_externalConfiguredFps);
+    }
     const double frameBudgetMs = 1000.0 / static_cast<double>(healthFps);
     const double viewerRttMs = m_viewerRttMs.load();
     const double viewerJitterMs = m_viewerJitterMs.load();
@@ -1090,9 +1096,23 @@ void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, do
                 " action=hold_codec");
         }
         m_codecUnhealthyWindows = 0;
+        if (m_videoCodec == VideoCodec::VP9 && pressureLevel > 0) {
+            ++m_codecHealthyWindows;
+            if (m_codecHealthyWindows >= 4) {
+                const int recoveredLevel = std::max(0, pressureLevel - 1);
+                m_codecPressureLevel.store(recoveredLevel, std::memory_order_release);
+                m_codecHealthyWindows = 0;
+                LogInfo("[codec] VP9 pressure recovery session=" + m_sessionId +
+                    " level=" + std::to_string(recoveredLevel) +
+                    " action=raise_fps_ceiling");
+            }
+        } else {
+            m_codecHealthyWindows = 0;
+        }
         return;
     }
 
+    m_codecHealthyWindows = 0;
     ++m_codecUnhealthyWindows;
     LogInfo("[codec] unhealthy window session=" + m_sessionId +
         " count=" + std::to_string(m_codecUnhealthyWindows) +
@@ -1105,10 +1125,23 @@ void WebRtcSender::observeCodecHealth(double encodeAvgMs, double encodeMaxMs, do
     // Require two consecutive 5-second health windows before considering a change.
     if (m_codecUnhealthyWindows < 2) return;
     if (m_negotiationLocked) {
-        LogWarn("[codec] sustained encoder pressure but SDP codec is locked session=" + m_sessionId +
-            " codec=" + activeVideoCodecName() +
-            " payload=" + std::to_string(m_payloadType) +
-            " action=hold_codec_until_renegotiation");
+        if (m_videoCodec == VideoCodec::VP9 && m_vp9VpxEncoder) {
+            const int oldLevel = m_codecPressureLevel.load(std::memory_order_acquire);
+            const int nextLevel = std::min(2, oldLevel + 1);
+            m_codecPressureLevel.store(nextLevel, std::memory_order_release);
+            LogWarn("[codec] sustained VP9 encoder pressure with locked SDP session=" + m_sessionId +
+                " payload=" + std::to_string(m_payloadType) +
+                " old_level=" + std::to_string(oldLevel) +
+                " new_level=" + std::to_string(nextLevel) +
+                (nextLevel == oldLevel
+                    ? " action=hold_reduced_profile"
+                    : " action=reduce_vp9_fps_in_place"));
+        } else {
+            LogWarn("[codec] sustained encoder pressure but SDP codec is locked session=" + m_sessionId +
+                " codec=" + activeVideoCodecName() +
+                " payload=" + std::to_string(m_payloadType) +
+                " action=hold_codec_until_renegotiation");
+        }
         m_codecUnhealthyWindows = 0;
         return;
     }
@@ -2892,6 +2925,17 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         profile.bitrateKbps = std::max(250, std::min(profile.bitrateKbps, viewerTargetBitrateKbps));
     }
 
+    const int activeCodecPressure = m_codecPressureLevel.load(std::memory_order_acquire);
+    if (m_videoCodec == VideoCodec::VP9 && activeCodecPressure > 0) {
+        if (activeCodecPressure >= 2) {
+            profile.fps = std::min(profile.fps, 18);
+            profile.bitrateKbps = std::min(profile.bitrateKbps, 5500);
+        } else {
+            profile.fps = std::min(profile.fps, 24);
+            profile.bitrateKbps = std::min(profile.bitrateKbps, 7000);
+        }
+    }
+
     const int viewerMaxW = m_viewerMaxWidth.load(std::memory_order_acquire);
     const int viewerMaxH = m_viewerMaxHeight.load(std::memory_order_acquire);
     const I420Frame& vp8Frame = (m_videoCodec == VideoCodec::VP8)
@@ -3207,7 +3251,10 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         const int vp9DefaultMaxQ = vp9Quality == "lossless" ? 0 : (vp9Quality == "near_lossless" ? 10 : (vp9Quality == "text" ? 22 : 38));
         const int vp9MinQ = readEnvInt("HI5_VP9_MIN_Q", vp9DefaultMinQ, 0, 63);
         const int vp9MaxQ = readEnvInt("HI5_VP9_MAX_Q", vp9DefaultMaxQ, 0, 63);
-        const int vp9CpuUsed = readEnvInt("HI5_VP9_CPUUSED", effectiveMode >= 2 ? 8 : 9, 0, 9);
+        const int vp9CpuUsed = readEnvInt(
+            "HI5_VP9_CPUUSED",
+            activeCodecPressure > 0 ? 9 : (effectiveMode >= 2 ? 8 : 9),
+            0, 9);
         const bool profileChangedVp9 =
             vp9EncoderFps != m_externalConfiguredFps ||
             vp9EncoderBitrateKbps != m_externalConfiguredBitrateKbps ||
