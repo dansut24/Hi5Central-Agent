@@ -198,6 +198,7 @@ target_include_directories(native_vp8_stream BEFORE PRIVATE
   src
   ${VPX_INCLUDE_DIRS}
   ${OPUS_INCLUDE_DIR}
+  ${LIBYUV_INCLUDE_DIR}
 )
 
 option(HI5_ENABLE_CEF_BROWSER "Enable CEF off-screen browser for Backstage" OFF)
@@ -255,6 +256,7 @@ target_link_libraries(native_vp8_stream PRIVATE
   ZLIB::ZLIB
   ${VPX_LIBRARIES}
   ${OPUS_LIBRARY}
+  ${LIBYUV_LIBRARY}
   d3d11
   dxgi
   windowscodecs
@@ -325,12 +327,14 @@ if(WIN32)
   hi5_use_static_msvc_runtime(hi5central_remote_host)
   target_include_directories(hi5central_remote_host PRIVATE
     ${WEBVIEW2_INCLUDE_DIR}
+    ${LIBYUV_INCLUDE_DIR}
     src
   )
   target_compile_definitions(hi5central_remote_host PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
   target_link_libraries(hi5central_remote_host PRIVATE
     ${WEBVIEW2_LOADER_STATIC}
     nlohmann_json::nlohmann_json Threads::Threads
+    ${LIBYUV_LIBRARY}
     d3d11 dxgi windowscodecs advapi32 user32 gdi32 shell32 shlwapi
     ole32 oleaut32 uuid wtsapi32 userenv psapi dwmapi uxtheme
   )
