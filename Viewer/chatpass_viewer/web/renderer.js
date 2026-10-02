@@ -103,7 +103,17 @@ let viewerReconnectCooldownUntil = 0;
 
 let statsTimer = null;
 let transitionWatchdogTimer = null;
-let lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, packetsReceived: 0, jitterDelay: 0, jitterEmitted: 0 };
+const REMOTE_DESKTOP_JITTER_BUFFER_TARGET_MS = 20;
+let lastStats = {
+  tsMs: 0,
+  bytes: 0,
+  frames: 0,
+  packetsLost: 0,
+  packetsReceived: 0,
+  jitterDelay: 0,
+  jitterTargetDelay: 0,
+  jitterEmitted: 0
+};
 const DESKTOP_ADAPTIVE_TIERS = [
   { bitrate: 8000, fps: 30, label: 'Native · 8 Mbps · 30 fps' },
   { bitrate: 6000, fps: 30, label: 'Native · 6 Mbps · 30 fps' },
@@ -170,6 +180,19 @@ function normalizeIceServers(value) {
 
 function activeIceServers() {
   return normalizeIceServers(currentSession?.iceServers);
+}
+
+function applyLowLatencyReceiverHint(receiver, kind = "media") {
+  if (!receiver || !("jitterBufferTarget" in receiver)) return;
+  try {
+    receiver.jitterBufferTarget = REMOTE_DESKTOP_JITTER_BUFFER_TARGET_MS;
+    console.log("[rtc] low-latency receiver target", {
+      kind,
+      jitterBufferTargetMs: REMOTE_DESKTOP_JITTER_BUFFER_TARGET_MS
+    });
+  } catch (e) {
+    console.warn("[rtc] receiver jitter target unavailable:", e?.message || e);
+  }
 }
 
 const FRAME_STALL_MS = 950;
@@ -950,7 +973,16 @@ function stopStatsPoll() {
     clearInterval(transitionWatchdogTimer);
     transitionWatchdogTimer = null;
   }
-  lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, packetsReceived: 0, jitterDelay: 0, jitterEmitted: 0 };
+  lastStats = {
+    tsMs: 0,
+    bytes: 0,
+    frames: 0,
+    packetsLost: 0,
+    packetsReceived: 0,
+    jitterDelay: 0,
+    jitterTargetDelay: 0,
+    jitterEmitted: 0
+  };
   lastFramesDecoded = 0;
 }
 
@@ -1629,6 +1661,7 @@ async function pollStatsOnce() {
   let packetsLostDelta = 0;
   let jitterMs = null;
   let jitterBufferMs = null;
+  let jitterBufferTargetMs = null;
 
   if (inbound) {
     const bytesReceived = Number(inbound.bytesReceived || 0);
@@ -1637,12 +1670,17 @@ async function pollStatsOnce() {
     packetsReceived = Number(inbound.packetsReceived || 0);
     jitterMs = Number.isFinite(Number(inbound.jitter)) ? Number(inbound.jitter) * 1000 : null;
     const jitterDelay = Number(inbound.jitterBufferDelay || 0);
+    const jitterTargetDelay = Number(inbound.jitterBufferTargetDelay || 0);
     const jitterEmitted = Number(inbound.jitterBufferEmittedCount || 0);
     if (jitterEmitted > lastStats.jitterEmitted) {
       const emittedDelta = jitterEmitted - lastStats.jitterEmitted;
       const delayDelta = jitterDelay - lastStats.jitterDelay;
+      const targetDelayDelta = jitterTargetDelay - lastStats.jitterTargetDelay;
       if (emittedDelta > 0 && delayDelta >= 0) {
         jitterBufferMs = (delayDelta / emittedDelta) * 1000;
+      }
+      if (emittedDelta > 0 && targetDelayDelta >= 0) {
+        jitterBufferTargetMs = (targetDelayDelta / emittedDelta) * 1000;
       }
     }
 
@@ -1674,6 +1712,7 @@ async function pollStatsOnce() {
     lastStats.packetsLost = packetsLost;
     lastStats.packetsReceived = packetsReceived;
     lastStats.jitterDelay = jitterDelay;
+    lastStats.jitterTargetDelay = jitterTargetDelay;
     lastStats.jitterEmitted = jitterEmitted;
   }
 
@@ -1687,6 +1726,7 @@ async function pollStatsOnce() {
     rtt_ms: rttMs ?? 0,
     jitter_ms: Number.isFinite(jitterMs) ? jitterMs : 0,
     jitter_buffer_ms: Number.isFinite(jitterBufferMs) ? jitterBufferMs : 0,
+    jitter_buffer_target_ms: Number.isFinite(jitterBufferTargetMs) ? jitterBufferTargetMs : 0,
     bitrate_kbps: Number.isFinite(bitrateKbps) ? bitrateKbps : 0,
     fps: Number.isFinite(fps) ? fps : 0,
     packets_lost: packetsLost ?? 0,
@@ -2396,9 +2436,11 @@ async function handleOffer(msg) {
     const codecs = caps?.codecs || [];
 
     if (transceiver && transceiver.setCodecPreferences && codecs.length) {
-      // Prefer modern codecs, but keep every browser-supported fallback. The Agent
-      // makes the final selection using endpoint hardware and live encode health.
-      const primaryOrder = ["video/vp8", "video/h264", "video/vp9", "video/av1", "video/h265", "video/hevc"];
+      // Mirror the Agent's stable production order instead of overriding it with
+      // the legacy VP8-first viewer preference. VP9 is the primary screen-content
+      // codec; H.264 remains next for explicitly offered hardware-qualified sessions,
+      // and VP8 stays available as the compatibility/low-resource fallback.
+      const primaryOrder = ["video/vp9", "video/h264", "video/vp8", "video/av1", "video/h265", "video/hevc"];
       const primary = [];
       for (const wanted of primaryOrder) {
         primary.push(...codecs.filter(c => String(c.mimeType).toLowerCase() === wanted));
@@ -2440,6 +2482,7 @@ async function handleOffer(msg) {
 
   pc.ontrack = async (ev) => {
     console.log("[rtc] ontrack", { trackKind: ev.track?.kind, streams: ev.streams?.length || 0 });
+    applyLowLatencyReceiverHint(ev.receiver, ev.track?.kind || "media");
     setTimeout(updateSelectedCodecFromStats, 500);
     setTimeout(updateSelectedCodecFromStats, 1500);
     const stream = (ev.streams && ev.streams[0])
