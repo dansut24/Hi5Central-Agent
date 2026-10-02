@@ -1,4 +1,4 @@
-name: Windows Agent and Viewer installers
+name: Windows Agent installers
 
 on:
   workflow_dispatch:
@@ -6,13 +6,11 @@ on:
     branches: [main, hardening-mobile-viewer, agent-hardening-v2]
     paths:
       - "Agent/**"
-      - "Viewer/**"
       - "ci/**"
       - ".github/workflows/windows-installers.yml"
   pull_request:
     paths:
       - "Agent/**"
-      - "Viewer/**"
       - "ci/**"
       - ".github/workflows/windows-installers.yml"
 
@@ -46,10 +44,7 @@ jobs:
             'Agent/app_portal/Hi5Central.AppPortal/MainWindow.axaml',
             'Agent/app_portal/Hi5Central.AppPortal/Broker/WindowsNamedPipeAppPortalBroker.cs',
             'Agent/chatpass_agent/src/network/snmp_discovery.h',
-            'Agent/chatpass_agent/src/network/snmp_discovery.cpp',
-            'Viewer/chatpass_viewer/CMakeLists.txt',
-            'Viewer/chatpass_viewer/installer/windows/Build-ViewerInstaller.ps1',
-            'Viewer/chatpass_viewer/installer/windows/Hi5CentralViewerSetup.iss'
+            'Agent/chatpass_agent/src/network/snmp_discovery.cpp'
           )
           foreach ($path in $required) {
             if (-not (Test-Path $path)) { throw "Missing local Windows build file: $path" }
@@ -212,7 +207,7 @@ jobs:
       - name: Build unsigned Windows installers
         shell: pwsh
         run: |
-          ./ci/Build-WindowsInstallers.ps1 -Version "0.1.${{ github.run_number }}"
+          ./ci/Build-WindowsInstallers.ps1 -Version "0.1.${{ github.run_number }}" -SkipViewer
 
       - name: Prepare portable Hi5Central Connect host
         shell: pwsh
@@ -274,17 +269,6 @@ jobs:
             Agent/chatpass_agent/build/Release/Hi5CentralUser.exe
             Agent/chatpass_agent/build/Release/Hi5CentralAppPortal.exe
 
-      - name: Upload Viewer installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: Hi5Central-Viewer-Windows
-          if-no-files-found: error
-          retention-days: 14
-          path: |
-            Viewer/chatpass_viewer/dist/installer/Hi5CentralViewerSetup.exe
-            Viewer/chatpass_viewer/dist/viewer/Hi5CentralViewer.exe
-            Viewer/chatpass_viewer/dist/viewer/web/**
-
       - name: Publish latest test installers
         if: github.event_name == 'push' && (github.ref == 'refs/heads/hardening-mobile-viewer' || github.ref == 'refs/heads/agent-hardening-v2')
         shell: pwsh
@@ -293,10 +277,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $publish | Out-Null
           Copy-Item 'Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe' $publish
           Copy-Item 'Agent/chatpass_agent/build/Release/Hi5CentralConnect.exe' $publish
-          Copy-Item 'Viewer/chatpass_viewer/dist/installer/Hi5CentralViewerSetup.exe' $publish
           Get-FileHash "$publish\Hi5CentralAgentSetup.exe" -Algorithm SHA256 | ForEach-Object { $_.Hash } | Set-Content "$publish\Hi5CentralAgentSetup.exe.sha256"
           Get-FileHash "$publish\Hi5CentralConnect.exe" -Algorithm SHA256 | ForEach-Object { $_.Hash } | Set-Content "$publish\Hi5CentralConnect.exe.sha256"
-          Get-FileHash "$publish\Hi5CentralViewerSetup.exe" -Algorithm SHA256 | ForEach-Object { $_.Hash } | Set-Content "$publish\Hi5CentralViewerSetup.exe.sha256"
           $meta = @{
             build = "0.1.${{ github.run_number }}"
             commit = "${{ github.sha }}"
