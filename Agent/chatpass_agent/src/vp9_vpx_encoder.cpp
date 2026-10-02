@@ -46,6 +46,10 @@ struct Vp9VpxEncoder::Impl {
         cfg.rc_target_bitrate = bitrateKbps;
         cfg.rc_resize_allowed = 0;
         cfg.rc_dropframe_thresh = 0;
+        // Match Chromium remoting's low-latency CBR behaviour: allow the
+        // encoder to spend the full target budget while limiting overshoot.
+        cfg.rc_undershoot_pct = 100;
+        cfg.rc_overshoot_pct = 15;
         cfg.rc_min_quantizer = minQuantizer;
         cfg.rc_max_quantizer = maxQuantizer;
         cfg.rc_buf_initial_sz = 400;
@@ -65,16 +69,30 @@ struct Vp9VpxEncoder::Impl {
         }
 
         vpx_codec_control(&codec, VP8E_SET_CPUUSED, cpuUsed);
+        const bool lossless = (minQuantizer == 0 && maxQuantizer == 0);
         // VP9 has a true mathematically lossless mode. HI5 uses it only when
         // both quantizer bounds are zero (HI5_IMAGE_QUALITY=lossless).
-        vpx_codec_control(&codec, VP9E_SET_LOSSLESS, (minQuantizer == 0 && maxQuantizer == 0) ? 1 : 0);
-#ifdef VP9E_SET_TILE_COLUMNS
-        // Two tile columns lets modern CPUs parallelise desktop frames without
-        // forcing a high thread count on smaller endpoints.
-        vpx_codec_control(&codec, VP9E_SET_TILE_COLUMNS, width >= 3840 ? 2 : (width >= 1920 ? 1 : 0));
-#endif
+        vpx_codec_control(&codec, VP9E_SET_LOSSLESS, lossless ? 1 : 0);
 #ifdef VP9E_SET_ROW_MT
-        vpx_codec_control(&codec, VP9E_SET_ROW_MT, 1);
+        if (threads > 1) {
+            vpx_codec_control(&codec, VP9E_SET_ROW_MT, 1);
+        }
+#endif
+#ifdef VP9E_SET_TILE_COLUMNS
+        int tileColumns = 0;
+        for (int t = threads; t > 1 && tileColumns < 3; t >>= 1) ++tileColumns;
+        vpx_codec_control(&codec, VP9E_SET_TILE_COLUMNS, tileColumns);
+#endif
+#ifdef VP9E_SET_NOISE_SENSITIVITY
+        vpx_codec_control(&codec, VP9E_SET_NOISE_SENSITIVITY, 0);
+#endif
+#ifdef VP9E_SET_TUNE_CONTENT
+        vpx_codec_control(&codec, VP9E_SET_TUNE_CONTENT, VP9E_CONTENT_SCREEN);
+#endif
+#ifdef VP9E_SET_AQ_MODE
+        // Chromium remoting uses cyclic refresh for lossy VP9 screen content;
+        // disable it only for true lossless encoding.
+        vpx_codec_control(&codec, VP9E_SET_AQ_MODE, lossless ? 0 : 3);
 #endif
         initialized = true;
     }
@@ -161,6 +179,10 @@ bool Vp9VpxEncoder::reconfigure(int fps, int bitrateKbps, int cpuUsed,
     m_impl->minQuantizer = minQuantizer;
     m_impl->maxQuantizer = maxQuantizer;
     vpx_codec_control(&m_impl->codec, VP8E_SET_CPUUSED, cpuUsed);
-    vpx_codec_control(&m_impl->codec, VP9E_SET_LOSSLESS, (minQuantizer == 0 && maxQuantizer == 0) ? 1 : 0);
+    const bool lossless = (minQuantizer == 0 && maxQuantizer == 0);
+    vpx_codec_control(&m_impl->codec, VP9E_SET_LOSSLESS, lossless ? 1 : 0);
+#ifdef VP9E_SET_AQ_MODE
+    vpx_codec_control(&m_impl->codec, VP9E_SET_AQ_MODE, lossless ? 0 : 3);
+#endif
     return true;
 }

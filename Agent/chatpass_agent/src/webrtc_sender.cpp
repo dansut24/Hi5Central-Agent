@@ -152,6 +152,21 @@ namespace {
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    static int recommendedVp9Threads(int frameWidth) {
+        int threads = frameWidth >= 5120 ? 32 :
+            (frameWidth >= 3840 ? 16 :
+            (frameWidth >= 2560 ? 8 :
+            (frameWidth >= 1280 ? 4 :
+            (frameWidth >= 720 ? 2 : 1))));
+#ifdef _WIN32
+        const DWORD cores = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        if (cores > 0) {
+            threads = std::min(threads, std::max(1, static_cast<int>(cores) / 2));
+        }
+#endif
+        return std::max(1, std::min(8, threads));
+    }
+
     static bool autoSoftwareVp9Allowed(std::string* reason = nullptr) {
 #ifdef _WIN32
         const DWORD cores = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -587,8 +602,9 @@ WebRtcSender::WebRtcSender(std::string sessionId,
     LogInfo("[codec] WebRtcSender codec mode=" + m_codecMode);
 
     // Do not enumerate every Media Foundation encoder at session startup.
-    // Auto is deliberately memory-first and starts/stays on VP8; explicitly
-    // selected codecs probe/instantiate their own encoder lazily on first frame.
+    // Stable Auto is deliberately resource-aware: capable endpoints may prefer
+    // software VP9, while VP8 remains the low-resource/compatibility fallback.
+    // Explicit hardware/experimental codecs are still instantiated lazily.
     if (g_hwAv1Failed.load(std::memory_order_acquire)) m_hwAv1Available = false;
     if (g_hwVp9Failed.load(std::memory_order_acquire)) m_hwVp9Available = false;
     if (g_hwH265Failed.load(std::memory_order_acquire)) m_hwH265Available = false;
@@ -602,13 +618,15 @@ WebRtcSender::WebRtcSender(std::string sessionId,
 
     m_autoCodec = (m_codecMode == "auto");
     if (m_autoCodec) {
-        // Remote-support Auto favours predictable endpoint CPU/RAM over maximum
-        // compression efficiency. Advertise all mature codecs, but begin with
-        // the proven low-latency VP8 baseline unless an operator explicitly
-        // selects VP9/H.264 (or a future hardware policy promotes them).
+        // Stable Auto is negotiated later. Start with VP8 state so every session
+        // has a universally decodable fallback before the SDP offer is built.
+        // Capable endpoints advertise VP9 first and VP8 second; constrained
+        // endpoints advertise VP8 only.
         m_videoCodec = VideoCodec::VP8;
         m_payloadType = 96;
-        LogInfo("[codec] adaptive auto mode enabled, VP8 low-CPU baseline preferred session=" + m_sessionId);
+        LogInfo("[codec] adaptive auto mode enabled vp9_preferred=" +
+            std::string(m_swVp9Allowed ? "1" : "0") +
+            " vp8_fallback=1 session=" + m_sessionId);
     }
     else if (m_codecMode == "av1_hw" || m_codecMode == "av1" || m_codecMode == "av1_sw") {
         m_videoCodec = VideoCodec::AV1;
@@ -1730,10 +1748,23 @@ void WebRtcSender::createPeerConnection() {
             media.addH265Codec(104);
             LogInfo("[codec] SDP experimental auto offer VP8=96 H264=102 VP9=98 AV1=100 H265=104 session=" + m_sessionId);
         } else {
-            m_videoCodec = VideoCodec::VP8;
-            m_payloadType = 96;
-            media.addVP8Codec(m_payloadType);
-            LogInfo("[codec] SDP stable auto offer VP8=96 only session=" + m_sessionId);
+            const bool preferVp9 = m_swVp9Allowed &&
+                readEnvInt("HI5_AUTO_PREFER_VP9", 1, 0, 1) == 1;
+            if (preferVp9) {
+                // Put VP9 first so the browser's answer selects the modern
+                // screen-content path, but keep VP8 in the same offer as a
+                // compatibility fallback. No live codec switch is required.
+                m_videoCodec = VideoCodec::VP9;
+                m_payloadType = 98;
+                media.addVP9Codec(98);
+                media.addVP8Codec(96);
+                LogInfo("[codec] SDP stable auto offer VP9=98 preferred VP8=96 fallback session=" + m_sessionId);
+            } else {
+                m_videoCodec = VideoCodec::VP8;
+                m_payloadType = 96;
+                media.addVP8Codec(m_payloadType);
+                LogInfo("[codec] SDP stable auto offer VP8=96 only reason=resource_gate_or_override session=" + m_sessionId);
+            }
         }
     }
     else if (m_videoCodec == VideoCodec::AV1) {
@@ -3163,24 +3194,37 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
         const int vp9MaxH = readEnvInt("HI5_VP9_MAX_HEIGHT", 1080, 0, 4320);
         const I420Frame& vp9Frame = scaleI420ForWebRtc(frame, m_vp9ScaleScratch, vp9MaxW, vp9MaxH, &vp9Scaled);
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
-        const int vp9EncoderFps = readEnvInt("HI5_VP9_ENCODER_FPS", std::min(30, std::max(1, m_fps)), 1, 60);
+        // Keep VP9's internal rate-control clock aligned with the same
+        // idle/active/motion cadence used to decide which frames we send.
+        const int vp9EncoderFps = readEnvInt("HI5_VP9_ENCODER_FPS", std::max(1, profile.fps), 1, 60);
         const std::string vp9Quality = imageQualityMode();
-        const int vp9DefaultKbps = vp9Quality == "lossless" ? std::max(16000, m_bitrateKbps) :
-            (vp9Quality == "near_lossless" ? std::max(12000, m_bitrateKbps) :
-            (vp9Quality == "text" ? std::max(8000, m_bitrateKbps) : std::max(250, m_bitrateKbps)));
+        const int vp9ProfileKbps = std::max(500, profile.bitrateKbps);
+        const int vp9DefaultKbps = vp9Quality == "lossless" ? std::max(16000, vp9ProfileKbps) :
+            (vp9Quality == "near_lossless" ? std::max(12000, vp9ProfileKbps) :
+            (vp9Quality == "text" ? std::max(8000, vp9ProfileKbps) : vp9ProfileKbps));
         const int vp9EncoderBitrateKbps = readEnvInt("HI5_VP9_ENCODER_KBPS", vp9DefaultKbps, 500, 30000);
         const int vp9DefaultMinQ = vp9Quality == "lossless" ? 0 : (vp9Quality == "near_lossless" ? 0 : (vp9Quality == "text" ? 2 : 4));
         const int vp9DefaultMaxQ = vp9Quality == "lossless" ? 0 : (vp9Quality == "near_lossless" ? 10 : (vp9Quality == "text" ? 22 : 38));
+        const int vp9MinQ = readEnvInt("HI5_VP9_MIN_Q", vp9DefaultMinQ, 0, 63);
+        const int vp9MaxQ = readEnvInt("HI5_VP9_MAX_Q", vp9DefaultMaxQ, 0, 63);
+        const int vp9CpuUsed = readEnvInt("HI5_VP9_CPUUSED", effectiveMode >= 2 ? 8 : 9, 0, 9);
+        const bool profileChangedVp9 =
+            vp9EncoderFps != m_externalConfiguredFps ||
+            vp9EncoderBitrateKbps != m_externalConfiguredBitrateKbps ||
+            vp9CpuUsed != m_externalConfiguredCpuUsed ||
+            vp9MaxQ != m_externalConfiguredMaxQuantizer;
 
         auto createSoftwareVp9 = [&]() -> bool {
             try {
                 m_vp9Encoder.reset();
                 m_vp9VpxEncoder = std::make_unique<Vp9VpxEncoder>(
                     vp9Frame.width, vp9Frame.height, vp9EncoderFps, vp9EncoderBitrateKbps,
-                    readEnvInt("HI5_VP9_CPUUSED", 8, 0, 9),
-                    readEnvInt("HI5_VP9_MIN_Q", vp9DefaultMinQ, 0, 63),
-                    readEnvInt("HI5_VP9_MAX_Q", vp9DefaultMaxQ, 0, 63),
-                    readEnvInt("HI5_VP9_THREADS", vp9Frame.width >= 3840 ? 4 : (vp9Frame.width > 1920 ? 2 : 1), 1, 8));
+                    vp9CpuUsed,
+                    vp9MinQ,
+                    vp9MaxQ,
+                    readEnvInt("HI5_VP9_THREADS",
+                        recommendedVp9Threads(vp9Frame.width),
+                        1, 8));
                 m_externalProfileName = "libvpx-vp9-interaction-ready";
                 m_codecMode = "vp9_sw";
                 m_vp9Failed = false;
@@ -3202,6 +3246,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
             m_externalEncoderHeight = vp9Frame.height;
             m_externalConfiguredFps = vp9EncoderFps;
             m_externalConfiguredBitrateKbps = vp9EncoderBitrateKbps;
+            m_externalConfiguredCpuUsed = vp9CpuUsed;
+            m_externalConfiguredMaxQuantizer = vp9MaxQ;
             m_externalProfileName = "mediafoundation-vp9-interaction-ready";
 
             const bool forceSoftware = m_codecMode == "vp9_sw" || (m_autoCodec && !m_hwVp9Available) || g_hwVp9Failed.load(std::memory_order_acquire);
@@ -3236,6 +3282,31 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, uint64_t captureT
                 return;
             }
             forceKeyframe = true;
+        }
+        else if (m_vp9VpxEncoder && profileChangedVp9) {
+            if (!m_vp9VpxEncoder->reconfigure(
+                    vp9EncoderFps,
+                    vp9EncoderBitrateKbps,
+                    vp9CpuUsed,
+                    vp9MinQ,
+                    vp9MaxQ)) {
+                LogWarn("[vp9] libvpx reconfigure failed session=" + m_sessionId +
+                    " action=recreate_on_next_frame");
+                m_vp9VpxEncoder.reset();
+                m_externalEncoderWidth = 0;
+                m_externalEncoderHeight = 0;
+                m_forceKeyframe = true;
+                return;
+            }
+            m_externalConfiguredFps = vp9EncoderFps;
+            m_externalConfiguredBitrateKbps = vp9EncoderBitrateKbps;
+            m_externalConfiguredCpuUsed = vp9CpuUsed;
+            m_externalConfiguredMaxQuantizer = vp9MaxQ;
+            LogInfo("[vp9] libvpx retuned session=" + m_sessionId +
+                " fps=" + std::to_string(vp9EncoderFps) +
+                " bitrate=" + std::to_string(vp9EncoderBitrateKbps) +
+                " cpuused=" + std::to_string(vp9CpuUsed) +
+                " qmax=" + std::to_string(vp9MaxQ));
         }
 
         try {

@@ -112,15 +112,15 @@ namespace hi5 {
         }
 
         decision.selectedCodec = "auto";
-        decision.encoder = "stable-vp8-webrtc";
-        // Production Auto currently negotiates the validated VP8 path only.
-        // Keep the service ceiling interaction-ready; the streamer/encoder still
-        // fall back to 1-2 FPS when idle and use 24 FPS for ordinary activity.
+        decision.encoder = "adaptive-vp9-vp8-webrtc";
+        // Stable Auto prefers the tuned VP9 software path on endpoints that pass
+        // the runtime CPU/RAM gate, while retaining VP8 as the low-resource and
+        // compatibility fallback. AV1/H.265 and hardware experiments remain opt-in.
         decision.fps = 30;
         decision.bitrateKbps = 8000;
         decision.hardware = false;
         decision.stable = true;
-        decision.reason = "Production Auto uses the validated VP8 path with a 30 FPS interaction ceiling; experimental codecs require explicit opt-in";
+        decision.reason = "Production Auto prefers tuned VP9 on capable endpoints and retains VP8 as the compatibility/low-resource fallback";
 
         return decision;
     }
