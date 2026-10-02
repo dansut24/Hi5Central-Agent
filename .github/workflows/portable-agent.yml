@@ -1,0 +1,96 @@
+name: Portable Agent macOS and Linux
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - feature/portable-macos-linux-agent
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libcurl4-openssl-dev
+      - name: Configure
+        run: |
+          cmake -S Agent/portable_agent -B build/portable-linux -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
+      - name: Build
+        run: cmake --build build/portable-linux
+      - name: Runtime self-test
+        run: |
+          build/portable-linux/Hi5CentralAgent --version
+          build/portable-linux/Hi5CentralAgent --self-test | tee /tmp/hi5-agent-self-test.json
+          python3 - <<'PY'
+          import json
+          with open('/tmp/hi5-agent-self-test.json') as f:
+              data=json.load(f)
+          assert data['platform']=='linux', data
+          assert data['hostname'], data
+          assert data['architecture'], data
+          assert data['memory']['totalBytes'] > 0, data
+          assert data['disk']['totalBytes'] > 0, data
+          PY
+      - name: Package
+        run: |
+          mkdir -p dist/linux/installer/linux
+          cp build/portable-linux/Hi5CentralAgent dist/linux/Hi5CentralAgent
+          cp Agent/portable_agent/installer/linux/install.sh dist/linux/installer/linux/install.sh
+          chmod +x dist/linux/Hi5CentralAgent dist/linux/installer/linux/install.sh
+          tar -C dist/linux -czf dist/Hi5CentralAgent-linux-x64.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-Agent-Linux-x64
+          path: dist/Hi5CentralAgent-linux-x64.tar.gz
+          retention-days: 14
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure universal build
+        run: |
+          cmake -S Agent/portable_agent -B build/portable-macos -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
+      - name: Build
+        run: cmake --build build/portable-macos
+      - name: Runtime self-test
+        run: |
+          build/portable-macos/Hi5CentralAgent --version
+          file build/portable-macos/Hi5CentralAgent
+          build/portable-macos/Hi5CentralAgent --self-test | tee /tmp/hi5-agent-self-test.json
+          python3 - <<'PY'
+          import json
+          with open('/tmp/hi5-agent-self-test.json') as f:
+              data=json.load(f)
+          assert data['platform']=='macos', data
+          assert data['hostname'], data
+          assert data['architecture'], data
+          assert data['memory']['totalBytes'] > 0, data
+          assert data['disk']['totalBytes'] > 0, data
+          PY
+      - name: Ad-hoc sign test binary
+        run: codesign --force --sign - build/portable-macos/Hi5CentralAgent
+      - name: Package
+        run: |
+          mkdir -p dist/macos/installer/macos
+          cp build/portable-macos/Hi5CentralAgent dist/macos/Hi5CentralAgent
+          cp Agent/portable_agent/installer/macos/install.sh dist/macos/installer/macos/install.sh
+          chmod +x dist/macos/Hi5CentralAgent dist/macos/installer/macos/install.sh
+          tar -C dist/macos -czf dist/Hi5CentralAgent-macOS-universal.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-Agent-macOS-universal
+          path: dist/Hi5CentralAgent-macOS-universal.tar.gz
+          retention-days: 14
+          if-no-files-found: error
