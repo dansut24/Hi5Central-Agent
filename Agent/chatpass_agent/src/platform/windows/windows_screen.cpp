@@ -898,14 +898,30 @@ struct DesktopFrameSource::Impl {
         }
 
         const int rowPitch = static_cast<int>(mapped.RowPitch);
-        bgraScratch.resize(static_cast<size_t>(rowPitch) * static_cast<size_t>(height));
-        std::memcpy(bgraScratch.data(), mapped.pData, bgraScratch.size());
-        context->Unmap(staging.Get(), 0);
+        const bool compositeCursor = Hi5CompositeCursorEnabled();
+        if (compositeCursor) {
+            // Software cursor compositing needs a writable BGRA copy. Keep this
+            // compatibility path opt-in; normal sessions render the pointer in
+            // the Viewer and can convert directly from the mapped DXGI surface.
+            bgraScratch.resize(static_cast<size_t>(rowPitch) * static_cast<size_t>(height));
+            std::memcpy(bgraScratch.data(), mapped.pData, bgraScratch.size());
+            context->Unmap(staging.Get(), 0);
 
-        const DisplayInfo d = currentDisplayInfoLocked();
-        compositeCursorBgra(d.x, d.y, width, height, bgraScratch, rowPitch);
-
-        bgraToI420(bgraScratch.data(), rowPitch, width, height, result.frame);
+            const DisplayInfo d = currentDisplayInfoLocked();
+            compositeCursorBgra(d.x, d.y, width, height, bgraScratch, rowPitch);
+            bgraToI420(bgraScratch.data(), rowPitch, width, height, result.frame);
+        } else {
+            try {
+                bgraToI420(
+                    static_cast<const uint8_t*>(mapped.pData),
+                    rowPitch, width, height, result.frame);
+            }
+            catch (...) {
+                context->Unmap(staging.Get(), 0);
+                throw;
+            }
+            context->Unmap(staging.Get(), 0);
+        }
         hasCapturedFrame = true;
 
         if (includeUnchangedFrame) {
