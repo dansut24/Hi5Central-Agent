@@ -9622,22 +9622,69 @@ exit 1
                         }
                     });
 
-                const int negotiationWidth = width > 0
-                    ? width
-                    : (ctx->displayGeometryAtStart.primaryWidth > 0
-                        ? ctx->displayGeometryAtStart.primaryWidth : 1920);
-                const int negotiationHeight = height > 0
-                    ? height
-                    : (ctx->displayGeometryAtStart.primaryHeight > 0
-                        ? ctx->displayGeometryAtStart.primaryHeight : 1080);
+                // For console sessions, negotiate against the monitor geometry reported
+                // by the actual interactive capture worker. GetSystemMetrics() in
+                // the LocalSystem service session can describe the Session-0
+                // desktop (for example 1024x768) rather than the user's monitor.
+                bool normalStreamerPrelaunched = false;
+                int captureWidth = 0;
+                int captureHeight = 0;
+                if (sessionMode == SessionMode::Console && !ctx->loginDesktopMode) {
+                    normalStreamerPrelaunched = LaunchNormalStreamer(*ctx);
+                    if (normalStreamerPrelaunched) {
+                        for (int attempt = 0; attempt < 100; ++attempt) {
+                            const int count = ctx->normalInputPipe.GetMonitorCount();
+                            if (count > 0) {
+                                const int monitorIndex = std::clamp(ctx->displayIndex, 0, count - 1);
+                                const auto monitor = ctx->normalInputPipe.GetMonitorInfo(monitorIndex);
+                                if (monitor.w > 0 && monitor.h > 0) {
+                                    captureWidth = monitor.w;
+                                    captureHeight = monitor.h;
+                                    ctx->lastCaptureMonitorWidth = monitor.w;
+                                    ctx->lastCaptureMonitorHeight = monitor.h;
+                                    LogI("[display-state] phase=pre_sdp_capture_monitor session=" + sessionId +
+                                        " monitor=" + std::to_string(monitorIndex) +
+                                        " geometry=" + std::to_string(monitor.w) + "x" + std::to_string(monitor.h));
+                                    break;
+                                }
+                            }
+                            Sleep(20);
+                        }
+                    }
+                }
+
+                const int negotiationWidth = captureWidth > 0
+                    ? captureWidth
+                    : (width > 0
+                        ? width
+                        : (ctx->displayGeometryAtStart.primaryWidth > 0
+                            ? ctx->displayGeometryAtStart.primaryWidth : 1920));
+                const int negotiationHeight = captureHeight > 0
+                    ? captureHeight
+                    : (height > 0
+                        ? height
+                        : (ctx->displayGeometryAtStart.primaryHeight > 0
+                            ? ctx->displayGeometryAtStart.primaryHeight : 1080));
+                const std::string negotiationGeometrySource =
+                    captureWidth > 0 && captureHeight > 0 ? "capture_monitor" :
+                    (width > 0 && height > 0 ? "configured" : "service_display_fallback");
                 LogI("[codec] media negotiation geometry session=" + sessionId +
                     " display=" + std::to_string(ctx->displayIndex) +
                     " size=" + std::to_string(negotiationWidth) + "x" + std::to_string(negotiationHeight) +
-                    " fps=" + std::to_string(fps));
+                    " fps=" + std::to_string(fps) +
+                    " source=" + negotiationGeometrySource);
 
                 if (!LaunchMediaHost(*ctx, iceServers, negotiationWidth, negotiationHeight, fps, bitrateKbps,
                     requestedCodec, sessionMode == SessionMode::Console)) {
                     LogE("media host startup failed session=" + sessionId);
+                    if (normalStreamerPrelaunched && ctx->normalStopEvent) {
+                        SetEvent(ctx->normalStopEvent);
+                        if (ctx->normalStreamerProcess) {
+                            WaitForSingleObject(ctx->normalStreamerProcess, 1500);
+                            CloseHandle(ctx->normalStreamerProcess);
+                            ctx->normalStreamerProcess = nullptr;
+                        }
+                    }
                     if (ctx->mediaStopEvent) SetEvent(ctx->mediaStopEvent);
                     ctx->mediaControlPipe.Close();
                     if (ctx->mediaEventPipeServer) {
@@ -9669,7 +9716,9 @@ exit 1
 
                 const bool launched = (sessionMode == SessionMode::Backstage)
                     ? LaunchBackstageHost(*ctx)
-                    : (ctx->loginDesktopMode ? LaunchSecureStreamer(*ctx) : LaunchNormalStreamer(*ctx));
+                    : (ctx->loginDesktopMode
+                        ? LaunchSecureStreamer(*ctx)
+                        : (normalStreamerPrelaunched || LaunchNormalStreamer(*ctx)));
 
                 if (!launched) {
                     StopPresenceBanner(sessionId);

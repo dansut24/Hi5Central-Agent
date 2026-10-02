@@ -35,6 +35,8 @@ Require-Literal $h264Mf 'MF_MT_MPEG2_LEVEL' 'Media Foundation H.264 output must 
 Require-Literal $sender 'SDP stable auto offer H264=102 adaptive-native preferred' 'Stable Auto must prefer H.264 only when it can carry the selected desktop natively.'
 Require-Literal $sender 'action=resize_native_in_place' 'H.264 must resize natively in-place when a monitor change fits the negotiated level.'
 Require-Literal $sender 'renegotiation_required=1' 'H.264 must flag monitor changes that exceed the negotiated level instead of oversizing the stream.'
+Require-Literal $service '[display-state] phase=pre_sdp_capture_monitor session=' 'Windows service must read monitor geometry from the interactive capture worker before SDP.'
+Require-Literal $service 'negotiationGeometrySource' 'Media negotiation diagnostics must identify the geometry source.'
 Require-Literal $service '[codec] media negotiation geometry session=' 'Windows service must pass real display geometry into the media host before SDP.'
 Require-Literal $sender 'action=stay_h264_cpu_fallback' 'Negotiated H.264 must fall back to CPU/software H.264 if the zero-copy path fails.'
 Require-Literal $viewer 'packetTotal>=120' 'Desktop Viewer quality loss calculation must require a meaningful RTP sample.'
