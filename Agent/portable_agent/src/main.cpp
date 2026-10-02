@@ -570,6 +570,17 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
+        if (hasArg(argc, argv, "--self-test-command")) {
+            const auto result = hi5::runShellCommand(
+                "printf 'hi5central-command-ok'",
+                10,
+                4096);
+            std::cout << hi5::buildCommandResultJson(
+                "printf 'hi5central-command-ok'",
+                result).dump(2) << std::endl;
+            return result.exitCode == 0 && result.output == "hi5central-command-ok" ? 0 : 1;
+        }
+
         if (hasArg(argc, argv, "--self-test")) {
             const auto memory = hi5::memoryStats();
             const auto disk = hi5::rootDiskStats();
