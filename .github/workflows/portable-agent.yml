@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - feature/portable-macos-linux-agent
+      - feature/portable-websocket-jobs
   pull_request:
 
 permissions:
@@ -20,7 +21,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libcurl4-openssl-dev
+          sudo apt-get install -y ninja-build libcurl4-openssl-dev libssl-dev
       - name: Configure
         run: |
           cmake -S Agent/portable_agent -B build/portable-linux -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
