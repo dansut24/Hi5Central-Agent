@@ -28,6 +28,7 @@ Require-Literal $viewer 'DESKTOP_ADAPTIVE_TIERS' 'Desktop Viewer adaptive native
 Require-Literal $viewer '["video/h264", "video/vp9", "video/vp8"' 'Desktop Viewer must preserve hardware-qualified H.264 first, VP9 second and VP8 fallback.'
 Require-Literal $sender 'ProbeHardwareCodecAvailable("h264", &h264EncoderName)' 'Stable Auto must qualify H.264 hardware before building the SDP offer.'
 Require-Literal $sender 'SDP stable auto offer H264=102 preferred' 'Stable Auto must expose the qualified zero-copy H.264 path to the Viewer.'
+Require-Literal $sender 'action=stay_h264_cpu_fallback' 'Negotiated H.264 must fall back to CPU/software H.264 if the zero-copy path fails.'
 Require-Literal $viewer 'packetTotal>=120' 'Desktop Viewer quality loss calculation must require a meaningful RTP sample.'
 Require-Literal $viewer 'sendDesktopStreamProfile' 'Desktop Viewer live stream-profile control is missing.'
 Require-Literal $viewer 'REMOTE_DESKTOP_JITTER_BUFFER_TARGET_MS = 20' 'Desktop Viewer low-latency jitter-buffer target is missing.'

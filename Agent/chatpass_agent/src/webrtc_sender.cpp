@@ -2740,11 +2740,23 @@ bool WebRtcSender::trySendExternalGpuH264(const SharedGpuFrame& frame, uint64_t 
         m_h264GpuFailed = true;
         m_hwH264Available = false;
         CacheHardwareCodecFailure(g_hwH264Failed, "h264", "gpu path failed: " + why);
-        if (m_autoCodec) {
+        if (m_autoCodec && m_negotiationLocked) {
+            // SDP is already committed to H.264, so changing codec here would
+            // require a new peer connection. Keep the negotiated payload alive
+            // and let media_host read the same shared frame back to I420, then
+            // encode it through the CPU/software H.264 path.
+            m_codecMode = "h264_sw";
+            m_h264Failed = false;
+            m_forceKeyframe = true;
+            LogWarn("[h264-gpu] zero-copy failed after negotiation session=" + m_sessionId +
+                " action=stay_h264_cpu_fallback");
+        } else if (m_autoCodec) {
             m_h264Failed = true;
             selectBestAutoCodec("recovery: GPU H.264 failed");
         } else {
             m_codecMode = "h264_sw";
+            m_h264Failed = false;
+            m_forceKeyframe = true;
         }
         return false;
     };
