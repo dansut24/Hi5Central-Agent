@@ -64,7 +64,9 @@ if(APPLE)
   set(HI5_AOM_STATIC_ARCHIVE "" CACHE FILEPATH "Path to static libaom.a")
   if(NOT HI5_AOM_INCLUDE_DIR OR NOT HI5_AOM_STATIC_ARCHIVE)
     pkg_check_modules(HI5_AOM REQUIRED aom)
-    set(HI5_AOM_INCLUDE_DIR "${HI5_AOM_INCLUDE_DIR}")
+    if(NOT HI5_AOM_INCLUDE_DIR)
+      list(GET HI5_AOM_INCLUDE_DIRS 0 HI5_AOM_INCLUDE_DIR)
+    endif()
     find_file(HI5_AOM_STATIC_ARCHIVE
       NAMES libaom.a
       PATHS ${HI5_AOM_LIBRARY_DIRS}
@@ -75,7 +77,7 @@ if(APPLE)
   if(NOT HI5_VPX_STATIC_ARCHIVE)
     message(FATAL_ERROR "Static libvpx archive is required for the macOS Remote Helper.")
   endif()
-  if(NOT HI5_AOM_INCLUDE_DIR)
+  if(NOT HI5_AOM_INCLUDE_DIR OR NOT EXISTS "${HI5_AOM_INCLUDE_DIR}/aom/aom_encoder.h")
     message(FATAL_ERROR "libaom headers are required for the macOS Remote Helper.")
   endif()
   if(NOT HI5_AOM_STATIC_ARCHIVE)
@@ -152,7 +154,7 @@ if(APPLE)
   target_include_directories(Hi5CentralRemoteHelper PRIVATE
     src
     ${HI5_VPX_INCLUDE_DIRS}
-    ${HI5_AOM_INCLUDE_DIRS}
+    ${HI5_AOM_INCLUDE_DIR}
   )
   target_compile_definitions(Hi5CentralRemoteHelper PRIVATE
     HI5_PLATFORM_MACOS=1
