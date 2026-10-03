@@ -31,27 +31,34 @@ FetchContent_MakeAvailable(nlohmann_json ixwebsocket)
 set(HI5_REMOTE_SOURCES)
 set(HI5_REMOTE_LIBRARIES)
 
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+set(NO_TESTS ON CACHE BOOL "" FORCE)
+set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+set(NO_MEDIA OFF CACHE BOOL "" FORCE)
+set(WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  libdatachannel
+  GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
+  GIT_TAG v0.24.5
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(libdatachannel)
+list(APPEND HI5_REMOTE_LIBRARIES LibDataChannel::LibDataChannelStatic)
+
 if(APPLE)
   enable_language(OBJCXX)
   list(APPEND HI5_REMOTE_SOURCES
-    src/remote_webrtc_stub.cpp
+    src/remote_h264_vt_encoder.mm
+    src/remote_webrtc.cpp
     src/remote_platform_macos.mm
   )
-elseif(UNIX)
-  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-  set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
-  set(NO_TESTS ON CACHE BOOL "" FORCE)
-  set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
-  set(NO_MEDIA OFF CACHE BOOL "" FORCE)
-  set(WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(
-    libdatachannel
-    GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
-    GIT_TAG v0.24.5
-    GIT_SHALLOW TRUE
+  set_source_files_properties(
+    src/remote_h264_vt_encoder.mm
+    src/remote_platform_macos.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
   )
-  FetchContent_MakeAvailable(libdatachannel)
-
+elseif(UNIX)
   pkg_check_modules(VPX REQUIRED IMPORTED_TARGET vpx)
   pkg_check_modules(HI5_X11 REQUIRED IMPORTED_TARGET x11 xext xtst)
 
@@ -61,7 +68,6 @@ elseif(UNIX)
     src/remote_platform_linux.cpp
   )
   list(APPEND HI5_REMOTE_LIBRARIES
-    LibDataChannel::LibDataChannelStatic
     PkgConfig::VPX
     PkgConfig::HI5_X11
   )
@@ -107,8 +113,13 @@ endif()
 if(APPLE)
   target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_MACOS=1)
   target_link_libraries(Hi5CentralAgent PRIVATE
+    "-framework ApplicationServices"
     "-framework Cocoa"
     "-framework CoreGraphics"
+    "-framework CoreMedia"
+    "-framework CoreVideo"
+    "-framework ScreenCaptureKit"
+    "-framework VideoToolbox"
   )
 elseif(UNIX)
   target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_LINUX=1)
