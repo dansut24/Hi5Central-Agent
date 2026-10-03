@@ -1,7 +1,12 @@
 #include "remote_webrtc.h"
 
 #include "remote_platform.h"
+
+#if defined(__APPLE__)
+#include "remote_h264_vt_encoder.h"
+#else
 #include "remote_vp8_encoder.h"
+#endif
 
 #include <rtc/rtc.hpp>
 
@@ -107,7 +112,11 @@ public:
         running_.store(false);
         canSend_.store(false);
         if (streamThread_.joinable()) streamThread_.join();
+#if defined(__APPLE__)
+        h264Encoder_.reset();
+#else
         encoder_.reset();
+#endif
         track_.reset();
         if (pc_) {
             try { pc_->close(); } catch (...) {}
@@ -186,7 +195,11 @@ public:
     void switchMonitor(int index) {
         if (!platform_) return;
         if (platform_->setDisplayIndex(index)) {
+#if defined(__APPLE__)
+            h264Encoder_.reset();
+#else
             encoder_.reset();
+#endif
             forceKeyframe_.store(true);
             sendMonitorInfo();
         }
@@ -205,7 +218,11 @@ private:
         pc_ = std::make_shared<rtc::PeerConnection>(config);
 
         rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
+#if defined(__APPLE__)
+        media.addH264Codec(payloadType_);
+#else
         media.addVP8Codec(payloadType_);
+#endif
         media.addSSRC(ssrc_, "video-stream");
         media.setBitrate(bitrateKbps_ * 1000);
         track_ = pc_->addTrack(media);
@@ -273,6 +290,26 @@ private:
             try {
                 auto captured = platform_->capture();
                 if (captured.hasFrame && captured.frame.width > 0 && captured.frame.height > 0) {
+                    const bool periodicKeyframe = (frameCounter % static_cast<std::uint64_t>(fps_ * 3)) == 0;
+                    const bool force = forceKeyframe_.exchange(false) || periodicKeyframe;
+
+#if defined(__APPLE__)
+                    if (!h264Encoder_ ||
+                        captured.frame.width != encoderWidth_ ||
+                        captured.frame.height != encoderHeight_) {
+                        encoderWidth_ = captured.frame.width;
+                        encoderHeight_ = captured.frame.height;
+                        h264Encoder_ = std::make_unique<H264VideoToolboxEncoder>(
+                            encoderWidth_, encoderHeight_, fps_, bitrateKbps_);
+                        forceKeyframe_.store(true);
+                    }
+
+                    const auto encoded = h264Encoder_->encode(captured.frame, force);
+                    if (!encoded.data.empty()) {
+                        sendH264(encoded);
+                        ++frameCounter;
+                    }
+#else
                     if (!encoder_ ||
                         captured.frame.width != encoderWidth_ ||
                         captured.frame.height != encoderHeight_) {
@@ -284,13 +321,12 @@ private:
                         forceKeyframe_.store(true);
                     }
 
-                    const bool periodicKeyframe = (frameCounter % static_cast<std::uint64_t>(fps_ * 3)) == 0;
-                    const bool force = forceKeyframe_.exchange(false) || periodicKeyframe;
                     const auto encoded = encoder_->encode(captured.frame, force);
                     if (!encoded.data.empty()) {
                         sendVp8(encoded);
                         ++frameCounter;
                     }
+#endif
                 }
             } catch (const std::exception& ex) {
                 sendError("capture_failed", ex.what());
@@ -302,6 +338,121 @@ private:
         }
     }
 
+#if defined(__APPLE__)
+    std::vector<std::vector<std::uint8_t>> splitH264NalUnits(const std::vector<std::uint8_t>& frame) {
+        std::vector<std::vector<std::uint8_t>> nalUnits;
+        if (frame.empty()) return nalUnits;
+
+        auto isStart3 = [&](std::size_t i) {
+            return i + 3 <= frame.size() &&
+                frame[i] == 0 && frame[i + 1] == 0 && frame[i + 2] == 1;
+        };
+        auto isStart4 = [&](std::size_t i) {
+            return i + 4 <= frame.size() &&
+                frame[i] == 0 && frame[i + 1] == 0 &&
+                frame[i + 2] == 0 && frame[i + 3] == 1;
+        };
+
+        std::size_t i = 0;
+        while (i < frame.size()) {
+            while (i < frame.size() && !isStart3(i) && !isStart4(i)) ++i;
+            if (i >= frame.size()) break;
+            const std::size_t startCode = isStart4(i) ? 4 : 3;
+            const std::size_t nalStart = i + startCode;
+            i = nalStart;
+            while (i < frame.size() && !isStart3(i) && !isStart4(i)) ++i;
+            if (i > nalStart) {
+                nalUnits.emplace_back(
+                    frame.begin() + static_cast<std::ptrdiff_t>(nalStart),
+                    frame.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+        }
+        if (nalUnits.empty()) nalUnits.push_back(frame);
+        return nalUnits;
+    }
+
+    void sendH264(const H264EncodedFrame& frame) {
+        if (!canSend_.load() || !track_ || !track_->isOpen()) return;
+
+        const auto nalUnits = splitH264NalUnits(frame.data);
+        constexpr std::size_t maxPayload = 1200;
+        std::lock_guard<std::mutex> lock(sendMutex_);
+
+        for (std::size_t ni = 0; ni < nalUnits.size(); ++ni) {
+            const auto& nal = nalUnits[ni];
+            if (nal.empty()) continue;
+
+            if (nal.size() <= maxPayload) {
+                const bool marker = ni + 1 == nalUnits.size();
+                std::vector<std::uint8_t> packet(12 + nal.size());
+                packet[0] = 0x80;
+                packet[1] = static_cast<std::uint8_t>((marker ? 0x80 : 0x00) | (payloadType_ & 0x7f));
+                packet[2] = static_cast<std::uint8_t>((sequence_ >> 8) & 0xff);
+                packet[3] = static_cast<std::uint8_t>(sequence_ & 0xff);
+                packet[4] = static_cast<std::uint8_t>((frame.rtpTimestamp >> 24) & 0xff);
+                packet[5] = static_cast<std::uint8_t>((frame.rtpTimestamp >> 16) & 0xff);
+                packet[6] = static_cast<std::uint8_t>((frame.rtpTimestamp >> 8) & 0xff);
+                packet[7] = static_cast<std::uint8_t>(frame.rtpTimestamp & 0xff);
+                packet[8] = static_cast<std::uint8_t>((ssrc_ >> 24) & 0xff);
+                packet[9] = static_cast<std::uint8_t>((ssrc_ >> 16) & 0xff);
+                packet[10] = static_cast<std::uint8_t>((ssrc_ >> 8) & 0xff);
+                packet[11] = static_cast<std::uint8_t>(ssrc_ & 0xff);
+                std::copy(nal.begin(), nal.end(), packet.begin() + 12);
+
+                rtc::binary binary;
+                binary.reserve(packet.size());
+                for (const auto byte : packet) binary.push_back(static_cast<std::byte>(byte));
+                track_->send(binary);
+                ++sequence_;
+                continue;
+            }
+
+            const std::uint8_t nalHeader = nal[0];
+            const std::uint8_t fuIndicator =
+                static_cast<std::uint8_t>((nalHeader & 0xe0) | 28);
+            const std::uint8_t nalType = static_cast<std::uint8_t>(nalHeader & 0x1f);
+            std::size_t offset = 1;
+            bool start = true;
+
+            while (offset < nal.size()) {
+                const std::size_t chunk = std::min(maxPayload - 2, nal.size() - offset);
+                const bool end = offset + chunk >= nal.size();
+                const bool marker = end && ni + 1 == nalUnits.size();
+
+                std::vector<std::uint8_t> packet(14 + chunk);
+                packet[0] = 0x80;
+                packet[1] = static_cast<std::uint8_t>((marker ? 0x80 : 0x00) | (payloadType_ & 0x7f));
+                packet[2] = static_cast<std::uint8_t>((sequence_ >> 8) & 0xff);
+                packet[3] = static_cast<std::uint8_t>(sequence_ & 0xff);
+                packet[4] = static_cast<std::uint8_t>((frame.rtpTimestamp >> 24) & 0xff);
+                packet[5] = static_cast<std::uint8_t>((frame.rtpTimestamp >> 16) & 0xff);
+                packet[6] = static_cast<std::uint8_t>((frame.rtpTimestamp >> 8) & 0xff);
+                packet[7] = static_cast<std::uint8_t>(frame.rtpTimestamp & 0xff);
+                packet[8] = static_cast<std::uint8_t>((ssrc_ >> 24) & 0xff);
+                packet[9] = static_cast<std::uint8_t>((ssrc_ >> 16) & 0xff);
+                packet[10] = static_cast<std::uint8_t>((ssrc_ >> 8) & 0xff);
+                packet[11] = static_cast<std::uint8_t>(ssrc_ & 0xff);
+                packet[12] = fuIndicator;
+                packet[13] = static_cast<std::uint8_t>(
+                    (start ? 0x80 : 0x00) |
+                    (end ? 0x40 : 0x00) |
+                    nalType);
+                std::copy(
+                    nal.begin() + static_cast<std::ptrdiff_t>(offset),
+                    nal.begin() + static_cast<std::ptrdiff_t>(offset + chunk),
+                    packet.begin() + 14);
+
+                rtc::binary binary;
+                binary.reserve(packet.size());
+                for (const auto byte : packet) binary.push_back(static_cast<std::byte>(byte));
+                track_->send(binary);
+                ++sequence_;
+                offset += chunk;
+                start = false;
+            }
+        }
+    }
+#else
     void sendVp8(const EncodedFrame& frame) {
         if (!canSend_.load() || !track_ || !track_->isOpen()) return;
 
@@ -344,6 +495,7 @@ private:
             first = false;
         }
     }
+#endif
 
     void sendMonitorInfo() {
         if (!platform_) return;
@@ -393,7 +545,11 @@ private:
     SendFn send_;
 
     std::unique_ptr<RemotePlatform> platform_;
+#if defined(__APPLE__)
+    std::unique_ptr<H264VideoToolboxEncoder> h264Encoder_;
+#else
     std::unique_ptr<Vp8Encoder> encoder_;
+#endif
     int encoderWidth_ = 0;
     int encoderHeight_ = 0;
 
