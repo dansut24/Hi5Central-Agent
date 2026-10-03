@@ -231,7 +231,7 @@ json agentCapabilities() {
         {"execution_contexts", json::array({"user", "root"})},
         {"software_inventory", true},
         {"native_software_actions", true},
-        {"remote_desktop", remoteDesktop.value("available", false)},
+        {"remote_desktop", remoteDesktop.value("implementation_ready", false)},
         {"remote_desktop_capabilities", remoteDesktop}
     };
 }
