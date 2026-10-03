@@ -164,6 +164,12 @@ public:
         if (pid == 0) {
             ::close(listenerFd_);
 
+            // The Agent is a long-lived multi-socket service. Do not leak its
+            // HTTPS/WebSocket/PipeWire/event descriptors into the desktop
+            // helper: libdatachannel must create its own clean ICE sockets.
+            const long maxFd = std::min<long>(sysconf(_SC_OPEN_MAX), 4096);
+            for (int fd = 3; fd < maxFd; ++fd) ::close(fd);
+
             const std::string runtime = "XDG_RUNTIME_DIR=" + user.runtimeDir;
             const std::string bus = "DBUS_SESSION_BUS_ADDRESS=unix:path=" + user.runtimeDir + "/bus";
             const char* runuser = "/usr/sbin/runuser";
