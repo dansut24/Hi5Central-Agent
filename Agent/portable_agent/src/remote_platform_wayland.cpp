@@ -707,9 +707,42 @@ private:
         spa_video_info_raw parsed {};
         if (spa_format_video_raw_parse(param, &parsed) < 0) return;
 
-        std::lock_guard<std::mutex> lock(self->frameMutex_);
-        self->videoInfo_ = parsed;
-        self->videoInfoValid_ = true;
+        {
+            std::lock_guard<std::mutex> lock(self->frameMutex_);
+            self->videoInfo_ = parsed;
+            self->videoInfoValid_ = true;
+        }
+
+        // GNOME/Mutter commonly prefers DMA-BUF for portal screencasts.
+        // The VP8 software encoder needs CPU-addressable pixels, so request a
+        // PipeWire buffer pool backed by MemPtr/MemFd. With MAP_BUFFERS,
+        // MemFd buffers are mapped and spa_data::data becomes readable.
+        if (self->pipeWireStream_ && parsed.size.width > 0 && parsed.size.height > 0) {
+            const int stride = static_cast<int>(parsed.size.width) * 4;
+            const int size = stride * static_cast<int>(parsed.size.height);
+            std::uint8_t bufferBytes[1024];
+            spa_pod_builder builder =
+                SPA_POD_BUILDER_INIT(bufferBytes, sizeof(bufferBytes));
+            const spa_pod* bufferParams[1];
+            bufferParams[0] = static_cast<const spa_pod*>(
+                spa_pod_builder_add_object(
+                    &builder,
+                    SPA_TYPE_OBJECT_ParamBuffers,
+                    SPA_PARAM_Buffers,
+                    SPA_PARAM_BUFFERS_buffers,
+                    SPA_POD_CHOICE_RANGE_Int(8, 2, 16),
+                    SPA_PARAM_BUFFERS_blocks,
+                    SPA_POD_Int(1),
+                    SPA_PARAM_BUFFERS_size,
+                    SPA_POD_Int(size),
+                    SPA_PARAM_BUFFERS_stride,
+                    SPA_POD_Int(stride),
+                    SPA_PARAM_BUFFERS_dataType,
+                    SPA_POD_CHOICE_FLAGS_Int(
+                        (1 << SPA_DATA_MemPtr) |
+                        (1 << SPA_DATA_MemFd))));
+            pw_stream_update_params(self->pipeWireStream_, bufferParams, 1);
+        }
     }
 
     static void onPipeWireProcess(void* data) {
