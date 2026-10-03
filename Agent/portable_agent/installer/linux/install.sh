@@ -12,6 +12,7 @@ BINARY="$INSTALL_DIR/Hi5CentralAgent"
 REMOTE_HELPER="$INSTALL_DIR/Hi5CentralRemoteHelper"
 STATE_FILE="$STATE_DIR/agent.json"
 BACKUP_BINARY="$INSTALL_DIR/Hi5CentralAgent.previous"
+BACKUP_HELPER="$INSTALL_DIR/Hi5CentralRemoteHelper.previous"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,10 +29,6 @@ fi
 
 if [[ ! -x "$SOURCE_DIR/Hi5CentralAgent" ]]; then
   echo "Hi5CentralAgent binary not found beside this installer." >&2
-  exit 1
-fi
-if [[ ! -x "$SOURCE_DIR/Hi5CentralRemoteHelper" ]]; then
-  echo "Hi5CentralRemoteHelper binary not found beside this installer." >&2
   exit 1
 fi
 if [[ ! -x "$SOURCE_DIR/Hi5CentralRemoteHelper" ]]; then
@@ -58,9 +55,9 @@ if [[ -x "$BINARY" ]]; then
   cp -f "$BINARY" "$BACKUP_BINARY"
   chmod 0755 "$BACKUP_BINARY"
 fi
-if [[ -x "$HELPER" ]]; then
+if [[ -x "$REMOTE_HELPER" ]]; then
   HAD_EXISTING_HELPER=true
-  cp -f "$HELPER" "$BACKUP_HELPER"
+  cp -f "$REMOTE_HELPER" "$BACKUP_HELPER"
   chmod 0755 "$BACKUP_HELPER"
 fi
 
@@ -70,7 +67,6 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
 fi
 
 install -m 0755 "$SOURCE_DIR/Hi5CentralAgent" "$BINARY"
-install -m 0755 "$SOURCE_DIR/Hi5CentralRemoteHelper" "$HELPER"
 install -m 0755 "$SOURCE_DIR/Hi5CentralRemoteHelper" "$REMOTE_HELPER"
 
 if [[ -s "$STATE_FILE" ]]; then
@@ -82,7 +78,9 @@ else
       install -m 0755 "$BACKUP_BINARY" "$BINARY"
     fi
     if [[ "$HAD_EXISTING_HELPER" == true && -x "$BACKUP_HELPER" ]]; then
-      install -m 0755 "$BACKUP_HELPER" "$HELPER"
+      install -m 0755 "$BACKUP_HELPER" "$REMOTE_HELPER"
+    else
+      rm -f "$REMOTE_HELPER"
     fi
     exit 2
   fi
@@ -94,7 +92,7 @@ else
       echo "Restoring previous Agent binary..." >&2
       install -m 0755 "$BACKUP_BINARY" "$BINARY"
       if [[ "$HAD_EXISTING_HELPER" == true && -x "$BACKUP_HELPER" ]]; then
-        install -m 0755 "$BACKUP_HELPER" "$HELPER"
+        install -m 0755 "$BACKUP_HELPER" "$REMOTE_HELPER"
       fi
     fi
     exit 1
@@ -140,7 +138,7 @@ if command -v systemd-analyze >/dev/null 2>&1; then
       echo "Restoring previous Agent binary and service..." >&2
       install -m 0755 "$BACKUP_BINARY" "$BINARY"
       if [[ "$HAD_EXISTING_HELPER" == true && -x "$BACKUP_HELPER" ]]; then
-        install -m 0755 "$BACKUP_HELPER" "$HELPER"
+        install -m 0755 "$BACKUP_HELPER" "$REMOTE_HELPER"
       fi
       systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -164,7 +162,9 @@ if ! systemctl restart "$SERVICE_NAME"; then
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     install -m 0755 "$BACKUP_BINARY" "$BINARY"
     if [[ "$HAD_EXISTING_HELPER" == true && -x "$BACKUP_HELPER" ]]; then
-      install -m 0755 "$BACKUP_HELPER" "$HELPER"
+      install -m 0755 "$BACKUP_HELPER" "$REMOTE_HELPER"
+    else
+      rm -f "$REMOTE_HELPER"
     fi
     systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
@@ -182,7 +182,9 @@ if ! systemctl is-active --quiet "$SERVICE_NAME"; then
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     install -m 0755 "$BACKUP_BINARY" "$BINARY"
     if [[ "$HAD_EXISTING_HELPER" == true && -x "$BACKUP_HELPER" ]]; then
-      install -m 0755 "$BACKUP_HELPER" "$HELPER"
+      install -m 0755 "$BACKUP_HELPER" "$REMOTE_HELPER"
+    else
+      rm -f "$REMOTE_HELPER"
     fi
     systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
