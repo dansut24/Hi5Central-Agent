@@ -114,6 +114,7 @@ add_executable(Hi5CentralAgent
   src/portable_live_tools.cpp
   src/software_inventory.cpp
   src/software_actions.cpp
+  src/os_updates.cpp
   ${HI5_REMOTE_SOURCES}
 )
 
