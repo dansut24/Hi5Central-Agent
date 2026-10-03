@@ -252,7 +252,11 @@ public:
                 return;
             }
             try {
+                std::cerr << "[remote-webrtc] applying remote description type=" << sdpType
+                          << " bytes=" << sdp.size()
+                          << " session=" << sessionId_ << "\n";
                 pc_->setRemoteDescription(rtc::Description(sdp, sdpType));
+                std::cerr << "[remote-webrtc] remote description applied session=" << sessionId_ << "\n";
             } catch (const std::exception& ex) {
                 sendError("answer_failed", ex.what());
             }
@@ -275,6 +279,9 @@ public:
             if (candidate.empty()) return;
             try {
                 pc_->addRemoteCandidate(rtc::Candidate(candidate, mid));
+                std::cerr << "[remote-webrtc] remote candidate accepted mid=" << mid
+                          << " bytes=" << candidate.size()
+                          << " session=" << sessionId_ << "\n";
             } catch (const std::exception& ex) {
                 sendError("candidate_failed", ex.what());
             }
@@ -349,6 +356,7 @@ private:
 #endif
 
         track_->onOpen([this]() {
+            std::cerr << "[remote-webrtc] track open session=" << sessionId_ << "\n";
             canSend_.store(true);
             sendState("connected", {
                 {"backend", platform_ ? platform_->backendName() : "unknown"},
@@ -364,6 +372,8 @@ private:
         });
 
         pc_->onStateChange([this](rtc::PeerConnection::State state) {
+            std::cerr << "[remote-webrtc] peer state=" << static_cast<int>(state)
+                      << " session=" << sessionId_ << "\n";
             if (state == rtc::PeerConnection::State::Disconnected ||
                 state == rtc::PeerConnection::State::Failed ||
                 state == rtc::PeerConnection::State::Closed) {
@@ -374,7 +384,15 @@ private:
             }
         });
 
+        pc_->onGatheringStateChange([this](rtc::PeerConnection::GatheringState state) {
+            std::cerr << "[remote-webrtc] gathering state=" << static_cast<int>(state)
+                      << " session=" << sessionId_ << "\n";
+        });
+
         pc_->onLocalDescription([this](rtc::Description description) {
+            std::cerr << "[remote-webrtc] local description type=" << description.typeString()
+                      << " bytes=" << std::string(description).size()
+                      << " session=" << sessionId_ << "\n";
             json payload = {
                 {"type", "webrtc_offer"},
                 {"session_id", sessionId_},
@@ -385,6 +403,9 @@ private:
         });
 
         pc_->onLocalCandidate([this](rtc::Candidate candidate) {
+            std::cerr << "[remote-webrtc] local candidate mid=" << candidate.mid()
+                      << " bytes=" << std::string(candidate).size()
+                      << " session=" << sessionId_ << "\n";
             send_({
                 {"type", "ice_candidate"},
                 {"session_id", sessionId_},
@@ -394,6 +415,8 @@ private:
             });
         });
 
+        std::cerr << "[remote-webrtc] setLocalDescription session=" << sessionId_
+                  << " ice_servers=" << iceServers_.size() << "\n";
         pc_->setLocalDescription();
     }
 
