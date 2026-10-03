@@ -4,9 +4,11 @@
 
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -90,29 +92,41 @@ struct H264VideoToolboxEncoder::Impl {
 
             CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sampleBuffer);
             if (block) {
-                std::size_t totalLength = 0;
-                char* dataPointer = nullptr;
-                if (CMBlockBufferGetDataPointer(
-                        block, 0, nullptr, &totalLength, &dataPointer) == kCMBlockBufferNoErr &&
-                    dataPointer && totalLength > 4) {
-                    std::size_t offset = 0;
-                    while (offset + 4 <= totalLength) {
-                        const auto* p = reinterpret_cast<const std::uint8_t*>(dataPointer + offset);
-                        const std::uint32_t nalLength =
-                            (static_cast<std::uint32_t>(p[0]) << 24) |
-                            (static_cast<std::uint32_t>(p[1]) << 16) |
-                            (static_cast<std::uint32_t>(p[2]) << 8) |
-                            static_cast<std::uint32_t>(p[3]);
-                        offset += 4;
-                        if (!nalLength || offset + nalLength > totalLength) break;
-                        appendAnnexB(
-                            encoded,
-                            reinterpret_cast<const std::uint8_t*>(dataPointer + offset),
-                            nalLength);
-                        offset += nalLength;
+                const std::size_t totalLength = CMBlockBufferGetDataLength(block);
+                if (totalLength > 4) {
+                    // VideoToolbox does not guarantee that CMBlockBuffer storage
+                    // is contiguous. Copy the AVCC payload first so every encoded
+                    // sample is parsed reliably instead of silently dropping
+                    // non-contiguous frame data.
+                    std::vector<std::uint8_t> avcc(totalLength);
+                    if (CMBlockBufferCopyDataBytes(
+                            block, 0, totalLength, avcc.data()) == kCMBlockBufferNoErr) {
+                        std::size_t offset = 0;
+                        while (offset + 4 <= avcc.size()) {
+                            const auto* p = avcc.data() + offset;
+                            const std::uint32_t nalLength =
+                                (static_cast<std::uint32_t>(p[0]) << 24) |
+                                (static_cast<std::uint32_t>(p[1]) << 16) |
+                                (static_cast<std::uint32_t>(p[2]) << 8) |
+                                static_cast<std::uint32_t>(p[3]);
+                            offset += 4;
+                            if (!nalLength || offset + nalLength > avcc.size()) break;
+                            appendAnnexB(encoded, avcc.data() + offset, nalLength);
+                            offset += nalLength;
+                        }
                     }
                 }
             }
+        }
+
+        static std::atomic<std::uint64_t> encodedFrameCount{0};
+        const auto encodedIndex = ++encodedFrameCount;
+        if (encodedIndex <= 5 || (encodedIndex % 300) == 0 || status != noErr) {
+            NSLog(@"Hi5Central H264 frame=%llu bytes=%zu keyframe=%d status=%d",
+                  static_cast<unsigned long long>(encodedIndex),
+                  encoded.size(),
+                  keyframe ? 1 : 0,
+                  static_cast<int>(status));
         }
 
         {
