@@ -36,6 +36,7 @@ add_executable(Hi5CentralAgent
   src/execution_context.cpp
   src/portable_live_tools.cpp
   src/software_inventory.cpp
+  src/software_actions.cpp
 )
 
 target_include_directories(Hi5CentralAgent PRIVATE src)
