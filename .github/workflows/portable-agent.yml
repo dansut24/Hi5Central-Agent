@@ -113,15 +113,33 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve native OpenSSL
+        run: |
+          if ! brew list openssl@3 >/dev/null 2>&1; then
+            brew install openssl@3
+          fi
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
       - name: Configure native build
         run: |
           cmake -S Agent/portable_agent -B build/portable-macos -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 \
             -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
       - name: Build
         run: cmake --build build/portable-macos
+      - name: Verify self-contained native binaries
+        run: |
+          echo "=== Agent dependencies ==="
+          otool -L build/portable-macos/Hi5CentralAgent
+          echo "=== Remote Helper dependencies ==="
+          otool -L build/portable-macos/Hi5CentralRemoteHelper | tee /tmp/hi5-helper-otool.txt
+          if grep -E '/(opt/homebrew|usr/local)/.*lib(ssl|crypto)' /tmp/hi5-helper-otool.txt; then
+            echo "Remote Helper must not depend on Homebrew OpenSSL dylibs." >&2
+            exit 1
+          fi
       - name: Runtime self-test
         run: |
           bash -n Agent/portable_agent/installer/macos/install.sh
@@ -180,8 +198,8 @@ jobs:
           lipo -create artifacts/arm64/Hi5CentralRemoteHelper artifacts/x86_64/Hi5CentralRemoteHelper -output "dist/macos/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper"
           file dist/macos/Hi5CentralAgent
           file "dist/macos/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper"
-          lipo -verify_arch arm64 x86_64 dist/macos/Hi5CentralAgent
-          lipo -verify_arch arm64 x86_64 "dist/macos/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper"
+          lipo dist/macos/Hi5CentralAgent -verify_arch arm64 x86_64
+          lipo "dist/macos/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper" -verify_arch arm64 x86_64
       - name: Package and sign
         run: |
           cp Agent/portable_agent/installer/macos/remote-helper-Info.plist "dist/macos/Hi5Central Remote Helper.app/Contents/Info.plist"
