@@ -19,7 +19,8 @@ struct CommandResult {
 CommandResult runShellCommand(
     const std::string& command,
     int timeoutSeconds,
-    std::size_t maxOutputBytes = 256 * 1024);
+    std::size_t maxOutputBytes = 256 * 1024,
+    const std::string& runAs = "root");
 
 nlohmann::json buildCommandResultJson(
     const std::string& command,
