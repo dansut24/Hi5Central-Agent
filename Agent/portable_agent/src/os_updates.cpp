@@ -89,7 +89,7 @@ json baseInventory(const std::string& provider) {
 
 #if defined(__linux__)
 
-std::map<std::string, json> linuxPackageClassification() {
+std::map<std::string, json> linuxPackageClassification(const std::string& manager) {
     std::map<std::string, json> result;
     const auto software = softwareInventory();
     if (!software.is_object()) return result;
@@ -98,7 +98,7 @@ std::map<std::string, json> linuxPackageClassification() {
 
     for (const auto& item : components) {
         if (!item.is_object()) continue;
-        if (lower(item.value("package_manager", std::string())) != "apt") continue;
+        if (lower(item.value("package_manager", std::string())) != manager) continue;
         const auto id = trim(item.value("package_id", std::string()));
         if (!id.empty()) result[id] = item;
     }
@@ -116,7 +116,7 @@ std::string aptLookupId(std::string id) {
     return id;
 }
 
-json collectLinuxUpdates(bool refreshMetadata) {
+json collectAptUpdates(bool refreshMetadata) {
     json inventory = baseInventory("apt");
     std::string refreshError;
 
@@ -133,7 +133,7 @@ json collectLinuxUpdates(bool refreshMetadata) {
         }
     }
 
-    const auto classification = linuxPackageClassification();
+    const auto classification = linuxPackageClassification("apt");
     const auto listing = runShellCommand(
         "/usr/bin/apt list --upgradable 2>/dev/null",
         120,
@@ -236,6 +236,178 @@ json collectLinuxUpdates(bool refreshMetadata) {
     inventory["security_count"] = securityCount;
     inventory["reboot_required"] = rebootRequired;
     if (!refreshError.empty()) inventory["refresh_error"] = refreshError;
+    return inventory;
+}
+
+std::string dnfBinary() {
+    if (std::filesystem::exists("/usr/bin/dnf")) return "/usr/bin/dnf";
+    if (std::filesystem::exists("/usr/bin/dnf5")) return "/usr/bin/dnf5";
+    return {};
+}
+
+std::pair<std::string, std::string> splitDnfPackageArch(const std::string& value) {
+    static const std::set<std::string> arches = {
+        "x86_64", "i686", "i586", "aarch64", "armv7hl", "ppc64le", "s390x", "noarch"
+    };
+    const auto dot = value.rfind('.');
+    if (dot == std::string::npos) return {value, std::string()};
+    const auto arch = value.substr(dot + 1);
+    if (!arches.count(arch)) return {value, std::string()};
+    return {value.substr(0, dot), arch};
+}
+
+std::map<std::string, std::string> dnfSecuritySeverities(
+    const std::string& dnf,
+    const std::map<std::string, json>& classification) {
+
+    std::map<std::string, std::string> result;
+    const auto advisory = runShellCommand(
+        dnf + " -q updateinfo list --updates --security 2>/dev/null",
+        120,
+        2 * 1024 * 1024,
+        "root");
+    std::istringstream stream(advisory.output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty() || line.rfind("Name", 0) == 0) continue;
+        std::istringstream row(line);
+        std::string advisoryId, type, severity, packageNevra;
+        if (!(row >> advisoryId >> type >> severity >> packageNevra)) continue;
+        if (lower(type) != "security") continue;
+
+        std::string matched;
+        for (const auto& [name, item] : classification) {
+            (void)item;
+            if (packageNevra.rfind(name + "-", 0) == 0 && name.size() > matched.size()) {
+                matched = name;
+            }
+        }
+        if (!matched.empty()) result[matched] = severity.empty() ? "Security" : severity;
+    }
+    return result;
+}
+
+bool dnfRestartLikely(const std::string& packageName) {
+    const auto name = lower(packageName);
+    static const char* prefixes[] = {
+        "kernel", "systemd", "glibc", "linux-firmware", "grub", "shim",
+        "dracut", "dbus", "NetworkManager"
+    };
+    for (const auto* raw : prefixes) {
+        const auto prefix = lower(raw);
+        if (name == prefix || name.rfind(prefix + "-", 0) == 0) return true;
+    }
+    return false;
+}
+
+json collectDnfUpdates(bool refreshMetadata) {
+    const auto dnf = dnfBinary();
+    json inventory = baseInventory("dnf");
+    if (dnf.empty()) {
+        inventory["status"] = "not_supported";
+        inventory["error"] = "DNF is not installed.";
+        return inventory;
+    }
+
+    std::string refreshError;
+    if (refreshMetadata) {
+        const auto refresh = runShellCommand(
+            dnf + " -q makecache --refresh",
+            300,
+            1024 * 1024,
+            "root");
+        if (refresh.exitCode != 0 || refresh.timedOut || !refresh.error.empty()) {
+            refreshError = refresh.error.empty()
+                ? "DNF metadata refresh exited with code " + std::to_string(refresh.exitCode)
+                : refresh.error;
+        }
+    }
+
+    const auto classification = linuxPackageClassification("dnf");
+    const auto securitySeverities = dnfSecuritySeverities(dnf, classification);
+    const auto listing = runShellCommand(
+        dnf + " -q check-upgrade 2>/dev/null",
+        180,
+        4 * 1024 * 1024,
+        "root");
+
+    // DNF deliberately exits 100 when updates are available.
+    if (listing.output.empty() && listing.exitCode != 0 && listing.exitCode != 100) {
+        inventory["status"] = "error";
+        inventory["error"] = listing.error.empty()
+            ? "Unable to enumerate DNF updates."
+            : listing.error;
+        return inventory;
+    }
+
+    json updates = json::array();
+    std::istringstream stream(listing.output);
+    std::string line;
+    int securityCount = 0;
+    bool restartLikely = false;
+
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty() || line == "Upgrades" || line.rfind("Last metadata", 0) == 0) continue;
+
+        std::istringstream row(line);
+        std::string packageArch, availableVersion, repository;
+        if (!(row >> packageArch >> availableVersion >> repository)) continue;
+        const auto [packageName, architecture] = splitDnfPackageArch(packageArch);
+        if (packageName.empty() || !safeLinuxPackageId(packageArch)) continue;
+
+        const auto classIt = classification.find(packageName);
+        if (classIt == classification.end()) continue;
+        const auto& classified = classIt->second;
+        // Desktop/user applications remain in Software Patching.
+        if (!classified.value("system_component", true)) continue;
+
+        const auto severityIt = securitySeverities.find(packageName);
+        const bool security = severityIt != securitySeverities.end();
+        const std::string severity = security
+            ? (severityIt->second.empty() ? "Security" : severityIt->second)
+            : "Normal";
+        const bool packageRestartLikely = dnfRestartLikely(packageName);
+
+        if (security) ++securityCount;
+        restartLikely = restartLikely || packageRestartLikely;
+
+        updates.push_back({
+            {"id", packageArch},
+            {"package", packageName},
+            {"name", packageName},
+            {"title", packageName},
+            {"installed_version", classified.value("version", std::string())},
+            {"available_version", availableVersion},
+            {"architecture", architecture},
+            {"source", repository},
+            {"package_manager", "dnf"},
+            {"security", security},
+            {"severity", severity},
+            {"category", security ? "Security" : "System"},
+            {"reboot_required", packageRestartLikely},
+            {"system_component", true},
+            {"actionable", true}
+        });
+    }
+
+    inventory["updates"] = updates;
+    inventory["pending_count"] = updates.size();
+    inventory["security_count"] = securityCount;
+    inventory["reboot_required"] = restartLikely;
+    if (!refreshError.empty()) inventory["refresh_error"] = refreshError;
+    return inventory;
+}
+
+json collectLinuxUpdates(bool refreshMetadata) {
+    if (!dnfBinary().empty()) return collectDnfUpdates(refreshMetadata);
+    if (std::filesystem::exists("/usr/bin/apt") || std::filesystem::exists("/usr/bin/apt-get")) {
+        return collectAptUpdates(refreshMetadata);
+    }
+    auto inventory = baseInventory("unsupported");
+    inventory["status"] = "not_supported";
+    inventory["error"] = "No supported Linux OS package manager was detected.";
     return inventory;
 }
 
@@ -490,14 +662,33 @@ OsUpdateActionResult installOsUpdates(const json& payload) {
 
     std::string command;
 #if defined(__linux__)
-    command = "DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y --only-upgrade --";
-    for (const auto& id : ids) {
-        if (!safeLinuxPackageId(id)) {
-            out.error = "Unsafe Linux package identity: " + id;
-            out.result = {{"status", "blocked"}, {"reason", "unsafe_package_id"}, {"update_id", id}};
+    const auto provider = lower(before.value("provider", std::string()));
+    if (provider == "dnf") {
+        const auto dnf = dnfBinary();
+        if (dnf.empty()) {
+            out.error = "DNF is no longer available on the endpoint.";
+            out.result = {{"status", "failed"}, {"reason", "provider_unavailable"}};
             return out;
         }
-        command += " " + id;
+        command = dnf + " -y upgrade";
+        for (const auto& id : ids) {
+            if (!safeLinuxPackageId(id)) {
+                out.error = "Unsafe Linux package identity: " + id;
+                out.result = {{"status", "blocked"}, {"reason", "unsafe_package_id"}, {"update_id", id}};
+                return out;
+            }
+            command += " " + id;
+        }
+    } else {
+        command = "DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y --only-upgrade --";
+        for (const auto& id : ids) {
+            if (!safeLinuxPackageId(id)) {
+                out.error = "Unsafe Linux package identity: " + id;
+                out.result = {{"status", "blocked"}, {"reason", "unsafe_package_id"}, {"update_id", id}};
+                return out;
+            }
+            command += " " + id;
+        }
     }
 #elif defined(__APPLE__)
     command = "/usr/sbin/softwareupdate --install";
