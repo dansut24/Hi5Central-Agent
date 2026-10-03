@@ -637,10 +637,6 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
-        if (hasArg(argc, argv, "--remote-helper")) {
-            return hi5::runRemoteDesktopHelper();
-        }
-
         if (hasArg(argc, argv, "--self-test-command")) {
             const auto result = hi5::runShellCommand(
                 "printf 'hi5central-command-ok'",
