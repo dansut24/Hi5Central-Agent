@@ -229,6 +229,10 @@ public:
         return sendLine(helperFd_, writeMutex_, message);
     }
 
+    bool running() const {
+        return running_.load() && helperFd_ >= 0;
+    }
+
     void stop() {
         const bool wasRunning = running_.exchange(false);
         if (wasRunning && helperFd_ >= 0) {
@@ -318,6 +322,22 @@ bool RemoteDesktopManager::handleMessage(const json& message) {
             return true;
         }
 
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto existing = sessions_.find(sessionId);
+            if (existing != sessions_.end()) {
+                if (existing->second && existing->second->running()) {
+                    // The viewer may retry start_webrtc while a Wayland portal
+                    // request or WebRTC negotiation is still in progress. Keep
+                    // the existing user-session helper instead of creating a
+                    // second GNOME portal/PipeWire session for the same ID.
+                    return true;
+                }
+                if (existing->second) existing->second->stop();
+                sessions_.erase(existing);
+            }
+        }
+
         auto session = std::make_unique<RemoteWebRtcSession>(sessionId, send_);
         std::string error;
         if (!session->start(message, error)) {
@@ -331,8 +351,6 @@ bool RemoteDesktopManager::handleMessage(const json& message) {
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
-        auto existing = sessions_.find(sessionId);
-        if (existing != sessions_.end()) existing->second->stop();
         sessions_[sessionId] = std::move(session);
         return true;
     }
