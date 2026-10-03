@@ -8,6 +8,7 @@ on:
       - feature/portable-macos-linux-agent
       - feature/portable-websocket-jobs
       - fix/linux-portable-agent-upgrade
+      - fix/linux-unit-validation-recovery
   pull_request:
 
 permissions:
@@ -31,6 +32,16 @@ jobs:
       - name: Runtime self-test
         run: |
           bash -n Agent/portable_agent/installer/linux/install.sh
+          unit_file="$(mktemp --suffix=.service /tmp/hi5central-agent-ci-XXXXXX)"
+          cat > "$unit_file" <<'EOF'
+          [Unit]
+          Description=Hi5Central Agent CI unit validation
+          [Service]
+          Type=simple
+          ExecStart=/bin/true
+          EOF
+          systemd-analyze verify "$unit_file"
+          rm -f "$unit_file"
           build/portable-linux/Hi5CentralAgent --version
           build/portable-linux/Hi5CentralAgent --self-test-command
           build/portable-linux/Hi5CentralAgent --self-test | tee /tmp/hi5-agent-self-test.json
