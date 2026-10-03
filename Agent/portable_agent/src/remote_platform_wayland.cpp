@@ -836,7 +836,12 @@ private:
         const spa_rectangle defaultSize = SPA_RECTANGLE(1920, 1080);
         const spa_rectangle minSize = SPA_RECTANGLE(1, 1);
         const spa_rectangle maxSize = SPA_RECTANGLE(8192, 8192);
-        const spa_fraction defaultRate = SPA_FRACTION(30, 1);
+        // GNOME/Mutter portal streams commonly advertise a variable
+        // framerate as 0/1 with maxFramerate carrying the supported range.
+        // Requiring framerate >= 1 here makes PipeWire reject an otherwise
+        // compatible BGRx/BGRA stream with "no more input formats".
+        const spa_fraction variableRate = SPA_FRACTION(0, 1);
+        const spa_fraction defaultMaxRate = SPA_FRACTION(30, 1);
         const spa_fraction minRate = SPA_FRACTION(1, 1);
         const spa_fraction maxRate = SPA_FRACTION(60, 1);
 
@@ -864,8 +869,10 @@ private:
                     &minSize,
                     &maxSize),
                 SPA_FORMAT_VIDEO_framerate,
+                SPA_POD_Fraction(&variableRate),
+                SPA_FORMAT_VIDEO_maxFramerate,
                 SPA_POD_CHOICE_RANGE_Fraction(
-                    &defaultRate,
+                    &defaultMaxRate,
                     &minRate,
                     &maxRate)));
 
