@@ -19,7 +19,9 @@ struct Vp8Encoder::Impl {
 
     vpx_codec_ctx_t codec{};
     vpx_codec_enc_cfg_t cfg{};
+    vpx_image_t image{};
     bool initialized = false;
+    bool imageAllocated = false;
     uint64_t frameCount = 0;
     uint64_t nextPts = 0;
 
@@ -79,9 +81,24 @@ struct Vp8Encoder::Impl {
         cfg.g_error_resilient = 1;
 #endif
 
-        if (vpx_codec_enc_init(&codec, vpx_codec_vp8_cx(), &cfg, 0) != VPX_CODEC_OK) {
-            throw std::runtime_error("vpx_codec_enc_init failed");
+        const auto initResult =
+            vpx_codec_enc_init(&codec, vpx_codec_vp8_cx(), &cfg, 0);
+        if (initResult != VPX_CODEC_OK) {
+            throw std::runtime_error(
+                std::string("vpx_codec_enc_init failed: ") +
+                vpx_codec_err_to_string(initResult));
         }
+
+        if (!vpx_img_alloc(
+                &image,
+                VPX_IMG_FMT_I420,
+                static_cast<unsigned int>(width),
+                static_cast<unsigned int>(height),
+                32)) {
+            vpx_codec_destroy(&codec);
+            throw std::runtime_error("vpx_img_alloc failed");
+        }
+        imageAllocated = true;
 
         vpx_codec_control(&codec, VP8E_SET_CPUUSED, cpuUsed);
         vpx_codec_control(&codec, VP8E_SET_NOISE_SENSITIVITY, 0);
@@ -90,6 +107,9 @@ struct Vp8Encoder::Impl {
     }
 
     ~Impl() {
+        if (imageAllocated) {
+            vpx_img_free(&image);
+        }
         if (initialized) {
             vpx_codec_destroy(&codec);
         }
@@ -115,29 +135,57 @@ EncodedFrame Vp8Encoder::encode(const I420Frame& frame, bool forceKeyframe) {
     if (!m_impl || frame.width != m_impl->width || frame.height != m_impl->height) {
         throw std::runtime_error("frame size mismatch");
     }
-
-    vpx_image_t img{};
-    if (!vpx_img_wrap(&img, VPX_IMG_FMT_I420,
-        static_cast<unsigned int>(frame.width),
-        static_cast<unsigned int>(frame.height),
-        1,
-        nullptr)) {
-        throw std::runtime_error("vpx_img_wrap failed");
+    if (!m_impl->imageAllocated) {
+        throw std::runtime_error("VP8 image buffer is not initialized");
     }
 
-    img.planes[0] = const_cast<unsigned char*>(frame.y.data());
-    img.planes[1] = const_cast<unsigned char*>(frame.u.data());
-    img.planes[2] = const_cast<unsigned char*>(frame.v.data());
-    img.stride[0] = frame.width;
-    img.stride[1] = (frame.width + 1) / 2;
-    img.stride[2] = (frame.width + 1) / 2;
+    const int chromaWidth = (frame.width + 1) / 2;
+    const int chromaHeight = (frame.height + 1) / 2;
+    const auto requiredY =
+        static_cast<std::size_t>(frame.width) * frame.height;
+    const auto requiredChroma =
+        static_cast<std::size_t>(chromaWidth) * chromaHeight;
+    if (frame.y.size() < requiredY ||
+        frame.u.size() < requiredChroma ||
+        frame.v.size() < requiredChroma) {
+        throw std::runtime_error("I420 frame plane size mismatch");
+    }
+
+    auto& img = m_impl->image;
+    for (int row = 0; row < frame.height; ++row) {
+        std::memcpy(
+            img.planes[0] + static_cast<std::size_t>(row) * img.stride[0],
+            frame.y.data() + static_cast<std::size_t>(row) * frame.width,
+            static_cast<std::size_t>(frame.width));
+    }
+    for (int row = 0; row < chromaHeight; ++row) {
+        std::memcpy(
+            img.planes[1] + static_cast<std::size_t>(row) * img.stride[1],
+            frame.u.data() + static_cast<std::size_t>(row) * chromaWidth,
+            static_cast<std::size_t>(chromaWidth));
+        std::memcpy(
+            img.planes[2] + static_cast<std::size_t>(row) * img.stride[2],
+            frame.v.data() + static_cast<std::size_t>(row) * chromaWidth,
+            static_cast<std::size_t>(chromaWidth));
+    }
 
     const uint64_t frameDuration = 90000 / static_cast<uint64_t>(std::max(1, m_impl->fps));
     const uint64_t pts = m_impl->nextPts;
     const long flags = forceKeyframe ? VPX_EFLAG_FORCE_KF : 0;
 
-    if (vpx_codec_encode(&m_impl->codec, &img, pts, frameDuration, flags, VPX_DL_REALTIME) != VPX_CODEC_OK) {
-        throw std::runtime_error("vpx_codec_encode failed");
+    const auto encodeResult =
+        vpx_codec_encode(&m_impl->codec, &img, pts, frameDuration, flags, VPX_DL_REALTIME);
+    if (encodeResult != VPX_CODEC_OK) {
+        std::string message =
+            std::string("vpx_codec_encode failed: ") +
+            vpx_codec_err_to_string(encodeResult);
+        if (const char* detail = vpx_codec_error_detail(&m_impl->codec);
+            detail && *detail) {
+            message += " (";
+            message += detail;
+            message += ")";
+        }
+        throw std::runtime_error(message);
     }
 
     EncodedFrame out;
