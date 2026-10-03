@@ -380,18 +380,13 @@ HelperResult runHelper(
             ::close(stdinPipe[1]);
         }
 
-        std::string contextError;
-        if (!applyExecutionContext(context, &contextError)) {
-            const std::string message = contextError + "\n";
-            ::write(STDERR_FILENO, message.data(), message.size());
-            _exit(126);
-        }
-
-        std::array<char*, 5> args {
+        std::string contextMode = context.mode.empty() ? "root" : context.mode;
+        std::array<char*, 6> args {
             const_cast<char*>(binary.c_str()),
             const_cast<char*>("--hi5-file-helper"),
             const_cast<char*>(operation.c_str()),
             const_cast<char*>(encodedPayload.c_str()),
+            const_cast<char*>(contextMode.c_str()),
             nullptr
         };
         ::execv(binary.c_str(), args.data());
@@ -1156,13 +1151,26 @@ int PortableLiveTools::runInternalHelper(int argc, char* argv[]) {
         return -1;
     }
 
-    if (argc < 4 || !argv[2] || !argv[3]) {
-        std::cerr << "Missing file helper operation or payload." << std::endl;
+    if (argc < 5 || !argv[2] || !argv[3] || !argv[4]) {
+        std::cerr << "Missing file helper operation, payload or execution context." << std::endl;
         return 2;
     }
 
     const std::string operation = argv[2];
     const std::string payloadText = base64DecodeString(argv[3]);
+    const std::string runAs = argv[4];
+
+    const ExecutionContext context = resolveExecutionContext(runAs);
+    if (!context.valid) {
+        std::cerr << (context.error.empty() ? "Invalid execution context." : context.error) << std::endl;
+        return 126;
+    }
+
+    std::string contextError;
+    if (!applyExecutionContext(context, &contextError)) {
+        std::cerr << contextError << std::endl;
+        return 126;
+    }
     const auto payload = json::parse(payloadText, nullptr, false);
     if (!payload.is_object()) {
         std::cerr << "Invalid file helper payload." << std::endl;
