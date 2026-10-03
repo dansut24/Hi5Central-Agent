@@ -387,6 +387,7 @@ std::vector<std::string> requestedUpdateIds(const json& payload, const json& inv
             for (const auto& item : updates) {
                 if (!item.is_object()) continue;
                 if (securityOnly && !item.value("security", false)) continue;
+                if (!item.value("actionable", true)) continue;
                 const auto id = trim(item.value("id", std::string()));
                 if (!id.empty() && seen.insert(id).second) result.push_back(id);
             }
