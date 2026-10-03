@@ -133,9 +133,9 @@ I420Frame cgImageToI420(CGImageRef image) {
 
     if (!context) return frame;
 
-    // CGImage drawing uses a bottom-left coordinate system by default.
-    CGContextTranslateCTM(context, 0, height);
-    CGContextScaleCTM(context, 1.0, -1.0);
+    // CGWindowListCreateImage already arrives in the row orientation expected
+    // by our raw bitmap buffer. Applying an extra vertical CoreGraphics flip
+    // inverts the WindowServer fallback image on VMware.
     CGContextSetBlendMode(context, kCGBlendModeCopy);
     CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
     CGContextRelease(context);
