@@ -11,6 +11,12 @@ set(HI5CENTRAL_AGENT_VERSION "0.3.0-alpha" CACHE STRING "Hi5Central portable Age
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
+if(APPLE)
+  # The macOS Remote Helper must be self-contained. libdatachannel otherwise
+  # resolves Homebrew's dylibs, which are not present on customer Macs.
+  set(OPENSSL_USE_STATIC_LIBS TRUE CACHE BOOL "" FORCE)
+  find_package(OpenSSL REQUIRED)
+endif()
 
 include(FetchContent)
 FetchContent_Declare(
@@ -28,33 +34,31 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json ixwebsocket)
 
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+set(NO_TESTS ON CACHE BOOL "" FORCE)
+set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+set(NO_MEDIA OFF CACHE BOOL "" FORCE)
+set(WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  libdatachannel
+  GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
+  GIT_TAG v0.24.5
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(libdatachannel)
+
 set(HI5_REMOTE_SOURCES)
 set(HI5_REMOTE_LIBRARIES)
 
 if(APPLE)
   enable_language(OBJCXX)
   list(APPEND HI5_REMOTE_SOURCES
-    src/remote_webrtc_stub.cpp
-    src/remote_platform_macos.mm
+    src/remote_webrtc_parent_macos.cpp
   )
 elseif(UNIX)
-  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-  set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
-  set(NO_TESTS ON CACHE BOOL "" FORCE)
-  set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
-  set(NO_MEDIA OFF CACHE BOOL "" FORCE)
-  set(WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(
-    libdatachannel
-    GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
-    GIT_TAG v0.24.5
-    GIT_SHALLOW TRUE
-  )
-  FetchContent_MakeAvailable(libdatachannel)
-
   pkg_check_modules(VPX REQUIRED IMPORTED_TARGET vpx)
   pkg_check_modules(HI5_X11 REQUIRED IMPORTED_TARGET x11 xext xtst)
-
   list(APPEND HI5_REMOTE_SOURCES
     src/remote_vp8_encoder.cpp
     src/remote_webrtc.cpp
@@ -84,11 +88,9 @@ add_executable(Hi5CentralAgent
 )
 
 target_include_directories(Hi5CentralAgent PRIVATE src)
-
 target_compile_definitions(Hi5CentralAgent PRIVATE
   HI5CENTRAL_AGENT_VERSION="${HI5CENTRAL_AGENT_VERSION}"
 )
-
 target_link_libraries(Hi5CentralAgent PRIVATE
   CURL::libcurl
   nlohmann_json::nlohmann_json
@@ -107,11 +109,47 @@ endif()
 if(APPLE)
   target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_MACOS=1)
   target_link_libraries(Hi5CentralAgent PRIVATE
+    "-framework ApplicationServices"
     "-framework Cocoa"
     "-framework CoreGraphics"
+  )
+
+  add_executable(Hi5CentralRemoteHelper
+    src/remote_helper_main_macos.mm
+    src/remote_h264_vt_encoder.mm
+    src/remote_webrtc.cpp
+    src/remote_platform_macos.mm
+  )
+  target_include_directories(Hi5CentralRemoteHelper PRIVATE src)
+  target_compile_definitions(Hi5CentralRemoteHelper PRIVATE
+    HI5_PLATFORM_MACOS=1
+    HI5CENTRAL_AGENT_VERSION="${HI5CENTRAL_AGENT_VERSION}"
+  )
+  set_source_files_properties(
+    src/remote_helper_main_macos.mm
+    src/remote_h264_vt_encoder.mm
+    src/remote_platform_macos.mm
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+  )
+  target_link_libraries(Hi5CentralRemoteHelper PRIVATE
+    nlohmann_json::nlohmann_json
+    LibDataChannel::LibDataChannelStatic
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
+    "-framework ApplicationServices"
+    "-framework Cocoa"
+    "-framework CoreGraphics"
+    "-framework CoreMedia"
+    "-framework CoreVideo"
+    "-framework ScreenCaptureKit"
+    "-framework VideoToolbox"
   )
 elseif(UNIX)
   target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_LINUX=1)
 endif()
 
 install(TARGETS Hi5CentralAgent RUNTIME DESTINATION bin)
+if(APPLE)
+  install(TARGETS Hi5CentralRemoteHelper RUNTIME DESTINATION bin)
+endif()

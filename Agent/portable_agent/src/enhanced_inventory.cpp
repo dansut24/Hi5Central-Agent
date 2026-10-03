@@ -15,6 +15,11 @@
 #include <vector>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <ApplicationServices/ApplicationServices.h>
+#include <CoreGraphics/CoreGraphics.h>
+#endif
+
 namespace hi5 {
 namespace {
 
@@ -533,29 +538,39 @@ json macSystemProfiler() {
 }
 
 json macRemoteCapabilities() {
+    const bool desktopSession = !activeUser().empty();
+
+    // TCC permissions belong to the per-user Remote Helper, not to the root
+    // LaunchDaemon collecting inventory. The helper performs the authoritative
+    // preflight/request when a remote session is started.
     return {
-        {"available", true},
-        {"implementation_ready", false},
+        {"available", desktopSession},
+        {"implementation_ready", true},
         {"backend", "macos_screencapturekit"},
+        {"codec", "h264_videotoolbox"},
         {"session_type", "aqua"},
-        {"desktop_session", !activeUser().empty()},
-        {"headless", activeUser().empty()},
-        {"management_only", false},
-        {"attended_supported", true},
-        {"unattended_supported", true},
+        {"desktop_session", desktopSession},
+        {"headless", !desktopSession},
+        {"management_only", !desktopSession},
+        {"attended_supported", desktopSession},
+        {"unattended_supported", desktopSession},
+        {"backstage_supported", false},
         {"requires_user_session", true},
         {"requires_user_consent", true},
+        {"permission_owner", "Hi5Central Remote Helper"},
         {"requires_initial_screen_recording_permission", true},
         {"requires_initial_accessibility_permission", true},
         {"screen_capture", {
-            {"available", true},
+            {"available", desktopSession},
             {"provider", "ScreenCaptureKit"},
-            {"permission", "Screen Recording"}
+            {"permission", "Screen Recording"},
+            {"permission_state", "checked_by_user_helper"}
         }},
         {"input_control", {
-            {"available", true},
+            {"available", desktopSession},
             {"provider", "CGEvent/Accessibility"},
-            {"permission", "Accessibility"}
+            {"permission", "Accessibility"},
+            {"permission_state", "checked_by_user_helper"}
         }}
     };
 }
