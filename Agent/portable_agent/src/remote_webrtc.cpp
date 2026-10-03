@@ -527,6 +527,8 @@ private:
 #endif
                 }
             } catch (const std::exception& ex) {
+                std::cerr << "[remote-webrtc] stream exception session="
+                          << sessionId_ << " error=" << ex.what() << "\n";
                 sendError("capture_failed", ex.what());
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             }
