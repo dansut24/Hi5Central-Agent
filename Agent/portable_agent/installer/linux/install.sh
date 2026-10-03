@@ -97,10 +97,14 @@ Restart=always
 RestartSec=5
 User=root
 Group=root
+# The Agent provides authenticated RMM Terminal and Files sessions. Those
+# tools must see the endpoint's real filesystem namespace; systemd's
+# ProtectSystem/ProtectHome/PrivateTmp views would make a root session only
+# partially privileged and hide the signed-in user's home.
 NoNewPrivileges=true
-ProtectSystem=full
-ProtectHome=true
-PrivateTmp=true
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=false
 ReadWritePaths=$STATE_DIR
 
 [Install]
