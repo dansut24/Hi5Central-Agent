@@ -89,15 +89,10 @@ if(APPLE)
 elseif(UNIX)
   pkg_check_modules(VPX REQUIRED IMPORTED_TARGET vpx)
   pkg_check_modules(HI5_X11 REQUIRED IMPORTED_TARGET x11 xext xtst)
+  pkg_check_modules(HI5_GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
+  pkg_check_modules(HI5_PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
   list(APPEND HI5_REMOTE_SOURCES
-    src/remote_vp8_encoder.cpp
-    src/remote_webrtc.cpp
-    src/remote_platform_linux.cpp
-  )
-  list(APPEND HI5_REMOTE_LIBRARIES
-    LibDataChannel::LibDataChannelStatic
-    PkgConfig::VPX
-    PkgConfig::HI5_X11
+    src/remote_webrtc_parent_linux.cpp
   )
 else()
   message(FATAL_ERROR "The portable Agent target currently supports macOS and Linux only.")
@@ -114,6 +109,7 @@ add_executable(Hi5CentralAgent
   src/portable_live_tools.cpp
   src/software_inventory.cpp
   src/software_actions.cpp
+  src/os_updates.cpp
   ${HI5_REMOTE_SOURCES}
 )
 
@@ -184,9 +180,31 @@ if(APPLE)
   )
 elseif(UNIX)
   target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_LINUX=1)
+
+  add_executable(Hi5CentralRemoteHelper
+    src/remote_helper_main_linux.cpp
+    src/remote_vp8_encoder.cpp
+    src/remote_webrtc.cpp
+    src/remote_platform_linux.cpp
+    src/remote_platform_wayland.cpp
+  )
+  target_include_directories(Hi5CentralRemoteHelper PRIVATE src)
+  target_compile_definitions(Hi5CentralRemoteHelper PRIVATE
+    HI5_PLATFORM_LINUX=1
+    HI5CENTRAL_AGENT_VERSION="${HI5CENTRAL_AGENT_VERSION}"
+  )
+  target_link_libraries(Hi5CentralRemoteHelper PRIVATE
+    nlohmann_json::nlohmann_json
+    LibDataChannel::LibDataChannelStatic
+    PkgConfig::VPX
+    PkgConfig::HI5_X11
+    PkgConfig::HI5_GIO
+    PkgConfig::HI5_PIPEWIRE
+    Threads::Threads
+  )
 endif()
 
 install(TARGETS Hi5CentralAgent RUNTIME DESTINATION bin)
-if(APPLE)
+if(APPLE OR UNIX)
   install(TARGETS Hi5CentralRemoteHelper RUNTIME DESTINATION bin)
 endif()

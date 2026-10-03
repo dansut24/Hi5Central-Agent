@@ -33,7 +33,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libcurl4-openssl-dev libssl-dev libvpx-dev libx11-dev libxext-dev libxtst-dev pkg-config
+          sudo apt-get install -y ninja-build libcurl4-openssl-dev libssl-dev libvpx-dev libx11-dev libxext-dev libxtst-dev libglib2.0-dev libpipewire-0.3-dev pkg-config
       - name: Configure
         run: |
           cmake -S Agent/portable_agent -B build/portable-linux -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
@@ -53,6 +53,8 @@ jobs:
           systemd-analyze verify "$unit_file"
           rm -f "$unit_file"
           build/portable-linux/Hi5CentralAgent --version
+          build/portable-linux/Hi5CentralRemoteHelper --help >/dev/null 2>&1 || true
+          test -x build/portable-linux/Hi5CentralRemoteHelper
           build/portable-linux/Hi5CentralAgent --self-test-command
           payload="$(printf '%s' '{"path":"/tmp","home":"/tmp"}' | base64 | tr -d '\n')"
           build/portable-linux/Hi5CentralAgent --hi5-file-helper list "$payload" current | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["ok"] and data["path"]=="/tmp"'
@@ -89,8 +91,9 @@ jobs:
         run: |
           mkdir -p dist/linux/installer/linux
           cp build/portable-linux/Hi5CentralAgent dist/linux/Hi5CentralAgent
+          cp build/portable-linux/Hi5CentralRemoteHelper dist/linux/Hi5CentralRemoteHelper
           cp Agent/portable_agent/installer/linux/install.sh dist/linux/installer/linux/install.sh
-          chmod +x dist/linux/Hi5CentralAgent dist/linux/installer/linux/install.sh
+          chmod +x dist/linux/Hi5CentralAgent dist/linux/Hi5CentralRemoteHelper dist/linux/installer/linux/install.sh
           tar -C dist/linux -czf dist/Hi5CentralAgent-linux-x64.tar.gz .
       - uses: actions/upload-artifact@v4
         with:

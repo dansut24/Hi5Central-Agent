@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -74,6 +75,11 @@ NativePackage packageFromPayload(const json& payload) {
         if (key.rfind("dpkg:", 0) == 0) {
             package.manager = "apt";
             std::string body = key.substr(5);
+            const auto lastColon = body.rfind(':');
+            package.id = lastColon == std::string::npos ? body : body.substr(0, lastColon);
+        } else if (key.rfind("rpm:", 0) == 0) {
+            package.manager = "dnf";
+            std::string body = key.substr(4);
             const auto lastColon = body.rfind(':');
             package.id = lastColon == std::string::npos ? body : body.substr(0, lastColon);
         } else if (key.rfind("snap:", 0) == 0) {
@@ -204,12 +210,17 @@ NativeSoftwareActionResult executePackageAction(
             "software_not_found",
             "The selected package is no longer present in the endpoint inventory.");
     }
+    const bool actionAllowed = update
+        ? currentItem.value("native_update_actionable", currentItem.value("native_actionable", false))
+        : currentItem.value("native_uninstall_actionable", currentItem.value("native_actionable", false));
     if (!currentItem.value("display_in_installed_software", false) ||
-        !currentItem.value("native_actionable", false) ||
+        !actionAllowed ||
         currentItem.value("system_component", true)) {
         return unsupported(
             "protected_system_component",
-            "Hi5Central classified this package as an operating-system component or non-actionable package.");
+            update
+                ? "Hi5Central classified this package as an operating-system component or non-actionable update."
+                : "This package does not expose a dependency-safe native uninstall action.");
     }
     std::string command;
     std::string runAs = "root";
@@ -228,6 +239,16 @@ NativeSoftwareActionResult executePackageAction(
         command = update
             ? "DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y --only-upgrade -- " + package.id
             : "DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get remove -y -- " + package.id;
+    } else if (package.manager == "dnf") {
+        if (!update) {
+            return unsupported(
+                "unsafe_dependency_removal",
+                "DNF uninstall is intentionally disabled until Hi5Central can verify an isolated removal plan.");
+        }
+        const std::string dnf = std::filesystem::exists("/usr/bin/dnf")
+            ? "/usr/bin/dnf"
+            : "/usr/bin/dnf5";
+        command = dnf + " -y upgrade " + package.id;
     } else if (package.manager == "snap") {
         command = update
             ? "/usr/bin/snap refresh " + package.id
@@ -263,9 +284,18 @@ NativeSoftwareActionResult executePackageAction(
 
     const bool installedAfter = packageStillInstalled(package);
     if (update) {
+        const auto after = currentPackageItem(package);
+        if (!after.is_object() || after.value("update_available", false)) {
+            out.result["status"] = "failed";
+            out.result["reason"] = "target_version_not_verified";
+            out.result["still_installed"] = installedAfter;
+            out.error = "Native package manager completed but the target update is still reported as pending.";
+            return out;
+        }
         out.success = true;
         out.result["status"] = "updated";
         out.result["still_installed"] = installedAfter;
+        out.result["installed_version"] = after.value("version", std::string());
         return out;
     }
 

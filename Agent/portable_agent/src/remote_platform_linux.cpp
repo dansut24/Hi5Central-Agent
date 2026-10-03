@@ -29,6 +29,9 @@
 #include <vector>
 
 namespace hi5 {
+
+std::unique_ptr<RemotePlatform> createWaylandPortalRemotePlatform();
+
 namespace {
 
 std::string trim(std::string value) {
@@ -120,10 +123,16 @@ UserSession currentGraphicalSession() {
     UserSession session;
 
     const auto sessionId = runCommand(
-        "loginctl list-sessions --no-legend 2>/dev/null | "
-        "awk '$4==\"seat0\" && $7==\"yes\" {print $1; exit} "
-        "$6==\"active\" && $3!=\"root\" {fallback=$1} "
-        "END {if (fallback) print fallback}' | head -1");
+        "fallback=''; for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do "
+        "active=$(loginctl show-session \"$s\" -p Active --value 2>/dev/null); "
+        "class=$(loginctl show-session \"$s\" -p Class --value 2>/dev/null); "
+        "type=$(loginctl show-session \"$s\" -p Type --value 2>/dev/null); "
+        "seat=$(loginctl show-session \"$s\" -p Seat --value 2>/dev/null); "
+        "if [ \"$active\" = yes ] && [ \"$class\" = user ] && "
+        "{ [ \"$type\" = wayland ] || [ \"$type\" = x11 ]; }; then "
+        "if [ \"$seat\" = seat0 ]; then printf '%s\\n' \"$s\"; exit; fi; "
+        "[ -z \"$fallback\" ] && fallback=\"$s\"; fi; "
+        "done; [ -n \"$fallback\" ] && printf '%s\\n' \"$fallback\"");
     if (sessionId.empty()) return session;
 
     const auto quotedSession = shellQuote(sessionId);
@@ -568,6 +577,10 @@ private:
 } // namespace
 
 std::unique_ptr<RemotePlatform> createRemotePlatform() {
+    const auto session = currentGraphicalSession();
+    if (session.type == "wayland") {
+        return createWaylandPortalRemotePlatform();
+    }
     return std::make_unique<X11RemotePlatform>();
 }
 

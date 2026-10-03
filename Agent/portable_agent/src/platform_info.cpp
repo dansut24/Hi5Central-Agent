@@ -239,7 +239,24 @@ std::string activeUser() {
     if (value == "root" || value == "loginwindow") return {};
     return value;
 #else
-    return runCommand("/usr/bin/who 2>/dev/null | /usr/bin/awk 'NF {print $1; exit}'");
+    // Prefer the active graphical logind session rather than the service user.
+    // This is required on modern GNOME/KDE Wayland systems where the Agent
+    // runs as root under systemd and `who` may otherwise report root/tty.
+    auto value = runCommand(
+        "for s in $(/usr/bin/loginctl list-sessions --no-legend 2>/dev/null | /usr/bin/awk '{print $1}'); do "
+        "active=$(/usr/bin/loginctl show-session \"$s\" -p Active --value 2>/dev/null); "
+        "class=$(/usr/bin/loginctl show-session \"$s\" -p Class --value 2>/dev/null); "
+        "type=$(/usr/bin/loginctl show-session \"$s\" -p Type --value 2>/dev/null); "
+        "seat=$(/usr/bin/loginctl show-session \"$s\" -p Seat --value 2>/dev/null); "
+        "if [ \"$active\" = yes ] && [ \"$class\" = user ] && "
+        "{ [ \"$type\" = wayland ] || [ \"$type\" = x11 ]; }; then "
+        "name=$(/usr/bin/loginctl show-session \"$s\" -p Name --value 2>/dev/null); "
+        "if [ \"$seat\" = seat0 ]; then printf '%s\\n' \"$name\"; exit; fi; "
+        "[ -z \"$fallback\" ] && fallback=\"$name\"; "
+        "fi; done; [ -n \"$fallback\" ] && printf '%s\\n' \"$fallback\"");
+    if (!value.empty() && value != "root") return value;
+    value = runCommand("/usr/bin/who 2>/dev/null | /usr/bin/awk '$1 != \"root\" && NF {print $1; exit}'");
+    return value == "root" ? std::string() : value;
 #endif
 }
 
