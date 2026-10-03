@@ -2,6 +2,8 @@
 
 namespace hi5 {
 
+class RemoteWebRtcSession {};
+
 RemoteDesktopManager::RemoteDesktopManager(SendFn send) : send_(std::move(send)) {}
 RemoteDesktopManager::~RemoteDesktopManager() = default;
 
