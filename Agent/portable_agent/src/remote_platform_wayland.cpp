@@ -18,9 +18,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace hi5 {
@@ -815,11 +817,13 @@ private:
             return false;
         }
 
-        static const pw_stream_events events = {
-            PW_VERSION_STREAM_EVENTS,
-            .param_changed = onPipeWireParamChanged,
-            .process = onPipeWireProcess,
-        };
+        static const pw_stream_events events = [] {
+            pw_stream_events value {};
+            value.version = PW_VERSION_STREAM_EVENTS;
+            value.param_changed = onPipeWireParamChanged;
+            value.process = onPipeWireProcess;
+            return value;
+        }();
         pw_stream_add_listener(
             pipeWireStream_,
             &pipeWireStreamListener_,
