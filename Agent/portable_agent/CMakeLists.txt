@@ -89,6 +89,8 @@ if(APPLE)
 elseif(UNIX)
   pkg_check_modules(VPX REQUIRED IMPORTED_TARGET vpx)
   pkg_check_modules(HI5_X11 REQUIRED IMPORTED_TARGET x11 xext xtst)
+  pkg_check_modules(HI5_GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
+  pkg_check_modules(HI5_PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
   list(APPEND HI5_REMOTE_SOURCES
     src/remote_webrtc_parent_linux.cpp
   )
@@ -184,6 +186,7 @@ elseif(UNIX)
     src/remote_vp8_encoder.cpp
     src/remote_webrtc.cpp
     src/remote_platform_linux.cpp
+    src/remote_platform_wayland.cpp
   )
   target_include_directories(Hi5CentralRemoteHelper PRIVATE src)
   target_compile_definitions(Hi5CentralRemoteHelper PRIVATE
@@ -195,6 +198,8 @@ elseif(UNIX)
     LibDataChannel::LibDataChannelStatic
     PkgConfig::VPX
     PkgConfig::HI5_X11
+    PkgConfig::HI5_GIO
+    PkgConfig::HI5_PIPEWIRE
     Threads::Threads
   )
 endif()
