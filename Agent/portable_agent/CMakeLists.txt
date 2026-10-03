@@ -12,6 +12,9 @@ find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 if(APPLE)
+  # The macOS Remote Helper must be self-contained. libdatachannel otherwise
+  # resolves Homebrew's dylibs, which are not present on customer Macs.
+  set(OPENSSL_USE_STATIC_LIBS TRUE CACHE BOOL "" FORCE)
   find_package(OpenSSL REQUIRED)
 endif()
 
@@ -32,9 +35,6 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json ixwebsocket)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-if(APPLE)
-  set(OPENSSL_USE_STATIC_LIBS ON CACHE BOOL "" FORCE)
-endif()
 set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
 set(NO_TESTS ON CACHE BOOL "" FORCE)
 set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
