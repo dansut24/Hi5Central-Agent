@@ -3,6 +3,7 @@
 #include "platform_info.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -65,6 +66,32 @@ ExecutionContext contextForUser(const std::string& username, const std::string& 
     out.shell = pwd.pw_shell && *pwd.pw_shell ? pwd.pw_shell : "/bin/sh";
 
     int groupCount = 16;
+#if defined(__APPLE__)
+    std::vector<int> nativeGroups(static_cast<std::size_t>(groupCount));
+    int groupsRc = getgrouplist(
+        username.c_str(),
+        static_cast<int>(out.gid),
+        nativeGroups.data(),
+        &groupCount);
+
+    if (groupsRc == -1 && groupCount > 0) {
+        nativeGroups.resize(static_cast<std::size_t>(groupCount));
+        groupsRc = getgrouplist(
+            username.c_str(),
+            static_cast<int>(out.gid),
+            nativeGroups.data(),
+            &groupCount);
+    }
+
+    if (groupsRc >= 0 && groupCount >= 0) {
+        nativeGroups.resize(static_cast<std::size_t>(groupCount));
+        out.groups.clear();
+        out.groups.reserve(nativeGroups.size());
+        for (const int group : nativeGroups) {
+            if (group >= 0) out.groups.push_back(static_cast<gid_t>(group));
+        }
+    }
+#else
     out.groups.resize(static_cast<std::size_t>(groupCount));
     int groupsRc = getgrouplist(
         username.c_str(),
@@ -85,8 +112,10 @@ ExecutionContext contextForUser(const std::string& username, const std::string& 
         out.groups.resize(static_cast<std::size_t>(groupCount));
     } else {
         out.groups.clear();
-        out.groups.push_back(out.gid);
     }
+#endif
+
+    if (out.groups.empty()) out.groups.push_back(out.gid);
 
     if (out.groups.empty()) out.groups.push_back(out.gid);
     out.valid = true;
@@ -105,6 +134,32 @@ std::string defaultRootShell() {
 
 ExecutionContext resolveExecutionContext(const std::string& runAs) {
     const std::string mode = normalizeRunAs(runAs.empty() ? "root" : runAs);
+
+    if (mode == "current") {
+        long size = sysconf(_SC_GETPW_R_SIZE_MAX);
+        if (size < 1024) size = 16384;
+        std::vector<char> buffer(static_cast<std::size_t>(size));
+        struct passwd pwd {};
+        struct passwd* result = nullptr;
+        if (getpwuid_r(geteuid(), &pwd, buffer.data(), buffer.size(), &result) != 0 || !result) {
+            ExecutionContext out;
+            out.mode = "current";
+            out.error = "Could not resolve current process identity.";
+            return out;
+        }
+        ExecutionContext out = contextForUser(pwd.pw_name ? pwd.pw_name : "", "current");
+        out.uid = geteuid();
+        out.gid = getegid();
+        out.groups.clear();
+        int count = getgroups(0, nullptr);
+        if (count > 0) {
+            out.groups.resize(static_cast<std::size_t>(count));
+            if (getgroups(count, out.groups.data()) < 0) out.groups.clear();
+        }
+        if (out.groups.empty()) out.groups.push_back(out.gid);
+        out.valid = true;
+        return out;
+    }
 
     if (mode == "root") {
         ExecutionContext out;
