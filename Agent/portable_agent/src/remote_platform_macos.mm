@@ -211,13 +211,49 @@ bool MacRemotePlatform::start(std::string& error) {
     std::lock_guard<std::mutex> lock(controlMutex_);
 
     if (@available(macOS 12.3, *)) {
-        const bool preflight = CGPreflightScreenCaptureAccess();
-        screenCaptureTrusted_ = preflight || CGRequestScreenCaptureAccess();
+        const bool screenPreflight = CGPreflightScreenCaptureAccess();
 
-        NSDictionary* options = @{
-            (__bridge NSString*)kAXTrustedCheckOptionPrompt: @YES
-        };
-        accessibilityTrusted_ = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+        // Accessibility should be checked silently first. Only ask macOS to
+        // show its privacy UI when the helper is genuinely not trusted.
+        accessibilityTrusted_ = AXIsProcessTrusted();
+        if (!accessibilityTrusted_) {
+            NSDictionary* options = @{
+                (__bridge NSString*)kAXTrustedCheckOptionPrompt: @YES
+            };
+            accessibilityTrusted_ =
+                AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+        }
+
+        // Do not call CGRequestScreenCaptureAccess merely because preflight is
+        // stale. In-place helper upgrades can leave the Settings toggle enabled
+        // while preflight briefly reports false. Probe ScreenCaptureKit itself
+        // first; if the real capture path works, permission is usable.
+        std::string captureError;
+        bool captureReady = loadDisplays(captureError);
+        if (captureReady) {
+            captureReady = startCaptureForIndex(currentDisplayIndex_, captureError);
+        }
+
+        screenCaptureTrusted_ = captureReady;
+
+        if (!captureReady && !screenPreflight) {
+            // Only now ask macOS to surface the permission UI, because the real
+            // ScreenCaptureKit path was actually unavailable.
+            const bool requested = CGRequestScreenCaptureAccess();
+            if (requested) {
+                captureError.clear();
+                captureReady = loadDisplays(captureError);
+                if (captureReady) {
+                    captureReady = startCaptureForIndex(currentDisplayIndex_, captureError);
+                }
+                screenCaptureTrusted_ = captureReady;
+            }
+        }
+
+        NSLog(@"Hi5Central permissions screen_preflight=%d capture_ready=%d accessibility=%d",
+              screenPreflight ? 1 : 0,
+              screenCaptureTrusted_ ? 1 : 0,
+              accessibilityTrusted_ ? 1 : 0);
 
         if (!screenCaptureTrusted_ || !accessibilityTrusted_) {
             std::string missing;
@@ -228,11 +264,12 @@ bool MacRemotePlatform::start(std::string& error) {
             }
             error = "macOS permission required: enable " + missing +
                 " for Hi5Central Remote Helper in System Settings > Privacy & Security, then retry the remote session.";
+            if (!captureError.empty()) {
+                error += " Capture error: " + captureError;
+            }
             return false;
         }
 
-        if (!loadDisplays(error)) return false;
-        if (!startCaptureForIndex(currentDisplayIndex_, error)) return false;
         return true;
     }
 
