@@ -33,6 +33,13 @@ mkdir -p "$INSTALL_DIR" "$LOG_DIR"
 chmod 700 "$INSTALL_DIR"
 
 echo "Preparing Hi5Central Agent..."
+CANDIDATE_VERSION=""
+if ! CANDIDATE_VERSION="$("$SOURCE_DIR/Hi5CentralAgent" --version 2>&1)"; then
+  echo "The candidate Hi5Central Agent binary cannot run on this Mac." >&2
+  echo "$CANDIDATE_VERSION" >&2
+  exit 1
+fi
+echo "Candidate version: $CANDIDATE_VERSION"
 
 if launchctl print "system/$LABEL" >/dev/null 2>&1; then
   echo "Stopping existing Hi5Central Agent service..."
