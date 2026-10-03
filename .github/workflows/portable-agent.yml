@@ -115,18 +115,59 @@ jobs:
       - uses: actions/checkout@v4
       - name: Resolve native codec dependencies
         run: |
-          for formula in openssl@3 libvpx aom; do
+          for formula in openssl@3 libvpx nasm; do
             if ! brew list "$formula" >/dev/null 2>&1; then
               brew install "$formula"
             fi
           done
+
           openssl_prefix="$(brew --prefix openssl@3)"
           vpx_prefix="$(brew --prefix libvpx)"
-          aom_prefix="$(brew --prefix aom)"
           test -f "$vpx_prefix/lib/libvpx.a"
-          test -f "$aom_prefix/lib/libaom.a"
+
+          # Homebrew's AOM bottles include VMAF and target newer macOS.
+          # Build a pinned, static, encoder-only AOM for our 12.3 target.
+          git clone --depth 1 --branch v3.12.1 \
+            https://aomedia.googlesource.com/aom \
+            "$RUNNER_TEMP/aom-src"
+
+          cmake -S "$RUNNER_TEMP/aom-src" -B "$RUNNER_TEMP/aom-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_DOCS=OFF \
+            -DENABLE_EXAMPLES=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_TOOLS=OFF \
+            -DCONFIG_AV1_ENCODER=1 \
+            -DCONFIG_AV1_DECODER=0 \
+            -DCONFIG_TUNE_VMAF=0
+
+          cmake --build "$RUNNER_TEMP/aom-build" --target aom
+          test -f "$RUNNER_TEMP/aom-build/libaom.a"
+          ! nm -u "$RUNNER_TEMP/aom-build/libaom.a" 2>/dev/null | grep -q "_vmaf_" || {
+            echo "Pinned libaom unexpectedly contains VMAF references." >&2
+            exit 1
+          }
+
+          # Feed the source-built archive into the existing pkg-config based CMake.
+          mkdir -p "$RUNNER_TEMP/aom-pkgconfig"
+          cat > "$RUNNER_TEMP/aom-pkgconfig/aom.pc" <<EOF
+          prefix=$RUNNER_TEMP/aom-src
+          exec_prefix=${prefix}
+          libdir=$RUNNER_TEMP/aom-build
+          includedir=$RUNNER_TEMP/aom-src
+
+          Name: aom
+          Description: Alliance for Open Media AV1 codec
+          Version: 3.12.1
+          Libs: -L${libdir} -laom
+          Cflags: -I${includedir}
+          EOF
+
           echo "OPENSSL_ROOT_DIR=$openssl_prefix" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=$vpx_prefix/lib/pkgconfig:$aom_prefix/lib/pkgconfig:$openssl_prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$vpx_prefix/lib/pkgconfig:$RUNNER_TEMP/aom-pkgconfig:$openssl_prefix/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: Configure native build
         run: |
           cmake -S Agent/portable_agent -B build/portable-macos -G Ninja \
