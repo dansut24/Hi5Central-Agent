@@ -650,6 +650,20 @@ int main(int argc, char* argv[]) {
         }
 
         if (hasArg(argc, argv, "--self-test-remote-capture")) {
+#if defined(__APPLE__)
+            // ScreenCaptureKit runs in the signed-in user's Remote Helper, not
+            // in the root LaunchDaemon. Keep the daemon self-test architecture
+            // aware rather than instantiating a GUI/TCC provider here.
+            const auto remote = hi5::remoteDesktopCapabilities();
+            std::cout << json({
+                {"ok", remote.value("implementation_ready", false)},
+                {"backend", remote.value("backend", "none")},
+                {"provider_process", "Hi5Central Remote Helper"},
+                {"requires_user_session", remote.value("requires_user_session", true)},
+                {"requires_user_consent", remote.value("requires_user_consent", true)}
+            }).dump(2) << std::endl;
+            return remote.value("implementation_ready", false) ? 0 : 2;
+#else
             auto provider = hi5::createRemotePlatform();
             std::string error;
             if (!provider || !provider->start(error)) {
@@ -674,17 +688,19 @@ int main(int argc, char* argv[]) {
             hashPlane(captured.frame.u);
             hashPlane(captured.frame.v);
             const auto displays = provider->displays();
+            const auto backend = provider->backendName();
             provider->stop();
 
             std::cout << json({
                 {"ok", captured.hasFrame},
-                {"backend", provider->backendName()},
+                {"backend", backend},
                 {"width", captured.frame.width},
                 {"height", captured.frame.height},
                 {"display_count", displays.size()},
                 {"sample_checksum", checksum}
             }).dump(2) << std::endl;
             return captured.hasFrame && captured.frame.width > 0 && captured.frame.height > 0 ? 0 : 3;
+#endif
         }
 
         if (hasArg(argc, argv, "--self-test")) {
