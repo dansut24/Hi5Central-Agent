@@ -212,7 +212,7 @@ json linuxRemoteCapabilities() {
     const bool libeiInstalled =
         pathExists("/usr/lib/x86_64-linux-gnu/libei.so.1") ||
         pathExists("/usr/lib64/libei.so.1") ||
-        !runCommand("ldconfig -p 2>/dev/null | grep -m1 'libei\.so'").empty();
+        !runCommand("ldconfig -p 2>/dev/null | grep -m1 'libei.so'").empty();
 
     const bool wayland = sessionType == "wayland" || waylandSocket;
     const bool x11 = sessionType == "x11" || (!wayland && x11Socket);
@@ -225,6 +225,7 @@ json linuxRemoteCapabilities() {
 
     return {
         {"available", (waylandReady || x11)},
+        {"implementation_ready", x11},
         {"backend", backend},
         {"session_type", sessionType.empty() ? (wayland ? "wayland" : (x11 ? "x11" : "none")) : sessionType},
         {"desktop_session", graphical},
@@ -534,6 +535,7 @@ json macSystemProfiler() {
 json macRemoteCapabilities() {
     return {
         {"available", true},
+        {"implementation_ready", false},
         {"backend", "macos_screencapturekit"},
         {"session_type", "aqua"},
         {"desktop_session", !activeUser().empty()},

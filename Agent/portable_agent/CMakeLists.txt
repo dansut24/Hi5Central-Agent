@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
+
 project(hi5central_portable_agent LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -9,6 +10,7 @@ set(HI5CENTRAL_AGENT_VERSION "0.3.0-alpha" CACHE STRING "Hi5Central portable Age
 
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -24,8 +26,48 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
   GIT_TAG v12.0.1
 )
-
 FetchContent_MakeAvailable(nlohmann_json ixwebsocket)
+
+set(HI5_REMOTE_SOURCES)
+set(HI5_REMOTE_LIBRARIES)
+
+if(APPLE)
+  enable_language(OBJCXX)
+  list(APPEND HI5_REMOTE_SOURCES
+    src/remote_webrtc_stub.cpp
+    src/remote_platform_macos.mm
+  )
+elseif(UNIX)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+  set(NO_TESTS ON CACHE BOOL "" FORCE)
+  set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+  set(NO_MEDIA OFF CACHE BOOL "" FORCE)
+  set(WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    libdatachannel
+    GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
+    GIT_TAG v0.24.5
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(libdatachannel)
+
+  pkg_check_modules(VPX REQUIRED IMPORTED_TARGET vpx)
+  pkg_check_modules(HI5_X11 REQUIRED IMPORTED_TARGET x11 xext xtst)
+
+  list(APPEND HI5_REMOTE_SOURCES
+    src/remote_vp8_encoder.cpp
+    src/remote_webrtc.cpp
+    src/remote_platform_linux.cpp
+  )
+  list(APPEND HI5_REMOTE_LIBRARIES
+    LibDataChannel::LibDataChannelStatic
+    PkgConfig::VPX
+    PkgConfig::HI5_X11
+  )
+else()
+  message(FATAL_ERROR "The portable Agent target currently supports macOS and Linux only.")
+endif()
 
 add_executable(Hi5CentralAgent
   src/main.cpp
@@ -38,6 +80,7 @@ add_executable(Hi5CentralAgent
   src/portable_live_tools.cpp
   src/software_inventory.cpp
   src/software_actions.cpp
+  ${HI5_REMOTE_SOURCES}
 )
 
 target_include_directories(Hi5CentralAgent PRIVATE src)
@@ -51,6 +94,7 @@ target_link_libraries(Hi5CentralAgent PRIVATE
   nlohmann_json::nlohmann_json
   ixwebsocket::ixwebsocket
   Threads::Threads
+  ${HI5_REMOTE_LIBRARIES}
 )
 
 if(UNIX)
@@ -62,10 +106,12 @@ endif()
 
 if(APPLE)
   target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_MACOS=1)
+  target_link_libraries(Hi5CentralAgent PRIVATE
+    "-framework Cocoa"
+    "-framework CoreGraphics"
+  )
 elseif(UNIX)
   target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_LINUX=1)
-else()
-  message(FATAL_ERROR "The portable Agent target currently supports macOS and Linux only.")
 endif()
 
 install(TARGETS Hi5CentralAgent RUNTIME DESTINATION bin)
