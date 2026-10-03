@@ -115,7 +115,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Resolve native codec dependencies
         run: |
-          for formula in openssl@3 libvpx nasm; do
+          for formula in openssl@3 libvpx; do
             if ! brew list "$formula" >/dev/null 2>&1; then
               brew install "$formula"
             fi
@@ -131,6 +131,13 @@ jobs:
             https://aomedia.googlesource.com/aom \
             "$RUNNER_TEMP/aom-src"
 
+          aom_cpu_args=()
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            # AOM 3.12.1 rejects Homebrew NASM 3.x. The generic x86 target
+            # avoids the external assembler while retaining functional AV1.
+            aom_cpu_args+=("-DAOM_TARGET_CPU=generic")
+          fi
+
           cmake -S "$RUNNER_TEMP/aom-src" -B "$RUNNER_TEMP/aom-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 \
@@ -142,7 +149,8 @@ jobs:
             -DENABLE_TOOLS=OFF \
             -DCONFIG_AV1_ENCODER=1 \
             -DCONFIG_AV1_DECODER=0 \
-            -DCONFIG_TUNE_VMAF=0
+            -DCONFIG_TUNE_VMAF=0 \
+            "${aom_cpu_args[@]}"
 
           cmake --build "$RUNNER_TEMP/aom-build" --target aom
           test -f "$RUNNER_TEMP/aom-build/libaom.a"
@@ -151,23 +159,8 @@ jobs:
             exit 1
           }
 
-          # Feed the source-built archive into the existing pkg-config based CMake.
-          mkdir -p "$RUNNER_TEMP/aom-pkgconfig"
-          cat > "$RUNNER_TEMP/aom-pkgconfig/aom.pc" <<EOF
-          prefix=$RUNNER_TEMP/aom-src
-          exec_prefix=${prefix}
-          libdir=$RUNNER_TEMP/aom-build
-          includedir=$RUNNER_TEMP/aom-src
-
-          Name: aom
-          Description: Alliance for Open Media AV1 codec
-          Version: 3.12.1
-          Libs: -L${libdir} -laom
-          Cflags: -I${includedir}
-          EOF
-
           echo "OPENSSL_ROOT_DIR=$openssl_prefix" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=$vpx_prefix/lib/pkgconfig:$RUNNER_TEMP/aom-pkgconfig:$openssl_prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$vpx_prefix/lib/pkgconfig:$openssl_prefix/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: Configure native build
         run: |
           cmake -S Agent/portable_agent -B build/portable-macos -G Ninja \
@@ -176,6 +169,8 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
             -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
             -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DHI5_AOM_INCLUDE_DIR="$RUNNER_TEMP/aom-src" \
+            -DHI5_AOM_STATIC_ARCHIVE="$RUNNER_TEMP/aom-build/libaom.a" \
             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
       - name: Build
         run: cmake --build build/portable-macos
