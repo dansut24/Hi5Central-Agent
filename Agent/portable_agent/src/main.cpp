@@ -1,5 +1,7 @@
 #include "agent_websocket.h"
 #include "enhanced_inventory.h"
+#include "remote_platform.h"
+#include "remote_webrtc.h"
 #include "http_client.h"
 #include "job_executor.h"
 #include "platform_info.h"
@@ -647,6 +649,44 @@ int main(int argc, char* argv[]) {
             return result.exitCode == 0 && result.output == "hi5central-command-ok" ? 0 : 1;
         }
 
+        if (hasArg(argc, argv, "--self-test-remote-capture")) {
+            auto provider = hi5::createRemotePlatform();
+            std::string error;
+            if (!provider || !provider->start(error)) {
+                std::cout << json({
+                    {"ok", false},
+                    {"backend", provider ? provider->backendName() : "none"},
+                    {"error", error.empty() ? "Remote provider unavailable." : error}
+                }).dump(2) << std::endl;
+                return 2;
+            }
+
+            const auto captured = provider->capture();
+            std::uint64_t checksum = 1469598103934665603ULL;
+            auto hashPlane = [&checksum](const std::vector<std::uint8_t>& plane) {
+                const std::size_t step = std::max<std::size_t>(1, plane.size() / 4096);
+                for (std::size_t i = 0; i < plane.size(); i += step) {
+                    checksum ^= plane[i];
+                    checksum *= 1099511628211ULL;
+                }
+            };
+            hashPlane(captured.frame.y);
+            hashPlane(captured.frame.u);
+            hashPlane(captured.frame.v);
+            const auto displays = provider->displays();
+            provider->stop();
+
+            std::cout << json({
+                {"ok", captured.hasFrame},
+                {"backend", provider->backendName()},
+                {"width", captured.frame.width},
+                {"height", captured.frame.height},
+                {"display_count", displays.size()},
+                {"sample_checksum", checksum}
+            }).dump(2) << std::endl;
+            return captured.hasFrame && captured.frame.width > 0 && captured.frame.height > 0 ? 0 : 3;
+        }
+
         if (hasArg(argc, argv, "--self-test")) {
             const auto memory = hi5::memoryStats();
             const auto disk = hi5::rootDiskStats();
@@ -722,6 +762,10 @@ int main(int argc, char* argv[]) {
             [&websocket](const json& message) {
                 return websocket.sendText(message.dump());
             });
+        hi5::RemoteDesktopManager remoteDesktop(
+            [&websocket](const json& message) {
+                return websocket.sendText(message.dump());
+            });
 
         if (!once) {
             jobWorker = std::thread(
@@ -731,7 +775,7 @@ int main(int argc, char* argv[]) {
 
             websocket.start(
                 websocketUrl(identity),
-                [&jobQueue, &liveTools](const std::string& text) {
+                [&jobQueue, &liveTools, &remoteDesktop](const std::string& text) {
                     const auto message = json::parse(text, nullptr, false);
                     if (!message.is_object()) return;
 
@@ -747,6 +791,8 @@ int main(int argc, char* argv[]) {
                         }
                     } else if (type == "hello_ack") {
                         logLine("INFO", "Agent WebSocket hello acknowledged");
+                    } else if (remoteDesktop.handleMessage(message)) {
+                        logLine("INFO", "Handled remote desktop message type=" + type);
                     } else if (liveTools.handleMessage(message)) {
                         logLine("INFO", "Handled live tool message type=" + type);
                     }
