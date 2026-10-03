@@ -239,7 +239,7 @@ json linuxRemoteCapabilities() {
 
     return {
         {"available", (waylandReady || x11)},
-        {"implementation_ready", x11},
+        {"implementation_ready", waylandReady || x11},
         {"backend", backend},
         {"session_type", sessionType.empty() ? (wayland ? "wayland" : (x11 ? "x11" : "none")) : sessionType},
         {"desktop_session", graphical},
@@ -256,7 +256,7 @@ json linuxRemoteCapabilities() {
         }},
         {"input_control", {
             {"available", wayland ? (waylandReady && (libeiInstalled || portalInstalled)) : x11},
-            {"provider", wayland ? (libeiInstalled ? "xdg-remote-desktop+eis" : "xdg-remote-desktop") : (x11 ? "x11" : "none")},
+            {"provider", wayland ? "xdg-remote-desktop-dbus" : (x11 ? "x11" : "none")},
             {"requires_user_consent", wayland}
         }},
         {"wayland", {
