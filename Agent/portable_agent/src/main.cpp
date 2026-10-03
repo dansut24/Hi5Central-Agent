@@ -3,6 +3,7 @@
 #include "job_executor.h"
 #include "platform_info.h"
 #include "portable_live_tools.h"
+#include "software_inventory.h"
 
 #include <nlohmann/json.hpp>
 
@@ -321,6 +322,7 @@ json buildInventory(const Identity& identity) {
             }
         })},
         {"network", hi5::networkInfo()},
+        {"software", hi5::softwareInventory()},
         {"sessions", {
             {"current_user", user},
             {"active_console_user", user}
@@ -619,6 +621,7 @@ int main(int argc, char* argv[]) {
                     {"totalBytes", disk.totalBytes},
                     {"usedPercent", disk.usedPercent}
                 }},
+                {"software", hi5::softwareInventory()},
                 {"capabilities", agentCapabilities()}
             };
             std::cout << output.dump(2) << std::endl;
