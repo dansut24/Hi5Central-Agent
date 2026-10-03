@@ -8,6 +8,7 @@
 #include "portable_live_tools.h"
 #include "software_inventory.h"
 #include "software_actions.h"
+#include "os_updates.h"
 
 #include <nlohmann/json.hpp>
 
@@ -231,6 +232,8 @@ json agentCapabilities() {
         {"execution_contexts", json::array({"user", "root"})},
         {"software_inventory", true},
         {"native_software_actions", true},
+        {"os_update_inventory", true},
+        {"os_update_actions", true},
         {"remote_desktop", remoteDesktop.value("implementation_ready", false)},
         {"remote_desktop_capabilities", remoteDesktop}
     };
@@ -333,6 +336,7 @@ json buildInventory(const Identity& identity) {
         })},
         {"network", hi5::networkInfo()},
         {"software", hi5::softwareInventory()},
+        {"os_updates", hi5::osUpdateInventory(false)},
         {"sessions", {
             {"current_user", user},
             {"active_console_user", user}
@@ -496,6 +500,59 @@ void executeJob(
             logLine(
                 action.success ? "INFO" : "WARN",
                 "Completed " + jobType + " id=" + jobId +
+                " success=" + (action.success ? "true" : "false"));
+            return;
+        }
+
+        if (jobType == "os.update.scan") {
+            const auto updates = hi5::osUpdateInventory(true);
+            const bool success =
+                updates.is_object() &&
+                updates.value("status", std::string("error")) != "error";
+
+            if (success) {
+                try { postInventory(http, identity); }
+                catch (const std::exception& inventoryError) {
+                    logLine("WARN", std::string("OS update scan completed but inventory refresh failed: ") + inventoryError.what());
+                }
+            }
+
+            postJobResult(
+                http,
+                identity,
+                jobId,
+                success,
+                updates,
+                success ? std::string() : updates.value("error", std::string("OS update scan failed.")));
+
+            logLine(
+                success ? "INFO" : "WARN",
+                "Completed os.update.scan id=" + jobId +
+                " success=" + (success ? "true" : "false"));
+            return;
+        }
+
+        if (jobType == "os.update.install") {
+            const auto action = hi5::installOsUpdates(payload);
+
+            if (action.success) {
+                try { postInventory(http, identity); }
+                catch (const std::exception& inventoryError) {
+                    logLine("WARN", std::string("OS update install completed but inventory refresh failed: ") + inventoryError.what());
+                }
+            }
+
+            postJobResult(
+                http,
+                identity,
+                jobId,
+                action.success,
+                action.result,
+                action.error);
+
+            logLine(
+                action.success ? "INFO" : "WARN",
+                "Completed os.update.install id=" + jobId +
                 " success=" + (action.success ? "true" : "false"));
             return;
         }
