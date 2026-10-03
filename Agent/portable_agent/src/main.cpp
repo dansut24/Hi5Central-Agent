@@ -2,6 +2,7 @@
 #include "http_client.h"
 #include "job_executor.h"
 #include "platform_info.h"
+#include "portable_live_tools.h"
 
 #include <nlohmann/json.hpp>
 
@@ -218,8 +219,9 @@ json agentCapabilities() {
         {"websocket", true},
         {"jobs", true},
         {"custom_command", true},
-        {"terminal", false},
-        {"files", false},
+        {"terminal", true},
+        {"files", true},
+        {"execution_contexts", json::array({"user", "root"})},
         {"remote_desktop", false}
     };
 }
@@ -562,6 +564,9 @@ void pollJobs(
 
 int main(int argc, char* argv[]) {
     try {
+        const int helperResult = hi5::PortableLiveTools::runInternalHelper(argc, argv);
+        if (helperResult >= 0) return helperResult;
+
         std::signal(SIGINT, signalHandler);
         std::signal(SIGTERM, signalHandler);
 
@@ -651,6 +656,11 @@ int main(int argc, char* argv[]) {
         std::thread jobWorker;
 
         hi5::AgentWebSocket websocket;
+        hi5::PortableLiveTools liveTools(
+            [&websocket](const json& message) {
+                return websocket.sendText(message.dump());
+            });
+
         if (!once) {
             jobWorker = std::thread(
                 [&http, &identity, &jobQueue]() {
@@ -659,7 +669,7 @@ int main(int argc, char* argv[]) {
 
             websocket.start(
                 websocketUrl(identity),
-                [&jobQueue](const std::string& text) {
+                [&jobQueue, &liveTools](const std::string& text) {
                     const auto message = json::parse(text, nullptr, false);
                     if (!message.is_object()) return;
 
@@ -675,6 +685,8 @@ int main(int argc, char* argv[]) {
                         }
                     } else if (type == "hello_ack") {
                         logLine("INFO", "Agent WebSocket hello acknowledged");
+                    } else if (liveTools.handleMessage(message)) {
+                        logLine("INFO", "Handled live tool message type=" + type);
                     }
                 },
                 [&websocket, &identity](bool connected, const std::string& detail) {
@@ -741,6 +753,7 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         } while (g_running);
 
+        liveTools.stopAll();
         websocket.stop();
         jobQueue.cv.notify_all();
         if (jobWorker.joinable()) jobWorker.join();
