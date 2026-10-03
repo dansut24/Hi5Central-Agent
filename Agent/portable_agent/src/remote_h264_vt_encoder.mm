@@ -10,7 +10,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
-#include <iterator>
 #include <mutex>
 #include <stdexcept>
 
@@ -173,21 +172,13 @@ struct H264VideoToolboxEncoder::Impl {
     }
     CVPixelBufferRef pixelBufferFromI420(const I420Frame& frame) {
         CVPixelBufferRef pixelBuffer = nullptr;
-        CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(
-            kCFAllocatorDefault,
-            0,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks);
-        CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, kCFNull);
-
         const CVReturn result = CVPixelBufferCreate(
             kCFAllocatorDefault,
             frame.width,
             frame.height,
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            attrs,
+            nullptr,
             &pixelBuffer);
-        CFRelease(attrs);
         if (result != kCVReturnSuccess || !pixelBuffer) return nullptr;
 
         CVPixelBufferLockBaseAddress(pixelBuffer, 0);
