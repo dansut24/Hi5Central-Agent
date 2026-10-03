@@ -425,6 +425,17 @@ json osUpdateInventory(bool refreshMetadata) {
             now - g_cachedAt < kCacheTtl) {
             return g_cachedInventory;
         }
+#if defined(__APPLE__)
+        // Apple Software Update discovery may take minutes on virtual or busy
+        // Macs. Never block normal telemetry/inventory on the first scan.
+        // The central scheduler or technician Scan action populates this cache.
+        if (!refreshMetadata && !g_cachedInventory.is_object()) {
+            auto pending = baseInventory("softwareupdate");
+            pending["status"] = "not_scanned";
+            pending["last_scan_utc"] = nullptr;
+            return pending;
+        }
+#endif
     }
 
     auto inventory = collectPlatformUpdates(refreshMetadata);
