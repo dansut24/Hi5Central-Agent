@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -30,7 +31,15 @@ public:
 
 private:
     struct TerminalSession;
-    struct UploadState;
+    struct UploadState {
+        std::string sessionId;
+        std::string transferId;
+        std::string directory;
+        std::string filename;
+        std::string runAs;
+        std::uint64_t expected = 0;
+        std::vector<unsigned char> bytes;
+    };
 
     void handleTerminalMessage(const nlohmann::json& message);
     void startTerminal(const nlohmann::json& message);
