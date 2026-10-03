@@ -9,6 +9,7 @@ on:
       - feature/portable-websocket-jobs
       - fix/linux-portable-agent-upgrade
       - fix/linux-unit-validation-recovery
+      - feature/unix-terminal-files-user-root
   pull_request:
 
 permissions:
