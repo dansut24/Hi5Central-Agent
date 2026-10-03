@@ -31,6 +31,7 @@ add_executable(Hi5CentralAgent
   src/main.cpp
   src/http_client.cpp
   src/platform_info.cpp
+  src/enhanced_inventory.cpp
   src/agent_websocket.cpp
   src/job_executor.cpp
   src/execution_context.cpp
