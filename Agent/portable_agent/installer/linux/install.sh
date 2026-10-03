@@ -9,8 +9,10 @@ STATE_DIR="/var/lib/hi5central/agent"
 SERVICE_FILE="/etc/systemd/system/hi5central-agent.service"
 SERVICE_NAME="hi5central-agent.service"
 BINARY="$INSTALL_DIR/Hi5CentralAgent"
+REMOTE_HOST="$INSTALL_DIR/Hi5CentralRemoteHost"
 STATE_FILE="$STATE_DIR/agent.json"
 BACKUP_BINARY="$INSTALL_DIR/Hi5CentralAgent.previous"
+BACKUP_REMOTE_HOST="$INSTALL_DIR/Hi5CentralRemoteHost.previous"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -29,6 +31,10 @@ if [[ ! -x "$SOURCE_DIR/Hi5CentralAgent" ]]; then
   echo "Hi5CentralAgent binary not found beside this installer." >&2
   exit 1
 fi
+if [[ ! -x "$SOURCE_DIR/Hi5CentralRemoteHost" ]]; then
+  echo "Hi5CentralRemoteHost binary not found beside this installer." >&2
+  exit 1
+fi
 
 echo "Preparing Hi5Central Agent..."
 CANDIDATE_VERSION=""
@@ -38,6 +44,11 @@ if ! CANDIDATE_VERSION="$("$SOURCE_DIR/Hi5CentralAgent" --version 2>&1)"; then
   exit 1
 fi
 echo "Candidate version: $CANDIDATE_VERSION"
+REMOTE_HOST_VERSION="$("$SOURCE_DIR/Hi5CentralRemoteHost" --version 2>&1 || true)"
+if [[ "$REMOTE_HOST_VERSION" != "$CANDIDATE_VERSION" ]]; then
+  echo "Hi5CentralRemoteHost version does not match the Agent candidate." >&2
+  exit 1
+fi
 
 install -d -m 0755 "$INSTALL_DIR"
 install -d -m 0700 "$STATE_DIR"
@@ -48,6 +59,10 @@ if [[ -x "$BINARY" ]]; then
   cp -f "$BINARY" "$BACKUP_BINARY"
   chmod 0755 "$BACKUP_BINARY"
 fi
+if [[ -x "$REMOTE_HOST" ]]; then
+  cp -f "$REMOTE_HOST" "$BACKUP_REMOTE_HOST"
+  chmod 0755 "$BACKUP_REMOTE_HOST"
+fi
 
 if systemctl is-active --quiet "$SERVICE_NAME"; then
   echo "Stopping existing Hi5Central Agent service..."
@@ -55,6 +70,7 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
 fi
 
 install -m 0755 "$SOURCE_DIR/Hi5CentralAgent" "$BINARY"
+install -m 0755 "$SOURCE_DIR/Hi5CentralRemoteHost" "$REMOTE_HOST"
 
 if [[ -s "$STATE_FILE" ]]; then
   echo "Existing Hi5Central Agent identity found; preserving enrollment."
@@ -63,6 +79,7 @@ else
     echo "--enrollment-token is required for a new installation." >&2
     if [[ "$HAD_EXISTING_BINARY" == true && -x "$BACKUP_BINARY" ]]; then
       install -m 0755 "$BACKUP_BINARY" "$BINARY"
+      if [[ -x "$BACKUP_REMOTE_HOST" ]]; then install -m 0755 "$BACKUP_REMOTE_HOST" "$REMOTE_HOST"; fi
     fi
     exit 2
   fi
@@ -73,6 +90,7 @@ else
     if [[ "$HAD_EXISTING_BINARY" == true && -x "$BACKUP_BINARY" ]]; then
       echo "Restoring previous Agent binary..." >&2
       install -m 0755 "$BACKUP_BINARY" "$BINARY"
+      if [[ -x "$BACKUP_REMOTE_HOST" ]]; then install -m 0755 "$BACKUP_REMOTE_HOST" "$REMOTE_HOST"; fi
     fi
     exit 1
   fi
@@ -114,6 +132,7 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     if [[ "$HAD_EXISTING_BINARY" == true && -x "$BACKUP_BINARY" ]]; then
       echo "Restoring previous Agent binary and service..." >&2
       install -m 0755 "$BACKUP_BINARY" "$BINARY"
+      if [[ -x "$BACKUP_REMOTE_HOST" ]]; then install -m 0755 "$BACKUP_REMOTE_HOST" "$REMOTE_HOST"; fi
       systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
     fi
@@ -135,6 +154,7 @@ if ! systemctl restart "$SERVICE_NAME"; then
     echo "Restoring previous Agent binary..." >&2
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     install -m 0755 "$BACKUP_BINARY" "$BINARY"
+      if [[ -x "$BACKUP_REMOTE_HOST" ]]; then install -m 0755 "$BACKUP_REMOTE_HOST" "$REMOTE_HOST"; fi
     systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
   exit 1
@@ -150,12 +170,13 @@ if ! systemctl is-active --quiet "$SERVICE_NAME"; then
     echo "Restoring previous Agent binary..." >&2
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     install -m 0755 "$BACKUP_BINARY" "$BINARY"
+      if [[ -x "$BACKUP_REMOTE_HOST" ]]; then install -m 0755 "$BACKUP_REMOTE_HOST" "$REMOTE_HOST"; fi
     systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
   exit 1
 fi
 
-rm -f "$BACKUP_BINARY"
+rm -f "$BACKUP_BINARY" "$BACKUP_REMOTE_HOST"
 
 echo
 echo "Hi5Central Agent installed successfully."
