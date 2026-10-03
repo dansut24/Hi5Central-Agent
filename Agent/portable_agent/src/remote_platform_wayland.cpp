@@ -7,7 +7,7 @@
 #include <linux/input-event-codes.h>
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
-#include <spa/param/video/raw.h>
+#include <spa/param/video/raw.h>\n#include <spa/param/buffers.h>
 
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
@@ -22,7 +22,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unistd.h>
+#include <unistd.h>\n#include <sys/mman.h>
 #include <vector>
 
 namespace hi5 {
