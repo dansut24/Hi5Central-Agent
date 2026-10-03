@@ -23,6 +23,13 @@ std::string trim(std::string value) {
     return value.substr(first, last - first + 1);
 }
 
+std::string lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
 std::string runCommand(const std::string& command) {
     std::array<char, 8192> buffer{};
     std::string output;
