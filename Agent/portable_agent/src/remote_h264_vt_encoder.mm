@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 
