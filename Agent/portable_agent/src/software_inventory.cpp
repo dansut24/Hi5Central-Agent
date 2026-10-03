@@ -99,6 +99,21 @@ bool desktopFileVisible(const std::string& path) {
     return application && !hidden && !noDisplay;
 }
 
+std::set<std::string> initialOsPackages() {
+    std::set<std::string> packages;
+    const auto output = runCommand(
+        "(gzip -dc /var/log/installer/initial-status.gz 2>/dev/null || "
+        "cat /var/log/installer/status 2>/dev/null) | "
+        "awk '$1==\"Package:\" {print $2}'");
+    std::istringstream stream(output);
+    std::string package;
+    while (std::getline(stream, package)) {
+        package = trim(package);
+        if (!package.empty()) packages.insert(package);
+    }
+    return packages;
+}
+
 std::set<std::string> visibleDesktopPackageOwners() {
     std::set<std::string> owners;
     const auto output = runCommand(
@@ -163,6 +178,7 @@ bool protectedManagedProduct(const std::string& packageName) {
 }
 void collectDpkg(json& items) {
     const auto desktopOwners = visibleDesktopPackageOwners();
+    const auto initialPackages = initialOsPackages();
     const auto output = runCommand(
         "dpkg-query -W -f='${Package}\\t${Version}\\t${Maintainer}\\t${Installed-Size}\\t${Architecture}\\t${Section}\\t${Priority}\\t${Essential}\\n' 2>/dev/null");
     std::istringstream stream(output);
@@ -177,9 +193,12 @@ void collectDpkg(json& items) {
         const auto section = trim(f[5]);
         const auto priority = trim(f[6]);
         const auto essential = trim(f[7]);
-        const bool visibleApplication = desktopOwners.count(name) > 0;
-        const bool systemComponent = criticalDpkgComponent(name, section, priority, essential);
+        const bool desktopApplication = desktopOwners.count(name) > 0;
+        const bool initialOsComponent = initialPackages.count(name) > 0;
+        const bool criticalComponent = criticalDpkgComponent(name, section, priority, essential);
         const bool protectedProduct = protectedManagedProduct(name);
+        const bool visibleApplication = desktopApplication && !initialOsComponent && !criticalComponent;
+        const bool systemComponent = !visibleApplication;
         items.push_back({
             {"name", name},
             {"version", trim(f[1])},
@@ -196,9 +215,10 @@ void collectDpkg(json& items) {
             {"priority", priority},
             {"essential", lower(essential) == "yes"},
             {"classification", visibleApplication ? "application" : "system_component"},
+            {"classification_reason", initialOsComponent ? "initial_os_install" : (criticalComponent ? "critical_os_component" : (desktopApplication ? "desktop_application" : "non_application_package"))},
             {"display_in_installed_software", visibleApplication},
-            {"system_component", !visibleApplication || systemComponent},
-            {"native_actionable", visibleApplication && !systemComponent && !protectedProduct},
+            {"system_component", systemComponent},
+            {"native_actionable", visibleApplication && !protectedProduct},
             {"update_available", false},
             {"latest_version", ""}
         });
@@ -287,22 +307,30 @@ void applyAptUpdates(json& items) {
 }
 
 json linuxInventory() {
-    json items = json::array();
-    collectDpkg(items);
-    collectSnap(items);
-    collectFlatpak(items);
-    applyAptUpdates(items);
-    sortItems(items);
-    std::size_t visibleApps = 0;
-    std::size_t hiddenComponents = 0;
-    for (const auto& item : items) {
-        if (item.value("display_in_installed_software", false)) ++visibleApps;
-        else ++hiddenComponents;
+    json components = json::array();
+    collectDpkg(components);
+    collectSnap(components);
+    collectFlatpak(components);
+    applyAptUpdates(components);
+    sortItems(components);
+
+    json applications = json::array();
+    for (const auto& item : components) {
+        if (item.value("display_in_installed_software", false)) {
+            applications.push_back(item);
+        }
     }
+
     return {
-        {"status", "collected"}, {"count", items.size()},
-        {"installed_apps", visibleApps}, {"hidden_system_components", hiddenComponents}, {"items", items},
-        {"recently_installed", json::array()}, {"recently_installed_count", 0},
+        {"status", "collected"},
+        {"count", applications.size()},
+        {"installed_apps", applications.size()},
+        {"component_count", components.size()},
+        {"hidden_system_components", components.size() - applications.size()},
+        {"items", applications},
+        {"components", components},
+        {"recently_installed", json::array()},
+        {"recently_installed_count", 0},
         {"providers", {
             {"dpkg", true},
             {"snap", fs::exists("/usr/bin/snap")},
@@ -363,18 +391,26 @@ json macApplications() {
 }
 
 json macInventory() {
-    json items = macApplications();
-    sortItems(items);
-    std::size_t visibleApps = 0;
-    std::size_t hiddenComponents = 0;
-    for (const auto& item : items) {
-        if (item.value("display_in_installed_software", false)) ++visibleApps;
-        else ++hiddenComponents;
+    json components = macApplications();
+    sortItems(components);
+
+    json applications = json::array();
+    for (const auto& item : components) {
+        if (item.value("display_in_installed_software", false)) {
+            applications.push_back(item);
+        }
     }
+
     return {
-        {"status", "collected"}, {"count", items.size()},
-        {"installed_apps", visibleApps}, {"hidden_system_components", hiddenComponents}, {"items", items},
-        {"recently_installed", json::array()}, {"recently_installed_count", 0},
+        {"status", "collected"},
+        {"count", applications.size()},
+        {"installed_apps", applications.size()},
+        {"component_count", components.size()},
+        {"hidden_system_components", components.size() - applications.size()},
+        {"items", applications},
+        {"components", components},
+        {"recently_installed", json::array()},
+        {"recently_installed_count", 0},
         {"providers", {{"applications", true}}}
     };
 }
@@ -388,7 +424,7 @@ json softwareInventory() {
 #elif defined(__linux__)
     return linuxInventory();
 #else
-    return {{"status","unsupported"},{"count",0},{"installed_apps",0},{"hidden_system_components",0},{"items",json::array()}};
+    return {{"status","unsupported"},{"count",0},{"installed_apps",0},{"component_count",0},{"hidden_system_components",0},{"items",json::array()},{"components",json::array()}};
 #endif
 }
 
