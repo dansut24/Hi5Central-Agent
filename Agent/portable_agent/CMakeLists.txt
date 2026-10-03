@@ -33,6 +33,8 @@ add_executable(Hi5CentralAgent
   src/platform_info.cpp
   src/agent_websocket.cpp
   src/job_executor.cpp
+  src/execution_context.cpp
+  src/portable_live_tools.cpp
 )
 
 target_include_directories(Hi5CentralAgent PRIVATE src)
@@ -47,6 +49,13 @@ target_link_libraries(Hi5CentralAgent PRIVATE
   ixwebsocket::ixwebsocket
   Threads::Threads
 )
+
+if(UNIX)
+  find_library(HI5_UTIL_LIBRARY util)
+  if(HI5_UTIL_LIBRARY)
+    target_link_libraries(Hi5CentralAgent PRIVATE ${HI5_UTIL_LIBRARY})
+  endif()
+endif()
 
 if(APPLE)
   target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_MACOS=1)

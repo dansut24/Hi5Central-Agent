@@ -1,4 +1,5 @@
 #include "job_executor.h"
+#include "execution_context.h"
 
 #include <algorithm>
 #include <chrono>
@@ -62,11 +63,18 @@ void drainPipe(
 CommandResult runShellCommand(
     const std::string& command,
     int timeoutSeconds,
-    std::size_t maxOutputBytes) {
+    std::size_t maxOutputBytes,
+    const std::string& runAs) {
 
     CommandResult result;
     if (command.empty()) {
         result.error = "Command is empty";
+        return result;
+    }
+
+    const ExecutionContext context = resolveExecutionContext(runAs);
+    if (!context.valid) {
+        result.error = context.error;
         return result;
     }
 
@@ -94,6 +102,19 @@ CommandResult runShellCommand(
         ::dup2(pipeFds[1], STDERR_FILENO);
         ::close(pipeFds[0]);
         ::close(pipeFds[1]);
+
+        std::string contextError;
+        if (!applyExecutionContext(context, &contextError)) {
+            const std::string message = contextError + "\n";
+            ::write(STDERR_FILENO, message.data(), message.size());
+            _exit(126);
+        }
+
+        ::setenv("HOME", context.home.c_str(), 1);
+        ::setenv("USER", context.username.c_str(), 1);
+        ::setenv("LOGNAME", context.username.c_str(), 1);
+        ::setenv("SHELL", context.shell.c_str(), 1);
+
         ::execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
         _exit(127);
     }
