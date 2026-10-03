@@ -25,6 +25,7 @@
 #include <unordered_set>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #ifndef HI5CENTRAL_AGENT_VERSION
 #define HI5CENTRAL_AGENT_VERSION "0.3.0-alpha"
