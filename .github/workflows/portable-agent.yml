@@ -113,12 +113,54 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Resolve native OpenSSL
+      - name: Resolve native codec dependencies
         run: |
-          if ! brew list openssl@3 >/dev/null 2>&1; then
-            brew install openssl@3
+          for formula in openssl@3 libvpx; do
+            if ! brew list "$formula" >/dev/null 2>&1; then
+              brew install "$formula"
+            fi
+          done
+
+          openssl_prefix="$(brew --prefix openssl@3)"
+          vpx_prefix="$(brew --prefix libvpx)"
+          test -f "$vpx_prefix/lib/libvpx.a"
+
+          # Homebrew's AOM bottles include VMAF and target newer macOS.
+          # Build a pinned, static, encoder-only AOM for our 12.3 target.
+          git clone --depth 1 --branch v3.12.1 \
+            https://aomedia.googlesource.com/aom \
+            "$RUNNER_TEMP/aom-src"
+
+          aom_cpu_args=()
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            # AOM 3.12.1 rejects Homebrew NASM 3.x. The generic x86 target
+            # avoids the external assembler while retaining functional AV1.
+            aom_cpu_args+=("-DAOM_TARGET_CPU=generic")
           fi
-          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+          cmake -S "$RUNNER_TEMP/aom-src" -B "$RUNNER_TEMP/aom-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_DOCS=OFF \
+            -DENABLE_EXAMPLES=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_TOOLS=OFF \
+            -DCONFIG_AV1_ENCODER=1 \
+            -DCONFIG_AV1_DECODER=0 \
+            -DCONFIG_TUNE_VMAF=0 \
+            "${aom_cpu_args[@]}"
+
+          cmake --build "$RUNNER_TEMP/aom-build" --target aom
+          test -f "$RUNNER_TEMP/aom-build/libaom.a"
+          ! nm -u "$RUNNER_TEMP/aom-build/libaom.a" 2>/dev/null | grep -q "_vmaf_" || {
+            echo "Pinned libaom unexpectedly contains VMAF references." >&2
+            exit 1
+          }
+
+          echo "OPENSSL_ROOT_DIR=$openssl_prefix" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$vpx_prefix/lib/pkgconfig:$openssl_prefix/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: Configure native build
         run: |
           cmake -S Agent/portable_agent -B build/portable-macos -G Ninja \
@@ -127,6 +169,8 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
             -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
             -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DHI5_AOM_INCLUDE_DIR="$RUNNER_TEMP/aom-src" \
+            -DHI5_AOM_STATIC_ARCHIVE="$RUNNER_TEMP/aom-build/libaom.a" \
             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
       - name: Build
         run: cmake --build build/portable-macos
@@ -136,8 +180,8 @@ jobs:
           otool -L build/portable-macos/Hi5CentralAgent
           echo "=== Remote Helper dependencies ==="
           otool -L build/portable-macos/Hi5CentralRemoteHelper | tee /tmp/hi5-helper-otool.txt
-          if grep -E '/(opt/homebrew|usr/local)/.*lib(ssl|crypto)' /tmp/hi5-helper-otool.txt; then
-            echo "Remote Helper must not depend on Homebrew OpenSSL dylibs." >&2
+          if grep -E '/(opt/homebrew|usr/local)/.*lib(ssl|crypto|vpx|aom).*\.dylib' /tmp/hi5-helper-otool.txt; then
+            echo "Remote Helper must not depend on Homebrew OpenSSL/VPX/AOM dylibs." >&2
             exit 1
           fi
       - name: Runtime self-test
