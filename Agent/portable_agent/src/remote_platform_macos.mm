@@ -90,6 +90,99 @@ I420Frame bgraToI420(CVPixelBufferRef pixelBuffer) {
     return frame;
 }
 
+bool isLikelyBlackFrame(const I420Frame& frame) {
+    if (frame.y.empty()) return false;
+
+    const std::size_t step = std::max<std::size_t>(1, frame.y.size() / 2048);
+    std::uint64_t sum = 0;
+    std::uint8_t maxY = 0;
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < frame.y.size(); i += step) {
+        const auto y = frame.y[i];
+        sum += y;
+        maxY = std::max(maxY, y);
+        ++count;
+    }
+    if (!count) return false;
+
+    const double average = static_cast<double>(sum) / static_cast<double>(count);
+    return average <= 18.5 && maxY <= 24;
+}
+
+I420Frame cgImageToI420(CGImageRef image) {
+    I420Frame frame;
+    if (!image) return frame;
+
+    const int width = static_cast<int>(CGImageGetWidth(image)) & ~1;
+    const int height = static_cast<int>(CGImageGetHeight(image)) & ~1;
+    if (width < 2 || height < 2) return frame;
+
+    const std::size_t stride = static_cast<std::size_t>(width) * 4;
+    std::vector<std::uint8_t> bgra(stride * static_cast<std::size_t>(height));
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(
+        bgra.data(),
+        static_cast<std::size_t>(width),
+        static_cast<std::size_t>(height),
+        8,
+        stride,
+        colorSpace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(colorSpace);
+
+    if (!context) return frame;
+
+    // CGImage drawing uses a bottom-left coordinate system by default.
+    CGContextTranslateCTM(context, 0, height);
+    CGContextScaleCTM(context, 1.0, -1.0);
+    CGContextSetBlendMode(context, kCGBlendModeCopy);
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+    CGContextRelease(context);
+
+    frame.width = width;
+    frame.height = height;
+    const int chromaWidth = width / 2;
+    const int chromaHeight = height / 2;
+    frame.y.resize(static_cast<std::size_t>(width) * height);
+    frame.u.resize(static_cast<std::size_t>(chromaWidth) * chromaHeight);
+    frame.v.resize(static_cast<std::size_t>(chromaWidth) * chromaHeight);
+
+    for (int y = 0; y < height; y += 2) {
+        for (int x = 0; x < width; x += 2) {
+            int sumR = 0;
+            int sumG = 0;
+            int sumB = 0;
+
+            for (int dy = 0; dy < 2; ++dy) {
+                const auto* row = bgra.data() + static_cast<std::size_t>(y + dy) * stride;
+                for (int dx = 0; dx < 2; ++dx) {
+                    const auto* px = row + static_cast<std::size_t>(x + dx) * 4;
+                    const int b = px[0];
+                    const int g = px[1];
+                    const int r = px[2];
+                    sumR += r;
+                    sumG += g;
+                    sumB += b;
+                    const int yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                    frame.y[static_cast<std::size_t>(y + dy) * width + x + dx] = clampByte(yy);
+                }
+            }
+
+            const int r = sumR / 4;
+            const int g = sumG / 4;
+            const int b = sumB / 4;
+            const int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+            const int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+            const auto ci = static_cast<std::size_t>(y / 2) * chromaWidth + x / 2;
+            frame.u[ci] = clampByte(u);
+            frame.v[ci] = clampByte(v);
+        }
+    }
+
+    return frame;
+}
+
 struct CaptureState {
     std::mutex mutex;
     I420Frame latestFrame;
@@ -187,12 +280,15 @@ public:
     int currentDisplayIndex() const override { return currentDisplayIndex_; }
     bool setDisplayIndex(int index) override;
     bool handleInput(const nlohmann::json& message, std::string& error) override;
-    std::string backendName() const override { return "macos_screencapturekit"; }
+    std::string backendName() const override {
+        return useWindowServerFallback_ ? "macos_windowserver" : "macos_screencapturekit";
+    }
     bool requiresConsent() const override { return true; }
 
 private:
     bool loadDisplays(std::string& error);
     bool startCaptureForIndex(int index, std::string& error);
+    I420Frame captureWindowServerComposite() const;
     void stopStreamOnly();
     CGPoint pointFromMessage(const nlohmann::json& message) const;
 
@@ -204,6 +300,9 @@ private:
     dispatch_queue_t captureQueue_ = nullptr;
     int currentDisplayIndex_ = 0;
     std::uint64_t lastReturnedFrameId_ = 0;
+    std::uint64_t fallbackFrameId_ = 0;
+    int consecutiveBlackFrames_ = 0;
+    bool useWindowServerFallback_ = false;
     bool accessibilityTrusted_ = false;
     bool screenCaptureTrusted_ = false;
 };
@@ -417,16 +516,82 @@ void MacRemotePlatform::stop() {
     }
 }
 
+I420Frame MacRemotePlatform::captureWindowServerComposite() const {
+    if (!displays_ || currentDisplayIndex_ < 0 ||
+        static_cast<NSUInteger>(currentDisplayIndex_) >= displays_.count) {
+        return {};
+    }
+
+    SCDisplay* display = displays_[static_cast<NSUInteger>(currentDisplayIndex_)];
+    const CGRect bounds = CGDisplayBounds(display.displayID);
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    CGImageRef image = CGWindowListCreateImage(
+        bounds,
+        kCGWindowListOptionOnScreenOnly,
+        kCGNullWindowID,
+        kCGWindowImageDefault);
+#pragma clang diagnostic pop
+
+    if (!image) return {};
+
+    I420Frame frame = cgImageToI420(image);
+    CGImageRelease(image);
+    return frame;
+}
+
 FrameCaptureResult MacRemotePlatform::capture() {
     FrameCaptureResult result;
-    std::lock_guard<std::mutex> lock(state_.mutex);
-    if (!state_.hasFrame || state_.frameId == 0) return result;
 
-    result.frame = state_.latestFrame;
+    I420Frame latest;
+    std::uint64_t sourceFrameId = 0;
+    {
+        std::lock_guard<std::mutex> lock(state_.mutex);
+        if (!state_.hasFrame || state_.frameId == 0) return result;
+        latest = state_.latestFrame;
+        sourceFrameId = state_.frameId;
+    }
+
+    const bool screenCaptureBlack = isLikelyBlackFrame(latest);
+    if (screenCaptureBlack) {
+        ++consecutiveBlackFrames_;
+    } else {
+        consecutiveBlackFrames_ = 0;
+    }
+
+    // Some virtual GPU/display implementations (notably VMware SVGA) expose
+    // an online display to ScreenCaptureKit while returning only black pixels.
+    // After repeated genuinely-black frames, try WindowServer's composited
+    // on-screen window surfaces instead of the virtual framebuffer.
+    if (!useWindowServerFallback_ && consecutiveBlackFrames_ >= 3) {
+        I420Frame fallbackProbe = captureWindowServerComposite();
+        if (fallbackProbe.width > 0 && fallbackProbe.height > 0 &&
+            !isLikelyBlackFrame(fallbackProbe)) {
+            useWindowServerFallback_ = true;
+            NSLog(@"Hi5Central switching macOS capture backend to WindowServer compositor vendor=0x%x",
+                  CGDisplayVendorNumber(
+                      displays_[static_cast<NSUInteger>(currentDisplayIndex_)].displayID));
+            latest = std::move(fallbackProbe);
+        }
+    }
+
+    if (useWindowServerFallback_) {
+        I420Frame fallback = captureWindowServerComposite();
+        if (fallback.width > 0 && fallback.height > 0) {
+            result.frame = std::move(fallback);
+            result.hasFrame = true;
+            result.changed = true;
+            result.frameId = ++fallbackFrameId_;
+            return result;
+        }
+    }
+
+    result.frame = std::move(latest);
     result.hasFrame = result.frame.width > 0 && result.frame.height > 0;
-    result.changed = state_.frameId != lastReturnedFrameId_;
-    result.frameId = state_.frameId;
-    lastReturnedFrameId_ = state_.frameId;
+    result.changed = sourceFrameId != lastReturnedFrameId_;
+    result.frameId = sourceFrameId;
+    lastReturnedFrameId_ = sourceFrameId;
     return result;
 }
 
