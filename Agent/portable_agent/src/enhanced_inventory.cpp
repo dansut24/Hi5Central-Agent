@@ -225,6 +225,7 @@ json linuxRemoteCapabilities() {
 
     return {
         {"available", (waylandReady || x11)},
+        {"implementation_ready", x11},
         {"backend", backend},
         {"session_type", sessionType.empty() ? (wayland ? "wayland" : (x11 ? "x11" : "none")) : sessionType},
         {"desktop_session", graphical},
@@ -534,6 +535,7 @@ json macSystemProfiler() {
 json macRemoteCapabilities() {
     return {
         {"available", true},
+        {"implementation_ready", false},
         {"backend", "macos_screencapturekit"},
         {"session_type", "aqua"},
         {"desktop_session", !activeUser().empty()},
