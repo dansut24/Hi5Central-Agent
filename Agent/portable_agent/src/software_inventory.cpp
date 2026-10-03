@@ -4,7 +4,9 @@
 #include <array>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -55,18 +57,122 @@ void sortItems(json& items) {
 }
 
 #if defined(__linux__)
-void collectDpkg(json& items) {
+
+std::string baseSection(std::string section) {
+    section = lower(trim(section));
+    const auto slash = section.rfind('/');
+    if (slash != std::string::npos) section = section.substr(slash + 1);
+    return section;
+}
+
+bool desktopFileVisible(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) return false;
+    bool inDesktopEntry = false;
+    bool application = false;
+    bool hidden = false;
+    bool noDisplay = false;
+    std::string line;
+    while (std::getline(input, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+        if (line.front() == '[' && line.back() == ']') {
+            inDesktopEntry = line == "[Desktop Entry]";
+            continue;
+        }
+        if (!inDesktopEntry) continue;
+        const auto pos = line.find('=');
+        if (pos == std::string::npos) continue;
+        const auto key = trim(line.substr(0, pos));
+        const auto value = lower(trim(line.substr(pos + 1)));
+        if (key == "Type") application = value == "application";
+        else if (key == "Hidden") hidden = value == "true";
+        else if (key == "NoDisplay") noDisplay = value == "true";
+    }
+    return application && !hidden && !noDisplay;
+}
+
+std::set<std::string> visibleDesktopPackageOwners() {
+    std::set<std::string> owners;
     const auto output = runCommand(
-        "dpkg-query -W -f='\${Package}\\t\${Version}\\t\${Maintainer}\\t\${Installed-Size}\\t\${Architecture}\\n' 2>/dev/null");
+        "dpkg-query -S '/usr/share/applications/*' '/usr/local/share/applications/*' 2>/dev/null");
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const auto marker = line.find(": /");
+        if (marker == std::string::npos) continue;
+        const std::string ownerList = line.substr(0, marker);
+        const std::string path = line.substr(marker + 2);
+        if (!desktopFileVisible(path)) continue;
+        std::size_t start = 0;
+        while (start < ownerList.size()) {
+            const auto comma = ownerList.find(',', start);
+            auto owner = trim(ownerList.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+            const auto archColon = owner.rfind(':');
+            if (archColon != std::string::npos) {
+                const auto suffix = owner.substr(archColon + 1);
+                if (suffix == "amd64" || suffix == "i386" || suffix == "arm64" || suffix == "armhf" || suffix == "all") owner = owner.substr(0, archColon);
+            }
+            if (!owner.empty()) owners.insert(owner);
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+    }
+    return owners;
+}
+
+bool criticalDpkgComponent(const std::string& packageName, const std::string& section, const std::string& priority, const std::string& essential) {
+    const auto normalizedSection = baseSection(section);
+    const auto normalizedPriority = lower(trim(priority));
+    const auto normalizedEssential = lower(trim(essential));
+    const auto name = lower(packageName);
+    if (normalizedEssential == "yes") return true;
+    if (normalizedPriority == "required" || normalizedPriority == "important") return true;
+    static const std::set<std::string> protectedSections = {
+        "kernel", "libs", "libdevel", "oldlibs", "debug", "introspection",
+        "metapackages", "localization", "translations", "fonts"
+    };
+    if (protectedSections.count(normalizedSection)) return true;
+    static const char* protectedPrefixes[] = {
+        "linux-image", "linux-headers", "linux-modules", "linux-firmware",
+        "libc", "systemd", "udev", "dbus", "dpkg", "apt", "init",
+        "grub", "shim", "base-files", "base-passwd", "coreutils",
+        "util-linux", "mount", "login", "passwd"
+    };
+    for (const auto* prefix : protectedPrefixes) {
+        if (name == prefix || name.rfind(std::string(prefix) + "-", 0) == 0) return true;
+    }
+    return false;
+}
+
+bool protectedManagedProduct(const std::string& packageName) {
+    const auto name = lower(packageName);
+    static const char* protectedTerms[] = {
+        "hi5central", "crowdstrike", "falcon-sensor", "sentinelone",
+        "sophos", "bitdefender", "cylance", "carbonblack", "huntress"
+    };
+    for (const auto* term : protectedTerms) if (name.find(term) != std::string::npos) return true;
+    return false;
+}
+void collectDpkg(json& items) {
+    const auto desktopOwners = visibleDesktopPackageOwners();
+    const auto output = runCommand(
+        "dpkg-query -W -f='${Package}\\t${Version}\\t${Maintainer}\\t${Installed-Size}\\t${Architecture}\\t${Section}\\t${Priority}\\t${Essential}\\n' 2>/dev/null");
     std::istringstream stream(output);
     std::string line;
     while (std::getline(stream, line)) {
         const auto f = tabs(line);
-        if (f.size() < 5 || trim(f[0]).empty()) continue;
+        if (f.size() < 8 || trim(f[0]).empty()) continue;
         std::uint64_t sizeKb = 0;
         try { sizeKb = std::stoull(trim(f[3])); } catch (...) {}
         const auto name = trim(f[0]);
         const auto arch = trim(f[4]);
+        const auto section = trim(f[5]);
+        const auto priority = trim(f[6]);
+        const auto essential = trim(f[7]);
+        const bool visibleApplication = desktopOwners.count(name) > 0;
+        const bool systemComponent = criticalDpkgComponent(name, section, priority, essential);
+        const bool protectedProduct = protectedManagedProduct(name);
         items.push_back({
             {"name", name},
             {"version", trim(f[1])},
@@ -79,13 +185,18 @@ void collectDpkg(json& items) {
             {"package_manager", "apt"},
             {"package_id", name},
             {"architecture", arch},
-            {"native_actionable", true},
+            {"section", section},
+            {"priority", priority},
+            {"essential", lower(essential) == "yes"},
+            {"classification", visibleApplication ? "application" : "system_component"},
+            {"display_in_installed_software", visibleApplication},
+            {"system_component", !visibleApplication || systemComponent},
+            {"native_actionable", visibleApplication && !systemComponent && !protectedProduct},
             {"update_available", false},
             {"latest_version", ""}
         });
     }
 }
-
 void collectSnap(json& items) {
     if (!fs::exists("/usr/bin/snap")) return;
     const auto output = runCommand("snap list --unicode=never 2>/dev/null | tail -n +2");
@@ -101,8 +212,9 @@ void collectSnap(json& items) {
             {"estimated_size_kb", nullptr}, {"scope", "system"},
             {"registry_key", "snap:" + name}, {"package_manager", "snap"},
             {"package_id", name}, {"channel", tracking},
-            {"native_actionable", true}, {"update_available", false},
-            {"latest_version", ""}
+            {"classification", "application"}, {"display_in_installed_software", true},
+            {"system_component", false}, {"native_actionable", !protectedManagedProduct(name)},
+            {"update_available", false}, {"latest_version", ""}
         });
     }
 }
@@ -126,8 +238,9 @@ void collectFlatpak(json& items) {
             {"scope", install == "user" ? "user" : "system"},
             {"registry_key", "flatpak:" + id + ":" + install},
             {"package_manager", "flatpak"}, {"package_id", id},
-            {"native_actionable", true}, {"update_available", false},
-            {"latest_version", ""}
+            {"classification", "application"}, {"display_in_installed_software", true},
+            {"system_component", false}, {"native_actionable", !protectedManagedProduct(id)},
+            {"update_available", false}, {"latest_version", ""}
         });
     }
 }
@@ -173,9 +286,15 @@ json linuxInventory() {
     collectFlatpak(items);
     applyAptUpdates(items);
     sortItems(items);
+    std::size_t visibleApps = 0;
+    std::size_t hiddenComponents = 0;
+    for (const auto& item : items) {
+        if (item.value("display_in_installed_software", false)) ++visibleApps;
+        else ++hiddenComponents;
+    }
     return {
         {"status", "collected"}, {"count", items.size()},
-        {"installed_apps", items.size()}, {"items", items},
+        {"installed_apps", visibleApps}, {"hidden_system_components", hiddenComponents}, {"items", items},
         {"recently_installed", json::array()}, {"recently_installed_count", 0},
         {"providers", {
             {"dpkg", true},
@@ -187,6 +306,17 @@ json linuxInventory() {
 #endif
 
 #if defined(__APPLE__)
+
+bool pathEndsWithApp(const std::string& path) {
+    return path.size() >= 4 && lower(path.substr(path.size() - 4)) == ".app";
+}
+
+bool macUserFacingApplication(const std::string& path) {
+    if (!pathEndsWithApp(path)) return false;
+    if (path.rfind("/Applications/", 0) == 0) return true;
+    if (path.rfind("/Users/", 0) == 0 && path.find("/Applications/") != std::string::npos) return true;
+    return false;
+}
 json macApplications() {
     json items = json::array();
     const auto output = runCommand(
@@ -202,6 +332,7 @@ json macApplications() {
         if (name.empty()) continue;
         const auto path = trim(app.value("path", ""));
         const auto source = trim(app.value("obtained_from", ""));
+        const bool visibleApplication = macUserFacingApplication(path);
         std::string publisher = source;
         if (source == "apple") publisher = "Apple";
         else if (source == "identified_developer") publisher = "Identified Developer";
@@ -214,6 +345,9 @@ json macApplications() {
             {"scope", path.rfind("/Users/", 0) == 0 ? "user" : "system"},
             {"registry_key", "app:" + identifier},
             {"package_manager", "app_bundle"}, {"package_id", identifier},
+            {"classification", visibleApplication ? "application" : "system_component"},
+            {"display_in_installed_software", visibleApplication},
+            {"system_component", !visibleApplication},
             {"native_actionable", false}, {"update_available", false},
             {"latest_version", ""}
         });
@@ -224,9 +358,15 @@ json macApplications() {
 json macInventory() {
     json items = macApplications();
     sortItems(items);
+    std::size_t visibleApps = 0;
+    std::size_t hiddenComponents = 0;
+    for (const auto& item : items) {
+        if (item.value("display_in_installed_software", false)) ++visibleApps;
+        else ++hiddenComponents;
+    }
     return {
         {"status", "collected"}, {"count", items.size()},
-        {"installed_apps", items.size()}, {"items", items},
+        {"installed_apps", visibleApps}, {"hidden_system_components", hiddenComponents}, {"items", items},
         {"recently_installed", json::array()}, {"recently_installed_count", 0},
         {"providers", {{"applications", true}}}
     };
@@ -241,7 +381,7 @@ json softwareInventory() {
 #elif defined(__linux__)
     return linuxInventory();
 #else
-    return {{"status","unsupported"},{"count",0},{"installed_apps",0},{"items",json::array()}};
+    return {{"status","unsupported"},{"count",0},{"installed_apps",0},{"hidden_system_components",0},{"items",json::array()}};
 #endif
 }
 
