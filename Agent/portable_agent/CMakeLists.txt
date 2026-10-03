@@ -53,6 +53,24 @@ set(HI5_REMOTE_LIBRARIES)
 
 if(APPLE)
   enable_language(OBJCXX)
+  pkg_check_modules(HI5_VPX REQUIRED vpx)
+  pkg_check_modules(HI5_AOM REQUIRED aom)
+  find_file(HI5_VPX_STATIC_ARCHIVE
+    NAMES libvpx.a
+    PATHS ${HI5_VPX_LIBRARY_DIRS}
+    NO_DEFAULT_PATH
+  )
+  find_file(HI5_AOM_STATIC_ARCHIVE
+    NAMES libaom.a
+    PATHS ${HI5_AOM_LIBRARY_DIRS}
+    NO_DEFAULT_PATH
+  )
+  if(NOT HI5_VPX_STATIC_ARCHIVE)
+    message(FATAL_ERROR "Static libvpx archive is required for the macOS Remote Helper.")
+  endif()
+  if(NOT HI5_AOM_STATIC_ARCHIVE)
+    message(FATAL_ERROR "Static libaom archive is required for the macOS Remote Helper.")
+  endif()
   list(APPEND HI5_REMOTE_SOURCES
     src/remote_webrtc_parent_macos.cpp
   )
@@ -117,10 +135,15 @@ if(APPLE)
   add_executable(Hi5CentralRemoteHelper
     src/remote_helper_main_macos.mm
     src/remote_h264_vt_encoder.mm
+    src/remote_software_video_encoder.cpp
     src/remote_webrtc.cpp
     src/remote_platform_macos.mm
   )
-  target_include_directories(Hi5CentralRemoteHelper PRIVATE src)
+  target_include_directories(Hi5CentralRemoteHelper PRIVATE
+    src
+    ${HI5_VPX_INCLUDE_DIRS}
+    ${HI5_AOM_INCLUDE_DIRS}
+  )
   target_compile_definitions(Hi5CentralRemoteHelper PRIVATE
     HI5_PLATFORM_MACOS=1
     HI5CENTRAL_AGENT_VERSION="${HI5CENTRAL_AGENT_VERSION}"
@@ -136,6 +159,8 @@ if(APPLE)
     LibDataChannel::LibDataChannelStatic
     OpenSSL::SSL
     OpenSSL::Crypto
+    ${HI5_VPX_STATIC_ARCHIVE}
+    ${HI5_AOM_STATIC_ARCHIVE}
     Threads::Threads
     "-framework ApplicationServices"
     "-framework Cocoa"

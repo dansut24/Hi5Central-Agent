@@ -113,12 +113,20 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Resolve native OpenSSL
+      - name: Resolve native codec dependencies
         run: |
-          if ! brew list openssl@3 >/dev/null 2>&1; then
-            brew install openssl@3
-          fi
-          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          for formula in openssl@3 libvpx aom; do
+            if ! brew list "$formula" >/dev/null 2>&1; then
+              brew install "$formula"
+            fi
+          done
+          openssl_prefix="$(brew --prefix openssl@3)"
+          vpx_prefix="$(brew --prefix libvpx)"
+          aom_prefix="$(brew --prefix aom)"
+          test -f "$vpx_prefix/lib/libvpx.a"
+          test -f "$aom_prefix/lib/libaom.a"
+          echo "OPENSSL_ROOT_DIR=$openssl_prefix" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$vpx_prefix/lib/pkgconfig:$aom_prefix/lib/pkgconfig:$openssl_prefix/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: Configure native build
         run: |
           cmake -S Agent/portable_agent -B build/portable-macos -G Ninja \
@@ -136,8 +144,8 @@ jobs:
           otool -L build/portable-macos/Hi5CentralAgent
           echo "=== Remote Helper dependencies ==="
           otool -L build/portable-macos/Hi5CentralRemoteHelper | tee /tmp/hi5-helper-otool.txt
-          if grep -E '/(opt/homebrew|usr/local)/.*lib(ssl|crypto)' /tmp/hi5-helper-otool.txt; then
-            echo "Remote Helper must not depend on Homebrew OpenSSL dylibs." >&2
+          if grep -E '/(opt/homebrew|usr/local)/.*lib(ssl|crypto|vpx|aom).*\.dylib' /tmp/hi5-helper-otool.txt; then
+            echo "Remote Helper must not depend on Homebrew OpenSSL/VPX/AOM dylibs." >&2
             exit 1
           fi
       - name: Runtime self-test

@@ -547,7 +547,14 @@ json macRemoteCapabilities() {
         {"available", desktopSession},
         {"implementation_ready", true},
         {"backend", "macos_screencapturekit"},
-        {"codec", "h264_videotoolbox"},
+        {"codec", "adaptive"},
+        {"preferred_codec", "h264_videotoolbox"},
+        {"codecs", json::array({
+            "h264_videotoolbox",
+            "vp8_libvpx",
+            "vp9_libvpx",
+            "av1_libaom"
+        })},
         {"session_type", "aqua"},
         {"desktop_session", desktopSession},
         {"headless", !desktopSession},
