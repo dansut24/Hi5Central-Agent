@@ -302,6 +302,7 @@ private:
     std::uint64_t lastReturnedFrameId_ = 0;
     std::uint64_t fallbackFrameId_ = 0;
     int consecutiveBlackFrames_ = 0;
+    CGDirectDisplayID fallbackDisplayId_ = kCGNullDirectDisplay;
     bool useWindowServerFallback_ = false;
     bool accessibilityTrusted_ = false;
     bool screenCaptureTrusted_ = false;
@@ -310,10 +311,11 @@ bool MacRemotePlatform::start(std::string& error) {
     std::lock_guard<std::mutex> lock(controlMutex_);
 
     if (@available(macOS 12.3, *)) {
+        const CGDirectDisplayID mainDisplay = CGMainDisplayID();
+        const std::uint32_t displayVendor = CGDisplayVendorNumber(mainDisplay);
+        const bool vmwareDisplay = displayVendor == 0x15ad;
         const bool screenPreflight = CGPreflightScreenCaptureAccess();
 
-        // Accessibility should be checked silently first. Only ask macOS to
-        // show its privacy UI when the helper is genuinely not trusted.
         accessibilityTrusted_ = AXIsProcessTrusted();
         if (!accessibilityTrusted_) {
             NSDictionary* options = @{
@@ -323,40 +325,71 @@ bool MacRemotePlatform::start(std::string& error) {
                 AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
         }
 
-        // Do not call CGRequestScreenCaptureAccess merely because preflight is
-        // stale. In-place helper upgrades can leave the Settings toggle enabled
-        // while preflight briefly reports false. Probe ScreenCaptureKit itself
-        // first; if the real capture path works, permission is usable.
         std::string captureError;
-        bool captureReady = loadDisplays(captureError);
-        if (captureReady) {
-            captureReady = startCaptureForIndex(currentDisplayIndex_, captureError);
-        }
+        bool captureReady = false;
 
-        screenCaptureTrusted_ = captureReady;
-
-        if (!captureReady && !screenPreflight) {
-            // Only now ask macOS to surface the permission UI, because the real
-            // ScreenCaptureKit path was actually unavailable.
-            const bool requested = CGRequestScreenCaptureAccess();
-            if (requested) {
-                captureError.clear();
-                captureReady = loadDisplays(captureError);
-                if (captureReady) {
-                    captureReady = startCaptureForIndex(currentDisplayIndex_, captureError);
-                }
-                screenCaptureTrusted_ = captureReady;
+        if (vmwareDisplay) {
+            // VMware's virtual SVGA display can either return black
+            // ScreenCaptureKit frames or hang SCShareableContent enumeration
+            // after a reboot. Bypass ReplayKit/ScreenCaptureKit completely and
+            // capture WindowServer's composited on-screen windows instead.
+            screenCaptureTrusted_ = screenPreflight;
+            if (!screenCaptureTrusted_) {
+                screenCaptureTrusted_ = CGRequestScreenCaptureAccess();
             }
+
+            if (screenCaptureTrusted_) {
+                fallbackDisplayId_ = mainDisplay;
+                currentDisplayIndex_ = 0;
+                useWindowServerFallback_ = true;
+                fallbackFrameId_ = 0;
+                consecutiveBlackFrames_ = 0;
+
+                I420Frame probe = captureWindowServerComposite();
+                captureReady = probe.width > 0 && probe.height > 0;
+                if (!captureReady) {
+                    captureError =
+                        "WindowServer could not capture the VMware virtual display.";
+                    useWindowServerFallback_ = false;
+                    fallbackDisplayId_ = kCGNullDirectDisplay;
+                    screenCaptureTrusted_ = false;
+                }
+            }
+
+            NSLog(@"Hi5Central VMware display vendor=0x%x direct_windowserver=%d screen_preflight=%d accessibility=%d",
+                  displayVendor,
+                  captureReady ? 1 : 0,
+                  screenPreflight ? 1 : 0,
+                  accessibilityTrusted_ ? 1 : 0);
+        } else {
+            captureReady = loadDisplays(captureError);
+            if (captureReady) {
+                captureReady = startCaptureForIndex(currentDisplayIndex_, captureError);
+            }
+
+            screenCaptureTrusted_ = captureReady;
+
+            if (!captureReady && !screenPreflight) {
+                const bool requested = CGRequestScreenCaptureAccess();
+                if (requested) {
+                    captureError.clear();
+                    captureReady = loadDisplays(captureError);
+                    if (captureReady) {
+                        captureReady = startCaptureForIndex(currentDisplayIndex_, captureError);
+                    }
+                    screenCaptureTrusted_ = captureReady;
+                }
+            }
+
+            NSLog(@"Hi5Central permissions screen_preflight=%d capture_ready=%d accessibility=%d",
+                  screenPreflight ? 1 : 0,
+                  screenCaptureTrusted_ ? 1 : 0,
+                  accessibilityTrusted_ ? 1 : 0);
         }
 
-        NSLog(@"Hi5Central permissions screen_preflight=%d capture_ready=%d accessibility=%d",
-              screenPreflight ? 1 : 0,
-              screenCaptureTrusted_ ? 1 : 0,
-              accessibilityTrusted_ ? 1 : 0);
-
-        if (!screenCaptureTrusted_ || !accessibilityTrusted_) {
+        if (!screenCaptureTrusted_ || !accessibilityTrusted_ || !captureReady) {
             std::string missing;
-            if (!screenCaptureTrusted_) missing += "Screen Recording";
+            if (!screenCaptureTrusted_ || !captureReady) missing += "Screen Recording";
             if (!accessibilityTrusted_) {
                 if (!missing.empty()) missing += " and ";
                 missing += "Accessibility";
@@ -508,6 +541,10 @@ void MacRemotePlatform::stop() {
     std::lock_guard<std::mutex> lock(controlMutex_);
     stopStreamOnly();
     displays_ = nil;
+    useWindowServerFallback_ = false;
+    fallbackDisplayId_ = kCGNullDirectDisplay;
+    fallbackFrameId_ = 0;
+    consecutiveBlackFrames_ = 0;
     {
         std::lock_guard<std::mutex> frameLock(state_.mutex);
         state_.latestFrame = {};
@@ -517,13 +554,16 @@ void MacRemotePlatform::stop() {
 }
 
 I420Frame MacRemotePlatform::captureWindowServerComposite() const {
-    if (!displays_ || currentDisplayIndex_ < 0 ||
-        static_cast<NSUInteger>(currentDisplayIndex_) >= displays_.count) {
-        return {};
+    CGDirectDisplayID displayId = fallbackDisplayId_;
+    if (displayId == kCGNullDirectDisplay) {
+        if (!displays_ || currentDisplayIndex_ < 0 ||
+            static_cast<NSUInteger>(currentDisplayIndex_) >= displays_.count) {
+            return {};
+        }
+        displayId = displays_[static_cast<NSUInteger>(currentDisplayIndex_)].displayID;
     }
 
-    SCDisplay* display = displays_[static_cast<NSUInteger>(currentDisplayIndex_)];
-    const CGRect bounds = CGDisplayBounds(display.displayID);
+    const CGRect bounds = CGDisplayBounds(displayId);
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -543,6 +583,17 @@ I420Frame MacRemotePlatform::captureWindowServerComposite() const {
 
 FrameCaptureResult MacRemotePlatform::capture() {
     FrameCaptureResult result;
+
+    if (useWindowServerFallback_) {
+        I420Frame fallback = captureWindowServerComposite();
+        if (fallback.width > 0 && fallback.height > 0) {
+            result.frame = std::move(fallback);
+            result.hasFrame = true;
+            result.changed = true;
+            result.frameId = ++fallbackFrameId_;
+        }
+        return result;
+    }
 
     I420Frame latest;
     std::uint64_t sourceFrameId = 0;
@@ -568,22 +619,12 @@ FrameCaptureResult MacRemotePlatform::capture() {
         I420Frame fallbackProbe = captureWindowServerComposite();
         if (fallbackProbe.width > 0 && fallbackProbe.height > 0 &&
             !isLikelyBlackFrame(fallbackProbe)) {
+            fallbackDisplayId_ =
+                displays_[static_cast<NSUInteger>(currentDisplayIndex_)].displayID;
             useWindowServerFallback_ = true;
             NSLog(@"Hi5Central switching macOS capture backend to WindowServer compositor vendor=0x%x",
-                  CGDisplayVendorNumber(
-                      displays_[static_cast<NSUInteger>(currentDisplayIndex_)].displayID));
+                  CGDisplayVendorNumber(fallbackDisplayId_));
             latest = std::move(fallbackProbe);
-        }
-    }
-
-    if (useWindowServerFallback_) {
-        I420Frame fallback = captureWindowServerComposite();
-        if (fallback.width > 0 && fallback.height > 0) {
-            result.frame = std::move(fallback);
-            result.hasFrame = true;
-            result.changed = true;
-            result.frameId = ++fallbackFrameId_;
-            return result;
         }
     }
 
@@ -598,6 +639,21 @@ FrameCaptureResult MacRemotePlatform::capture() {
 std::vector<DisplayInfo> MacRemotePlatform::displays() const {
     std::lock_guard<std::mutex> lock(controlMutex_);
     std::vector<DisplayInfo> result;
+
+    if (useWindowServerFallback_ && fallbackDisplayId_ != kCGNullDirectDisplay) {
+        const CGRect bounds = CGDisplayBounds(fallbackDisplayId_);
+        DisplayInfo info;
+        info.index = 0;
+        info.name = "Display 1";
+        info.x = static_cast<int>(std::lround(bounds.origin.x));
+        info.y = static_cast<int>(std::lround(bounds.origin.y));
+        info.width = static_cast<int>(std::lround(bounds.size.width));
+        info.height = static_cast<int>(std::lround(bounds.size.height));
+        info.primary = true;
+        result.push_back(std::move(info));
+        return result;
+    }
+
     if (!displays_) return result;
 
     const CGDirectDisplayID mainDisplay = CGMainDisplayID();
@@ -619,6 +675,7 @@ std::vector<DisplayInfo> MacRemotePlatform::displays() const {
 
 bool MacRemotePlatform::setDisplayIndex(int index) {
     std::lock_guard<std::mutex> lock(controlMutex_);
+    if (useWindowServerFallback_) return index == 0;
     if (index == currentDisplayIndex_) return true;
     std::string error;
     return startCaptureForIndex(index, error);
@@ -636,13 +693,16 @@ CGPoint MacRemotePlatform::pointFromMessage(const nlohmann::json& message) const
         return location;
     }
 
-    if (!displays_ || currentDisplayIndex_ < 0 ||
-        static_cast<NSUInteger>(currentDisplayIndex_) >= displays_.count) {
-        return CGPointZero;
+    CGDirectDisplayID displayId = fallbackDisplayId_;
+    if (displayId == kCGNullDirectDisplay) {
+        if (!displays_ || currentDisplayIndex_ < 0 ||
+            static_cast<NSUInteger>(currentDisplayIndex_) >= displays_.count) {
+            return CGPointZero;
+        }
+        displayId = displays_[static_cast<NSUInteger>(currentDisplayIndex_)].displayID;
     }
 
-    SCDisplay* display = displays_[static_cast<NSUInteger>(currentDisplayIndex_)];
-    const CGRect bounds = CGDisplayBounds(display.displayID);
+    const CGRect bounds = CGDisplayBounds(displayId);
     const double xn = std::clamp(message.value("x_norm", 0.0), 0.0, 1.0);
     const double yn = std::clamp(message.value("y_norm", 0.0), 0.0, 1.0);
     return CGPointMake(
