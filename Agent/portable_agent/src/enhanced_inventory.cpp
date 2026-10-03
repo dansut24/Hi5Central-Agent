@@ -56,6 +56,46 @@ json commandJson(const std::string& command, std::size_t limit = 4 * 1024 * 1024
     return parsed.is_discarded() ? json() : parsed;
 }
 
+std::uint64_t uintValue(const std::string& text);
+
+std::string jsonString(const json& object, const char* key) {
+    if (!object.is_object()) return {};
+    auto it = object.find(key);
+    if (it == object.end() || it->is_null()) return {};
+    if (it->is_string()) return it->get<std::string>();
+    if (it->is_number_integer()) return std::to_string(it->get<long long>());
+    if (it->is_number_unsigned()) return std::to_string(it->get<unsigned long long>());
+    if (it->is_number_float()) return std::to_string(it->get<double>());
+    return {};
+}
+
+std::uint64_t jsonUInt(const json& object, const char* key) {
+    if (!object.is_object()) return 0;
+    auto it = object.find(key);
+    if (it == object.end() || it->is_null()) return 0;
+    if (it->is_number_unsigned()) return it->get<std::uint64_t>();
+    if (it->is_number_integer()) {
+        const auto value = it->get<long long>();
+        return value > 0 ? static_cast<std::uint64_t>(value) : 0;
+    }
+    if (it->is_string()) return uintValue(it->get<std::string>());
+    return 0;
+}
+
+bool jsonBool(const json& object, const char* key) {
+    if (!object.is_object()) return false;
+    auto it = object.find(key);
+    if (it == object.end() || it->is_null()) return false;
+    if (it->is_boolean()) return it->get<bool>();
+    if (it->is_number_integer()) return it->get<long long>() != 0;
+    if (it->is_string()) {
+        auto value = it->get<std::string>();
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+        return value == "1" || value == "true" || value == "yes";
+    }
+    return false;
+}
+
 bool pathExists(const fs::path& path) {
     std::error_code ec;
     return fs::exists(path, ec) && !ec;
@@ -261,30 +301,30 @@ json linuxPhysicalDisks() {
         "lsblk -J -b -e 7 -o NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,VENDOR,FSTYPE,MOUNTPOINTS,UUID 2>/dev/null");
     if (!root.is_object() || !root.contains("blockdevices") || !root["blockdevices"].is_array()) return disks;
     for (const auto& item : root["blockdevices"]) {
-        if (!item.is_object() || item.value("type", "") != "disk") continue;
+        if (!item.is_object() || jsonString(item, "type") != "disk") continue;
         json disk = {
-            {"name", item.value("name", "")},
-            {"device", item.value("path", "")},
-            {"model", item.value("model", "")},
-            {"vendor", item.value("vendor", "")},
-            {"serial_number", item.value("serial", "")},
-            {"transport", item.value("tran", "")},
-            {"size_bytes", item.value("size", 0ULL)},
-            {"rotational", item.value("rota", false)},
-            {"removable", item.value("rm", false)},
+            {"name", jsonString(item, "name")},
+            {"device", jsonString(item, "path")},
+            {"model", jsonString(item, "model")},
+            {"vendor", jsonString(item, "vendor")},
+            {"serial_number", jsonString(item, "serial")},
+            {"transport", jsonString(item, "tran")},
+            {"size_bytes", jsonUInt(item, "size")},
+            {"rotational", jsonBool(item, "rota")},
+            {"removable", jsonBool(item, "rm")},
             {"partitions", json::array()}
         };
         if (item.contains("children") && item["children"].is_array()) {
             for (const auto& child : item["children"]) {
                 if (!child.is_object()) continue;
                 disk["partitions"].push_back({
-                    {"name", child.value("name", "")},
-                    {"device", child.value("path", "")},
-                    {"type", child.value("type", "")},
-                    {"size_bytes", child.value("size", 0ULL)},
-                    {"filesystem", child.value("fstype", "")},
-                    {"uuid", child.value("uuid", "")},
-                    {"mountpoints", child.contains("mountpoints") ? child["mountpoints"] : json::array()}
+                    {"name", jsonString(child, "name")},
+                    {"device", jsonString(child, "path")},
+                    {"type", jsonString(child, "type")},
+                    {"size_bytes", jsonUInt(child, "size")},
+                    {"filesystem", jsonString(child, "fstype")},
+                    {"uuid", jsonString(child, "uuid")},
+                    {"mountpoints", child.contains("mountpoints") && child["mountpoints"].is_array() ? child["mountpoints"] : json::array()}
                 });
             }
         }
@@ -425,9 +465,9 @@ json linuxEnhancedInventory() {
     if (lscpu.is_object() && lscpu.contains("lscpu") && lscpu["lscpu"].is_array()) {
         for (const auto& row : lscpu["lscpu"]) {
             if (!row.is_object()) continue;
-            auto key = row.value("field", "");
+            auto key = jsonString(row, "field");
             if (!key.empty() && key.back() == ':') key.pop_back();
-            cpu[key] = row.value("data", "");
+            if (!key.empty()) cpu[key] = jsonString(row, "data");
         }
     }
 
@@ -523,13 +563,15 @@ void appendMacStorage(const json& root, const char* key, json& disks) {
     if (it == root.end() || !it->is_array()) return;
     for (const auto& controller : *it) {
         if (!controller.is_object()) continue;
+        const auto controllerName = jsonString(controller, "_name");
+        const auto pciModel = jsonString(controller, "sppci_model");
         json disk = {
-            {"name", controller.value("_name", controller.value("sppci_model", ""))},
-            {"model", controller.value("device_model", controller.value("_name", ""))},
-            {"vendor", controller.value("device_manufacturer", "")},
-            {"serial_number", controller.value("device_serial", "")},
-            {"size", controller.value("size", "")},
-            {"protocol", controller.value("physical_interconnect", "")},
+            {"name", controllerName.empty() ? pciModel : controllerName},
+            {"model", jsonString(controller, "device_model").empty() ? controllerName : jsonString(controller, "device_model")},
+            {"vendor", jsonString(controller, "device_manufacturer")},
+            {"serial_number", jsonString(controller, "device_serial")},
+            {"size", jsonString(controller, "size")},
+            {"protocol", jsonString(controller, "physical_interconnect")},
             {"source", key}
         };
         if (controller.contains("_items") && controller["_items"].is_array()) {
@@ -556,22 +598,26 @@ json macEnhancedInventory() {
         if (dit != profiler.end() && dit->is_array()) {
             for (const auto& gpu : *dit) {
                 if (!gpu.is_object()) continue;
+                const auto gpuModel = jsonString(gpu, "sppci_model");
+                const auto gpuName = jsonString(gpu, "_name");
+                const auto vram = jsonString(gpu, "spdisplays_vram");
                 gpus.push_back({
-                    {"name", gpu.value("sppci_model", gpu.value("_name", ""))},
-                    {"vendor", gpu.value("spdisplays_vendor", "")},
-                    {"vram", gpu.value("spdisplays_vram", gpu.value("spdisplays_vram_shared", ""))},
-                    {"metal_support", gpu.value("spdisplays_metal", "")}
+                    {"name", gpuModel.empty() ? gpuName : gpuModel},
+                    {"vendor", jsonString(gpu, "spdisplays_vendor")},
+                    {"vram", vram.empty() ? jsonString(gpu, "spdisplays_vram_shared") : vram},
+                    {"metal_support", jsonString(gpu, "spdisplays_metal")}
                 });
                 auto displayIt = gpu.find("spdisplays_ndrvs");
                 if (displayIt != gpu.end() && displayIt->is_array()) {
                     for (const auto& display : *displayIt) {
                         if (!display.is_object()) continue;
+                        const auto primaryResolution = jsonString(display, "_spdisplays_resolution");
                         monitors.push_back({
-                            {"name", display.value("_name", "")},
-                            {"resolution", display.value("_spdisplays_resolution", display.value("spdisplays_resolution", ""))},
-                            {"main", display.value("spdisplays_main", "") == "spdisplays_yes"},
-                            {"online", display.value("spdisplays_online", "") != "spdisplays_no"},
-                            {"connection_type", display.value("spdisplays_connection_type", "")}
+                            {"name", jsonString(display, "_name")},
+                            {"resolution", primaryResolution.empty() ? jsonString(display, "spdisplays_resolution") : primaryResolution},
+                            {"main", jsonString(display, "spdisplays_main") == "spdisplays_yes"},
+                            {"online", jsonString(display, "spdisplays_online") != "spdisplays_no"},
+                            {"connection_type", jsonString(display, "spdisplays_connection_type")}
                         });
                     }
                 }
@@ -595,13 +641,13 @@ json macEnhancedInventory() {
                 auto cit = power.find("sppower_battery_charge_info");
                 battery["present"] = bit != power.end() || cit != power.end();
                 if (bit != power.end() && bit->is_object()) {
-                    battery["cycle_count"] = bit->value("sppower_battery_cycle_count", "");
-                    battery["health"] = bit->value("sppower_battery_health", "");
-                    battery["condition"] = bit->value("sppower_battery_condition", "");
+                    battery["cycle_count"] = jsonString(*bit, "sppower_battery_cycle_count");
+                    battery["health"] = jsonString(*bit, "sppower_battery_health");
+                    battery["condition"] = jsonString(*bit, "sppower_battery_condition");
                 }
                 if (cit != power.end() && cit->is_object()) {
-                    battery["charge_percent"] = cit->value("sppower_battery_charge_remaining", "");
-                    battery["charging"] = cit->value("sppower_battery_is_charging", "") == "TRUE";
+                    battery["charge_percent"] = jsonString(*cit, "sppower_battery_charge_remaining");
+                    battery["charging"] = jsonString(*cit, "sppower_battery_is_charging") == "TRUE";
                 }
             }
         }
@@ -609,40 +655,45 @@ json macEnhancedInventory() {
 
     const auto totalMemory = runCommand("/usr/sbin/sysctl -n hw.memsize 2>/dev/null");
     json memoryModules = json::array();
+    const auto chipType = jsonString(hardware, "chip_type");
     if (!totalMemory.empty()) {
         memoryModules.push_back({
             {"locator", "Unified/System Memory"},
             {"capacity_bytes", uintValue(totalMemory)},
-            {"memory_type", hardware.value("chip_type", "").empty() ? "System memory" : "Unified memory"},
+            {"memory_type", chipType.empty() ? "System memory" : "Unified memory"},
             {"manufacturer", "Apple"}
         });
     }
 
+    const auto machineModel = jsonString(hardware, "machine_model");
+    const auto machineName = jsonString(hardware, "machine_name");
+    const auto hwSerial = jsonString(hardware, "serial_number");
     const json motherboard = {
         {"manufacturer", "Apple Inc."},
-        {"product", hardware.value("machine_model", "")},
-        {"serial_number", hardware.value("serial_number", "")},
-        {"version", hardware.value("machine_name", "")},
-        {"bios_version", hardware.value("boot_rom_version", "")},
+        {"product", machineModel},
+        {"serial_number", hwSerial},
+        {"version", machineName},
+        {"bios_version", jsonString(hardware, "boot_rom_version")},
         {"smbios_version", ""}
     };
 
     const json hardwareDetail = {
         {"manufacturer", "Apple Inc."},
-        {"model", hardware.value("machine_model", model())},
-        {"serial_number", hardware.value("serial_number", serialNumber())},
-        {"device_uuid", hardware.value("platform_UUID", "")},
+        {"model", machineModel.empty() ? model() : machineModel},
+        {"serial_number", hwSerial.empty() ? serialNumber() : hwSerial},
+        {"device_uuid", jsonString(hardware, "platform_UUID")},
         {"sku", ""},
-        {"system_family", hardware.value("machine_name", "")},
+        {"system_family", machineName},
         {"bios_date", ""}
     };
 
+    const auto totalCores = jsonString(hardware, "total_number_cores");
     const json cpuDetail = {
-        {"name", hardware.value("chip_type", cpuModel())},
+        {"name", chipType.empty() ? cpuModel() : chipType},
         {"vendor", "Apple"},
-        {"cores", hardware.value("total_number_cores", "")},
-        {"sockets", hardware.value("number_processors", "")},
-        {"logical_processors", hardware.value("total_number_cores", "")},
+        {"cores", totalCores},
+        {"sockets", jsonString(hardware, "number_processors")},
+        {"logical_processors", totalCores},
         {"max_clock_mhz", ""},
         {"virtualization", ""}
     };
