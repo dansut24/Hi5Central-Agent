@@ -78,7 +78,7 @@ else
   fi
 fi
 
-UNIT_TMP="$(mktemp)"
+UNIT_TMP="$(mktemp --suffix=.service /tmp/hi5central-agent-XXXXXX)"
 cleanup() {
   rm -f "$UNIT_TMP"
 }
@@ -112,7 +112,10 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     echo "Generated systemd unit failed validation." >&2
     systemd-analyze verify "$UNIT_TMP" >&2 || true
     if [[ "$HAD_EXISTING_BINARY" == true && -x "$BACKUP_BINARY" ]]; then
+      echo "Restoring previous Agent binary and service..." >&2
       install -m 0755 "$BACKUP_BINARY" "$BINARY"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
     fi
     exit 1
   fi
