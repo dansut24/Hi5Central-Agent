@@ -70,7 +70,7 @@ else
   "$BINARY"     --state-dir "$INSTALL_DIR"     --api-base "$API_BASE"     --enrollment-token "$TOKEN"     --enroll-only
 fi
 
-PLIST_TMP="$(mktemp /tmp/com.hi5central.agent.XXXXXX.plist)"
+PLIST_TMP="$(mktemp -t hi5central-agent-plist)"
 cleanup() {
   rm -f "$PLIST_TMP"
 }
@@ -115,6 +115,7 @@ fi
 install -o root -g wheel -m 0644 "$PLIST_TMP" "$PLIST"
 
 echo "Starting Hi5Central Agent service..."
+launchctl enable "system/$LABEL" >/dev/null 2>&1 || true
 BOOTSTRAP_OUTPUT=""
 if ! BOOTSTRAP_OUTPUT="$(launchctl bootstrap system "$PLIST" 2>&1)"; then
   echo "Hi5Central Agent LaunchDaemon bootstrap failed." >&2
@@ -128,7 +129,6 @@ if ! BOOTSTRAP_OUTPUT="$(launchctl bootstrap system "$PLIST" 2>&1)"; then
   exit 1
 fi
 
-launchctl enable "system/$LABEL"
 launchctl kickstart -k "system/$LABEL"
 
 sleep 1
