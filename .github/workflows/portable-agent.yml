@@ -68,6 +68,7 @@ jobs:
         run: cmake --build build/portable-macos
       - name: Runtime self-test
         run: |
+          bash -n Agent/portable_agent/installer/macos/install.sh
           build/portable-macos/Hi5CentralAgent --version
           file build/portable-macos/Hi5CentralAgent
           build/portable-macos/Hi5CentralAgent --self-test-command
