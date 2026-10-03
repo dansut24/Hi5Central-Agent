@@ -29,6 +29,9 @@
 #include <vector>
 
 namespace hi5 {
+
+std::unique_ptr<RemotePlatform> createWaylandPortalRemotePlatform();
+
 namespace {
 
 std::string trim(std::string value) {
@@ -574,6 +577,10 @@ private:
 } // namespace
 
 std::unique_ptr<RemotePlatform> createRemotePlatform() {
+    const auto session = currentGraphicalSession();
+    if (session.type == "wayland") {
+        return createWaylandPortalRemotePlatform();
+    }
     return std::make_unique<X11RemotePlatform>();
 }
 
