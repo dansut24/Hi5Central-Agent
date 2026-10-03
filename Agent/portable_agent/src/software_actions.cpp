@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace hi5 {
 namespace {
@@ -92,11 +94,11 @@ NativePackage packageFromPayload(const json& payload) {
     return package;
 }
 
-bool packageStillInstalled(const NativePackage& package) {
+nlohmann::json currentPackageItem(const NativePackage& package) {
     const auto inventory = softwareInventory();
-    if (!inventory.is_object()) return false;
+    if (!inventory.is_object()) return nullptr;
     const auto items = inventory.value("items", json::array());
-    if (!items.is_array()) return false;
+    if (!items.is_array()) return nullptr;
 
     for (const auto& item : items) {
         if (!item.is_object()) continue;
@@ -104,9 +106,58 @@ bool packageStillInstalled(const NativePackage& package) {
         if (clean(item.value("package_id", "")) != package.id) continue;
         const auto scope = lower(clean(item.value("scope", "system")));
         if (package.manager == "flatpak" && !package.scope.empty() && scope != package.scope) continue;
-        return true;
+        return item;
     }
-    return false;
+    return nullptr;
+}
+
+bool packageStillInstalled(const NativePackage& package) {
+    return currentPackageItem(package).is_object();
+}
+
+bool aptRemovalIsSafe(const NativePackage& package, std::string* detail) {
+    const std::string command = "DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get --simulate remove -- " + package.id;
+    const auto simulation = runShellCommand(command, 60, 256 * 1024, "root");
+    if (simulation.exitCode != 0 || simulation.timedOut || !simulation.error.empty()) {
+        if (detail) *detail = simulation.error.empty() ? "APT removal simulation failed." : simulation.error;
+        return false;
+    }
+
+    const auto lowered = lower(simulation.output);
+    if (lowered.find("essential packages will be removed") != std::string::npos ||
+        lowered.find("warning: the following essential") != std::string::npos) {
+        if (detail) *detail = "APT reports that an essential package would be removed.";
+        return false;
+    }
+
+    std::vector<std::string> removals;
+    std::istringstream stream(simulation.output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        line = clean(line);
+        if (line.rfind("Remv ", 0) != 0) continue;
+        std::istringstream row(line.substr(5));
+        std::string packageName;
+        row >> packageName;
+        const auto colon = packageName.rfind(':');
+        if (colon != std::string::npos) {
+            const auto suffix = packageName.substr(colon + 1);
+            if (suffix == "amd64" || suffix == "i386" || suffix == "arm64" || suffix == "armhf") packageName = packageName.substr(0, colon);
+        }
+        if (!packageName.empty()) removals.push_back(packageName);
+    }
+
+    if (removals.empty()) {
+        if (detail) *detail = "APT did not produce a verifiable removal plan.";
+        return false;
+    }
+    for (const auto& removal : removals) {
+        if (removal != package.id) {
+            if (detail) *detail = "APT would also remove dependency/reverse-dependency package: " + removal;
+            return false;
+        }
+    }
+    return true;
 }
 
 NativeSoftwareActionResult unsupported(
@@ -147,10 +198,33 @@ NativeSoftwareActionResult executePackageAction(
     }
 
 #if defined(__linux__)
+    const auto currentItem = currentPackageItem(package);
+    if (!currentItem.is_object()) {
+        return unsupported(
+            "software_not_found",
+            "The selected package is no longer present in the endpoint inventory.");
+    }
+    if (!currentItem.value("display_in_installed_software", false) ||
+        !currentItem.value("native_actionable", false) ||
+        currentItem.value("system_component", true)) {
+        return unsupported(
+            "protected_system_component",
+            "Hi5Central classified this package as an operating-system component or non-actionable package.");
+    }
     std::string command;
     std::string runAs = "root";
 
     if (package.manager == "apt") {
+        if (!update) {
+            std::string simulationDetail;
+            if (!aptRemovalIsSafe(package, &simulationDetail)) {
+                return unsupported(
+                    "unsafe_dependency_removal",
+                    simulationDetail.empty()
+                        ? "APT could not prove this uninstall is isolated to the selected application."
+                        : simulationDetail);
+            }
+        }
         command = update
             ? "DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y --only-upgrade -- " + package.id
             : "DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get remove -y -- " + package.id;
