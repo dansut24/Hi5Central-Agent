@@ -14,6 +14,7 @@ on:
       - feature/portable-native-software-actions
       - fix/macos-user-file-helper-context
       - fix/software-inventory-classification
+      - fix/software-inventory-safe-view
   pull_request:
 
 permissions:
