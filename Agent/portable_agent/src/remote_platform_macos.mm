@@ -109,12 +109,48 @@ bool isLikelyBlackFrame(const I420Frame& frame) {
     return average <= 18.5 && maxY <= 24;
 }
 
+struct H264CaptureSize {
+    int width = 0;
+    int height = 0;
+};
+
+H264CaptureSize h264Level31CaptureSize(int sourceWidth, int sourceHeight) {
+    sourceWidth &= ~1;
+    sourceHeight &= ~1;
+    if (sourceWidth < 2 || sourceHeight < 2) return {};
+
+    constexpr double maxWidth = 1280.0;
+    constexpr double maxHeight = 720.0;
+    const double scale = std::min({
+        1.0,
+        maxWidth / static_cast<double>(sourceWidth),
+        maxHeight / static_cast<double>(sourceHeight)
+    });
+
+    int width = std::max(2, static_cast<int>(
+        std::floor(static_cast<double>(sourceWidth) * scale / 2.0)) * 2);
+    int height = std::max(2, static_cast<int>(
+        std::floor(static_cast<double>(sourceHeight) * scale / 2.0)) * 2);
+
+    auto macroblocks = [](int value) { return (value + 15) / 16; };
+    while (macroblocks(width) * macroblocks(height) > 3600) {
+        if (width >= height && width > 2) width -= 2;
+        else if (height > 2) height -= 2;
+        else break;
+    }
+
+    return {width, height};
+}
+
 I420Frame cgImageToI420(CGImageRef image) {
     I420Frame frame;
     if (!image) return frame;
 
-    const int width = static_cast<int>(CGImageGetWidth(image)) & ~1;
-    const int height = static_cast<int>(CGImageGetHeight(image)) & ~1;
+    const int sourceWidth = static_cast<int>(CGImageGetWidth(image)) & ~1;
+    const int sourceHeight = static_cast<int>(CGImageGetHeight(image)) & ~1;
+    const auto target = h264Level31CaptureSize(sourceWidth, sourceHeight);
+    const int width = target.width;
+    const int height = target.height;
     if (width < 2 || height < 2) return frame;
 
     const std::size_t stride = static_cast<std::size_t>(width) * 4;
@@ -137,6 +173,7 @@ I420Frame cgImageToI420(CGImageRef image) {
     CGContextTranslateCTM(context, 0, height);
     CGContextScaleCTM(context, 1.0, -1.0);
     CGContextSetBlendMode(context, kCGBlendModeCopy);
+    CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
     CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
     CGContextRelease(context);
 
@@ -464,9 +501,17 @@ bool MacRemotePlatform::startCaptureForIndex(int index, std::string& error) {
     SCDisplay* display = displays_[static_cast<NSUInteger>(index)];
     SCContentFilter* filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
     SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
-    config.width = static_cast<NSInteger>(display.width) & ~1;
-    config.height = static_cast<NSInteger>(display.height) & ~1;
+    const auto target = h264Level31CaptureSize(
+        static_cast<int>(display.width),
+        static_cast<int>(display.height));
+    config.width = target.width;
+    config.height = target.height;
     config.minimumFrameInterval = CMTimeMake(1, 30);
+    NSLog(@"Hi5Central macOS H264 capture scale source=%ldx%ld stream=%dx%d",
+          static_cast<long>(display.width),
+          static_cast<long>(display.height),
+          target.width,
+          target.height);
     config.queueDepth = 5;
     config.pixelFormat = kCVPixelFormatType_32BGRA;
     config.showsCursor = YES;
@@ -622,8 +667,10 @@ FrameCaptureResult MacRemotePlatform::capture() {
             fallbackDisplayId_ =
                 displays_[static_cast<NSUInteger>(currentDisplayIndex_)].displayID;
             useWindowServerFallback_ = true;
-            NSLog(@"Hi5Central switching macOS capture backend to WindowServer compositor vendor=0x%x",
-                  CGDisplayVendorNumber(fallbackDisplayId_));
+            NSLog(@"Hi5Central switching macOS capture backend to WindowServer compositor vendor=0x%x stream=%dx%d",
+                  CGDisplayVendorNumber(fallbackDisplayId_),
+                  fallbackProbe.width,
+                  fallbackProbe.height);
             latest = std::move(fallbackProbe);
         }
     }
