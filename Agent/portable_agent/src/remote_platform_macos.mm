@@ -121,6 +121,21 @@ struct CaptureState {
     auto frame = hi5::bgraToI420(pixelBuffer);
     if (frame.width < 2 || frame.height < 2) return;
 
+    static std::atomic<std::uint64_t> captureFrameCount{0};
+    const auto captureIndex = ++captureFrameCount;
+    if (captureIndex <= 3 || (captureIndex % 300) == 0) {
+        std::uint64_t sample = 0;
+        if (!frame.y.empty()) {
+            const std::size_t step = std::max<std::size_t>(1, frame.y.size() / 1024);
+            for (std::size_t i = 0; i < frame.y.size(); i += step) sample += frame.y[i];
+        }
+        NSLog(@"Hi5Central remote capture frame=%llu size=%dx%d luma_sample=%llu",
+              static_cast<unsigned long long>(captureIndex),
+              frame.width,
+              frame.height,
+              static_cast<unsigned long long>(sample));
+    }
+
     std::lock_guard<std::mutex> lock(state->mutex);
     state->latestFrame = std::move(frame);
     state->hasFrame = true;
@@ -408,6 +423,17 @@ bool MacRemotePlatform::setDisplayIndex(int index) {
 }
 
 CGPoint MacRemotePlatform::pointFromMessage(const nlohmann::json& message) const {
+    // Click/down/up messages from older Viewer builds may not carry pointer
+    // coordinates. In that case use the current macOS pointer location rather
+    // than defaulting the event to the top-left corner of the display.
+    if (!message.contains("x_norm") || !message.contains("y_norm")) {
+        CGEventRef current = CGEventCreate(nullptr);
+        if (!current) return CGPointZero;
+        const CGPoint location = CGEventGetLocation(current);
+        CFRelease(current);
+        return location;
+    }
+
     if (!displays_ || currentDisplayIndex_ < 0 ||
         static_cast<NSUInteger>(currentDisplayIndex_) >= displays_.count) {
         return CGPointZero;
