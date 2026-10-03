@@ -99,6 +99,21 @@ bool desktopFileVisible(const std::string& path) {
     return application && !hidden && !noDisplay;
 }
 
+std::set<std::string> installerBaselinePackages() {
+    std::set<std::string> packages;
+    const auto output = runCommand(
+        "if [ -r /var/log/installer/initial-status.gz ]; then "
+        "zgrep '^Package:' /var/log/installer/initial-status.gz 2>/dev/null | sed 's/^Package: //'; "
+        "fi");
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (!line.empty()) packages.insert(line);
+    }
+    return packages;
+}
+
 std::set<std::string> visibleDesktopPackageOwners() {
     std::set<std::string> owners;
     const auto output = runCommand(
@@ -163,6 +178,7 @@ bool protectedManagedProduct(const std::string& packageName) {
 }
 void collectDpkg(json& items) {
     const auto desktopOwners = visibleDesktopPackageOwners();
+    const auto baselinePackages = installerBaselinePackages();
     const auto output = runCommand(
         "dpkg-query -W -f='${Package}\\t${Version}\\t${Maintainer}\\t${Installed-Size}\\t${Architecture}\\t${Section}\\t${Priority}\\t${Essential}\\n' 2>/dev/null");
     std::istringstream stream(output);
@@ -178,6 +194,8 @@ void collectDpkg(json& items) {
         const auto priority = trim(f[6]);
         const auto essential = trim(f[7]);
         const bool visibleApplication = desktopOwners.count(name) > 0;
+        const bool osBaseline = baselinePackages.count(name) > 0;
+        const bool managedApplication = visibleApplication && !osBaseline;
         const bool systemComponent = criticalDpkgComponent(name, section, priority, essential);
         const bool protectedProduct = protectedManagedProduct(name);
         items.push_back({
@@ -195,10 +213,11 @@ void collectDpkg(json& items) {
             {"section", section},
             {"priority", priority},
             {"essential", lower(essential) == "yes"},
-            {"classification", visibleApplication ? "application" : "system_component"},
-            {"display_in_installed_software", visibleApplication},
-            {"system_component", !visibleApplication || systemComponent},
-            {"native_actionable", visibleApplication && !systemComponent && !protectedProduct},
+            {"classification", managedApplication ? "application" : (visibleApplication ? "system_application" : "system_component")},
+            {"display_in_installed_software", managedApplication},
+            {"os_baseline", osBaseline},
+            {"system_component", !managedApplication || systemComponent},
+            {"native_actionable", managedApplication && !systemComponent && !protectedProduct},
             {"update_available", false},
             {"latest_version", ""}
         });
@@ -295,13 +314,21 @@ json linuxInventory() {
     sortItems(items);
     std::size_t visibleApps = 0;
     std::size_t hiddenComponents = 0;
+    std::size_t hiddenSystemApplications = 0;
     for (const auto& item : items) {
-        if (item.value("display_in_installed_software", false)) ++visibleApps;
-        else ++hiddenComponents;
+        if (item.value("display_in_installed_software", false)) {
+            ++visibleApps;
+        } else {
+            ++hiddenComponents;
+            if (item.value("classification", "") == "system_application") ++hiddenSystemApplications;
+        }
     }
     return {
         {"status", "collected"}, {"count", items.size()},
-        {"installed_apps", visibleApps}, {"hidden_system_components", hiddenComponents}, {"items", items},
+        {"installed_apps", visibleApps},
+        {"hidden_system_components", hiddenComponents},
+        {"hidden_system_applications", hiddenSystemApplications},
+        {"items", items},
         {"recently_installed", json::array()}, {"recently_installed_count", 0},
         {"providers", {
             {"dpkg", true},
