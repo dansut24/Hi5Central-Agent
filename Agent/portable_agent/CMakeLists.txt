@@ -10,7 +10,6 @@ set(HI5CENTRAL_AGENT_VERSION "0.3.0-alpha" CACHE STRING "Hi5Central portable Age
 
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
-find_package(PkgConfig REQUIRED)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -28,16 +27,59 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json ixwebsocket)
 
-set(HI5_REMOTE_SOURCES)
-set(HI5_REMOTE_LIBRARIES)
-
+set(HI5_AGENT_PLATFORM_SOURCES)
 if(APPLE)
-  enable_language(OBJCXX)
-  list(APPEND HI5_REMOTE_SOURCES
+  list(APPEND HI5_AGENT_PLATFORM_SOURCES
     src/remote_webrtc_stub.cpp
-    src/remote_platform_macos.mm
+    src/remote_bridge_stub.cpp
   )
 elseif(UNIX)
+  list(APPEND HI5_AGENT_PLATFORM_SOURCES src/remote_bridge.cpp)
+else()
+  message(FATAL_ERROR "The portable Agent target currently supports macOS and Linux only.")
+endif()
+
+add_executable(Hi5CentralAgent
+  src/main.cpp
+  src/http_client.cpp
+  src/platform_info.cpp
+  src/enhanced_inventory.cpp
+  src/agent_websocket.cpp
+  src/job_executor.cpp
+  src/execution_context.cpp
+  src/portable_live_tools.cpp
+  src/software_inventory.cpp
+  src/software_actions.cpp
+  ${HI5_AGENT_PLATFORM_SOURCES}
+)
+
+target_include_directories(Hi5CentralAgent PRIVATE src)
+
+target_compile_definitions(Hi5CentralAgent PRIVATE
+  HI5CENTRAL_AGENT_VERSION="${HI5CENTRAL_AGENT_VERSION}"
+)
+
+target_link_libraries(Hi5CentralAgent PRIVATE
+  CURL::libcurl
+  nlohmann_json::nlohmann_json
+  ixwebsocket::ixwebsocket
+  Threads::Threads
+)
+
+if(UNIX)
+  find_library(HI5_UTIL_LIBRARY util)
+  if(HI5_UTIL_LIBRARY)
+    target_link_libraries(Hi5CentralAgent PRIVATE ${HI5_UTIL_LIBRARY})
+  endif()
+endif()
+
+if(APPLE)
+  target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_MACOS=1)
+elseif(UNIX)
+  target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_LINUX=1)
+
+  find_package(PkgConfig REQUIRED)
+
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
   set(NO_TESTS ON CACHE BOOL "" FORCE)
@@ -55,63 +97,29 @@ elseif(UNIX)
   pkg_check_modules(VPX REQUIRED IMPORTED_TARGET vpx)
   pkg_check_modules(HI5_X11 REQUIRED IMPORTED_TARGET x11 xext xtst)
 
-  list(APPEND HI5_REMOTE_SOURCES
+  add_executable(Hi5CentralRemoteHost
+    src/remote_host_main.cpp
+    src/platform_info.cpp
     src/remote_vp8_encoder.cpp
     src/remote_webrtc.cpp
     src/remote_platform_linux.cpp
   )
-  list(APPEND HI5_REMOTE_LIBRARIES
+
+  target_include_directories(Hi5CentralRemoteHost PRIVATE src)
+  target_compile_definitions(Hi5CentralRemoteHost PRIVATE
+    HI5CENTRAL_AGENT_VERSION="${HI5CENTRAL_AGENT_VERSION}"
+    HI5_PLATFORM_LINUX=1
+  )
+  target_link_libraries(Hi5CentralRemoteHost PRIVATE
+    nlohmann_json::nlohmann_json
     LibDataChannel::LibDataChannelStatic
     PkgConfig::VPX
     PkgConfig::HI5_X11
+    Threads::Threads
   )
-else()
-  message(FATAL_ERROR "The portable Agent target currently supports macOS and Linux only.")
-endif()
-
-add_executable(Hi5CentralAgent
-  src/main.cpp
-  src/http_client.cpp
-  src/platform_info.cpp
-  src/enhanced_inventory.cpp
-  src/agent_websocket.cpp
-  src/job_executor.cpp
-  src/execution_context.cpp
-  src/portable_live_tools.cpp
-  src/software_inventory.cpp
-  src/software_actions.cpp
-  ${HI5_REMOTE_SOURCES}
-)
-
-target_include_directories(Hi5CentralAgent PRIVATE src)
-
-target_compile_definitions(Hi5CentralAgent PRIVATE
-  HI5CENTRAL_AGENT_VERSION="${HI5CENTRAL_AGENT_VERSION}"
-)
-
-target_link_libraries(Hi5CentralAgent PRIVATE
-  CURL::libcurl
-  nlohmann_json::nlohmann_json
-  ixwebsocket::ixwebsocket
-  Threads::Threads
-  ${HI5_REMOTE_LIBRARIES}
-)
-
-if(UNIX)
-  find_library(HI5_UTIL_LIBRARY util)
-  if(HI5_UTIL_LIBRARY)
-    target_link_libraries(Hi5CentralAgent PRIVATE ${HI5_UTIL_LIBRARY})
-  endif()
-endif()
-
-if(APPLE)
-  target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_MACOS=1)
-  target_link_libraries(Hi5CentralAgent PRIVATE
-    "-framework Cocoa"
-    "-framework CoreGraphics"
-  )
-elseif(UNIX)
-  target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_LINUX=1)
 endif()
 
 install(TARGETS Hi5CentralAgent RUNTIME DESTINATION bin)
+if(TARGET Hi5CentralRemoteHost)
+  install(TARGETS Hi5CentralRemoteHost RUNTIME DESTINATION bin)
+endif()
