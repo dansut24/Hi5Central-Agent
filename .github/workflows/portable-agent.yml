@@ -10,6 +10,7 @@ on:
       - fix/linux-portable-agent-upgrade
       - fix/linux-unit-validation-recovery
       - feature/unix-terminal-files-user-root
+      - feature/portable-software-inventory
       - fix/macos-user-file-helper-context
   pull_request:
 
