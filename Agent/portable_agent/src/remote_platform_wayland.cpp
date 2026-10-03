@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <string>
@@ -750,8 +751,16 @@ private:
         auto* self = static_cast<WaylandPortalRemotePlatform*>(data);
         if (!self || !self->pipeWireStream_) return;
 
+        static std::atomic<std::uint64_t> processCallbacks{0};
+        const auto callbackNumber = ++processCallbacks;
         pw_buffer* pipeBuffer = pw_stream_dequeue_buffer(self->pipeWireStream_);
-        if (!pipeBuffer) return;
+        if (!pipeBuffer) {
+            if (callbackNumber <= 3) {
+                std::cerr << "[wayland-capture] process without buffer n="
+                          << callbackNumber << "\n";
+            }
+            return;
+        }
 
         spa_buffer* buffer = pipeBuffer->buffer;
         if (buffer && buffer->n_datas > 0) {
@@ -762,6 +771,22 @@ private:
                 std::lock_guard<std::mutex> lock(self->frameMutex_);
                 info = self->videoInfo_;
                 valid = self->videoInfoValid_;
+            }
+
+            if (callbackNumber <= 3) {
+                std::cerr << "[wayland-capture] process n=" << callbackNumber
+                          << " valid=" << (valid ? 1 : 0)
+                          << " type=" << source.type
+                          << " fd=" << source.fd
+                          << " data=" << (source.data ? 1 : 0)
+                          << " maxsize=" << source.maxsize
+                          << " chunk=" << (source.chunk ? 1 : 0)
+                          << " chunk_size=" << (source.chunk ? source.chunk->size : 0)
+                          << " chunk_offset=" << (source.chunk ? source.chunk->offset : 0)
+                          << " stride=" << (source.chunk ? source.chunk->stride : 0)
+                          << " format=" << static_cast<int>(info.format)
+                          << " size=" << info.size.width << "x" << info.size.height
+                          << "\n";
             }
 
             if (valid &&
@@ -796,6 +821,14 @@ private:
                         stride,
                         info.format);
                     if (frame.width > 0 && !frame.y.empty()) {
+                        static std::atomic<std::uint64_t> convertedFrames{0};
+                        const auto convertedNumber = ++convertedFrames;
+                        if (convertedNumber <= 3) {
+                            std::cerr << "[wayland-capture] converted frame n="
+                                      << convertedNumber
+                                      << " size=" << frame.width << "x" << frame.height
+                                      << " y_bytes=" << frame.y.size() << "\n";
+                        }
                         std::lock_guard<std::mutex> lock(self->frameMutex_);
                         self->latestFrame_ = std::move(frame);
                         ++self->latestFrameId_;

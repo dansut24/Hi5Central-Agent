@@ -428,6 +428,9 @@ private:
     void streamLoop() {
         const auto interval = std::chrono::milliseconds(1000 / fps_);
         std::uint64_t frameCounter = 0;
+        std::uint64_t capturePolls = 0;
+        bool loggedCapture = false;
+        bool loggedEncoded = false;
 
         while (running_.load()) {
             const auto started = std::chrono::steady_clock::now();
@@ -437,8 +440,20 @@ private:
             }
 
             try {
+                ++capturePolls;
                 auto captured = platform_->capture();
+                if (!captured.hasFrame && capturePolls % 150 == 0) {
+                    std::cerr << "[remote-webrtc] capture waiting polls=" << capturePolls
+                              << " session=" << sessionId_ << "\n";
+                }
                 if (captured.hasFrame && captured.frame.width > 0 && captured.frame.height > 0) {
+                    if (!loggedCapture) {
+                        loggedCapture = true;
+                        std::cerr << "[remote-webrtc] first captured frame size="
+                                  << captured.frame.width << "x" << captured.frame.height
+                                  << " frame_id=" << captured.frameId
+                                  << " session=" << sessionId_ << "\n";
+                    }
                     const bool periodicKeyframe = (frameCounter % static_cast<std::uint64_t>(fps_ * 3)) == 0;
                     const bool force = forceKeyframe_.exchange(false) || periodicKeyframe;
 
@@ -499,6 +514,13 @@ private:
 
                     const auto encoded = encoder_->encode(captured.frame, force);
                     if (!encoded.data.empty()) {
+                        if (!loggedEncoded) {
+                            loggedEncoded = true;
+                            std::cerr << "[remote-webrtc] first VP8 frame bytes="
+                                      << encoded.data.size()
+                                      << " keyframe=" << (encoded.keyframe ? 1 : 0)
+                                      << " session=" << sessionId_ << "\n";
+                        }
                         sendVp8(encoded);
                         ++frameCounter;
                     }
