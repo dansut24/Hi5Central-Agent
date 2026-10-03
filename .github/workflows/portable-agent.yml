@@ -13,6 +13,7 @@ on:
       - feature/portable-software-inventory
       - feature/portable-native-software-actions
       - fix/macos-user-file-helper-context
+      - fix/software-inventory-classification
   pull_request:
 
 permissions:
