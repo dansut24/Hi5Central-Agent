@@ -450,12 +450,18 @@ void executeJob(
                 5,
                 std::min(3600, payload.value("timeout_seconds", 120)));
 
+            const std::string runAs = payload.value(
+                "run_as",
+                payload.value("runAs", std::string("root")));
+
             const auto commandResult = hi5::runShellCommand(
                 command,
                 timeoutSeconds,
-                256 * 1024);
+                256 * 1024,
+                runAs);
 
-            const auto result = hi5::buildCommandResultJson(command, commandResult);
+            auto result = hi5::buildCommandResultJson(command, commandResult);
+            result["run_as"] = runAs;
             const bool success =
                 commandResult.error.empty() &&
                 commandResult.exitCode == 0;
