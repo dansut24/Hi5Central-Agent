@@ -11,6 +11,7 @@ on:
       - fix/linux-unit-validation-recovery
       - feature/unix-terminal-files-user-root
       - feature/portable-software-inventory
+      - feature/portable-native-software-actions
       - fix/macos-user-file-helper-context
   pull_request:
 

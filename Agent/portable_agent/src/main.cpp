@@ -4,6 +4,7 @@
 #include "platform_info.h"
 #include "portable_live_tools.h"
 #include "software_inventory.h"
+#include "software_actions.h"
 
 #include <nlohmann/json.hpp>
 
@@ -224,6 +225,8 @@ json agentCapabilities() {
         {"terminal", true},
         {"files", true},
         {"execution_contexts", json::array({"user", "root"})},
+        {"software_inventory", true},
+        {"native_software_actions", true},
         {"remote_desktop", false}
     };
 }
@@ -444,6 +447,33 @@ void executeJob(
                     {"platform", hi5::platformId()}
                 });
             logLine("INFO", "Completed job id=" + jobId + " type=" + jobType);
+            return;
+        }
+
+        if (jobType == "software.uninstall" || jobType == "software.update") {
+            const auto action = jobType == "software.uninstall"
+                ? hi5::uninstallNativeSoftware(payload)
+                : hi5::updateNativeSoftware(payload);
+
+            if (action.success) {
+                try { postInventory(http, identity); }
+                catch (const std::exception& inventoryError) {
+                    logLine("WARN", std::string("Software action completed but inventory refresh failed: ") + inventoryError.what());
+                }
+            }
+
+            postJobResult(
+                http,
+                identity,
+                jobId,
+                action.success,
+                action.result,
+                action.error);
+
+            logLine(
+                action.success ? "INFO" : "WARN",
+                "Completed " + jobType + " id=" + jobId +
+                " success=" + (action.success ? "true" : "false"));
             return;
         }
 
