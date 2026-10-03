@@ -26,6 +26,7 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <unistd.h>
+#include <vector>
 
 namespace hi5 {
 namespace {
@@ -60,6 +61,50 @@ std::string shellQuote(const std::string& value) {
     return out;
 }
 
+std::string xServerAuthorityForDisplay(const std::string& display) {
+    if (display.empty()) return {};
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
+        if (ec) break;
+        const auto pid = entry.path().filename().string();
+        if (pid.empty() || !std::all_of(pid.begin(), pid.end(), [](unsigned char ch) { return std::isdigit(ch); })) {
+            continue;
+        }
+
+        std::ifstream in(entry.path() / "cmdline", std::ios::binary);
+        if (!in) continue;
+        const std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (raw.empty()) continue;
+
+        std::vector<std::string> args;
+        std::size_t start = 0;
+        while (start < raw.size()) {
+            const auto end = raw.find('\0', start);
+            const auto value = raw.substr(start, end == std::string::npos ? std::string::npos : end - start);
+            if (!value.empty()) args.push_back(value);
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        if (args.empty()) continue;
+
+        const auto executable = std::filesystem::path(args.front()).filename().string();
+        const bool xServer =
+            executable == "Xorg" || executable == "X" ||
+            executable == "Xwayland" || executable == "Xwayland.bin";
+        if (!xServer || std::find(args.begin(), args.end(), display) == args.end()) continue;
+
+        for (std::size_t i = 0; i + 1 < args.size(); ++i) {
+            if (args[i] != "-auth") continue;
+            const auto& candidate = args[i + 1];
+            std::error_code authEc;
+            if (!candidate.empty() && std::filesystem::exists(candidate, authEc) && !authEc) {
+                return candidate;
+            }
+        }
+    }
+    return {};
+}
+
 struct UserSession {
     std::string user;
     uid_t uid = static_cast<uid_t>(-1);
@@ -73,31 +118,38 @@ struct UserSession {
 
 UserSession currentGraphicalSession() {
     UserSession session;
-    session.user = activeUser();
-    if (session.user.empty()) return session;
 
-    long size = sysconf(_SC_GETPW_R_SIZE_MAX);
-    if (size < 1024) size = 16384;
-    std::vector<char> buffer(static_cast<std::size_t>(size));
-    struct passwd pwd {};
-    struct passwd* result = nullptr;
-    if (getpwnam_r(session.user.c_str(), &pwd, buffer.data(), buffer.size(), &result) == 0 && result) {
-        session.uid = pwd.pw_uid;
-        session.home = pwd.pw_dir ? pwd.pw_dir : "";
-    }
-
-    const auto quotedUser = shellQuote(session.user);
     const auto sessionId = runCommand(
         "loginctl list-sessions --no-legend 2>/dev/null | "
-        "awk '$3==" + quotedUser + " && $0 ~ /yes/ {print $1; exit} "
-        "$3==" + quotedUser + " {fallback=$1} END {if (fallback) print fallback}' | head -1");
+        "awk '$4==\"seat0\" && $7==\"yes\" {print $1; exit} "
+        "$6==\"active\" && $3!=\"root\" {fallback=$1} "
+        "END {if (fallback) print fallback}' | head -1");
+    if (sessionId.empty()) return session;
 
-    if (!sessionId.empty()) {
-        session.type = runCommand("loginctl show-session " + shellQuote(sessionId) + " -p Type --value 2>/dev/null");
-        session.display = runCommand("loginctl show-session " + shellQuote(sessionId) + " -p Display --value 2>/dev/null");
-        const auto leader = runCommand("loginctl show-session " + shellQuote(sessionId) + " -p Leader --value 2>/dev/null");
-        if (!leader.empty()) {
-            const std::string environPath = "/proc/" + leader + "/environ";
+    const auto quotedSession = shellQuote(sessionId);
+    session.user = runCommand("loginctl show-session " + quotedSession + " -p Name --value 2>/dev/null");
+    const auto uidText = runCommand("loginctl show-session " + quotedSession + " -p User --value 2>/dev/null");
+    if (!uidText.empty()) {
+        try { session.uid = static_cast<uid_t>(std::stoul(uidText)); } catch (...) {}
+    }
+
+    if (!session.user.empty()) {
+        long size = sysconf(_SC_GETPW_R_SIZE_MAX);
+        if (size < 1024) size = 16384;
+        std::vector<char> buffer(static_cast<std::size_t>(size));
+        struct passwd pwd {};
+        struct passwd* result = nullptr;
+        if (getpwnam_r(session.user.c_str(), &pwd, buffer.data(), buffer.size(), &result) == 0 && result) {
+            if (session.uid == static_cast<uid_t>(-1)) session.uid = pwd.pw_uid;
+            session.home = pwd.pw_dir ? pwd.pw_dir : "";
+        }
+    }
+
+    session.type = runCommand("loginctl show-session " + quotedSession + " -p Type --value 2>/dev/null");
+    session.display = runCommand("loginctl show-session " + quotedSession + " -p Display --value 2>/dev/null");
+    const auto leader = runCommand("loginctl show-session " + quotedSession + " -p Leader --value 2>/dev/null");
+    if (!leader.empty()) {
+        const std::string environPath = "/proc/" + leader + "/environ";
             std::ifstream in(environPath, std::ios::binary);
             if (in) {
                 std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -119,7 +171,6 @@ UserSession currentGraphicalSession() {
                 }
             }
         }
-    }
 
     if (session.runtimeDir.empty() && session.uid != static_cast<uid_t>(-1)) {
         session.runtimeDir = "/run/user/" + std::to_string(session.uid);
@@ -127,11 +178,20 @@ UserSession currentGraphicalSession() {
     if (session.dbusAddress.empty() && !session.runtimeDir.empty()) {
         session.dbusAddress = "unix:path=" + session.runtimeDir + "/bus";
     }
+    if (session.display.empty() && session.type == "x11") session.display = ":0";
+
+    if (!session.xauthority.empty()) {
+        std::error_code authEc;
+        if (!std::filesystem::exists(session.xauthority, authEc) || authEc) session.xauthority.clear();
+    }
+    if (session.xauthority.empty()) {
+        session.xauthority = xServerAuthorityForDisplay(session.display);
+    }
     if (session.xauthority.empty() && !session.home.empty()) {
         const auto candidate = session.home + "/.Xauthority";
-        if (std::filesystem::exists(candidate)) session.xauthority = candidate;
+        std::error_code authEc;
+        if (std::filesystem::exists(candidate, authEc) && !authEc) session.xauthority = candidate;
     }
-    if (session.display.empty() && session.type == "x11") session.display = ":0";
     return session;
 }
 
