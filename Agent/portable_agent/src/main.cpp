@@ -1,4 +1,5 @@
 #include "agent_websocket.h"
+#include "enhanced_inventory.h"
 #include "http_client.h"
 #include "job_executor.h"
 #include "platform_info.h"
@@ -216,6 +217,7 @@ std::map<std::string, std::string> authHeaders(const Identity& identity) {
 }
 
 json agentCapabilities() {
+    const auto remoteDesktop = hi5::remoteDesktopCapabilities();
     return {
         {"telemetry", true},
         {"inventory", true},
@@ -227,7 +229,8 @@ json agentCapabilities() {
         {"execution_contexts", json::array({"user", "root"})},
         {"software_inventory", true},
         {"native_software_actions", true},
-        {"remote_desktop", false}
+        {"remote_desktop", remoteDesktop.value("available", false)},
+        {"remote_desktop_capabilities", remoteDesktop}
     };
 }
 
@@ -270,12 +273,14 @@ json buildInventory(const Identity& identity) {
     const auto version = hi5::osVersion();
     const auto build = hi5::osBuild();
     const auto arch = hi5::architecture();
+    const auto collectedAt = hi5::nowIsoUtc();
+    const auto enhanced = hi5::enhancedHardwareInventory();
 
-    return {
+    json inventory = {
         {"type", "inventory_snapshot"},
         {"device_id", identity.deviceId},
         {"platform", hi5::platformId()},
-        {"collected_at", hi5::nowIsoUtc()},
+        {"collected_at", collectedAt},
         {"summary", {
             {"hostname", hi5::hostname()},
             {"platform", hi5::platformId()},
@@ -338,8 +343,24 @@ json buildInventory(const Identity& identity) {
             {"transport", "websocket+https"},
             {"capabilities", agentCapabilities()}
         }},
-        {"deep_inventory_included", false}
+        {"deep_inventory_included", true},
+        {"deep_inventory_collected_at", collectedAt}
     };
+
+    if (enhanced.is_object()) {
+        for (auto it = enhanced.begin(); it != enhanced.end(); ++it) {
+            inventory[it.key()] = it.value();
+        }
+    }
+
+    if (inventory.contains("cpu_detail") && inventory["cpu_detail"].is_object()) {
+        for (auto it = inventory["cpu_detail"].begin(); it != inventory["cpu_detail"].end(); ++it) {
+            inventory["cpu"][it.key()] = it.value();
+        }
+        inventory.erase("cpu_detail");
+    }
+
+    return inventory;
 }
 
 void postTelemetry(
