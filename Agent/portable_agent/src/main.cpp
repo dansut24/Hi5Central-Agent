@@ -585,7 +585,8 @@ int main(int argc, char* argv[]) {
             const auto result = hi5::runShellCommand(
                 "printf 'hi5central-command-ok'",
                 10,
-                4096);
+                4096,
+                geteuid() == 0 ? "root" : "current");
             std::cout << hi5::buildCommandResultJson(
                 "printf 'hi5central-command-ok'",
                 result).dump(2) << std::endl;
