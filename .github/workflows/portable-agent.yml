@@ -7,6 +7,7 @@ on:
       - main
       - feature/portable-macos-linux-agent
       - feature/portable-websocket-jobs
+      - fix/linux-portable-agent-upgrade
   pull_request:
 
 permissions:
@@ -29,6 +30,7 @@ jobs:
         run: cmake --build build/portable-linux
       - name: Runtime self-test
         run: |
+          bash -n Agent/portable_agent/installer/linux/install.sh
           build/portable-linux/Hi5CentralAgent --version
           build/portable-linux/Hi5CentralAgent --self-test-command
           build/portable-linux/Hi5CentralAgent --self-test | tee /tmp/hi5-agent-self-test.json
