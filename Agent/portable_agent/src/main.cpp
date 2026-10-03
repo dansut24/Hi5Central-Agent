@@ -707,17 +707,17 @@ int main(int argc, char* argv[]) {
         }
 
         if (hasArg(argc, argv, "--self-test-remote-capture")) {
-#if defined(__APPLE__)
-            // ScreenCaptureKit runs in the signed-in user's Remote Helper, not
-            // in the root LaunchDaemon. Keep the daemon self-test architecture
-            // aware rather than instantiating a GUI/TCC provider here.
+#if defined(__APPLE__) || defined(__linux__)
+            // Interactive capture/control runs in the signed-in user's Remote
+            // Helper on macOS and Linux. Keep the privileged daemon self-test
+            // capability-aware rather than opening a GUI capture provider here.
             const auto remote = hi5::remoteDesktopCapabilities();
             std::cout << json({
                 {"ok", remote.value("implementation_ready", false)},
                 {"backend", remote.value("backend", "none")},
                 {"provider_process", "Hi5Central Remote Helper"},
                 {"requires_user_session", remote.value("requires_user_session", true)},
-                {"requires_user_consent", remote.value("requires_user_consent", true)}
+                {"requires_user_consent", remote.value("requires_user_consent", false)}
             }).dump(2) << std::endl;
             return remote.value("implementation_ready", false) ? 0 : 2;
 #else
