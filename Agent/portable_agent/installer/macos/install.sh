@@ -10,6 +10,8 @@ PLIST="/Library/LaunchDaemons/com.hi5central.agent.plist"
 LABEL="com.hi5central.agent"
 BINARY="$INSTALL_DIR/Hi5CentralAgent"
 STATE_FILE="$INSTALL_DIR/agent.json"
+REMOTE_HELPER_SOURCE="$SOURCE_DIR/Hi5Central Remote Helper.app"
+REMOTE_HELPER_INSTALL="/Applications/Hi5Central Remote Helper.app"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,6 +28,11 @@ fi
 
 if [[ ! -x "$SOURCE_DIR/Hi5CentralAgent" ]]; then
   echo "Hi5CentralAgent binary not found beside this installer." >&2
+  exit 1
+fi
+
+if [[ ! -x "$REMOTE_HELPER_SOURCE/Contents/MacOS/Hi5CentralRemoteHelper" ]]; then
+  echo "Hi5Central Remote Helper.app is missing from this package." >&2
   exit 1
 fi
 
@@ -64,6 +71,13 @@ if launchctl print "system/$LABEL" >/dev/null 2>&1; then
 fi
 
 install -m 0755 "$SOURCE_DIR/Hi5CentralAgent" "$BINARY"
+
+echo "Installing Hi5Central Remote Helper..."
+/usr/bin/pkill -f '/Applications/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper' >/dev/null 2>&1 || true
+rm -rf "$REMOTE_HELPER_INSTALL"
+/usr/bin/ditto "$REMOTE_HELPER_SOURCE" "$REMOTE_HELPER_INSTALL"
+chown -R root:wheel "$REMOTE_HELPER_INSTALL"
+chmod 0755 "$REMOTE_HELPER_INSTALL/Contents/MacOS/Hi5CentralRemoteHelper"
 
 if [[ -s "$STATE_FILE" ]]; then
   echo "Existing Hi5Central Agent identity found; preserving enrollment."
