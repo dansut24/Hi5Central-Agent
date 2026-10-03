@@ -539,10 +539,10 @@ json macSystemProfiler() {
 
 json macRemoteCapabilities() {
     const bool desktopSession = !activeUser().empty();
-    const bool screenGranted = CGPreflightScreenCaptureAccess();
-    const bool accessibilityGranted = AXIsProcessTrusted();
-    const bool permissionsReady = screenGranted && accessibilityGranted;
 
+    // TCC permissions belong to the per-user Remote Helper, not to the root
+    // LaunchDaemon collecting inventory. The helper performs the authoritative
+    // preflight/request when a remote session is started.
     return {
         {"available", desktopSession},
         {"implementation_ready", true},
@@ -553,23 +553,24 @@ json macRemoteCapabilities() {
         {"headless", !desktopSession},
         {"management_only", !desktopSession},
         {"attended_supported", desktopSession},
-        {"unattended_supported", desktopSession && permissionsReady},
+        {"unattended_supported", desktopSession},
         {"backstage_supported", false},
         {"requires_user_session", true},
-        {"requires_user_consent", !permissionsReady},
+        {"requires_user_consent", true},
+        {"permission_owner", "Hi5Central Remote Helper"},
         {"requires_initial_screen_recording_permission", true},
         {"requires_initial_accessibility_permission", true},
         {"screen_capture", {
             {"available", desktopSession},
             {"provider", "ScreenCaptureKit"},
             {"permission", "Screen Recording"},
-            {"permission_granted", screenGranted}
+            {"permission_state", "checked_by_user_helper"}
         }},
         {"input_control", {
             {"available", desktopSession},
             {"provider", "CGEvent/Accessibility"},
             {"permission", "Accessibility"},
-            {"permission_granted", accessibilityGranted}
+            {"permission_state", "checked_by_user_helper"}
         }}
     };
 }

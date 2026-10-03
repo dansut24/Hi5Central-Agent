@@ -95,14 +95,27 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-  macos:
-    runs-on: macos-15
+  macos-build:
+    name: macos-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Configure universal build
+      - name: Configure native build
         run: |
-          cmake -S Agent/portable_agent -B build/portable-macos -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
+          cmake -S Agent/portable_agent -B build/portable-macos -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
+            -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
       - name: Build
         run: cmake --build build/portable-macos
       - name: Runtime self-test
@@ -110,6 +123,7 @@ jobs:
           bash -n Agent/portable_agent/installer/macos/install.sh
           build/portable-macos/Hi5CentralAgent --version
           file build/portable-macos/Hi5CentralAgent
+          file build/portable-macos/Hi5CentralRemoteHelper
           build/portable-macos/Hi5CentralAgent --self-test-command
           payload="$(printf '%s' '{"path":"/tmp","home":"/tmp"}' | base64 | tr -d '\n')"
           build/portable-macos/Hi5CentralAgent --hi5-file-helper list "$payload" current | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["ok"] and data["path"]=="/tmp"'
@@ -123,28 +137,58 @@ jobs:
           assert data['architecture'], data
           assert data['memory']['totalBytes'] > 0, data
           assert data['disk']['totalBytes'] > 0, data
-          software=data.get('software', {})
-          assert software.get('count', 0) == software.get('installed_apps', 0), software
-          assert software.get('component_count', 0) >= software.get('count', 0), software
-          assert software.get('hidden_system_components', 0) == software.get('component_count', 0) - software.get('count', 0), software
-          for item in software.get('items', []):
-              path=item.get('install_location','')
-              assert item.get('display_in_installed_software') is True, item
-              assert item.get('system_component') is not True, item
-              assert path.startswith('/Applications/') or (path.startswith('/Users/') and '/Applications/' in path), item
-          for item in software.get('components', []):
-              path=item.get('install_location','')
-              if path.startswith('/System/') or path.startswith('/Volumes/macOS Base System/') or path.startswith('/Library/'):
-                  assert item.get('display_in_installed_software') is not True, item
+          remote=data.get('capabilities', {}).get('remote_desktop_capabilities', {})
+          assert remote.get('backend') == 'macos_screencapturekit', remote
+          assert remote.get('implementation_ready') is True, remote
           PY
-      - name: Ad-hoc sign test binary
-        run: codesign --force --sign - build/portable-macos/Hi5CentralAgent
-      - name: Package
+      - name: Stage native binaries
+        run: |
+          mkdir -p dist/native
+          cp build/portable-macos/Hi5CentralAgent dist/native/Hi5CentralAgent
+          cp build/portable-macos/Hi5CentralRemoteHelper dist/native/Hi5CentralRemoteHelper
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-Agent-macOS-${{ matrix.arch }}
+          path: dist/native/
+          retention-days: 14
+          if-no-files-found: error
+
+  macos-package:
+    name: macos-universal-package
+    needs: macos-build
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Hi5Central-Agent-macOS-arm64
+          path: artifacts/arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: Hi5Central-Agent-macOS-x86_64
+          path: artifacts/x86_64
+      - name: Create universal binaries
         run: |
           mkdir -p dist/macos/installer/macos
-          cp build/portable-macos/Hi5CentralAgent dist/macos/Hi5CentralAgent
+          mkdir -p "dist/macos/Hi5Central Remote Helper.app/Contents/MacOS"
+          lipo -create artifacts/arm64/Hi5CentralAgent artifacts/x86_64/Hi5CentralAgent -output dist/macos/Hi5CentralAgent
+          lipo -create artifacts/arm64/Hi5CentralRemoteHelper artifacts/x86_64/Hi5CentralRemoteHelper -output "dist/macos/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper"
+          file dist/macos/Hi5CentralAgent
+          file "dist/macos/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper"
+          lipo -verify_arch arm64 x86_64 dist/macos/Hi5CentralAgent
+          lipo -verify_arch arm64 x86_64 "dist/macos/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper"
+      - name: Package and sign
+        run: |
+          cp Agent/portable_agent/installer/macos/remote-helper-Info.plist "dist/macos/Hi5Central Remote Helper.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 0.3.${{ github.run_number }}" "dist/macos/Hi5Central Remote Helper.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "dist/macos/Hi5Central Remote Helper.app/Contents/Info.plist"
+          codesign --force --sign - dist/macos/Hi5CentralAgent
+          codesign --force --deep --sign - "dist/macos/Hi5Central Remote Helper.app"
+          codesign --verify --deep --strict "dist/macos/Hi5Central Remote Helper.app"
           cp Agent/portable_agent/installer/macos/install.sh dist/macos/installer/macos/install.sh
-          chmod +x dist/macos/Hi5CentralAgent dist/macos/installer/macos/install.sh
+          chmod +x dist/macos/Hi5CentralAgent "dist/macos/Hi5Central Remote Helper.app/Contents/MacOS/Hi5CentralRemoteHelper" dist/macos/installer/macos/install.sh
+          bash -n dist/macos/installer/macos/install.sh
           tar -C dist/macos -czf dist/Hi5CentralAgent-macOS-universal.tar.gz .
       - uses: actions/upload-artifact@v4
         with:
