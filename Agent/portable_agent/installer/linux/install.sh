@@ -9,6 +9,7 @@ STATE_DIR="/var/lib/hi5central/agent"
 SERVICE_FILE="/etc/systemd/system/hi5central-agent.service"
 SERVICE_NAME="hi5central-agent.service"
 BINARY="$INSTALL_DIR/Hi5CentralAgent"
+REMOTE_HELPER="$INSTALL_DIR/Hi5CentralRemoteHelper"
 STATE_FILE="$STATE_DIR/agent.json"
 BACKUP_BINARY="$INSTALL_DIR/Hi5CentralAgent.previous"
 
@@ -27,6 +28,10 @@ fi
 
 if [[ ! -x "$SOURCE_DIR/Hi5CentralAgent" ]]; then
   echo "Hi5CentralAgent binary not found beside this installer." >&2
+  exit 1
+fi
+if [[ ! -x "$SOURCE_DIR/Hi5CentralRemoteHelper" ]]; then
+  echo "Hi5CentralRemoteHelper binary not found beside this installer." >&2
   exit 1
 fi
 
@@ -55,6 +60,7 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
 fi
 
 install -m 0755 "$SOURCE_DIR/Hi5CentralAgent" "$BINARY"
+install -m 0755 "$SOURCE_DIR/Hi5CentralRemoteHelper" "$REMOTE_HELPER"
 
 if [[ -s "$STATE_FILE" ]]; then
   echo "Existing Hi5Central Agent identity found; preserving enrollment."
