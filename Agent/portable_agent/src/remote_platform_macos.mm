@@ -212,7 +212,7 @@ bool MacRemotePlatform::start(std::string& error) {
                 missing += "Accessibility";
             }
             error = "macOS permission required: enable " + missing +
-                " for Hi5Central Agent in System Settings > Privacy & Security, then retry the remote session.";
+                " for Hi5Central Remote Helper in System Settings > Privacy & Security, then retry the remote session.";
             return false;
         }
 
