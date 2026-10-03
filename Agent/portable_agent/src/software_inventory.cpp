@@ -198,7 +198,11 @@ void collectDpkg(json& items) {
         const bool initialOsComponent = initialPackages.count(name) > 0;
         const bool criticalComponent = criticalDpkgComponent(name, section, priority, essential);
         const bool protectedProduct = protectedManagedProduct(name);
-        const bool visibleApplication = desktopApplication && !initialOsComponent && !criticalComponent;
+        // A package being present in the distribution's initial image does not make it
+        // an OS component. User-facing applications such as Firefox, 7-Zip and
+        // LibreOffice are commonly preinstalled by desktop distributions. Keep them
+        // visible while critical/runtime packages remain protected below.
+        const bool visibleApplication = desktopApplication && !criticalComponent;
         const bool systemComponent = !visibleApplication;
         items.push_back({
             {"name", name},
@@ -216,7 +220,8 @@ void collectDpkg(json& items) {
             {"priority", priority},
             {"essential", lower(essential) == "yes"},
             {"classification", visibleApplication ? "application" : "system_component"},
-            {"classification_reason", initialOsComponent ? "initial_os_install" : (criticalComponent ? "critical_os_component" : (desktopApplication ? "desktop_application" : "non_application_package"))},
+            {"classification_reason", criticalComponent ? "critical_os_component" : (desktopApplication ? (initialOsComponent ? "desktop_application_initial_os" : "desktop_application") : (initialOsComponent ? "initial_os_install" : "non_application_package"))},
+            {"initial_os_install", initialOsComponent},
             {"display_in_installed_software", visibleApplication},
             {"system_component", systemComponent},
             {"native_actionable", visibleApplication && !protectedProduct},
