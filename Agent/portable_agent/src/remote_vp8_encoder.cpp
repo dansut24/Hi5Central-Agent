@@ -103,6 +103,7 @@ struct Vp8Encoder::Impl {
         vpx_codec_control(&codec, VP8E_SET_CPUUSED, cpuUsed);
         vpx_codec_control(&codec, VP8E_SET_NOISE_SENSITIVITY, 0);
         vpx_codec_control(&codec, VP8E_SET_STATIC_THRESHOLD, 0);
+        vpx_codec_control(&codec, VP8E_SET_SCREEN_CONTENT_MODE, 1);
         initialized = true;
     }
 
@@ -245,5 +246,6 @@ bool Vp8Encoder::reconfigure(int fps,
     vpx_codec_control(&m_impl->codec, VP8E_SET_CPUUSED, cpuUsed);
     vpx_codec_control(&m_impl->codec, VP8E_SET_NOISE_SENSITIVITY, 0);
     vpx_codec_control(&m_impl->codec, VP8E_SET_STATIC_THRESHOLD, 0);
+    vpx_codec_control(&m_impl->codec, VP8E_SET_SCREEN_CONTENT_MODE, 1);
     return true;
 }
