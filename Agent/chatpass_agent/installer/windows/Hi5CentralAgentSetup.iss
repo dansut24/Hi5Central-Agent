@@ -176,6 +176,29 @@ begin
   Exec(ExpandConstant('{sys}\sc.exe'), 'stop ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+procedure HardenAgentConfig(ConfigPath: String);
+var
+  ResultCode: Integer;
+  Args: String;
+begin
+  Args :=
+    '"' + ConfigPath + '" ' +
+    '/inheritance:r ' +
+    '/grant:r *S-1-5-18:F *S-1-5-32-544:F';
+
+  if not Exec(
+    ExpandConstant('{sys}\icacls.exe'),
+    Args,
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+    Log('Hi5Central warning: unable to launch icacls for Agent config.')
+  else if ResultCode <> 0 then
+    Log('Hi5Central warning: icacls returned ' + IntToStr(ResultCode) + ' for Agent config.');
+end;
+
 procedure WriteAgentConfig;
 var
   ConfigPath: String;
@@ -239,6 +262,8 @@ begin
 
   if ProvisionBlob <> '' then
     SetIniString('agent', 'provision_blob', ProvisionBlob, ConfigPath);
+
+  HardenAgentConfig(ConfigPath);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
