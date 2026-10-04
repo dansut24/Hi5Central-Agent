@@ -161,10 +161,12 @@ public:
         std::string sessionId,
         std::vector<std::string> iceServers,
         std::string requestedCodec,
+        bool persistentAccessRequested,
         SendFn send)
         : sessionId_(std::move(sessionId)),
           iceServers_(std::move(iceServers)),
           requestedCodec_(std::move(requestedCodec)),
+          persistentAccessRequested_(persistentAccessRequested),
           send_(std::move(send)),
           ssrc_(randomU32()),
           sequence_(randomU16()) {}
@@ -177,6 +179,7 @@ public:
             error = "No remote desktop provider is available for this platform.";
             return false;
         }
+        platform_->setPersistentAccessRequested(persistentAccessRequested_);
         if (!platform_->start(error)) return false;
 
         activeCodec_ = resolveVideoCodec(requestedCodec_, platform_->backendName());
@@ -871,6 +874,7 @@ private:
     std::string sessionId_;
     std::vector<std::string> iceServers_;
     std::string requestedCodec_ = "auto";
+    bool persistentAccessRequested_ = false;
     SendFn send_;
 
     VideoCodec activeCodec_ = VideoCodec::VP8;
@@ -941,10 +945,14 @@ bool RemoteDesktopManager::handleMessage(const json& message) {
             }
         }
 
+        const bool persistentAccessRequested =
+            message.value("wayland_persistence", false);
+
         auto session = std::make_unique<RemoteWebRtcSession>(
             sessionId,
             iceServersFromMessage(message),
             requestedCodec,
+            persistentAccessRequested,
             send_);
         std::string error;
         if (!session->start(error)) {
