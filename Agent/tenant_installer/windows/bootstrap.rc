@@ -1,0 +1,4 @@
+#include <windows.h>
+#define IDR_AGENT_SETUP 101
+1 RT_MANIFEST "bootstrap.manifest"
+IDR_AGENT_SETUP RCDATA "payload/Hi5CentralAgentSetup.exe"
