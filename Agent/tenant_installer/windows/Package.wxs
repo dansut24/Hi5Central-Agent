@@ -13,7 +13,7 @@
       <Directory Id="Hi5CentralFolder" Name="Hi5Central">
         <Directory Id="DeploymentInstallerFolder" Name="Deployment Installer">
           <Component Id="DeploymentInstallerComponent" Guid="*">
-            <File Id="AgentSetupExe" Source="$(var.SetupExe)" KeyPath="yes" />
+            <File Id="DeploymentBootstrapExe" Source="$(var.BootstrapExe)" KeyPath="yes" />
           </Component>
         </Directory>
       </Directory>
@@ -24,15 +24,15 @@
     </Feature>
 
     <CustomAction
-      Id="RunAgentSetup"
-      FileRef="AgentSetupExe"
-      ExeCommand="/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DEPLOYMENT_CONFIG=&quot;[HI5DEPLOYMENTCONFIG]&quot; /INSTALL_SOURCE=&quot;deployment-msi&quot;"
+      Id="RunDeploymentBootstrap"
+      FileRef="DeploymentBootstrapExe"
+      ExeCommand="--quiet --config &quot;[HI5DEPLOYMENTCONFIG]&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
 
     <InstallExecuteSequence>
-      <Custom Action="RunAgentSetup" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="RunDeploymentBootstrap" After="InstallFiles" Condition="NOT Installed" />
     </InstallExecuteSequence>
   </Package>
 </Wix>
