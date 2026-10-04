@@ -7,6 +7,7 @@
     UpgradeCode="A824267A-6EEA-4D38-9382-245EB857E275">
     <MediaTemplate EmbedCab="yes" />
     <Property Id="ARPSYSTEMCOMPONENT" Value="1" />
+    <Property Id="HI5DEPLOYMENTCONFIG" Secure="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="Hi5CentralFolder" Name="Hi5Central">
@@ -25,7 +26,7 @@
     <CustomAction
       Id="RunTenantBootstrap"
       FileRef="TenantBootstrapExe"
-      ExeCommand="--quiet"
+      ExeCommand="--quiet --config &quot;[HI5DEPLOYMENTCONFIG]&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
