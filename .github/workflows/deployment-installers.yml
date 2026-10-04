@@ -2,6 +2,11 @@ name: Generic deployment installers
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/deployment-installers.yml'
+      - 'Agent/tenant_installer/**'
+      - 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss'
   push:
     branches:
       - main
@@ -19,31 +24,41 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-      - name: Build shared deployment EXE
+
+      - name: Download current Agent setup payload
         shell: pwsh
         run: |
-          dotnet publish Agent/tenant_installer/windows/Hi5CentralTenantInstaller.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o dist/windows/publish
-          New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
-          Copy-Item dist/windows/publish/Hi5CentralAgentTenantInstaller.exe dist/windows/Hi5CentralAgentDeployment-Windows.exe
-          if ((Get-Item "dist/windows/Hi5CentralAgentDeployment-Windows.exe").Length -lt 1000000) {
-            throw "Deployment bootstrap EXE is unexpectedly small."
+          $payloadDir = 'Agent/tenant_installer/windows/payload'
+          New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe' -OutFile "$payloadDir/Hi5CentralAgentSetup.exe"
+          $size = (Get-Item "$payloadDir/Hi5CentralAgentSetup.exe").Length
+          if ($size -lt 1000000 -or $size -gt 50000000) {
+            throw "Agent setup payload size is unexpected: $size bytes"
           }
-      - name: Build shared deployment MSI
+
+      - name: Build native single-file Windows installer template
         shell: pwsh
         run: |
-          dotnet tool install --global wix --version 5.0.2
-          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
-          $bootstrapExe = (Resolve-Path 'dist/windows/Hi5CentralAgentDeployment-Windows.exe').Path
-          wix build Agent/tenant_installer/windows/Package.wxs -arch x64 -d "BootstrapExe=$bootstrapExe" -o dist/windows/Hi5CentralAgentDeployment-Windows.msi
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio C++ build tools not found.' }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
+          $output = (Join-Path (Resolve-Path '.').Path 'dist/windows/Hi5CentralAgentTemplate.exe')
+          $source = (Resolve-Path 'Agent/tenant_installer/windows').Path
+          $compile = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cd /d "' + $source + '" && rc /nologo /fo bootstrap.res bootstrap.rc && cl /nologo /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE bootstrap.cpp bootstrap.res advapi32.lib user32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:bootstrap.manifest /OUT:"' + $output + '"'
+          cmd.exe /d /s /c $compile
+          if ($LASTEXITCODE -ne 0) { throw "Native Windows bootstrap build failed with exit code $LASTEXITCODE." }
+          $size = (Get-Item $output).Length
+          if ($size -lt 1000000 -or $size -gt 50000000) {
+            throw "Native Windows installer template size is unexpected: $size bytes"
+          }
+          Write-Host "Native Windows template size: $size bytes"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: Hi5Central-Deployment-Windows
-          path: |
-            dist/windows/Hi5CentralAgentDeployment-Windows.exe
-            dist/windows/Hi5CentralAgentDeployment-Windows.msi
+          name: Hi5Central-Windows-Tenant-Template
+          path: dist/windows/Hi5CentralAgentTemplate.exe
           retention-days: 30
           if-no-files-found: error
 
