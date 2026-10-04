@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -38,6 +39,8 @@ constexpr const char* kPortalPath = "/org/freedesktop/portal/desktop";
 constexpr const char* kRemoteDesktopInterface = "org.freedesktop.portal.RemoteDesktop";
 constexpr const char* kScreenCastInterface = "org.freedesktop.portal.ScreenCast";
 constexpr const char* kClipboardInterface = "org.freedesktop.portal.Clipboard";
+constexpr const char* kHostRegistryInterface = "org.freedesktop.host.portal.Registry";
+constexpr const char* kPortalAppId = "com.hi5central.RemoteHelper";
 constexpr const char* kRequestInterface = "org.freedesktop.portal.Request";
 constexpr const char* kSessionInterface = "org.freedesktop.portal.Session";
 
@@ -124,6 +127,11 @@ std::string tokenPart(const std::string& prefix) {
 }
 
 std::string waylandRestoreTokenPath() {
+    const char* managedStateDir = std::getenv("HI5CENTRAL_WAYLAND_STATE_DIR");
+    if (managedStateDir && *managedStateDir) {
+        return std::string(managedStateDir) + "/wayland-remote-desktop.token";
+    }
+
     const gchar* stateDir = g_get_user_state_dir();
     if (!stateDir || !*stateDir) return {};
     return std::string(stateDir) + "/hi5central/wayland-remote-desktop.token";
@@ -293,6 +301,14 @@ public:
                 busError,
                 "Unable to connect to the active Wayland session bus.");
             return false;
+        }
+
+        std::string identityError;
+        portalIdentityRegistered_ = registerPortalHostIdentity(identityError);
+        if (!portalIdentityRegistered_ && !identityError.empty()) {
+            std::cerr
+                << "[wayland-portal] host app identity registration unavailable: "
+                << identityError << "\n";
         }
 
         remoteDesktopPortalVersion_ = portalInterfaceVersion(kRemoteDesktopInterface);
@@ -508,6 +524,42 @@ public:
     }
 
 private:
+    bool registerPortalHostIdentity(std::string& error) const {
+        if (!bus_) {
+            error = "Wayland portal session bus is unavailable.";
+            return false;
+        }
+
+        GVariantBuilder options;
+        g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+
+        GError* callError = nullptr;
+        GVariant* result = g_dbus_connection_call_sync(
+            bus_,
+            kPortalName,
+            kPortalPath,
+            kHostRegistryInterface,
+            "Register",
+            g_variant_new("(sa{sv})", kPortalAppId, &options),
+            G_VARIANT_TYPE("()"),
+            G_DBUS_CALL_FLAGS_NONE,
+            5000,
+            nullptr,
+            &callError);
+        if (!result) {
+            error = glibErrorMessage(
+                callError,
+                "XDG host application registry is unavailable.");
+            return false;
+        }
+
+        g_variant_unref(result);
+        std::cerr
+            << "[wayland-portal] registered host app identity "
+            << kPortalAppId << "\n";
+        return true;
+    }
+
     guint32 portalInterfaceVersion(const char* interfaceName) const {
         if (!bus_ || !interfaceName || !*interfaceName) return 0;
 
@@ -1440,6 +1492,7 @@ private:
         clipboardRequested_ = false;
         clipboardEnabled_ = false;
         restoreToken_.clear();
+        portalIdentityRegistered_ = false;
         portalPersistenceSupported_ = false;
         remoteDesktopPortalVersion_ = 0;
         streamNodeId_ = 0;
@@ -1460,6 +1513,7 @@ private:
     GDBusConnection* bus_ = nullptr;
     std::string sessionHandle_;
     std::string restoreToken_;
+    bool portalIdentityRegistered_ = false;
     bool portalPersistenceSupported_ = false;
     guint32 remoteDesktopPortalVersion_ = 0;
     bool clipboardRequested_ = false;
