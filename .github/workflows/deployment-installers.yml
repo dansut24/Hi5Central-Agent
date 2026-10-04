@@ -46,7 +46,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
           $output = (Join-Path (Resolve-Path '.').Path 'dist/windows/Hi5CentralAgentTemplate.exe')
           $source = (Resolve-Path 'Agent/tenant_installer/windows').Path
-          $compile = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cd /d "' + $source + '" && rc /nologo /fo bootstrap.res bootstrap.rc && cl /nologo /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE bootstrap.cpp bootstrap.res advapi32.lib user32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:bootstrap.manifest /OUT:"' + $output + '"'
+          $compile = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cd /d "' + $source + '" && rc /nologo /fo bootstrap.res bootstrap.rc && cl /nologo /std:c++17 /O2 /MT /EHsc /DUNICODE /D_UNICODE bootstrap.cpp bootstrap.res advapi32.lib user32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /MANIFEST:NO /OUT:"' + $output + '"'
           cmd.exe /d /s /c $compile
           if ($LASTEXITCODE -ne 0) { throw "Native Windows bootstrap build failed with exit code $LASTEXITCODE." }
           $size = (Get-Item $output).Length
