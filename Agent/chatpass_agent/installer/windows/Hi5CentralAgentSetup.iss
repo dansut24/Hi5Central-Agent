@@ -87,6 +87,83 @@ begin
     Result := B;
 end;
 
+function JsonStringValue(JsonText: String; Name: String): String;
+var
+  Tail: String;
+  P: Integer;
+begin
+  Result := '';
+  P := Pos('"' + Name + '"', JsonText);
+  if P = 0 then
+    Exit;
+
+  Tail := Copy(JsonText, P + Length(Name) + 2, Length(JsonText));
+  P := Pos(':', Tail);
+  if P = 0 then
+    Exit;
+
+  Tail := Copy(Tail, P + 1, Length(Tail));
+  P := Pos('"', Tail);
+  if P = 0 then
+    Exit;
+
+  Tail := Copy(Tail, P + 1, Length(Tail));
+  P := Pos('"', Tail);
+  if P = 0 then
+    Exit;
+
+  Result := Copy(Tail, 1, P - 1);
+end;
+
+procedure ApplyDeploymentJson(
+  var ApiBaseUrl: String;
+  var DeploymentId: String;
+  var DeploymentSecret: String;
+  var InstallSource: String);
+var
+  ConfigPath: String;
+  JsonText: AnsiString;
+  Value: String;
+begin
+  ConfigPath := ParamValue('DEPLOYMENT_CONFIG', '');
+
+  if ConfigPath = '' then
+    ConfigPath := ExpandConstant('{src}\Hi5CentralDeployment.json');
+
+  if not FileExists(ConfigPath) then
+    ConfigPath := ExpandConstant('{commonappdata}\Hi5Central\Deployment.json');
+
+  if not FileExists(ConfigPath) then
+    Exit;
+
+  if not LoadStringFromFile(ConfigPath, JsonText) then
+    RaiseException('Unable to read Hi5Central deployment configuration: ' + ConfigPath);
+
+  if ApiBaseUrl = '' then
+  begin
+    Value := JsonStringValue(JsonText, 'apiBase');
+    if Value <> '' then
+      ApiBaseUrl := Value;
+  end;
+
+  if DeploymentId = '' then
+  begin
+    Value := JsonStringValue(JsonText, 'deploymentId');
+    if Value <> '' then
+      DeploymentId := Value;
+  end;
+
+  if DeploymentSecret = '' then
+  begin
+    Value := JsonStringValue(JsonText, 'deploymentSecret');
+    if Value <> '' then
+      DeploymentSecret := Value;
+  end;
+
+  if InstallSource = '' then
+    InstallSource := 'deployment-json';
+end;
+
 function IsUpgradeStopOnly: Boolean;
 begin
   Result := False;
@@ -115,17 +192,27 @@ var
 begin
   ConfigPath := ExpandConstant('{commonappdata}\Hi5Central\Agent\config.ini');
 
-  ApiBaseUrl := TrimSlashRight(FirstNonEmpty(ParamValue('API_BASE_URL', ''), ParamValue('API_URL', 'https://rmm.hi5central.com')));
+  ApiBaseUrl := TrimSlashRight(FirstNonEmpty(ParamValue('API_BASE_URL', ''), ParamValue('API_URL', '')));
   AgentWsBaseUrl := FirstNonEmpty(ParamValue('AGENT_WS_BASE_URL', ''), ParamValue('WSS_URL', 'wss://rmm.hi5central.com/agent/ws'));
 
   EnrollmentToken := FirstNonEmpty(ParamValue('ENROLLMENT_TOKEN', ''), ParamValue('ENROLL_TOKEN', ''));
   TenantId := ParamValue('TENANT_ID', '');
   GroupId := ParamValue('GROUP_ID', '');
   DeploymentId := ParamValue('DEPLOYMENT_ID', '');
-  PackageId := FirstNonEmpty(ParamValue('PACKAGE_ID', ''), DeploymentId);
   DeploymentSecret := ParamValue('DEPLOYMENT_SECRET', '');
   ProvisionBlob := ParamValue('PROVISION_BLOB', '');
-  InstallSource := ParamValue('INSTALL_SOURCE', 'manual-installer');
+  InstallSource := ParamValue('INSTALL_SOURCE', '');
+
+  ApplyDeploymentJson(ApiBaseUrl, DeploymentId, DeploymentSecret, InstallSource);
+
+  if ApiBaseUrl = '' then
+    ApiBaseUrl := 'https://rmm.hi5central.com';
+
+  ApiBaseUrl := TrimSlashRight(ApiBaseUrl);
+  PackageId := FirstNonEmpty(ParamValue('PACKAGE_ID', ''), DeploymentId);
+
+  if InstallSource = '' then
+    InstallSource := 'manual-installer';
 
   SetIniString('agent', 'api_base_url', ApiBaseUrl, ConfigPath);
   SetIniString('agent', 'agent_ws_base_url', AgentWsBaseUrl, ConfigPath);
