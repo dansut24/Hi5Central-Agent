@@ -115,14 +115,28 @@ std::string preparePortalStateDir(const UserIdentity& user) {
     return userDir;
 }
 
-bool clearPortalRestoreToken(const UserIdentity& user, std::string& error) {
+std::string portalRestoreTokenPath(const UserIdentity& user) {
     const std::string stateDir = portalStateDir(user);
-    if (stateDir.empty()) {
+    return stateDir.empty() ? std::string() : stateDir + "/wayland-remote-desktop.token";
+}
+
+bool portalRestoreTokenRemembered(const UserIdentity& user) {
+    const std::string tokenPath = portalRestoreTokenPath(user);
+    if (tokenPath.empty()) return false;
+
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(tokenPath, ec) || ec) return false;
+    const auto size = std::filesystem::file_size(tokenPath, ec);
+    return !ec && size > 0;
+}
+
+bool clearPortalRestoreToken(const UserIdentity& user, std::string& error) {
+    const std::string tokenPath = portalRestoreTokenPath(user);
+    if (tokenPath.empty()) {
         error = "No active Linux user is available.";
         return false;
     }
 
-    const std::string tokenPath = stateDir + "/wayland-remote-desktop.token";
     if (::unlink(tokenPath.c_str()) == 0 || errno == ENOENT) return true;
 
     error = "Unable to remove the remembered Wayland access token: " +
@@ -360,6 +374,23 @@ RemoteDesktopManager::~RemoteDesktopManager() { stopAll(); }
 bool RemoteDesktopManager::handleMessage(const json& message) {
     if (!message.is_object()) return false;
     const std::string type = message.value("type", "");
+
+    if (type == "get_wayland_persistence_status") {
+        const auto user = activeUserIdentity();
+        const bool userAvailable =
+            !user.name.empty() &&
+            user.uid != static_cast<uid_t>(-1);
+        send_({
+            {"type", "wayland_persistence_status"},
+            {"request_id", message.value("request_id", "")},
+            {"supported", userAvailable},
+            {"remembered", userAvailable && portalRestoreTokenRemembered(user)},
+            {"user", user.name},
+            {"status", !userAvailable ? "unavailable" :
+                (portalRestoreTokenRemembered(user) ? "remembered" : "not_remembered")}
+        });
+        return true;
+    }
 
     if (type == "forget_wayland_remote_access") {
         const auto user = activeUserIdentity();
