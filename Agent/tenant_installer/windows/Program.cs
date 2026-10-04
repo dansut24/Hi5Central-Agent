@@ -1,45 +1,35 @@
-using System;
 using System.Diagnostics;
-using System.IO;
-using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text.Json;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace Hi5Central.AgentTenantInstaller;
 
-internal sealed record DeploymentConfig(
-    int SchemaVersion,
-    string ApiBase,
-    string DeploymentId,
-    string DeploymentSecret);
-
 internal static class Program
 {
+    private const string DeploymentId = "__DEPLOYMENT_ID__";
+    private const string DeploymentSecret = "__DEPLOYMENT_SECRET__";
+    private const string ApiBase = "__API_BASE__";
     private const string SetupUrl = "https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe";
-    private const string DefaultConfigName = "Hi5CentralDeployment.json";
 
     [STAThread]
     private static async Task Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-        var quiet = HasArg(args, "--quiet");
-        var tempDir = Path.Combine(Path.GetTempPath(), "Hi5Central", "DeploymentInstaller", Guid.NewGuid().ToString("N"));
+        var quiet = args.Any(arg => string.Equals(arg, "--quiet", StringComparison.OrdinalIgnoreCase));
+        var tempDir = Path.Combine(Path.GetTempPath(), "Hi5Central", "TenantInstaller", Guid.NewGuid().ToString("N"));
         var setupPath = Path.Combine(tempDir, "Hi5CentralAgentSetup.exe");
 
         try
         {
             Directory.CreateDirectory(tempDir);
             using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
-            var config = await LoadConfigAsync(client, args);
 
             using var tokenResponse = await client.PostAsJsonAsync(
-                $"{config.ApiBase.TrimEnd('/')}/api/v1/agent/deployments/{config.DeploymentId}/enrollment-token",
-                new { deploymentSecret = config.DeploymentSecret });
+                $"{ApiBase.TrimEnd('/')}/api/v1/agent/deployments/{DeploymentId}/enrollment-token",
+                new { deploymentSecret = DeploymentSecret });
             tokenResponse.EnsureSuccessStatusCode();
-
             using var tokenDocument = JsonDocument.Parse(await tokenResponse.Content.ReadAsStringAsync());
             var enrollmentToken = tokenDocument.RootElement.GetProperty("enrollmentToken").GetString();
             if (string.IsNullOrWhiteSpace(enrollmentToken))
@@ -60,8 +50,8 @@ internal static class Program
                 CreateNoWindow = true,
                 Arguments =
                     $"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART " +
-                    $"/ENROLLMENT_TOKEN=\"{enrollmentToken}\" /API_BASE_URL=\"{config.ApiBase}\" " +
-                    $"/INSTALL_SOURCE=\"deployment-config\""
+                    $"/ENROLLMENT_TOKEN=\"{enrollmentToken}\" /API_BASE_URL=\"{ApiBase}\" " +
+                    $"/INSTALL_SOURCE=\"tenant-native-installer\""
             });
 
             if (process is null)
@@ -96,64 +86,5 @@ internal static class Program
         {
             try { Directory.Delete(tempDir, recursive: true); } catch { }
         }
-    }
-
-    private static bool HasArg(string[] args, string name) =>
-        args.Any(arg => string.Equals(arg, name, StringComparison.OrdinalIgnoreCase));
-
-    private static string? ArgValue(string[] args, string name)
-    {
-        for (var i = 0; i < args.Length - 1; i++)
-        {
-            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
-                return args[i + 1];
-        }
-        return null;
-    }
-
-    private static async Task<DeploymentConfig> LoadConfigAsync(HttpClient client, string[] args)
-    {
-        var source =
-            ArgValue(args, "--config") ??
-            ArgValue(args, "--config-url") ??
-            Environment.GetEnvironmentVariable("HI5_DEPLOYMENT_CONFIG");
-
-        if (string.IsNullOrWhiteSpace(source))
-        {
-            var adjacent = Path.Combine(AppContext.BaseDirectory, DefaultConfigName);
-            if (File.Exists(adjacent)) source = adjacent;
-        }
-
-        if (string.IsNullOrWhiteSpace(source))
-            throw new InvalidOperationException(
-                $"Deployment configuration was not found. Place {DefaultConfigName} beside this installer or pass --config <path-or-url>.");
-
-        string json;
-        if (Uri.TryCreate(source, UriKind.Absolute, out var uri) &&
-            (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp))
-        {
-            if (uri.Scheme != Uri.UriSchemeHttps)
-                throw new InvalidOperationException("Deployment configuration URLs must use HTTPS.");
-            json = await client.GetStringAsync(uri);
-        }
-        else
-        {
-            json = await File.ReadAllTextAsync(Path.GetFullPath(source));
-        }
-
-        var config = JsonSerializer.Deserialize<DeploymentConfig>(
-            json,
-            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-
-        if (config is null || config.SchemaVersion != 1)
-            throw new InvalidOperationException("Deployment configuration is invalid or unsupported.");
-        if (!Uri.TryCreate(config.ApiBase, UriKind.Absolute, out var apiUri) || apiUri.Scheme != Uri.UriSchemeHttps)
-            throw new InvalidOperationException("Deployment API base must use HTTPS.");
-        if (!Guid.TryParse(config.DeploymentId, out _))
-            throw new InvalidOperationException("Deployment ID is invalid.");
-        if (string.IsNullOrWhiteSpace(config.DeploymentSecret))
-            throw new InvalidOperationException("Deployment credential is missing.");
-
-        return config;
     }
 }
