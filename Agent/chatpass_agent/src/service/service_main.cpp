@@ -1792,7 +1792,56 @@ class Worker {
                 const std::string defaultAgentWsBase = "wss://rmm.hi5central.com/agent/ws";
                 const std::wstring configDir = L"C:\\ProgramData\\Hi5Central\\Agent";
 
-                AgentIdentity ident = loadAgentIdentityFromDir(configDir, defaultAgentWsBase);
+                AgentIdentity ident;
+                int enrollmentRetrySeconds = 15;
+                constexpr int kEnrollmentRetryMaxSeconds = 15 * 60;
+
+                for (;;) {
+                    if (stop_.load()) {
+                        LogI("worker stop requested while waiting for enrollment");
+                        return;
+                    }
+
+                    try {
+                        ident = loadAgentIdentityFromDir(configDir, defaultAgentWsBase);
+                        break;
+                    }
+                    catch (const std::exception& ex) {
+                        const std::string detail = ex.what();
+                        const bool revoked =
+                            detail.find("HTTP 410") != std::string::npos ||
+                            detail.find("revoked") != std::string::npos;
+
+                        LogW(
+                            std::string("agent pending enrollment; ") +
+                            (revoked ? "deployment is revoked or unavailable" : "waiting for connectivity") +
+                            " retry_seconds=" + std::to_string(enrollmentRetrySeconds) +
+                            " detail=" + detail
+                        );
+
+                        const int sleepSlices = enrollmentRetrySeconds * 10;
+                        for (int slice = 0; slice < sleepSlices && !stop_.load(); ++slice) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+
+                        enrollmentRetrySeconds = std::min(enrollmentRetrySeconds * 2, kEnrollmentRetryMaxSeconds);
+                    }
+                    catch (...) {
+                        LogW(
+                            "agent pending enrollment; unknown enrollment error retry_seconds=" +
+                            std::to_string(enrollmentRetrySeconds)
+                        );
+
+                        const int sleepSlices = enrollmentRetrySeconds * 10;
+                        for (int slice = 0; slice < sleepSlices && !stop_.load(); ++slice) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+
+                        enrollmentRetrySeconds = std::min(enrollmentRetrySeconds * 2, kEnrollmentRetryMaxSeconds);
+                    }
+                }
+
+                if (stop_.load()) return;
 
                 LogI("identity loaded device_id=" + ident.deviceId);
                 LogI("agent ws base=" + ident.agentWsBaseUrl);

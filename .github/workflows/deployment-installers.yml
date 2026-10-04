@@ -7,6 +7,9 @@ on:
       - '.github/workflows/deployment-installers.yml'
       - 'Agent/tenant_installer/**'
       - 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss'
+      - 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1'
+      - 'Agent/chatpass_agent/src/service/service_main.cpp'
+      - 'Agent/chatpass_agent/CMakeLists.txt'
   push:
     branches:
       - main
@@ -14,6 +17,9 @@ on:
       - '.github/workflows/deployment-installers.yml'
       - 'Agent/tenant_installer/**'
       - 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss'
+      - 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1'
+      - 'Agent/chatpass_agent/src/service/service_main.cpp'
+      - 'Agent/chatpass_agent/CMakeLists.txt'
 
 permissions:
   contents: read
@@ -21,20 +27,38 @@ permissions:
 jobs:
   windows:
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download current Agent setup payload
+      - name: Install Windows build dependencies
         shell: pwsh
         run: |
+          choco install innosetup -y --no-progress
+          nuget install Microsoft.Web.WebView2 -OutputDirectory Agent/chatpass_agent/external -NonInteractive
+          $vcpkg = 'C:\vcpkg\vcpkg.exe'
+          if (-not (Test-Path $vcpkg)) { throw 'GitHub runner vcpkg was not found at C:\vcpkg.' }
+          & $vcpkg install openssl:x64-windows-static nlohmann-json:x64-windows-static libvpx:x64-windows-static libdatachannel:x64-windows-static
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg dependency install failed with exit code $LASTEXITCODE." }
+
+      - name: Build current Windows Agent setup
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio C++ build tools not found.' }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $repo = (Resolve-Path 'Agent/chatpass_agent').Path
+          $script = Join-Path $repo 'installer\windows\Build-AgentInstaller.ps1'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Clean -Generator "Visual Studio 18 2026" -Platform x64 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows-static -LibDataChannelRoot C:\vcpkg\installed\x64-windows-static -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Windows Agent installer build failed with exit code $LASTEXITCODE." }
+          $built = 'Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe'
+          if (-not (Test-Path $built)) { throw 'Windows Agent installer output is missing.' }
           $payloadDir = 'Agent/tenant_installer/windows/payload'
           New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
-          Invoke-WebRequest -UseBasicParsing -Uri 'https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe' -OutFile "$payloadDir/Hi5CentralAgentSetup.exe"
-          $size = (Get-Item "$payloadDir/Hi5CentralAgentSetup.exe").Length
-          if ($size -lt 1000000 -or $size -gt 50000000) {
-            throw "Agent setup payload size is unexpected: $size bytes"
-          }
+          Copy-Item $built "$payloadDir/Hi5CentralAgentSetup.exe"
+          Write-Host "Current Agent setup size: $((Get-Item $built).Length) bytes"
 
       - name: Build native single-file Windows installer template
         shell: pwsh
