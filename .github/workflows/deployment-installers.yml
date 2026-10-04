@@ -79,10 +79,42 @@ jobs:
           }
           Write-Host "Native Windows template size: $size bytes"
 
+      - name: Build tenant-stampable Windows MSI template
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+          $bootstrap = (Resolve-Path 'dist/windows/Hi5CentralAgentTemplate.exe').Path
+          wix build Agent/tenant_installer/windows/Package.wxs -arch x64 -d "BootstrapExe=$bootstrap" -o dist/windows/Hi5CentralAgentTemplate.msi
+          if ($LASTEXITCODE -ne 0) { throw "Windows MSI template build failed with exit code $LASTEXITCODE." }
+
+          $msi = 'dist/windows/Hi5CentralAgentTemplate.msi'
+          $bytes = [System.IO.File]::ReadAllBytes($msi)
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          $markers = @(
+            'H5MSI_ID_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+            'H5MSI_SECRET_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+            'H5MSI_API_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+          )
+          foreach ($marker in $markers) {
+            $count = ([regex]::Matches($text, [regex]::Escape($marker))).Count
+            if ($count -ne 1) {
+              throw "MSI tenant stamp marker must occur exactly once; marker prefix $($marker.Substring(0, [Math]::Min(16, $marker.Length))) occurred $count times."
+            }
+          }
+
+          $size = (Get-Item $msi).Length
+          if ($size -lt 1000000 -or $size -gt 60000000) {
+            throw "Windows MSI template size is unexpected: $size bytes"
+          }
+          Write-Host "Tenant-stampable Windows MSI template size: $size bytes"
+
       - uses: actions/upload-artifact@v4
         with:
           name: Hi5Central-Windows-Tenant-Template
-          path: dist/windows/Hi5CentralAgentTemplate.exe
+          path: |
+            dist/windows/Hi5CentralAgentTemplate.exe
+            dist/windows/Hi5CentralAgentTemplate.msi
           retention-days: 30
           if-no-files-found: error
 

@@ -7,7 +7,15 @@
     UpgradeCode="A824267A-6EEA-4D38-9382-245EB857E275">
     <MediaTemplate EmbedCab="yes" />
     <Property Id="ARPSYSTEMCOMPONENT" Value="1" />
-    <Property Id="HI5DEPLOYMENTCONFIG" Secure="yes" />
+
+    <!--
+      These fixed-size values are stamped in-memory by the Hi5Central API.
+      Their byte lengths must stay stable so a tenant-specific MSI can be
+      produced instantly without rebuilding the MSI or requiring a JSON sidecar.
+    -->
+    <Property Id="HI5DEPLOYMENTID" Value="H5MSI_ID_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" Secure="yes" Hidden="yes" />
+    <Property Id="HI5DEPLOYMENTSECRET" Value="H5MSI_SECRET_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" Secure="yes" Hidden="yes" />
+    <Property Id="HI5APIBASE" Value="H5MSI_API_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" Secure="yes" Hidden="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="Hi5CentralFolder" Name="Hi5Central">
@@ -26,7 +34,7 @@
     <CustomAction
       Id="RunDeploymentBootstrap"
       FileRef="DeploymentBootstrapExe"
-      ExeCommand="--quiet --config &quot;[HI5DEPLOYMENTCONFIG]&quot;"
+      ExeCommand="--quiet --deployment-id &quot;[HI5DEPLOYMENTID]&quot; --deployment-secret &quot;[HI5DEPLOYMENTSECRET]&quot; --api-base &quot;[HI5APIBASE]&quot; --install-source &quot;deployment-msi&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
