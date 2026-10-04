@@ -48,7 +48,7 @@ jobs:
           $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
           $repo = (Resolve-Path 'Agent/chatpass_agent').Path
           $script = Join-Path $repo 'installer\windows\Build-AgentInstaller.ps1'
-          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Clean -Generator "Visual Studio 17 2022" -Platform x64 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows-static -LibDataChannelRoot C:\vcpkg\installed\x64-windows-static -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Clean -Generator "Visual Studio 18 2026" -Platform x64 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows-static -LibDataChannelRoot C:\vcpkg\installed\x64-windows-static -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"'
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "Windows Agent installer build failed with exit code $LASTEXITCODE." }
           $built = 'Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe'
