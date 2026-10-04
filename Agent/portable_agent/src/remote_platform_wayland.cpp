@@ -14,7 +14,9 @@
 #include <X11/keysym.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -34,6 +36,7 @@ constexpr const char* kPortalName = "org.freedesktop.portal.Desktop";
 constexpr const char* kPortalPath = "/org/freedesktop/portal/desktop";
 constexpr const char* kRemoteDesktopInterface = "org.freedesktop.portal.RemoteDesktop";
 constexpr const char* kScreenCastInterface = "org.freedesktop.portal.ScreenCast";
+constexpr const char* kClipboardInterface = "org.freedesktop.portal.Clipboard";
 constexpr const char* kRequestInterface = "org.freedesktop.portal.Request";
 constexpr const char* kSessionInterface = "org.freedesktop.portal.Session";
 
@@ -237,8 +240,18 @@ public:
 
         if (!createPortalSession(error) ||
             !selectPortalDevices(error) ||
-            !selectPortalSources(error) ||
-            !startPortalSession(error) ||
+            !selectPortalSources(error)) {
+            stopLocked();
+            return false;
+        }
+
+        std::string clipboardError;
+        clipboardRequested_ = requestClipboardAccess(clipboardError);
+        if (!clipboardRequested_ && !clipboardError.empty()) {
+            std::cerr << "[wayland-clipboard] unavailable: " << clipboardError << "\n";
+        }
+
+        if (!startPortalSession(error) ||
             !openPipeWireRemote(error) ||
             !startPipeWire(error)) {
             stopLocked();
@@ -361,13 +374,26 @@ public:
 
         if (kind == "text_input") {
             const std::string text = message.value("text", "");
-            for (const unsigned char ch : text) {
-                if (ch < 0x20 || ch > 0x7e) continue;
-                std::string one(1, static_cast<char>(ch));
-                KeySym sym = XStringToKeysym(one.c_str());
-                if (sym == NoSymbol) continue;
-                if (!notifyKeysym(static_cast<std::int32_t>(sym), 1U, error) ||
-                    !notifyKeysym(static_cast<std::int32_t>(sym), 0U, error)) {
+            const gchar* cursor = text.c_str();
+            const gchar* end = cursor + text.size();
+            while (cursor < end && *cursor) {
+                const gunichar codepoint = g_utf8_get_char_validated(
+                    cursor,
+                    static_cast<gssize>(end - cursor));
+                if (codepoint == static_cast<gunichar>(-1) ||
+                    codepoint == static_cast<gunichar>(-2)) {
+                    ++cursor;
+                    continue;
+                }
+                cursor = g_utf8_next_char(cursor);
+                if (codepoint < 0x20 || codepoint == 0x7f) continue;
+
+                const std::uint32_t keysym =
+                    codepoint <= 0xff
+                        ? static_cast<std::uint32_t>(codepoint)
+                        : (0x01000000U | static_cast<std::uint32_t>(codepoint));
+                if (!notifyKeysym(static_cast<std::int32_t>(keysym), 1U, error) ||
+                    !notifyKeysym(static_cast<std::int32_t>(keysym), 0U, error)) {
                     return false;
                 }
             }
@@ -376,6 +402,25 @@ public:
 
         error = "Unsupported Wayland input event: " + kind;
         return false;
+    }
+
+    bool readClipboardText(std::string& text, std::string& error) override {
+        text.clear();
+        if (!clipboardEnabled_) {
+            error = "Wayland clipboard access was not granted for this remote session.";
+            return false;
+        }
+
+        if (readClipboardMime("text/plain;charset=utf-8", text, error)) return true;
+        const std::string firstError = error;
+        error.clear();
+        if (readClipboardMime("text/plain", text, error)) return true;
+        if (error.empty()) error = firstError;
+        return false;
+    }
+
+    bool supportsClipboardRead() const override {
+        return clipboardEnabled_;
     }
 
     std::string backendName() const override {
@@ -579,6 +624,115 @@ private:
         return reply.response == 0;
     }
 
+    bool requestClipboardAccess(std::string& error) {
+        if (!bus_ || sessionHandle_.empty()) {
+            error = "Wayland remote desktop session is not ready for clipboard access.";
+            return false;
+        }
+
+        GVariantBuilder options;
+        g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+        GError* callError = nullptr;
+        GVariant* result = g_dbus_connection_call_sync(
+            bus_,
+            kPortalName,
+            kPortalPath,
+            kClipboardInterface,
+            "RequestClipboard",
+            g_variant_new(
+                "(oa{sv})",
+                sessionHandle_.c_str(),
+                &options),
+            nullptr,
+            G_DBUS_CALL_FLAGS_NONE,
+            5000,
+            nullptr,
+            &callError);
+        if (!result) {
+            error = glibErrorMessage(
+                callError,
+                "Wayland clipboard portal is unavailable.");
+            return false;
+        }
+        g_variant_unref(result);
+        return true;
+    }
+
+    bool readClipboardMime(
+        const char* mimeType,
+        std::string& text,
+        std::string& error) {
+
+        GUnixFDList* fdList = nullptr;
+        GError* callError = nullptr;
+        GVariant* result = g_dbus_connection_call_with_unix_fd_list_sync(
+            bus_,
+            kPortalName,
+            kPortalPath,
+            kClipboardInterface,
+            "SelectionRead",
+            g_variant_new(
+                "(os)",
+                sessionHandle_.c_str(),
+                mimeType),
+            G_VARIANT_TYPE("(h)"),
+            G_DBUS_CALL_FLAGS_NONE,
+            5000,
+            nullptr,
+            &fdList,
+            nullptr,
+            &callError);
+
+        if (!result || !fdList) {
+            if (result) g_variant_unref(result);
+            if (fdList) g_object_unref(fdList);
+            error = glibErrorMessage(
+                callError,
+                std::string("Unable to read Wayland clipboard type ") + mimeType + ".");
+            return false;
+        }
+
+        gint32 handle = -1;
+        g_variant_get(result, "(h)", &handle);
+        g_variant_unref(result);
+
+        GError* fdError = nullptr;
+        const int fd = g_unix_fd_list_get(fdList, handle, &fdError);
+        g_object_unref(fdList);
+        if (fd < 0) {
+            error = glibErrorMessage(
+                fdError,
+                "Wayland clipboard portal returned an invalid file descriptor.");
+            return false;
+        }
+
+        constexpr std::size_t kMaxClipboardBytes = 4U * 1024U * 1024U;
+        std::array<char, 8192> buffer {};
+        std::string value;
+        bool ok = true;
+        while (value.size() < kMaxClipboardBytes) {
+            const std::size_t remaining = kMaxClipboardBytes - value.size();
+            const ssize_t count = ::read(
+                fd,
+                buffer.data(),
+                std::min(buffer.size(), remaining));
+            if (count > 0) {
+                value.append(buffer.data(), static_cast<std::size_t>(count));
+                continue;
+            }
+            if (count == 0) break;
+            if (errno == EINTR) continue;
+            ok = false;
+            error = "Unable to read data from the Wayland clipboard portal.";
+            break;
+        }
+        ::close(fd);
+
+        if (!ok) return false;
+        text = std::move(value);
+        return true;
+    }
+
     bool startPortalSession(std::string& error) {
         GVariantBuilder options;
         g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
@@ -603,6 +757,17 @@ private:
 
         guint32 devices = 0;
         (void)g_variant_lookup(reply.results, "devices", "u", &devices);
+
+        gboolean clipboardEnabled = FALSE;
+        if (clipboardRequested_) {
+            (void)g_variant_lookup(
+                reply.results,
+                "clipboard_enabled",
+                "b",
+                &clipboardEnabled);
+        }
+        clipboardEnabled_ = clipboardEnabled == TRUE;
+
         if ((devices & 2U) == 0U) {
             error = "Wayland portal did not grant pointer control.";
             return false;
@@ -1116,6 +1281,8 @@ private:
         }
 
         sessionHandle_.clear();
+        clipboardRequested_ = false;
+        clipboardEnabled_ = false;
         streamNodeId_ = 0;
         logicalWidth_ = 0;
         logicalHeight_ = 0;
@@ -1133,6 +1300,8 @@ private:
     mutable std::mutex frameMutex_;
     GDBusConnection* bus_ = nullptr;
     std::string sessionHandle_;
+    bool clipboardRequested_ = false;
+    bool clipboardEnabled_ = false;
     guint32 streamNodeId_ = 0;
     int logicalWidth_ = 0;
     int logicalHeight_ = 0;
