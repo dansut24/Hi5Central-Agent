@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winsvc.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <array>
@@ -48,6 +49,47 @@ std::wstring Utf8ToWide(const std::string& value) {
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
         static_cast<int>(value.size()), result.data(), required);
     return result;
+}
+
+std::string WideToUtf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int required = WideCharToMultiByte(CP_UTF8, 0, value.data(),
+        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (required <= 0) return {};
+    std::string result(static_cast<size_t>(required), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+        result.data(), required, nullptr, nullptr);
+    return result;
+}
+
+std::wstring Trim(std::wstring value) {
+    while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
+    while (!value.empty() && iswspace(value.back())) value.pop_back();
+    return value;
+}
+
+std::wstring CommandLineOption(const std::wstring& name) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return {};
+
+    std::wstring value;
+    const std::wstring prefix = name + L"=";
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring arg = argv[i] ? argv[i] : L"";
+        if (_wcsicmp(arg.c_str(), name.c_str()) == 0 && i + 1 < argc) {
+            value = argv[++i] ? argv[i] : L"";
+            break;
+        }
+        if (arg.size() > prefix.size() &&
+            _wcsnicmp(arg.c_str(), prefix.c_str(), prefix.size()) == 0) {
+            value = arg.substr(prefix.size());
+            break;
+        }
+    }
+
+    LocalFree(argv);
+    return Trim(value);
 }
 
 std::string FixedField(const volatile char* value, size_t capacity) {
@@ -166,6 +208,7 @@ bool RunAgentSetup(const std::filesystem::path& setupPath,
                    const std::string& deploymentId,
                    const std::string& deploymentSecret,
                    const std::string& apiBase,
+                   const std::string& installSource,
                    DWORD& exitCode,
                    std::wstring& error) {
     std::wstring args =
@@ -175,7 +218,7 @@ bool RunAgentSetup(const std::filesystem::path& setupPath,
         L" /DEPLOYMENT_SECRET=" + Quote(Utf8ToWide(deploymentSecret)) +
         L" /PACKAGE_ID=" + Quote(Utf8ToWide(deploymentId)) +
         L" /API_BASE_URL=" + Quote(Utf8ToWide(apiBase)) +
-        L" /INSTALL_SOURCE=" + Quote(L"tenant-installer");
+        L" /INSTALL_SOURCE=" + Quote(Utf8ToWide(installSource));
 
     std::vector<wchar_t> command(args.begin(), args.end());
     command.push_back(L'\0');
@@ -258,14 +301,34 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         gHi5DeploymentConfig.magic[14] == 'E' &&
         gHi5DeploymentConfig.magic[15] == '3';
 
-    const std::string deploymentId = FixedField(gHi5DeploymentConfig.deploymentId, sizeof(gHi5DeploymentConfig.deploymentId));
-    const std::string deploymentSecret = FixedField(gHi5DeploymentConfig.deploymentSecret, sizeof(gHi5DeploymentConfig.deploymentSecret));
-    const std::string apiBase = FixedField(gHi5DeploymentConfig.apiBase, sizeof(gHi5DeploymentConfig.apiBase));
+    const std::wstring deploymentIdOverride = CommandLineOption(L"--deployment-id");
+    const std::wstring deploymentSecretOverride = CommandLineOption(L"--deployment-secret");
+    const std::wstring apiBaseOverride = CommandLineOption(L"--api-base");
+    const std::wstring installSourceOverride = CommandLineOption(L"--install-source");
+
+    const std::string deploymentId = deploymentIdOverride.empty()
+        ? FixedField(gHi5DeploymentConfig.deploymentId, sizeof(gHi5DeploymentConfig.deploymentId))
+        : WideToUtf8(deploymentIdOverride);
+    const std::string deploymentSecret = deploymentSecretOverride.empty()
+        ? FixedField(gHi5DeploymentConfig.deploymentSecret, sizeof(gHi5DeploymentConfig.deploymentSecret))
+        : WideToUtf8(deploymentSecretOverride);
+    const std::string apiBase = apiBaseOverride.empty()
+        ? FixedField(gHi5DeploymentConfig.apiBase, sizeof(gHi5DeploymentConfig.apiBase))
+        : WideToUtf8(apiBaseOverride);
+    const std::string installSource = installSourceOverride.empty()
+        ? "tenant-installer"
+        : WideToUtf8(installSourceOverride);
+
+    const bool templateDeploymentId =
+        deploymentId == "__TEMPLATE__" || deploymentId.rfind("H5MSI_ID_", 0) == 0;
+    const bool templateDeploymentSecret =
+        deploymentSecret == "__TEMPLATE__" || deploymentSecret.rfind("H5MSI_SECRET_", 0) == 0;
+    const bool templateApiBase = apiBase.rfind("H5MSI_API_", 0) == 0;
 
     if (!validMagic ||
-        deploymentId.empty() || deploymentId == "__TEMPLATE__" ||
-        deploymentSecret.empty() || deploymentSecret == "__TEMPLATE__" ||
-        apiBase.rfind("https://", 0) != 0) {
+        deploymentId.empty() || templateDeploymentId ||
+        deploymentSecret.empty() || templateDeploymentSecret ||
+        templateApiBase || apiBase.rfind("https://", 0) != 0) {
         ShowError(
             L"This Hi5Central Agent installer has not been assigned to a tenant. "
             L"Download a new installer from the Hi5Central portal.",
@@ -282,7 +345,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     DWORD setupExitCode = ERROR_GEN_FAILURE;
     const bool installed = RunAgentSetup(
-        setupPath, deploymentId, deploymentSecret, apiBase, setupExitCode, error);
+        setupPath, deploymentId, deploymentSecret, apiBase, installSource, setupExitCode, error);
 
     DeleteFileW(setupPath.c_str());
 
