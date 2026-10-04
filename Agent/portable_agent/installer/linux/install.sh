@@ -2,6 +2,8 @@
 set -euo pipefail
 
 TOKEN=""
+DEPLOYMENT_ID=""
+DEPLOYMENT_SECRET=""
 API_BASE="https://api.hi5central.com"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALL_DIR="/opt/hi5central/agent"
@@ -19,6 +21,8 @@ BACKUP_HELPER="$INSTALL_DIR/Hi5CentralRemoteHelper.previous"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --enrollment-token) TOKEN="${2:-}"; shift 2 ;;
+    --deployment-id) DEPLOYMENT_ID="${2:-}"; shift 2 ;;
+    --deployment-secret) DEPLOYMENT_SECRET="${2:-}"; shift 2 ;;
     --api-base) API_BASE="${2:-}"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -92,8 +96,8 @@ install -m 0755 "$SOURCE_DIR/Hi5CentralRemoteHelper" "$REMOTE_HELPER"
 if [[ -s "$STATE_FILE" ]]; then
   echo "Existing Hi5Central Agent identity found; preserving enrollment."
 else
-  if [[ -z "$TOKEN" ]]; then
-    echo "--enrollment-token is required for a new installation." >&2
+  if [[ -z "$TOKEN" && -z "$DEPLOYMENT_ID" ]]; then
+    echo "--deployment-id or --enrollment-token is required for a new installation." >&2
     if [[ "$HAD_EXISTING_BINARY" == true && -x "$BACKUP_BINARY" ]]; then
       install -m 0755 "$BACKUP_BINARY" "$BINARY"
     fi
@@ -104,9 +108,19 @@ else
     fi
     exit 2
   fi
+  if [[ -n "$DEPLOYMENT_ID" && -z "$DEPLOYMENT_SECRET" ]]; then
+    echo "--deployment-secret is required with --deployment-id." >&2
+    exit 2
+  fi
 
   echo "Enrolling Hi5Central Agent..."
-  if ! "$BINARY"       --state-dir "$STATE_DIR"       --api-base "$API_BASE"       --enrollment-token "$TOKEN"       --enroll-only; then
+  ENROLL_ARGS=(--state-dir "$STATE_DIR" --api-base "$API_BASE" --enroll-only)
+  if [[ -n "$DEPLOYMENT_ID" ]]; then
+    ENROLL_ARGS+=(--deployment-id "$DEPLOYMENT_ID" --deployment-secret "$DEPLOYMENT_SECRET")
+  else
+    ENROLL_ARGS+=(--enrollment-token "$TOKEN")
+  fi
+  if ! "$BINARY" "${ENROLL_ARGS[@]}"; then
     echo "Enrollment failed." >&2
     if [[ "$HAD_EXISTING_BINARY" == true && -x "$BACKUP_BINARY" ]]; then
       echo "Restoring previous Agent binary..." >&2

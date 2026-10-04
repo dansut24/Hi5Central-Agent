@@ -1,7 +1,9 @@
 #include "remote_webrtc.h"
+#include "remote_session_ui.h"
 
 #if defined(__linux__)
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -56,13 +58,24 @@ int connectSocket(const std::string& path) {
         }
         std::strncpy(address.sun_path, path.c_str(), sizeof(address.sun_path) - 1);
 
-        if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+        if (::connect(
+                fd,
+                reinterpret_cast<sockaddr*>(&address),
+                sizeof(address)) == 0) {
             return fd;
         }
         ::close(fd);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return -1;
+}
+
+bool terminalMessage(const std::string& type) {
+    return type == "viewer_disconnected" ||
+           type == "viewer_closed" ||
+           type == "viewer_left" ||
+           type == "end_session" ||
+           type == "stop_webrtc";
 }
 
 int runHelper(int argc, char** argv) {
@@ -73,34 +86,67 @@ int runHelper(int argc, char** argv) {
     if (fd < 0) return 3;
 
     std::mutex writeMutex;
-    hi5::RemoteDesktopManager manager([&](const json& message) {
+    auto send = [&](const json& message) {
         return sendLine(fd, writeMutex, message);
+    };
+
+    hi5::RemoteSessionUi sessionUi(send);
+    hi5::RemoteDesktopManager manager(send);
+    std::atomic<bool> readerDone{false};
+
+    std::thread reader([&]() {
+        std::string buffered;
+        char chunk[8192];
+
+        while (true) {
+            const ssize_t count = ::read(fd, chunk, sizeof(chunk));
+            if (count > 0) {
+                buffered.append(chunk, static_cast<std::size_t>(count));
+                for (;;) {
+                    const auto newline = buffered.find('\n');
+                    if (newline == std::string::npos) break;
+
+                    std::string line = buffered.substr(0, newline);
+                    buffered.erase(0, newline + 1);
+                    if (line.empty()) continue;
+
+                    auto message = json::parse(line, nullptr, false);
+                    if (message.is_discarded() || !message.is_object()) continue;
+
+                    const std::string type = message.value("type", "");
+                    if (type == "start_webrtc") {
+                        sessionUi.handleStart(message);
+                        manager.handleMessage(message);
+                    } else if (type == "chat_message") {
+                        sessionUi.handleChatMessage(message);
+                    } else if (type == "chat_close") {
+                        sessionUi.handleChatClose();
+                    } else {
+                        manager.handleMessage(message);
+                        if (terminalMessage(type)) {
+                            sessionUi.handleSessionEnd();
+                        }
+                    }
+                }
+                continue;
+            }
+            if (count < 0 && errno == EINTR) continue;
+            break;
+        }
+
+        manager.stopAll();
+        sessionUi.handleSessionEnd();
+        readerDone.store(true);
+        sessionUi.quit();
     });
 
-    std::string buffered;
-    char chunk[8192];
-    while (true) {
-        const ssize_t count = ::read(fd, chunk, sizeof(chunk));
-        if (count > 0) {
-            buffered.append(chunk, static_cast<std::size_t>(count));
-            for (;;) {
-                const auto newline = buffered.find('\n');
-                if (newline == std::string::npos) break;
-                std::string line = buffered.substr(0, newline);
-                buffered.erase(0, newline + 1);
-                if (line.empty()) continue;
-                auto message = json::parse(line, nullptr, false);
-                if (!message.is_discarded() && message.is_object()) {
-                    manager.handleMessage(message);
-                }
-            }
-            continue;
-        }
-        if (count < 0 && errno == EINTR) continue;
-        break;
-    }
+    sessionUi.run();
 
-    manager.stopAll();
+    if (!readerDone.load()) {
+        ::shutdown(fd, SHUT_RDWR);
+    }
+    if (reader.joinable()) reader.join();
+
     ::close(fd);
     return 0;
 }

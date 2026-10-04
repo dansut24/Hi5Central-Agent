@@ -2,6 +2,8 @@
 set -euo pipefail
 
 TOKEN=""
+DEPLOYMENT_ID=""
+DEPLOYMENT_SECRET=""
 API_BASE="https://api.hi5central.com"
 SOURCE_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 INSTALL_DIR="/Library/Application Support/Hi5Central/Agent"
@@ -16,6 +18,8 @@ REMOTE_HELPER_INSTALL="/Applications/Hi5Central Remote Helper.app"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --enrollment-token) TOKEN="${2:-}"; shift 2 ;;
+    --deployment-id) DEPLOYMENT_ID="${2:-}"; shift 2 ;;
+    --deployment-secret) DEPLOYMENT_SECRET="${2:-}"; shift 2 ;;
     --api-base) API_BASE="${2:-}"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -82,13 +86,23 @@ chmod 0755 "$REMOTE_HELPER_INSTALL/Contents/MacOS/Hi5CentralRemoteHelper"
 if [[ -s "$STATE_FILE" ]]; then
   echo "Existing Hi5Central Agent identity found; preserving enrollment."
 else
-  if [[ -z "$TOKEN" ]]; then
-    echo "--enrollment-token is required for a new installation." >&2
+  if [[ -z "$TOKEN" && -z "$DEPLOYMENT_ID" ]]; then
+    echo "--deployment-id or --enrollment-token is required for a new installation." >&2
+    exit 2
+  fi
+  if [[ -n "$DEPLOYMENT_ID" && -z "$DEPLOYMENT_SECRET" ]]; then
+    echo "--deployment-secret is required with --deployment-id." >&2
     exit 2
   fi
 
   echo "Enrolling Hi5Central Agent..."
-  "$BINARY"     --state-dir "$INSTALL_DIR"     --api-base "$API_BASE"     --enrollment-token "$TOKEN"     --enroll-only
+  ENROLL_ARGS=(--state-dir "$INSTALL_DIR" --api-base "$API_BASE" --enroll-only)
+  if [[ -n "$DEPLOYMENT_ID" ]]; then
+    ENROLL_ARGS+=(--deployment-id "$DEPLOYMENT_ID" --deployment-secret "$DEPLOYMENT_SECRET")
+  else
+    ENROLL_ARGS+=(--enrollment-token "$TOKEN")
+  fi
+  "$BINARY" "${ENROLL_ARGS[@]}"
 fi
 
 PLIST_TMP="$(mktemp -t hi5central-agent-plist)"

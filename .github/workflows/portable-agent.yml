@@ -15,6 +15,7 @@ on:
       - fix/macos-user-file-helper-context
       - fix/software-inventory-classification
       - fix/software-inventory-safe-view
+      - feature/unix-session-presence-chat
   pull_request:
 
 permissions:
@@ -33,7 +34,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libcurl4-openssl-dev libssl-dev libvpx-dev libx11-dev libxext-dev libxtst-dev libglib2.0-dev libpipewire-0.3-dev pkg-config
+          sudo apt-get install -y ninja-build libcurl4-openssl-dev libssl-dev libvpx-dev libx11-dev libxext-dev libxtst-dev libglib2.0-dev libgtk-3-dev libpipewire-0.3-dev pkg-config
       - name: Configure
         run: |
           cmake -S Agent/portable_agent -B build/portable-linux -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}

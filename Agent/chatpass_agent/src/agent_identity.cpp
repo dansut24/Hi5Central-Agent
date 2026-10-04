@@ -433,11 +433,15 @@ namespace {
         const std::string tenantId = getFirst(legacyConfig, { "tenant_id", "tenantid" });
         const std::string groupId = getFirst(legacyConfig, { "group_id", "groupid" });
         const std::string packageId = getFirst(legacyConfig, { "package_id", "packageid", "enrollment_package_id" });
+        const std::string deploymentId = getFirst(legacyConfig, { "deployment_id", "deploymentid" });
+        const std::string deploymentSecret = getFirst(legacyConfig, { "deployment_secret", "deploymentsecret" });
         const std::string provisionBlob = getFirst(legacyConfig, { "provision_blob", "provisionblob" });
 
         if (!tenantId.empty()) body["tenant_id"] = tenantId;
         if (!groupId.empty()) body["group_id"] = groupId;
         if (!packageId.empty()) body["package_id"] = packageId;
+        if (!deploymentId.empty()) body["deploymentId"] = deploymentId;
+        if (!deploymentSecret.empty()) body["deploymentSecret"] = deploymentSecret;
         if (!provisionBlob.empty()) body["provision_blob"] = provisionBlob;
 
         const auto res = json::parse(httpPostJson(url, body.dump()), nullptr, false);
@@ -620,4 +624,3 @@ AgentIdentity loadAgentIdentityFromDir(
     ident.agentWsBaseUrl = newState.agentWsBaseUrl;
     return ident;
 }
-

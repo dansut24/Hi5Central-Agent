@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Hi5Central Agent Tenant Installer"
+    Manufacturer="Hi5Central"
+    Version="1.0.0"
+    UpgradeCode="A824267A-6EEA-4D38-9382-245EB857E275">
+    <MediaTemplate EmbedCab="yes" />
+    <Property Id="ARPSYSTEMCOMPONENT" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="Hi5CentralFolder" Name="Hi5Central">
+        <Directory Id="TenantBootstrapFolder" Name="Tenant Installer">
+          <Component Id="TenantBootstrapComponent" Guid="*">
+            <File Id="TenantBootstrapExe" Source="$(var.BootstrapExe)" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Hi5Central Agent" Level="1">
+      <ComponentRef Id="TenantBootstrapComponent" />
+    </Feature>
+
+    <CustomAction
+      Id="RunTenantBootstrap"
+      FileRef="TenantBootstrapExe"
+      ExeCommand="--quiet"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RunTenantBootstrap" After="InstallFiles" Condition="NOT Installed" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
+
+⏳ Process is running. Use read_process_output to get more output.

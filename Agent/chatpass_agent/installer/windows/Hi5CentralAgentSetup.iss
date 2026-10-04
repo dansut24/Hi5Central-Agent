@@ -108,6 +108,8 @@ var
   TenantId: String;
   GroupId: String;
   PackageId: String;
+  DeploymentId: String;
+  DeploymentSecret: String;
   ProvisionBlob: String;
   InstallSource: String;
 begin
@@ -119,7 +121,9 @@ begin
   EnrollmentToken := FirstNonEmpty(ParamValue('ENROLLMENT_TOKEN', ''), ParamValue('ENROLL_TOKEN', ''));
   TenantId := ParamValue('TENANT_ID', '');
   GroupId := ParamValue('GROUP_ID', '');
-  PackageId := ParamValue('PACKAGE_ID', '');
+  DeploymentId := ParamValue('DEPLOYMENT_ID', '');
+  PackageId := FirstNonEmpty(ParamValue('PACKAGE_ID', ''), DeploymentId);
+  DeploymentSecret := ParamValue('DEPLOYMENT_SECRET', '');
   ProvisionBlob := ParamValue('PROVISION_BLOB', '');
   InstallSource := ParamValue('INSTALL_SOURCE', 'manual-installer');
 
@@ -139,6 +143,12 @@ begin
 
   if PackageId <> '' then
     SetIniString('agent', 'package_id', PackageId, ConfigPath);
+
+  if DeploymentId <> '' then
+    SetIniString('agent', 'deployment_id', DeploymentId, ConfigPath);
+
+  if DeploymentSecret <> '' then
+    SetIniString('agent', 'deployment_secret', DeploymentSecret, ConfigPath);
 
   if ProvisionBlob <> '' then
     SetIniString('agent', 'provision_blob', ProvisionBlob, ConfigPath);
