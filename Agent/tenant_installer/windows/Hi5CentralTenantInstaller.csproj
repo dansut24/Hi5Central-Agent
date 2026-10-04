@@ -6,10 +6,11 @@
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <PublishTrimmed>false</PublishTrimmed>
-    <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>Hi5CentralAgentTenantInstaller</AssemblyName>
     <RootNamespace>Hi5Central.AgentTenantInstaller</RootNamespace>
   </PropertyGroup>
 </Project>
+
+⏳ Process is running. Use read_process_output to get more output.
