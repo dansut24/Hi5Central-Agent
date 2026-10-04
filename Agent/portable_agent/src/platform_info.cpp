@@ -188,6 +188,72 @@ std::string osBuild() {
 #endif
 }
 
+std::string osDistributionId() {
+#if defined(__APPLE__)
+    return "macos";
+#else
+    const auto values = osRelease();
+    const auto it = values.find("ID");
+    return it == values.end() ? "linux" : trim(it->second);
+#endif
+}
+
+std::string osDistributionVersion() {
+#if defined(__APPLE__)
+    return osVersion();
+#else
+    const auto values = osRelease();
+    const auto it = values.find("VERSION_ID");
+    return it == values.end() ? osVersion() : trim(it->second);
+#endif
+}
+
+std::string osDistributionName() {
+#if defined(__APPLE__)
+    return "macOS";
+#else
+    const auto values = osRelease();
+    for (const auto* key : {"PRETTY_NAME", "NAME"}) {
+        const auto it = values.find(key);
+        if (it != values.end() && !trim(it->second).empty()) return trim(it->second);
+    }
+    return "Linux";
+#endif
+}
+
+std::string osDistributionLike() {
+#if defined(__APPLE__)
+    return "";
+#else
+    const auto values = osRelease();
+    const auto it = values.find("ID_LIKE");
+    return it == values.end() ? "" : trim(it->second);
+#endif
+}
+
+std::string osDistributionCodename() {
+#if defined(__APPLE__)
+    return "";
+#else
+    const auto values = osRelease();
+    for (const auto* key : {"VERSION_CODENAME", "DEBIAN_CODENAME"}) {
+        const auto it = values.find(key);
+        if (it != values.end() && !trim(it->second).empty()) return trim(it->second);
+    }
+    return "";
+#endif
+}
+
+std::string osUbuntuCodename() {
+#if defined(__APPLE__)
+    return "";
+#else
+    const auto values = osRelease();
+    const auto it = values.find("UBUNTU_CODENAME");
+    return it == values.end() ? "" : trim(it->second);
+#endif
+}
+
 std::string manufacturer() {
 #if defined(__APPLE__)
     return "Apple Inc.";
