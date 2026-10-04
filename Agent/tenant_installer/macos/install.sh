@@ -10,9 +10,19 @@ TMP_DIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
+ENROLLMENT_TOKEN="$(/usr/bin/curl -fsSL -X POST \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: text/plain' \
+  --data "{\"deploymentSecret\":\"$DEPLOYMENT_SECRET\"}" \
+  "$API_BASE/api/v1/agent/deployments/$DEPLOYMENT_ID/enrollment-token")"
+
+if [[ -z "$ENROLLMENT_TOKEN" ]]; then
+  echo "Hi5Central did not return an enrollment token." >&2
+  exit 1
+fi
+
 /usr/bin/curl -fsSL "$AGENT_URL" -o "$TMP_DIR/agent.tar.gz"
 /usr/bin/tar -xzf "$TMP_DIR/agent.tar.gz" -C "$TMP_DIR"
 "$TMP_DIR/installer/macos/install.sh" \
-  --deployment-id "$DEPLOYMENT_ID" \
-  --deployment-secret "$DEPLOYMENT_SECRET" \
+  --enrollment-token "$ENROLLMENT_TOKEN" \
   --api-base "$API_BASE"
