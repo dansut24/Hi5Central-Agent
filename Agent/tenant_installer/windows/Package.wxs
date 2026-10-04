@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
-    Name="Hi5Central Agent Tenant Installer"
+    Name="Hi5Central Agent Deployment"
     Manufacturer="Hi5Central"
     Version="1.0.0"
     UpgradeCode="A824267A-6EEA-4D38-9382-245EB857E275">
@@ -11,30 +11,28 @@
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="Hi5CentralFolder" Name="Hi5Central">
-        <Directory Id="TenantBootstrapFolder" Name="Tenant Installer">
-          <Component Id="TenantBootstrapComponent" Guid="*">
-            <File Id="TenantBootstrapExe" Source="$(var.BootstrapExe)" KeyPath="yes" />
+        <Directory Id="DeploymentInstallerFolder" Name="Deployment Installer">
+          <Component Id="DeploymentInstallerComponent" Guid="*">
+            <File Id="AgentSetupExe" Source="$(var.SetupExe)" KeyPath="yes" />
           </Component>
         </Directory>
       </Directory>
     </StandardDirectory>
 
     <Feature Id="MainFeature" Title="Hi5Central Agent" Level="1">
-      <ComponentRef Id="TenantBootstrapComponent" />
+      <ComponentRef Id="DeploymentInstallerComponent" />
     </Feature>
 
     <CustomAction
-      Id="RunTenantBootstrap"
-      FileRef="TenantBootstrapExe"
-      ExeCommand="--quiet --config &quot;[HI5DEPLOYMENTCONFIG]&quot;"
+      Id="RunAgentSetup"
+      FileRef="AgentSetupExe"
+      ExeCommand="/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DEPLOYMENT_CONFIG=&quot;[HI5DEPLOYMENTCONFIG]&quot; /INSTALL_SOURCE=&quot;deployment-msi&quot;"
       Execute="deferred"
       Impersonate="no"
       Return="check" />
 
     <InstallExecuteSequence>
-      <Custom Action="RunTenantBootstrap" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="RunAgentSetup" After="InstallFiles" Condition="NOT Installed" />
     </InstallExecuteSequence>
   </Package>
 </Wix>
-
-⏳ Process is running. Use read_process_output to get more output.
