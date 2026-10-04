@@ -107,6 +107,7 @@ elseif(UNIX)
   pkg_check_modules(HI5_X11 REQUIRED IMPORTED_TARGET x11 xext xtst)
   pkg_check_modules(HI5_GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
   pkg_check_modules(HI5_PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+  pkg_check_modules(HI5_GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
   list(APPEND HI5_REMOTE_SOURCES
     src/remote_webrtc_parent_linux.cpp
   )
@@ -158,6 +159,7 @@ if(APPLE)
 
   add_executable(Hi5CentralRemoteHelper
     src/remote_helper_main_macos.mm
+    src/remote_session_ui_macos.mm
     src/remote_h264_vt_encoder.mm
     src/remote_software_video_encoder.cpp
     src/remote_webrtc.cpp
@@ -174,6 +176,7 @@ if(APPLE)
   )
   set_source_files_properties(
     src/remote_helper_main_macos.mm
+    src/remote_session_ui_macos.mm
     src/remote_h264_vt_encoder.mm
     src/remote_platform_macos.mm
     PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
@@ -199,6 +202,7 @@ elseif(UNIX)
 
   add_executable(Hi5CentralRemoteHelper
     src/remote_helper_main_linux.cpp
+    src/remote_session_ui_linux.cpp
     src/remote_vp8_encoder.cpp
     src/remote_webrtc.cpp
     src/remote_platform_linux.cpp
@@ -219,6 +223,7 @@ elseif(UNIX)
     PkgConfig::HI5_X11
     PkgConfig::HI5_GIO
     PkgConfig::HI5_PIPEWIRE
+    PkgConfig::HI5_GTK
     Threads::Threads
     m
   )

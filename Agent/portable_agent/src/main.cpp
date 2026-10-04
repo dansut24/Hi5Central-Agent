@@ -172,16 +172,20 @@ Identity loadIdentity(const std::filesystem::path& dir) {
 Identity enroll(
     const hi5::HttpClient& http,
     const std::string& apiBase,
-    const std::string& token) {
+    const std::string& token,
+    const std::string& deploymentId,
+    const std::string& deploymentSecret) {
 
-    const json request = {
-        {"enrollmentToken", token},
+    json request = {
         {"hostname", hi5::hostname()},
         {"platform", hi5::platformId()},
         {"architecture", hi5::architecture()},
         {"agentVersion", HI5CENTRAL_AGENT_VERSION},
         {"fingerprint", hi5::machineId()}
     };
+    if (!token.empty()) request["enrollmentToken"] = token;
+    if (!deploymentId.empty()) request["deploymentId"] = deploymentId;
+    if (!deploymentSecret.empty()) request["deploymentSecret"] = deploymentSecret;
 
     const auto response = http.postJson(
         apiBase + "/api/v1/agent/enroll",
@@ -820,10 +824,19 @@ int main(int argc, char* argv[]) {
         if (identity.deviceId.empty() || identity.deviceKey.empty()) {
             std::string token = argValue(argc, argv, "--enrollment-token");
             if (token.empty()) token = getenvString("HI5_ENROLLMENT_TOKEN");
+            std::string deploymentId = argValue(argc, argv, "--deployment-id");
+            if (deploymentId.empty()) deploymentId = getenvString("HI5_DEPLOYMENT_ID");
+            std::string deploymentSecret = argValue(argc, argv, "--deployment-secret");
+            if (deploymentSecret.empty()) deploymentSecret = getenvString("HI5_DEPLOYMENT_SECRET");
 
-            if (token.empty()) {
+            if (token.empty() && deploymentId.empty()) {
                 throw std::runtime_error(
-                    "Agent is not enrolled. Supply --enrollment-token <token> or HI5_ENROLLMENT_TOKEN.");
+                    "Agent is not enrolled. Supply --deployment-id <id>, HI5_DEPLOYMENT_ID, "
+                    "--enrollment-token <token>, or HI5_ENROLLMENT_TOKEN.");
+            }
+            if (!deploymentId.empty() && deploymentSecret.empty()) {
+                throw std::runtime_error(
+                    "Persistent deployment enrollment requires --deployment-secret or HI5_DEPLOYMENT_SECRET.");
             }
 
             logLine(
@@ -831,7 +844,7 @@ int main(int argc, char* argv[]) {
                 "Enrolling " + hi5::hostname() +
                 " as " + hi5::platformId() + "/" + hi5::architecture());
 
-            identity = enroll(http, apiBase, token);
+            identity = enroll(http, apiBase, token, deploymentId, deploymentSecret);
             saveIdentity(stateDir, identity);
             logLine("INFO", "Enrollment succeeded device_id=" + identity.deviceId);
         }
