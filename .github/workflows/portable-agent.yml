@@ -15,6 +15,7 @@ on:
       - fix/macos-user-file-helper-context
       - fix/software-inventory-classification
       - fix/software-inventory-safe-view
+      - feature/unix-session-presence-chat
   pull_request:
 
 permissions:
@@ -272,4 +273,4 @@ jobs:
           path: dist/Hi5CentralAgent-macOS-universal.tar.gz
           retention-days: 14
           if-no-files-found: error
-🔄 Process 247373 is waiting for input (detected: "")
+🔄 Process 247714 is waiting for input (detected: "")
