@@ -603,9 +603,17 @@ private:
 
         guint32 devices = 0;
         (void)g_variant_lookup(reply.results, "devices", "u", &devices);
+        std::cerr << "[wayland-input] granted_devices=" << devices
+                  << " keyboard=" << ((devices & 1U) ? 1 : 0)
+                  << " pointer=" << ((devices & 2U) ? 1 : 0)
+                  << " touchscreen=" << ((devices & 4U) ? 1 : 0)
+                  << "\n";
         if ((devices & 2U) == 0U) {
             error = "Wayland portal did not grant pointer control.";
             return false;
+        }
+        if ((devices & 1U) == 0U) {
+            std::cerr << "[wayland-input] keyboard control was not granted by portal\n";
         }
 
         GVariant* streams = g_variant_lookup_value(
@@ -632,6 +640,7 @@ private:
         }
 
         streamNodeId_ = nodeId;
+        std::cerr << "[wayland-input] stream_node=" << streamNodeId_ << "\n";
 
         GVariant* size = g_variant_lookup_value(
             properties,
@@ -643,6 +652,8 @@ private:
             g_variant_get(size, "(ii)", &width, &height);
             logicalWidth_ = std::max(0, static_cast<int>(width));
             logicalHeight_ = std::max(0, static_cast<int>(height));
+            std::cerr << "[wayland-input] logical_size="
+                      << logicalWidth_ << "x" << logicalHeight_ << "\n";
             g_variant_unref(size);
         }
         g_variant_unref(properties);
