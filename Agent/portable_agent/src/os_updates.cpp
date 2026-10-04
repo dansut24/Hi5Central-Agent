@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -288,11 +289,25 @@ std::pair<std::string, std::string> splitDnfPackageArch(const std::string& value
     return {value.substr(0, dot), arch};
 }
 
-std::map<std::string, std::string> dnfSecuritySeverities(
+struct DnfSecurityInfo {
+    std::string severity;
+    std::set<std::string> advisoryIds;
+    std::set<std::string> cveIds;
+};
+
+bool safeAdvisoryId(const std::string& value) {
+    if (value.empty() || value.size() > 160) return false;
+    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '.' || ch == '+' || ch == '-' || ch == '_' || ch == ':';
+    });
+}
+
+std::map<std::string, DnfSecurityInfo> dnfSecurityInfo(
     const std::string& dnf,
     const std::map<std::string, json>& classification) {
 
-    std::map<std::string, std::string> result;
+    std::map<std::string, DnfSecurityInfo> result;
+    std::map<std::string, std::set<std::string>> advisoryPackages;
     const auto advisory = runShellCommand(
         dnf + " -q updateinfo list --updates --security 2>/dev/null",
         120,
@@ -306,7 +321,7 @@ std::map<std::string, std::string> dnfSecuritySeverities(
         std::istringstream row(line);
         std::string advisoryId, type, severity, packageNevra;
         if (!(row >> advisoryId >> type >> severity >> packageNevra)) continue;
-        if (lower(type) != "security") continue;
+        if (lower(type) != "security" || !safeAdvisoryId(advisoryId)) continue;
 
         std::string matched;
         for (const auto& [name, item] : classification) {
@@ -315,7 +330,44 @@ std::map<std::string, std::string> dnfSecuritySeverities(
                 matched = name;
             }
         }
-        if (!matched.empty()) result[matched] = severity.empty() ? "Security" : severity;
+        if (matched.empty()) continue;
+        auto& info = result[matched];
+        info.severity = severity.empty() ? "Security" : severity;
+        info.advisoryIds.insert(advisoryId);
+        advisoryPackages[advisoryId].insert(matched);
+    }
+
+    if (advisoryPackages.empty()) return result;
+
+    std::string command;
+    std::size_t advisoryCount = 0;
+    for (const auto& [advisoryId, packages] : advisoryPackages) {
+        (void)packages;
+        if (advisoryCount++ >= 128) break;
+        command += "printf '__HI5_ADVISORY__ %s\\n' " + shellQuote(advisoryId) + "; ";
+        command += dnf + " -q updateinfo info " + shellQuote(advisoryId) + " 2>/dev/null || true; ";
+    }
+
+    const auto details = runShellCommand(command, 240, 8 * 1024 * 1024, "root");
+    std::istringstream detailStream(details.output);
+    std::string currentAdvisory;
+    const std::regex cvePattern("CVE-[0-9]{4}-[0-9]{4,}", std::regex::icase);
+    while (std::getline(detailStream, line)) {
+        line = trim(line);
+        if (line.rfind("__HI5_ADVISORY__ ", 0) == 0) {
+            currentAdvisory = trim(line.substr(18));
+            continue;
+        }
+        if (currentAdvisory.empty()) continue;
+        for (std::sregex_iterator it(line.begin(), line.end(), cvePattern), end; it != end; ++it) {
+            std::string cve = it->str();
+            std::transform(cve.begin(), cve.end(), cve.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::toupper(ch));
+            });
+            for (const auto& packageName : advisoryPackages[currentAdvisory]) {
+                result[packageName].cveIds.insert(cve);
+            }
+        }
     }
     return result;
 }
@@ -357,7 +409,7 @@ json collectDnfUpdates(bool refreshMetadata) {
     }
 
     const auto classification = linuxPackageClassification("dnf");
-    const auto securitySeverities = dnfSecuritySeverities(dnf, classification);
+    const auto securityInfo = dnfSecurityInfo(dnf, classification);
     const auto listing = runShellCommand(
         dnf + " -q check-upgrade 2>/dev/null",
         180,
@@ -395,15 +447,22 @@ json collectDnfUpdates(bool refreshMetadata) {
         // Desktop/user applications remain in Software Patching.
         if (!classified.value("system_component", true)) continue;
 
-        const auto severityIt = securitySeverities.find(packageName);
-        const bool security = severityIt != securitySeverities.end();
+        const auto securityIt = securityInfo.find(packageName);
+        const bool security = securityIt != securityInfo.end();
         const std::string severity = security
-            ? (severityIt->second.empty() ? "Security" : severityIt->second)
+            ? (securityIt->second.severity.empty() ? "Security" : securityIt->second.severity)
             : "Normal";
         const bool packageRestartLikely = dnfRestartLikely(packageName);
 
         if (security) ++securityCount;
         restartLikely = restartLikely || packageRestartLikely;
+
+        json advisoryIds = json::array();
+        json cveIds = json::array();
+        if (security) {
+            for (const auto& advisoryId : securityIt->second.advisoryIds) advisoryIds.push_back(advisoryId);
+            for (const auto& cveId : securityIt->second.cveIds) cveIds.push_back(cveId);
+        }
 
         updates.push_back({
             {"id", packageArch},
@@ -417,6 +476,8 @@ json collectDnfUpdates(bool refreshMetadata) {
             {"package_manager", "dnf"},
             {"security", security},
             {"severity", severity},
+            {"advisories", advisoryIds},
+            {"cve_ids", cveIds},
             {"category", security ? "Security" : "System"},
             {"reboot_required", packageRestartLikely},
             {"system_component", true},
