@@ -386,12 +386,19 @@ public:
                     continue;
                 }
                 cursor = g_utf8_next_char(cursor);
-                if (codepoint < 0x20 || codepoint == 0x7f) continue;
 
-                const std::uint32_t keysym =
-                    codepoint <= 0xff
+                std::uint32_t keysym = 0;
+                if (codepoint == '\n' || codepoint == '\r') {
+                    keysym = static_cast<std::uint32_t>(XK_Return);
+                } else if (codepoint == '\t') {
+                    keysym = static_cast<std::uint32_t>(XK_Tab);
+                } else if (codepoint < 0x20 || codepoint == 0x7f) {
+                    continue;
+                } else {
+                    keysym = codepoint <= 0xff
                         ? static_cast<std::uint32_t>(codepoint)
                         : (0x01000000U | static_cast<std::uint32_t>(codepoint));
+                }
                 if (!notifyKeysym(static_cast<std::int32_t>(keysym), 1U, error) ||
                     !notifyKeysym(static_cast<std::int32_t>(keysym), 0U, error)) {
                     return false;
