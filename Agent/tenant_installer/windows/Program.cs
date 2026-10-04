@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Net.Http;
+using System.Net.Http.Json;
+using System.Text.Json;
 using System.Windows.Forms;
 
 namespace Hi5Central.AgentTenantInstaller;
@@ -23,6 +25,16 @@ internal static class Program
         {
             Directory.CreateDirectory(tempDir);
             using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+
+            using var tokenResponse = await client.PostAsJsonAsync(
+                $"{ApiBase.TrimEnd('/')}/api/v1/agent/deployments/{DeploymentId}/enrollment-token",
+                new { deploymentSecret = DeploymentSecret });
+            tokenResponse.EnsureSuccessStatusCode();
+            using var tokenDocument = JsonDocument.Parse(await tokenResponse.Content.ReadAsStringAsync());
+            var enrollmentToken = tokenDocument.RootElement.GetProperty("enrollmentToken").GetString();
+            if (string.IsNullOrWhiteSpace(enrollmentToken))
+                throw new InvalidOperationException("Hi5Central did not return an enrollment token.");
+
             using (var response = await client.GetAsync(SetupUrl, HttpCompletionOption.ResponseHeadersRead))
             {
                 response.EnsureSuccessStatusCode();
@@ -38,8 +50,7 @@ internal static class Program
                 CreateNoWindow = true,
                 Arguments =
                     $"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART " +
-                    $"/DEPLOYMENT_ID=\"{DeploymentId}\" /DEPLOYMENT_SECRET=\"{DeploymentSecret}\" " +
-                    $"/PACKAGE_ID=\"{DeploymentId}\" /API_BASE_URL=\"{ApiBase}\" " +
+                    $"/ENROLLMENT_TOKEN=\"{enrollmentToken}\" /API_BASE_URL=\"{ApiBase}\" " +
                     $"/INSTALL_SOURCE=\"tenant-native-installer\""
             });
 
