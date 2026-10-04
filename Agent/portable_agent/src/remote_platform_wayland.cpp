@@ -26,6 +26,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -120,6 +121,62 @@ std::string tokenPart(const std::string& prefix) {
     return prefix + std::to_string(
         static_cast<unsigned long long>(::getpid())) + "_" +
         std::to_string(static_cast<unsigned long long>(counter.fetch_add(1)));
+}
+
+std::string waylandRestoreTokenPath() {
+    const gchar* stateDir = g_get_user_state_dir();
+    if (!stateDir || !*stateDir) return {};
+    return std::string(stateDir) + "/hi5central/wayland-remote-desktop.token";
+}
+
+std::string loadWaylandRestoreToken() {
+    const std::string path = waylandRestoreTokenPath();
+    if (path.empty()) return {};
+
+    gchar* contents = nullptr;
+    gsize length = 0;
+    GError* error = nullptr;
+    if (!g_file_get_contents(path.c_str(), &contents, &length, &error)) {
+        if (error) g_error_free(error);
+        return {};
+    }
+
+    std::string token(contents ? contents : "", static_cast<std::size_t>(length));
+    g_free(contents);
+    while (!token.empty() && (token.back() == '\n' || token.back() == '\r')) {
+        token.pop_back();
+    }
+    return token;
+}
+
+bool saveWaylandRestoreToken(const std::string& token) {
+    if (token.empty()) return false;
+    const std::string path = waylandRestoreTokenPath();
+    if (path.empty()) return false;
+
+    const auto slash = path.find_last_of('/');
+    if (slash == std::string::npos) return false;
+    const std::string directory = path.substr(0, slash);
+    if (g_mkdir_with_parents(directory.c_str(), 0700) != 0 && errno != EEXIST) {
+        return false;
+    }
+
+    GError* error = nullptr;
+    if (!g_file_set_contents(
+            path.c_str(),
+            token.data(),
+            static_cast<gssize>(token.size()),
+            &error)) {
+        if (error) g_error_free(error);
+        return false;
+    }
+    (void)::chmod(path.c_str(), 0600);
+    return true;
+}
+
+void clearWaylandRestoreToken() {
+    const std::string path = waylandRestoreTokenPath();
+    if (!path.empty()) (void)::unlink(path.c_str());
 }
 
 KeySym keySymForMessage(const nlohmann::json& message) {
@@ -237,6 +294,18 @@ public:
                 "Unable to connect to the active Wayland session bus.");
             return false;
         }
+
+        remoteDesktopPortalVersion_ = portalInterfaceVersion(kRemoteDesktopInterface);
+        portalPersistenceSupported_ = remoteDesktopPortalVersion_ >= 2U;
+        restoreToken_ = portalPersistenceSupported_
+            ? loadWaylandRestoreToken()
+            : std::string();
+        std::cerr
+            << "[wayland-portal] RemoteDesktop version="
+            << remoteDesktopPortalVersion_
+            << " persistence=" << (portalPersistenceSupported_ ? 1 : 0)
+            << " restore_token=" << (restoreToken_.empty() ? "none" : "available")
+            << "\n";
 
         if (!createPortalSession(error) ||
             !selectPortalDevices(error) ||
@@ -439,6 +508,44 @@ public:
     }
 
 private:
+    guint32 portalInterfaceVersion(const char* interfaceName) const {
+        if (!bus_ || !interfaceName || !*interfaceName) return 0;
+
+        GError* callError = nullptr;
+        GVariant* result = g_dbus_connection_call_sync(
+            bus_,
+            kPortalName,
+            kPortalPath,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            g_variant_new("(ss)", interfaceName, "version"),
+            G_VARIANT_TYPE("(v)"),
+            G_DBUS_CALL_FLAGS_NONE,
+            5000,
+            nullptr,
+            &callError);
+        if (!result) {
+            if (callError) g_error_free(callError);
+            return 0;
+        }
+
+        GVariant* boxed = nullptr;
+        g_variant_get(result, "(@v)", &boxed);
+        g_variant_unref(result);
+        if (!boxed) return 0;
+
+        GVariant* value = g_variant_get_variant(boxed);
+        g_variant_unref(boxed);
+        if (!value) return 0;
+
+        guint32 version = 0;
+        if (g_variant_is_of_type(value, G_VARIANT_TYPE_UINT32)) {
+            version = g_variant_get_uint32(value);
+        }
+        g_variant_unref(value);
+        return version;
+    }
+
     PortalReply portalRequest(
         const char* interfaceName,
         const char* methodName,
@@ -581,6 +688,21 @@ private:
             "{sv}",
             "types",
             g_variant_new_uint32(1U | 2U));
+
+        if (portalPersistenceSupported_) {
+            g_variant_builder_add(
+                &options,
+                "{sv}",
+                "persist_mode",
+                g_variant_new_uint32(2U));
+            if (!restoreToken_.empty()) {
+                g_variant_builder_add(
+                    &options,
+                    "{sv}",
+                    "restore_token",
+                    g_variant_new_string(restoreToken_.c_str()));
+            }
+        }
 
         auto reply = portalRequest(
             kRemoteDesktopInterface,
@@ -761,6 +883,33 @@ private:
             120000,
             error);
         if (reply.response != 0 || !reply.results) return false;
+
+        if (portalPersistenceSupported_) {
+            const gchar* refreshedToken = nullptr;
+            if (g_variant_lookup(
+                    reply.results,
+                    "restore_token",
+                    "&s",
+                    &refreshedToken) &&
+                refreshedToken &&
+                *refreshedToken) {
+                restoreToken_ = refreshedToken;
+                if (saveWaylandRestoreToken(restoreToken_)) {
+                    std::cerr
+                        << "[wayland-portal] persistent permission token refreshed\n";
+                } else {
+                    std::cerr
+                        << "[wayland-portal] unable to persist refreshed permission token\n";
+                }
+            } else if (!restoreToken_.empty()) {
+                // Restore tokens are single-use. If a successful Start did not
+                // issue a replacement, do not keep retrying a stale token.
+                restoreToken_.clear();
+                clearWaylandRestoreToken();
+                std::cerr
+                    << "[wayland-portal] persistence not granted; cleared stale restore token\n";
+            }
+        }
 
         guint32 devices = 0;
         (void)g_variant_lookup(reply.results, "devices", "u", &devices);
@@ -1290,6 +1439,9 @@ private:
         sessionHandle_.clear();
         clipboardRequested_ = false;
         clipboardEnabled_ = false;
+        restoreToken_.clear();
+        portalPersistenceSupported_ = false;
+        remoteDesktopPortalVersion_ = 0;
         streamNodeId_ = 0;
         logicalWidth_ = 0;
         logicalHeight_ = 0;
@@ -1307,6 +1459,9 @@ private:
     mutable std::mutex frameMutex_;
     GDBusConnection* bus_ = nullptr;
     std::string sessionHandle_;
+    std::string restoreToken_;
+    bool portalPersistenceSupported_ = false;
+    guint32 remoteDesktopPortalVersion_ = 0;
     bool clipboardRequested_ = false;
     bool clipboardEnabled_ = false;
     guint32 streamNodeId_ = 0;
