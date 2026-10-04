@@ -24,6 +24,10 @@ public:
 
     virtual bool handleInput(const nlohmann::json& message, std::string& error) = 0;
 
+    // Session-scoped opt-in. Backends that cannot persist remote-desktop
+    // consent ignore this and continue with their normal one-time behavior.
+    virtual void setPersistentAccessRequested(bool requested) { (void)requested; }
+
     virtual bool readClipboardText(std::string& text, std::string& error) {
         text.clear();
         error = "Remote clipboard reading is not supported by this desktop backend.";

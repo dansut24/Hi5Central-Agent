@@ -94,11 +94,16 @@ std::string helperPath() {
     return {};
 }
 
+std::string portalStateDir(const UserIdentity& user) {
+    if (user.uid == static_cast<uid_t>(-1)) return {};
+    return "/var/lib/hi5central/portal/" + std::to_string(user.uid);
+}
+
 std::string preparePortalStateDir(const UserIdentity& user) {
     if (user.uid == static_cast<uid_t>(-1) || user.gid == static_cast<gid_t>(-1)) return {};
 
     const std::string root = "/var/lib/hi5central/portal";
-    const std::string userDir = root + "/" + std::to_string(user.uid);
+    const std::string userDir = portalStateDir(user);
 
     if (::mkdir(root.c_str(), 0755) != 0 && errno != EEXIST) return {};
     (void)::chmod(root.c_str(), 0755);
@@ -108,6 +113,21 @@ std::string preparePortalStateDir(const UserIdentity& user) {
     if (::chmod(userDir.c_str(), 0700) != 0) return {};
 
     return userDir;
+}
+
+bool clearPortalRestoreToken(const UserIdentity& user, std::string& error) {
+    const std::string stateDir = portalStateDir(user);
+    if (stateDir.empty()) {
+        error = "No active Linux user is available.";
+        return false;
+    }
+
+    const std::string tokenPath = stateDir + "/wayland-remote-desktop.token";
+    if (::unlink(tokenPath.c_str()) == 0 || errno == ENOENT) return true;
+
+    error = "Unable to remove the remembered Wayland access token: " +
+        std::string(std::strerror(errno));
+    return false;
 }
 
 } // namespace
@@ -340,6 +360,24 @@ RemoteDesktopManager::~RemoteDesktopManager() { stopAll(); }
 bool RemoteDesktopManager::handleMessage(const json& message) {
     if (!message.is_object()) return false;
     const std::string type = message.value("type", "");
+
+    if (type == "forget_wayland_remote_access") {
+        const auto user = activeUserIdentity();
+        std::string error;
+        const bool ok =
+            !user.name.empty() &&
+            user.uid != static_cast<uid_t>(-1) &&
+            clearPortalRestoreToken(user, error);
+        send_({
+            {"type", "wayland_persistence_forgotten"},
+            {"request_id", message.value("request_id", "")},
+            {"success", ok},
+            {"user", user.name},
+            {"error", ok ? "" : (error.empty() ? "No active Linux desktop user is available." : error)}
+        });
+        return true;
+    }
+
     const std::string sessionId = message.value("session_id", message.value("sessionId", ""));
     if (sessionId.empty()) return false;
 
