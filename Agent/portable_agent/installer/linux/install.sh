@@ -6,6 +6,8 @@ API_BASE="https://api.hi5central.com"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALL_DIR="/opt/hi5central/agent"
 STATE_DIR="/var/lib/hi5central/agent"
+PORTAL_STATE_ROOT="/var/lib/hi5central/portal"
+PORTAL_DESKTOP_FILE="/usr/share/applications/com.hi5central.RemoteHelper.desktop"
 SERVICE_FILE="/etc/systemd/system/hi5central-agent.service"
 SERVICE_NAME="hi5central-agent.service"
 BINARY="$INSTALL_DIR/Hi5CentralAgent"
@@ -47,6 +49,24 @@ echo "Candidate version: $CANDIDATE_VERSION"
 
 install -d -m 0755 "$INSTALL_DIR"
 install -d -m 0700 "$STATE_DIR"
+install -d -m 0755 "$PORTAL_STATE_ROOT"
+install -d -m 0755 /usr/share/applications
+
+PORTAL_DESKTOP_TMP="$(mktemp /tmp/hi5central-remote-helper-XXXXXX.desktop)"
+cat > "$PORTAL_DESKTOP_TMP" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Hi5Central Remote Helper
+Comment=Hi5Central remote desktop session helper
+Exec=$REMOTE_HELPER --remote-helper
+TryExec=$REMOTE_HELPER
+Icon=computer
+Terminal=false
+NoDisplay=true
+Categories=System;RemoteAccess;
+EOF
+install -m 0644 "$PORTAL_DESKTOP_TMP" "$PORTAL_DESKTOP_FILE"
+rm -f "$PORTAL_DESKTOP_TMP"
 
 HAD_EXISTING_BINARY=false
 HAD_EXISTING_HELPER=false
@@ -124,7 +144,7 @@ ProtectHome=read-only
 PrivateTmp=true
 RuntimeDirectory=hi5central
 RuntimeDirectoryMode=0755
-ReadWritePaths=$STATE_DIR /run/hi5central
+ReadWritePaths=$STATE_DIR $PORTAL_STATE_ROOT /run/hi5central
 
 [Install]
 WantedBy=multi-user.target
