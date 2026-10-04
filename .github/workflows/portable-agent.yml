@@ -39,6 +39,13 @@ jobs:
           cmake -S Agent/portable_agent -B build/portable-linux -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
       - name: Build
         run: cmake --build build/portable-linux
+      - name: Verify Linux codec linkage
+        run: |
+          ldd build/portable-linux/Hi5CentralRemoteHelper | tee /tmp/hi5-linux-helper-ldd.txt
+          if grep -E 'libvpx\.so' /tmp/hi5-linux-helper-ldd.txt; then
+            echo "Linux Remote Helper must statically link libvpx to avoid distro ABI mismatches." >&2
+            exit 1
+          fi
       - name: Runtime self-test
         run: |
           bash -n Agent/portable_agent/installer/linux/install.sh
