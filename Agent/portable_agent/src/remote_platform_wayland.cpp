@@ -290,6 +290,10 @@ public:
         stop();
     }
 
+    void setPersistentAccessRequested(bool requested) override {
+        persistentAccessRequested_ = requested;
+    }
+
     bool start(std::string& error) override {
         std::lock_guard<std::mutex> stateLock(stateMutex_);
         if (started_) return true;
@@ -312,14 +316,16 @@ public:
         }
 
         remoteDesktopPortalVersion_ = portalInterfaceVersion(kRemoteDesktopInterface);
-        portalPersistenceSupported_ = remoteDesktopPortalVersion_ >= 2U;
+        portalPersistenceSupported_ =
+            persistentAccessRequested_ && remoteDesktopPortalVersion_ >= 2U;
         restoreToken_ = portalPersistenceSupported_
             ? loadWaylandRestoreToken()
             : std::string();
         std::cerr
             << "[wayland-portal] RemoteDesktop version="
             << remoteDesktopPortalVersion_
-            << " persistence=" << (portalPersistenceSupported_ ? 1 : 0)
+            << " persistence_requested=" << (persistentAccessRequested_ ? 1 : 0)
+            << " persistence_available=" << (portalPersistenceSupported_ ? 1 : 0)
             << " restore_token=" << (restoreToken_.empty() ? "none" : "available")
             << "\n";
 
@@ -1513,6 +1519,7 @@ private:
     GDBusConnection* bus_ = nullptr;
     std::string sessionHandle_;
     std::string restoreToken_;
+    bool persistentAccessRequested_ = false;
     bool portalIdentityRegistered_ = false;
     bool portalPersistenceSupported_ = false;
     guint32 remoteDesktopPortalVersion_ = 0;
