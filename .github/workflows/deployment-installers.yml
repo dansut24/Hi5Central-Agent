@@ -9,6 +9,7 @@ on:
       - 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss'
       - 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1'
       - 'Agent/chatpass_agent/src/service/service_main.cpp'
+      - 'Agent/chatpass_agent/CMakeLists.txt'
   push:
     branches:
       - main
@@ -18,6 +19,7 @@ on:
       - 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss'
       - 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1'
       - 'Agent/chatpass_agent/src/service/service_main.cpp'
+      - 'Agent/chatpass_agent/CMakeLists.txt'
 
 permissions:
   contents: read
