@@ -539,6 +539,23 @@ private:
                         }
                         sendVp8(encoded);
                         ++frameCounter;
+                        if (pc_ && frameCounter % static_cast<std::uint64_t>(std::max(1, fps_ * 5)) == 0) {
+                            std::cerr << "[remote-quality] session=" << sessionId_
+                                      << " frames=" << frameCounter
+                                      << " bytes_sent=" << pc_->bytesSent();
+                            if (const auto latency = pc_->rtt(); latency.has_value()) {
+                                std::cerr << " rtt_ms=" << latency->count();
+                            } else {
+                                std::cerr << " rtt_ms=unknown";
+                            }
+                            rtc::Candidate localCandidate;
+                            rtc::Candidate remoteCandidate;
+                            if (pc_->getSelectedCandidatePair(&localCandidate, &remoteCandidate)) {
+                                std::cerr << " local_candidate=" << localCandidate
+                                          << " remote_candidate=" << remoteCandidate;
+                            }
+                            std::cerr << "\n";
+                        }
                     }
 #endif
                 }
