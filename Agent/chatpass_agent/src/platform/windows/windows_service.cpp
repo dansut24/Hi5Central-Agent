@@ -1,5 +1,6 @@
 ﻿#include "service/service_main.h"
 #include "agent_identity.h"
+#include "agent_version.h"
 
 #include "signaling_client.h"
 #include "webrtc_sender.h"
@@ -14,7 +15,6 @@
 #include "ui/agent_presence_controller.h"
 #include "ui/chat_controller.h"
 #include "inventory/inventory_snapshot.h"
-#include "patching/patch_worker.h"
 
 #include <nlohmann/json.hpp>
 #include <rtc/rtc.hpp>
@@ -23,6 +23,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <wincrypt.h>
+#include <dpapi.h>
 #include <sddl.h>
 #include <wtsapi32.h>
 #include <userenv.h>
@@ -821,6 +823,204 @@ namespace hi5 {
             MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
             return w;
         }
+
+        static std::string PatchHostExePath() {
+            const std::string current = CurrentExePath();
+            if (current.empty()) return {};
+            const std::filesystem::path candidate =
+                std::filesystem::path(current).parent_path() / "Hi5CentralPatchHost.exe";
+            std::error_code ec;
+            if (!std::filesystem::exists(candidate, ec)) return {};
+            return candidate.string();
+        }
+
+        static HANDLE LaunchServiceChildProcess(const std::string& exePath, const std::string& args) {
+            std::wstring command = L"\"" + WideFromUtf8(exePath) + L"\" " + WideFromUtf8(args);
+            std::wstring workDir = WideFromUtf8(DirOfPath(exePath));
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            const BOOL ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                CREATE_NO_WINDOW, nullptr, workDir.empty() ? nullptr : workDir.c_str(), &si, &pi);
+            if (!ok) return nullptr;
+            CloseHandle(pi.hThread);
+            return pi.hProcess;
+        }
+
+        static std::string PatchSafeId(const std::string& value) {
+            std::string out;
+            out.reserve(value.size());
+            for (const unsigned char ch : value) {
+                if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.') out.push_back(static_cast<char>(ch));
+            }
+            if (out.empty()) out = "patch";
+            if (out.size() > 96) out.resize(96);
+            return out;
+        }
+
+        static bool ApplyPatchFileAcl(const std::filesystem::path& path) {
+            PSECURITY_DESCRIPTOR descriptor = nullptr;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+                SDDL_REVISION_1,
+                &descriptor,
+                nullptr)) {
+                return false;
+            }
+            const BOOL ok = SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, descriptor);
+            LocalFree(descriptor);
+            return ok == TRUE;
+        }
+
+        static bool ApplyPatchDirectoryAcl(const std::filesystem::path& path) {
+            PSECURITY_DESCRIPTOR descriptor = nullptr;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+                SDDL_REVISION_1,
+                &descriptor,
+                nullptr)) {
+                return false;
+            }
+            const BOOL ok = SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, descriptor);
+            LocalFree(descriptor);
+            return ok == TRUE;
+        }
+
+        static bool WriteProtectedPatchManifest(const std::filesystem::path& path, const json& manifest) {
+            const std::string plain = manifest.dump();
+            DATA_BLOB input{};
+            input.pbData = const_cast<BYTE*>(reinterpret_cast<const BYTE*>(plain.data()));
+            input.cbData = static_cast<DWORD>(plain.size());
+
+            DATA_BLOB output{};
+            const DWORD flags = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN;
+            if (!CryptProtectData(&input, L"Hi5Central Patch Manifest", nullptr, nullptr, nullptr, flags, &output)) {
+                return false;
+            }
+
+            bool written = false;
+            try {
+                std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+                if (stream) {
+                    stream.write(reinterpret_cast<const char*>(output.pbData), static_cast<std::streamsize>(output.cbData));
+                    written = stream.good();
+                }
+            } catch (...) {
+                written = false;
+            }
+            LocalFree(output.pbData);
+            if (!written) return false;
+            return ApplyPatchFileAcl(path);
+        }
+
+        static json RunPatchHostSoftwareJob(
+            const AgentIdentity& ident,
+            const std::string& jobId,
+            const json& payload,
+            std::string& errorMessage) {
+
+            const std::string patchHost = PatchHostExePath();
+            if (patchHost.empty()) {
+                errorMessage = "Hi5CentralPatchHost.exe is not installed.";
+                return json::object();
+            }
+
+            namespace fs = std::filesystem;
+            const fs::path root = fs::path(LR"(C:\ProgramData\Hi5Central\Agent\PatchHost)");
+            std::error_code ec;
+            fs::create_directories(root, ec);
+            if (ec) {
+                errorMessage = "Unable to create PatchHost working directory.";
+                return json::object();
+            }
+            if (!ApplyPatchDirectoryAcl(root)) {
+                errorMessage = "Unable to secure PatchHost working directory.";
+                return json::object();
+            }
+
+            const std::string safeId = PatchSafeId(jobId);
+            const fs::path manifestPath = root / Utf8ToWide(safeId + ".manifest.dpapi");
+            const fs::path resultPath = root / Utf8ToWide(safeId + ".result.json");
+            fs::remove(manifestPath, ec);
+            ec.clear();
+            fs::remove(resultPath, ec);
+
+            json manifest = payload.is_object() ? payload : json::object();
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            manifest["protocolVersion"] = 1;
+            manifest["action"] = payload.value("action", std::string("software.install"));
+            manifest["jobId"] = jobId;
+            manifest["deviceId"] = ident.deviceId;
+            manifest["issuedUnixMs"] = nowMs;
+            manifest["expiresUnixMs"] = nowMs + (10LL * 60LL * 1000LL);
+
+            if (!WriteProtectedPatchManifest(manifestPath, manifest)) {
+                errorMessage = "Unable to protect PatchHost manifest.";
+                fs::remove(manifestPath, ec);
+                return json::object();
+            }
+
+            const std::string args =
+                "--execute-manifest " + QuoteArg(manifestPath.string()) +
+                " --output " + QuoteArg(resultPath.string());
+
+            HANDLE process = LaunchServiceChildProcess(patchHost, args);
+            if (!process) {
+                errorMessage = "Unable to launch Hi5CentralPatchHost.exe.";
+                fs::remove(manifestPath, ec);
+                return json::object();
+            }
+
+            const DWORD wait = WaitForSingleObject(process, 35 * 60 * 1000);
+            DWORD exitCode = 1;
+            if (wait == WAIT_TIMEOUT) {
+                TerminateProcess(process, ERROR_TIMEOUT);
+                exitCode = ERROR_TIMEOUT;
+                errorMessage = "PatchHost execution timed out.";
+            } else if (!GetExitCodeProcess(process, &exitCode)) {
+                exitCode = GetLastError();
+                errorMessage = "Unable to read PatchHost exit code.";
+            }
+            CloseHandle(process);
+
+            std::string resultText;
+            try {
+                std::ifstream stream(resultPath, std::ios::binary);
+                if (stream) {
+                    std::ostringstream buffer;
+                    buffer << stream.rdbuf();
+                    resultText = buffer.str();
+                }
+            } catch (...) {}
+
+            fs::remove(manifestPath, ec);
+            ec.clear();
+            fs::remove(resultPath, ec);
+
+            if (resultText.empty()) {
+                if (errorMessage.empty()) errorMessage = "PatchHost did not return a result.";
+                return json{
+                    {"success", false},
+                    {"patchHostExitCode", static_cast<int>(exitCode)}
+                };
+            }
+
+            json result = json::parse(resultText, nullptr, false);
+            if (result.is_discarded() || !result.is_object()) {
+                errorMessage = "PatchHost returned invalid JSON.";
+                return json{
+                    {"success", false},
+                    {"patchHostExitCode", static_cast<int>(exitCode)}
+                };
+            }
+            result["patchHostExitCode"] = static_cast<int>(exitCode);
+            if (!result.value("success", false) && errorMessage.empty()) {
+                errorMessage = result.value("error", std::string("PatchHost reported failure."));
+            }
+            return result;
+        }
+
 
         static bool EnableTokenPrivilege(HANDLE token, const wchar_t* privName) {
             TOKEN_PRIVILEGES tp{};
@@ -1829,7 +2029,7 @@ LogI(
                 signaling_->onOpen([this, ident]() {
                     LogI("websocket connected");
                     if (signaling_) {
-                        signaling_->send(R"({"type":"hello"})");
+                        signaling_->send(json{{"type", "hello"}, {"agent_version", kAgentVersion}}.dump());
                         LogI("hello sent");
                         SendInventorySnapshotSafe(ident);
                     }
@@ -2099,29 +2299,8 @@ LogI(
                 signaling_->connect();
                 StartInventoryLoop(ident);
 
-                const std::string enablePatchWorker = ReadConfigValue("HI5_ENABLE_PATCH_WORKER");
-                const bool patchWorkerEnabled =
-                    enablePatchWorker == "1" ||
-                    enablePatchWorker == "true" ||
-                    enablePatchWorker == "TRUE" ||
-                    enablePatchWorker == "yes" ||
-                    enablePatchWorker == "YES";
-
-                if (patchWorkerEnabled) {
-                    PatchWorkerConfig patchConfig;
-                    patchConfig.enabled = true;
-                    patchConfig.apiBaseUrl = ReadConfigValue("HI5_PATCH_API_BASE_URL");
-                    if (patchConfig.apiBaseUrl.empty()) {
-                        patchConfig.apiBaseUrl = "https://api.hi5central.com";
-                    }
-                    patchConfig.apiKey = ReadConfigValue("HI5_PATCH_API_KEY");
-                    patchConfig.deviceId = ident.deviceId;
-                    patchConfig.pollSeconds = ReadConfigInt("HI5_PATCH_POLL_SECONDS", 300, 30, 3600);
-                    LogI("[patch] worker enabled");
-                    patchWorker_.Start(patchConfig);
-                } else {
-                    LogI("[patch] worker disabled by default; set HI5_ENABLE_PATCH_WORKER=1 to enable");
-                }
+                StartPatchDiscoveryLoop(ident);
+                LogI("[patchhost] standalone PatchHost architecture active; legacy in-process patch worker disabled");
 
                 auto nextUiCleanupSweep = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                 while (!stop_.load()) {
@@ -2166,7 +2345,6 @@ LogI(
                     StopSession(nextId);
                 }
 
-                patchWorker_.Stop();
                 StopInventoryLoop();
                 StopChatOverlays();
                 StopPresenceBanners();
@@ -3331,6 +3509,88 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         });
                         return;
                     }
+
+                    if (jobType == "patch.software.bulk") {
+                        json items = payload.value("items", json::array());
+                        json results = json::array();
+                        int succeeded = 0;
+                        int failed = 0;
+                        if (!items.is_array() || items.empty() || items.size() > 50) {
+                            PostJobResult(ident, jobId, false, json{
+                                {"success", false},
+                                {"error", "bulk_patch_items_invalid"},
+                                {"attemptedCount", 0}
+                            }, "Bulk software patch requires between 1 and 50 items.");
+                            return;
+                        }
+
+                        size_t index = 0;
+                        for (const auto& item : items) {
+                            index += 1;
+                            if (!item.is_object()) {
+                                failed += 1;
+                                results.push_back(json{
+                                    {"success", false},
+                                    {"error", "bulk_patch_item_invalid"},
+                                    {"index", static_cast<int>(index)}
+                                });
+                                continue;
+                            }
+                            std::string patchError;
+                            json patchPayload = item;
+                            patchPayload["action"] = "software.install";
+                            const std::string childJobId = jobId + "-" + std::to_string(index);
+                            json itemResult = RunPatchHostSoftwareJob(ident, childJobId, patchPayload, patchError);
+                            itemResult["index"] = static_cast<int>(index);
+                            itemResult["catalogueId"] = item.value("catalogueId", std::string());
+                            itemResult["packageId"] = item.value("packageId", std::string());
+                            itemResult["applicationName"] = item.value("applicationName", std::string());
+                            if (itemResult.value("success", false)) succeeded += 1;
+                            else {
+                                failed += 1;
+                                if (!patchError.empty()) itemResult["agentError"] = patchError;
+                            }
+                            results.push_back(std::move(itemResult));
+                        }
+
+                        json capabilities = json::object();
+                        for (const auto& itemResult : results) {
+                            if (itemResult.contains("capabilities") && itemResult["capabilities"].is_object()) {
+                                capabilities = itemResult["capabilities"];
+                                break;
+                            }
+                        }
+                        json result = {
+                            {"success", failed == 0},
+                            {"mode", payload.value("mode", std::string("selected_catalogue"))},
+                            {"attemptedCount", static_cast<int>(items.size())},
+                            {"succeededCount", succeeded},
+                            {"failedCount", failed},
+                            {"items", results},
+                            {"capabilities", capabilities}
+                        };
+                        PostJobResult(ident, jobId, failed == 0, result, failed == 0 ? std::string() : "One or more software updates failed.");
+                        try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                        try { SendPatchDiscoverySafe(ident); } catch (...) {}
+                        return;
+                    }
+
+                    if (jobType == "patch.software" || jobType == "patch.vendor_artifact.inspect") {
+                        std::string patchError;
+                        json patchPayload = payload;
+                        patchPayload["action"] = jobType == "patch.vendor_artifact.inspect"
+                            ? "software.inspect"
+                            : "software.install";
+                        json result = RunPatchHostSoftwareJob(ident, jobId, patchPayload, patchError);
+                        const bool ok = result.value("success", false);
+                        PostJobResult(ident, jobId, ok, result, patchError);
+                        if (ok && jobType == "patch.software") {
+                            try { SendInventorySnapshotSafe(ident); } catch (...) {}
+                            try { SendPatchDiscoverySafe(ident); } catch (...) {}
+                        }
+                        return;
+                    }
+
 
                     if (jobType == "custom.command") {
                         const std::string command = payload.value("command", std::string("whoami"));
@@ -4741,6 +5001,113 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
                     });
             }
+
+            void SendPatchDiscoverySafe(const AgentIdentity& ident) {
+                const std::string patchHost = PatchHostExePath();
+                if (patchHost.empty()) {
+                    LogI("[patchhost] executable not installed; discovery skipped");
+                    return;
+                }
+
+                namespace fs = std::filesystem;
+                const fs::path root = fs::path(LR"(C:\ProgramData\Hi5Central\Agent\PatchHost)");
+                std::error_code ec;
+                fs::create_directories(root, ec);
+                if (ec || !ApplyPatchDirectoryAcl(root)) {
+                    LogW("[patchhost] unable to secure working directory; discovery skipped");
+                    return;
+                }
+                const fs::path outputPath = root / L"discovery.json";
+                fs::remove(outputPath, ec);
+
+                const std::string args = "--discover-software --output " + QuoteArg(outputPath.string());
+                HANDLE process = LaunchServiceChildProcess(patchHost, args);
+                if (!process) {
+                    LogW("[patchhost] failed to launch discovery");
+                    return;
+                }
+
+                const DWORD wait = WaitForSingleObject(process, 5 * 60 * 1000);
+                DWORD exitCode = 1;
+                if (wait == WAIT_TIMEOUT) {
+                    TerminateProcess(process, ERROR_TIMEOUT);
+                    exitCode = ERROR_TIMEOUT;
+                    LogW("[patchhost] discovery timed out and was terminated");
+                } else {
+                    GetExitCodeProcess(process, &exitCode);
+                }
+                CloseHandle(process);
+
+                std::ifstream stream(outputPath, std::ios::binary);
+                if (!stream) {
+                    LogW("[patchhost] discovery output missing exit_code=" + std::to_string(exitCode));
+                    return;
+                }
+
+                std::ostringstream buffer;
+                buffer << stream.rdbuf();
+                json result = json::parse(buffer.str(), nullptr, false);
+                fs::remove(outputPath, ec);
+                if (result.is_discarded() || !result.is_object()) {
+                    LogW("[patchhost] discovery output was invalid JSON");
+                    return;
+                }
+
+                json payload = {
+                    {"capabilities", result.value("capabilities", json::object())},
+                    {"packages", result.value("packages", json::array())},
+                    {"winget", result.value("winget", json::object())},
+                    {"success", result.value("success", false)}
+                };
+                if (result.contains("error")) payload["error"] = result["error"];
+                if (result.contains("detail")) payload["detail"] = result["detail"];
+
+                try {
+                    HttpPostJsonWithAgentAuth(
+                        "https://api.hi5central.com/api/v1/agent/devices/patch-discovery",
+                        payload.dump(),
+                        ident
+                    );
+                    LogI("[patchhost] discovery posted packages=" +
+                        std::to_string(payload["packages"].size()) +
+                        " exit_code=" + std::to_string(exitCode));
+                }
+                catch (const std::exception& ex) {
+                    LogW(std::string("[patchhost] discovery post failed: ") + ex.what());
+                }
+            }
+
+            void StartPatchDiscoveryLoop(AgentIdentity ident) {
+                std::thread([this, ident = std::move(ident)]() mutable {
+                    const int intervalSeconds = ReadConfigInt(
+                        "HI5_PATCH_DISCOVERY_SECONDS",
+                        6 * 60 * 60,
+                        15 * 60,
+                        24 * 60 * 60
+                    );
+
+                    // Publish PatchHost capabilities promptly after service start so an
+                    // Agent upgrade cannot leave the control plane showing stale PatchHost
+                    // capabilities for the old build. Full recurring discovery remains on
+                    // the normal long interval below.
+                    for (int i = 0; i < 5 && !stop_.load(); ++i) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
+
+                    while (!stop_.load()) {
+                        if (!HasActiveSessions()) {
+                            SendPatchDiscoverySafe(ident);
+                        } else {
+                            LogI("[patchhost] discovery deferred while remote session is active");
+                        }
+
+                        for (int i = 0; i < intervalSeconds && !stop_.load(); ++i) {
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                        }
+                    }
+                }).detach();
+            }
+
 
             void StartTelemetryLoop(AgentIdentity ident) {
                 std::thread([this, ident = std::move(ident)]() mutable {
@@ -6343,7 +6710,6 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             ChatController chatController_;
             std::unique_ptr<SignalingClient> signaling_;
             std::thread inventoryThread_;
-            PatchWorker patchWorker_;
 
             std::mutex sessionsMu_;
             std::unordered_map<std::string, std::unique_ptr<SessionContext>> sessions_;

@@ -9,6 +9,10 @@ on:
       - 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss'
       - 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1'
       - 'Agent/chatpass_agent/src/service/service_main.cpp'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp'
+      - 'Agent/chatpass_agent/src/patching/patch_host_main.cpp'
+      - 'Agent/chatpass_agent/src/agent_identity.cpp'
+      - 'Agent/chatpass_agent/src/agent_version.h'
       - 'Agent/chatpass_agent/CMakeLists.txt'
   push:
     branches:
@@ -19,6 +23,10 @@ on:
       - 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss'
       - 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1'
       - 'Agent/chatpass_agent/src/service/service_main.cpp'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp'
+      - 'Agent/chatpass_agent/src/patching/patch_host_main.cpp'
+      - 'Agent/chatpass_agent/src/agent_identity.cpp'
+      - 'Agent/chatpass_agent/src/agent_version.h'
       - 'Agent/chatpass_agent/CMakeLists.txt'
 
 permissions:
@@ -50,7 +58,9 @@ jobs:
           $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
           $repo = (Resolve-Path 'Agent/chatpass_agent').Path
           $script = Join-Path $repo 'installer\windows\Build-AgentInstaller.ps1'
-          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Clean -Generator "Visual Studio 18 2026" -Platform x64 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows-static -LibDataChannelRoot C:\vcpkg\installed\x64-windows-static -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"'
+          $agentVersion = '0.1.' + (251 + [int]'${{ github.run_number }}')
+          Write-Host "Windows Agent version: $agentVersion"
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Clean -Generator "Visual Studio 18 2026" -Platform x64 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows-static -LibDataChannelRoot C:\vcpkg\installed\x64-windows-static -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" -AgentVersion "' + $agentVersion + '"'
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "Windows Agent installer build failed with exit code $LASTEXITCODE." }
           $built = 'Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe'
