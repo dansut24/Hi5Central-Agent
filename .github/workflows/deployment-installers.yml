@@ -15,25 +15,25 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - name: Build generic deployment EXE
+      - name: Download shared Agent EXE
         shell: pwsh
         run: |
-          dotnet publish Agent/tenant_installer/windows/Hi5CentralTenantInstaller.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o dist/windows/publish
           New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
-          Copy-Item dist/windows/publish/Hi5CentralAgentTenantInstaller.exe dist/windows/Hi5CentralAgentDeployment-Windows.exe
+          Invoke-WebRequest -UseBasicParsing -Uri "https://downloads.hi5central.com/agent/latest/Hi5CentralAgentSetup.exe" -OutFile "dist/windows/Hi5CentralAgentSetup.exe"
+          if ((Get-Item "dist/windows/Hi5CentralAgentSetup.exe").Length -lt 1000000) {
+            throw "Downloaded Agent setup is unexpectedly small."
+          }
       - name: Build generic deployment MSI
         shell: pwsh
         run: |
           dotnet tool install --global wix --version 5.0.2
           $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
-          $bootstrapExe = (Resolve-Path 'dist/windows/Hi5CentralAgentDeployment-Windows.exe').Path
-          wix build Agent/tenant_installer/windows/Package.wxs -arch x64 -d "BootstrapExe=$bootstrapExe" -o dist/windows/Hi5CentralAgentDeployment-Windows.msi
+          $setupExe = (Resolve-Path 'dist/windows/Hi5CentralAgentSetup.exe').Path
+          wix build Agent/tenant_installer/windows/Package.wxs -arch x64 -d "SetupExe=$setupExe" -o dist/windows/Hi5CentralAgentDeployment-Windows.msi
       - uses: actions/upload-artifact@v4
         with:
           name: Hi5Central-Deployment-Windows
-          path: |
-            dist/windows/Hi5CentralAgentDeployment-Windows.exe
-            dist/windows/Hi5CentralAgentDeployment-Windows.msi
+          path: dist/windows/Hi5CentralAgentDeployment-Windows.msi
           retention-days: 30
           if-no-files-found: error
 
