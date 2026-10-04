@@ -34,6 +34,8 @@ NSString* ns(const std::string& value) {
     return [NSString stringWithUTF8String:value.c_str()] ?: @"";
 }
 
+} // namespace
+
 @interface Hi5SessionUiTarget : NSObject
 @property(copy) void (^openChatHandler)(void);
 @property(copy) void (^sendChatHandler)(void);
@@ -50,8 +52,6 @@ NSString* ns(const std::string& value) {
 }
 @end
 
-} // namespace
-
 namespace hi5 {
 
 struct RemoteSessionUi::Impl {
@@ -60,12 +60,12 @@ struct RemoteSessionUi::Impl {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
         target = [[Hi5SessionUiTarget alloc] init];
-        __unsafe_unretained Impl* weakSelf = this;
+        Impl* self = this;
         target.openChatHandler = ^{
-            if (weakSelf) weakSelf->showChat();
+            if (self) self->showChat();
         };
         target.sendChatHandler = ^{
-            if (weakSelf) weakSelf->sendCurrentMessage();
+            if (self) self->sendCurrentMessage();
         };
     }
 
