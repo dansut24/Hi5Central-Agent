@@ -3,6 +3,7 @@
 #if defined(__APPLE__)
 
 #import <ApplicationServices/ApplicationServices.h>
+#import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -280,6 +281,8 @@ public:
     int currentDisplayIndex() const override { return currentDisplayIndex_; }
     bool setDisplayIndex(int index) override;
     bool handleInput(const nlohmann::json& message, std::string& error) override;
+    bool readClipboardText(std::string& text, std::string& error) override;
+    bool supportsClipboardRead() const override { return true; }
     std::string backendName() const override {
         return useWindowServerFallback_ ? "macos_windowserver" : "macos_screencapturekit";
     }
@@ -836,6 +839,30 @@ bool MacRemotePlatform::handleInput(const nlohmann::json& message, std::string& 
 
     error = "Unsupported macOS input event: " + kind;
     return false;
+}
+
+bool MacRemotePlatform::readClipboardText(std::string& text, std::string& error) {
+    @autoreleasepool {
+        NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
+        if (!pasteboard) {
+            error = "Unable to access the macOS pasteboard.";
+            return false;
+        }
+
+        NSString* value = [pasteboard stringForType:NSPasteboardTypeString];
+        if (!value) {
+            text.clear();
+            return true;
+        }
+
+        const char* utf8 = [value UTF8String];
+        if (!utf8) {
+            error = "Unable to encode the macOS clipboard as UTF-8.";
+            return false;
+        }
+        text.assign(utf8);
+        return true;
+    }
 }
 
 } // namespace
