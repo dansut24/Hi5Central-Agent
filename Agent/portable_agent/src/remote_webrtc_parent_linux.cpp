@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <grp.h>
+#include <iostream>
 #include <mutex>
 #include <pwd.h>
 #include <signal.h>
@@ -93,6 +94,22 @@ std::string helperPath() {
     return {};
 }
 
+std::string preparePortalStateDir(const UserIdentity& user) {
+    if (user.uid == static_cast<uid_t>(-1) || user.gid == static_cast<gid_t>(-1)) return {};
+
+    const std::string root = "/var/lib/hi5central/portal";
+    const std::string userDir = root + "/" + std::to_string(user.uid);
+
+    if (::mkdir(root.c_str(), 0755) != 0 && errno != EEXIST) return {};
+    (void)::chmod(root.c_str(), 0755);
+
+    if (::mkdir(userDir.c_str(), 0700) != 0 && errno != EEXIST) return {};
+    if (::chown(userDir.c_str(), user.uid, user.gid) != 0) return {};
+    if (::chmod(userDir.c_str(), 0700) != 0) return {};
+
+    return userDir;
+}
+
 } // namespace
 
 class RemoteWebRtcSession {
@@ -119,6 +136,13 @@ public:
         if (helper.empty()) {
             error = "Hi5CentralRemoteHelper is not installed. Upgrade the Linux Agent.";
             return false;
+        }
+
+        const std::string portalStateDir = preparePortalStateDir(user);
+        if (portalStateDir.empty()) {
+            std::cerr
+                << "[wayland-portal] unable to prepare persistent per-user state directory; "
+                << "portal permission will not survive helper restarts\n";
         }
 
         const std::string socketDir = "/run/hi5central";
@@ -172,6 +196,8 @@ public:
 
             const std::string runtime = "XDG_RUNTIME_DIR=" + user.runtimeDir;
             const std::string bus = "DBUS_SESSION_BUS_ADDRESS=unix:path=" + user.runtimeDir + "/bus";
+            const std::string portalState =
+                "HI5CENTRAL_WAYLAND_STATE_DIR=" + portalStateDir;
             const char* runuser = "/usr/sbin/runuser";
             const char* env = "/usr/bin/env";
 
@@ -184,6 +210,7 @@ public:
                 env,
                 runtime.c_str(),
                 bus.c_str(),
+                portalState.c_str(),
                 helper.c_str(),
                 "--remote-helper",
                 "--socket",
