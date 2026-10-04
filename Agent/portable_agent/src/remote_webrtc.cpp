@@ -188,7 +188,8 @@ public:
             {"codec", codecName(activeCodec_)},
             {"fps", fps_},
             {"bitrate_kbps", bitrateKbps_},
-            {"requires_user_consent", platform_->requiresConsent()}
+            {"requires_user_consent", platform_->requiresConsent()},
+            {"clipboard_read", platform_->supportsClipboardRead()}
         });
 
         try {
@@ -290,6 +291,23 @@ public:
 
     void handleInput(const json& message) {
         if (!platform_) return;
+
+        const std::string kind =
+            message.value("kind", message.value("type", std::string()));
+        if (kind == "clipboard_get") {
+            std::string text;
+            std::string error;
+            const bool ok = platform_->readClipboardText(text, error);
+            send_({
+                {"type", "clipboard_result"},
+                {"session_id", sessionId_},
+                {"ok", ok},
+                {"text", ok ? text : std::string()},
+                {"error", ok ? std::string() : error}
+            });
+            return;
+        }
+
         std::string error;
         if (!platform_->handleInput(message, error) && !error.empty()) {
             sendError("input_failed", error);
@@ -362,7 +380,8 @@ private:
                 {"backend", platform_ ? platform_->backendName() : "unknown"},
                 {"codec", codecName(activeCodec_)},
                 {"fps", fps_},
-                {"bitrate_kbps", bitrateKbps_}
+                {"bitrate_kbps", bitrateKbps_},
+                {"clipboard_read", platform_ ? platform_->supportsClipboardRead() : false}
             });
             startStreaming();
         });
