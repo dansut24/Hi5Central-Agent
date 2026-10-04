@@ -90,7 +90,14 @@ elseif(UNIX)
   pkg_check_modules(VPX REQUIRED vpx)
   find_file(HI5_VPX_STATIC_ARCHIVE
     NAMES libvpx.a
-    PATHS ${VPX_LIBRARY_DIRS}
+    PATHS
+      ${VPX_LIBRARY_DIRS}
+      /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+      /usr/local/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+      /usr/lib64
+      /usr/local/lib64
+      /usr/lib
+      /usr/local/lib
     NO_DEFAULT_PATH
   )
   if(NOT HI5_VPX_STATIC_ARCHIVE)
