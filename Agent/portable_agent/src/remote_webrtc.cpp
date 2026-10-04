@@ -4,6 +4,11 @@
 
 #if defined(__APPLE__)
 #include "remote_h264_vt_encoder.h"
+#include "remote_software_video_encoder.h"
+
+#include <rtc/av1rtppacketizer.hpp>
+#include <rtc/rtcpnackresponder.hpp>
+#include <rtc/rtcpsrreporter.hpp>
 #else
 #include "remote_vp8_encoder.h"
 #endif
@@ -13,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -69,15 +75,96 @@ std::string normaliseCandidate(std::string candidate) {
     return candidate;
 }
 
+enum class VideoCodec {
+    H264,
+    VP8,
+    VP9,
+    AV1,
+};
+
+std::string lowerAscii(std::string value) {
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+std::string codecName(VideoCodec codec) {
+    switch (codec) {
+        case VideoCodec::H264: return "h264";
+        case VideoCodec::VP8: return "vp8";
+        case VideoCodec::VP9: return "vp9";
+        case VideoCodec::AV1: return "av1";
+    }
+    return "unknown";
+}
+
+VideoCodec resolveVideoCodec(const std::string& requested, const std::string& backend) {
+    const auto codec = lowerAscii(requested);
+#if defined(__APPLE__)
+    if (codec == "h264" || codec == "avc") return VideoCodec::H264;
+    if (codec == "vp8") return VideoCodec::VP8;
+    if (codec == "vp9") return VideoCodec::VP9;
+    if (codec == "av1" || codec == "av01") return VideoCodec::AV1;
+
+    // VMware's WindowServer path is software capture already. Prefer VP8 for
+    // auto mode so it also bypasses VideoToolbox during compatibility testing.
+    if (backend == "macos_windowserver") return VideoCodec::VP8;
+    return VideoCodec::H264;
+#else
+    (void)backend;
+    return VideoCodec::VP8;
+#endif
+}
+
+int codecFps(VideoCodec codec) {
+    switch (codec) {
+        case VideoCodec::VP8: return 20;
+        case VideoCodec::VP9: return 15;
+        case VideoCodec::AV1: return 8;
+        case VideoCodec::H264: return 30;
+    }
+    return 30;
+}
+
+int codecBitrateKbps(VideoCodec codec) {
+    switch (codec) {
+        case VideoCodec::VP8: return 7000;
+        case VideoCodec::VP9: return 5500;
+        case VideoCodec::AV1: return 3500;
+        case VideoCodec::H264: return 12000;
+    }
+    return 8000;
+}
+
+#if defined(__APPLE__)
+SoftwareVideoCodec softwareCodec(VideoCodec codec) {
+    switch (codec) {
+        case VideoCodec::VP9: return SoftwareVideoCodec::VP9;
+        case VideoCodec::AV1: return SoftwareVideoCodec::AV1;
+        case VideoCodec::VP8:
+        default:
+            return SoftwareVideoCodec::VP8;
+    }
+}
+#endif
+
 } // namespace
 
 class RemoteWebRtcSession {
 public:
     using SendFn = RemoteDesktopManager::SendFn;
 
-    RemoteWebRtcSession(std::string sessionId, std::vector<std::string> iceServers, SendFn send)
+    RemoteWebRtcSession(
+        std::string sessionId,
+        std::vector<std::string> iceServers,
+        std::string requestedCodec,
+        SendFn send)
         : sessionId_(std::move(sessionId)),
           iceServers_(std::move(iceServers)),
+          requestedCodec_(std::move(requestedCodec)),
           send_(std::move(send)),
           ssrc_(randomU32()),
           sequence_(randomU16()) {}
@@ -92,9 +179,17 @@ public:
         }
         if (!platform_->start(error)) return false;
 
+        activeCodec_ = resolveVideoCodec(requestedCodec_, platform_->backendName());
+        fps_ = codecFps(activeCodec_);
+        bitrateKbps_ = codecBitrateKbps(activeCodec_);
+
         sendState("starting", {
             {"backend", platform_->backendName()},
-            {"requires_user_consent", platform_->requiresConsent()}
+            {"codec", codecName(activeCodec_)},
+            {"fps", fps_},
+            {"bitrate_kbps", bitrateKbps_},
+            {"requires_user_consent", platform_->requiresConsent()},
+            {"clipboard_read", platform_->supportsClipboardRead()}
         });
 
         try {
@@ -114,6 +209,9 @@ public:
         if (streamThread_.joinable()) streamThread_.join();
 #if defined(__APPLE__)
         h264Encoder_.reset();
+        softwareEncoder_.reset();
+        av1Packetizer_.reset();
+        av1RtpConfig_.reset();
 #else
         encoder_.reset();
 #endif
@@ -155,7 +253,11 @@ public:
                 return;
             }
             try {
+                std::cerr << "[remote-webrtc] applying remote description type=" << sdpType
+                          << " bytes=" << sdp.size()
+                          << " session=" << sessionId_ << "\n";
                 pc_->setRemoteDescription(rtc::Description(sdp, sdpType));
+                std::cerr << "[remote-webrtc] remote description applied session=" << sessionId_ << "\n";
             } catch (const std::exception& ex) {
                 sendError("answer_failed", ex.what());
             }
@@ -178,6 +280,9 @@ public:
             if (candidate.empty()) return;
             try {
                 pc_->addRemoteCandidate(rtc::Candidate(candidate, mid));
+                std::cerr << "[remote-webrtc] remote candidate accepted mid=" << mid
+                          << " bytes=" << candidate.size()
+                          << " session=" << sessionId_ << "\n";
             } catch (const std::exception& ex) {
                 sendError("candidate_failed", ex.what());
             }
@@ -186,6 +291,23 @@ public:
 
     void handleInput(const json& message) {
         if (!platform_) return;
+
+        const std::string kind =
+            message.value("kind", message.value("type", std::string()));
+        if (kind == "clipboard_get") {
+            std::string text;
+            std::string error;
+            const bool ok = platform_->readClipboardText(text, error);
+            send_({
+                {"type", "clipboard_result"},
+                {"session_id", sessionId_},
+                {"ok", ok},
+                {"text", ok ? text : std::string()},
+                {"error", ok ? std::string() : error}
+            });
+            return;
+        }
+
         std::string error;
         if (!platform_->handleInput(message, error) && !error.empty()) {
             sendError("input_failed", error);
@@ -197,6 +319,7 @@ public:
         if (platform_->setDisplayIndex(index)) {
 #if defined(__APPLE__)
             h264Encoder_.reset();
+            softwareEncoder_.reset();
 #else
             encoder_.reset();
 #endif
@@ -219,7 +342,12 @@ private:
 
         rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
 #if defined(__APPLE__)
-        media.addH264Codec(payloadType_);
+        switch (activeCodec_) {
+            case VideoCodec::H264: media.addH264Codec(payloadType_); break;
+            case VideoCodec::VP8: media.addVP8Codec(payloadType_); break;
+            case VideoCodec::VP9: media.addVP9Codec(payloadType_); break;
+            case VideoCodec::AV1: media.addAV1Codec(payloadType_); break;
+        }
 #else
         media.addVP8Codec(payloadType_);
 #endif
@@ -227,9 +355,34 @@ private:
         media.setBitrate(bitrateKbps_ * 1000);
         track_ = pc_->addTrack(media);
 
+#if defined(__APPLE__)
+        if (activeCodec_ == VideoCodec::AV1) {
+            av1RtpConfig_ = std::make_shared<rtc::RtpPacketizationConfig>(
+                ssrc_,
+                "video-stream",
+                payloadType_,
+                rtc::AV1RtpPacketizer::ClockRate);
+            av1Packetizer_ = std::make_shared<rtc::AV1RtpPacketizer>(
+                rtc::AV1RtpPacketizer::Packetization::TemporalUnit,
+                av1RtpConfig_,
+                1200);
+            auto srReporter = std::make_shared<rtc::RtcpSrReporter>(av1RtpConfig_);
+            av1Packetizer_->addToChain(srReporter);
+            av1Packetizer_->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+            track_->setMediaHandler(av1Packetizer_);
+        }
+#endif
+
         track_->onOpen([this]() {
+            std::cerr << "[remote-webrtc] track open session=" << sessionId_ << "\n";
             canSend_.store(true);
-            sendState("connected", {{"backend", platform_ ? platform_->backendName() : "unknown"}});
+            sendState("connected", {
+                {"backend", platform_ ? platform_->backendName() : "unknown"},
+                {"codec", codecName(activeCodec_)},
+                {"fps", fps_},
+                {"bitrate_kbps", bitrateKbps_},
+                {"clipboard_read", platform_ ? platform_->supportsClipboardRead() : false}
+            });
             startStreaming();
         });
         track_->onClosed([this]() {
@@ -238,6 +391,8 @@ private:
         });
 
         pc_->onStateChange([this](rtc::PeerConnection::State state) {
+            std::cerr << "[remote-webrtc] peer state=" << static_cast<int>(state)
+                      << " session=" << sessionId_ << "\n";
             if (state == rtc::PeerConnection::State::Disconnected ||
                 state == rtc::PeerConnection::State::Failed ||
                 state == rtc::PeerConnection::State::Closed) {
@@ -248,7 +403,15 @@ private:
             }
         });
 
+        pc_->onGatheringStateChange([this](rtc::PeerConnection::GatheringState state) {
+            std::cerr << "[remote-webrtc] gathering state=" << static_cast<int>(state)
+                      << " session=" << sessionId_ << "\n";
+        });
+
         pc_->onLocalDescription([this](rtc::Description description) {
+            std::cerr << "[remote-webrtc] local description type=" << description.typeString()
+                      << " bytes=" << std::string(description).size()
+                      << " session=" << sessionId_ << "\n";
             json payload = {
                 {"type", "webrtc_offer"},
                 {"session_id", sessionId_},
@@ -259,6 +422,9 @@ private:
         });
 
         pc_->onLocalCandidate([this](rtc::Candidate candidate) {
+            std::cerr << "[remote-webrtc] local candidate mid=" << candidate.mid()
+                      << " bytes=" << std::string(candidate).size()
+                      << " session=" << sessionId_ << "\n";
             send_({
                 {"type", "ice_candidate"},
                 {"session_id", sessionId_},
@@ -268,6 +434,8 @@ private:
             });
         });
 
+        std::cerr << "[remote-webrtc] setLocalDescription session=" << sessionId_
+                  << " ice_servers=" << iceServers_.size() << "\n";
         pc_->setLocalDescription();
     }
 
@@ -279,6 +447,9 @@ private:
     void streamLoop() {
         const auto interval = std::chrono::milliseconds(1000 / fps_);
         std::uint64_t frameCounter = 0;
+        std::uint64_t capturePolls = 0;
+        bool loggedCapture = false;
+        bool loggedEncoded = false;
 
         while (running_.load()) {
             const auto started = std::chrono::steady_clock::now();
@@ -288,26 +459,65 @@ private:
             }
 
             try {
+                ++capturePolls;
                 auto captured = platform_->capture();
+                if (!captured.hasFrame && capturePolls % 150 == 0) {
+                    std::cerr << "[remote-webrtc] capture waiting polls=" << capturePolls
+                              << " session=" << sessionId_ << "\n";
+                }
                 if (captured.hasFrame && captured.frame.width > 0 && captured.frame.height > 0) {
+                    if (!loggedCapture) {
+                        loggedCapture = true;
+                        std::cerr << "[remote-webrtc] first captured frame size="
+                                  << captured.frame.width << "x" << captured.frame.height
+                                  << " frame_id=" << captured.frameId
+                                  << " session=" << sessionId_ << "\n";
+                    }
                     const bool periodicKeyframe = (frameCounter % static_cast<std::uint64_t>(fps_ * 3)) == 0;
                     const bool force = forceKeyframe_.exchange(false) || periodicKeyframe;
 
 #if defined(__APPLE__)
-                    if (!h264Encoder_ ||
-                        captured.frame.width != encoderWidth_ ||
-                        captured.frame.height != encoderHeight_) {
-                        encoderWidth_ = captured.frame.width;
-                        encoderHeight_ = captured.frame.height;
-                        h264Encoder_ = std::make_unique<H264VideoToolboxEncoder>(
-                            encoderWidth_, encoderHeight_, fps_, bitrateKbps_);
-                        forceKeyframe_.store(true);
-                    }
+                    if (activeCodec_ == VideoCodec::H264) {
+                        if (!h264Encoder_ ||
+                            captured.frame.width != encoderWidth_ ||
+                            captured.frame.height != encoderHeight_) {
+                            encoderWidth_ = captured.frame.width;
+                            encoderHeight_ = captured.frame.height;
+                            softwareEncoder_.reset();
+                            h264Encoder_ = std::make_unique<H264VideoToolboxEncoder>(
+                                encoderWidth_, encoderHeight_, fps_, bitrateKbps_);
+                            forceKeyframe_.store(true);
+                        }
 
-                    const auto encoded = h264Encoder_->encode(captured.frame, force);
-                    if (!encoded.data.empty()) {
-                        sendH264(encoded);
-                        ++frameCounter;
+                        const auto encoded = h264Encoder_->encode(captured.frame, force);
+                        if (!encoded.data.empty()) {
+                            sendH264(encoded);
+                            ++frameCounter;
+                        }
+                    } else {
+                        if (!softwareEncoder_ ||
+                            captured.frame.width != encoderWidth_ ||
+                            captured.frame.height != encoderHeight_) {
+                            encoderWidth_ = captured.frame.width;
+                            encoderHeight_ = captured.frame.height;
+                            h264Encoder_.reset();
+                            softwareEncoder_ = std::make_unique<SoftwareVideoEncoder>(
+                                softwareCodec(activeCodec_),
+                                encoderWidth_,
+                                encoderHeight_,
+                                fps_,
+                                bitrateKbps_,
+                                std::max(2, std::min(8, static_cast<int>(std::thread::hardware_concurrency()))));
+                            forceKeyframe_.store(true);
+                        }
+
+                        const auto encoded = softwareEncoder_->encode(captured.frame, force);
+                        if (!encoded.data.empty()) {
+                            if (activeCodec_ == VideoCodec::VP8) sendVp8Software(encoded);
+                            else if (activeCodec_ == VideoCodec::VP9) sendVp9(encoded);
+                            else if (activeCodec_ == VideoCodec::AV1) sendAv1(encoded);
+                            ++frameCounter;
+                        }
                     }
 #else
                     if (!encoder_ ||
@@ -323,12 +533,21 @@ private:
 
                     const auto encoded = encoder_->encode(captured.frame, force);
                     if (!encoded.data.empty()) {
+                        if (!loggedEncoded) {
+                            loggedEncoded = true;
+                            std::cerr << "[remote-webrtc] first VP8 frame bytes="
+                                      << encoded.data.size()
+                                      << " keyframe=" << (encoded.keyframe ? 1 : 0)
+                                      << " session=" << sessionId_ << "\n";
+                        }
                         sendVp8(encoded);
                         ++frameCounter;
                     }
 #endif
                 }
             } catch (const std::exception& ex) {
+                std::cerr << "[remote-webrtc] stream exception session="
+                          << sessionId_ << " error=" << ex.what() << "\n";
                 sendError("capture_failed", ex.what());
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             }
@@ -452,6 +671,115 @@ private:
             }
         }
     }
+
+    void sendRtpPayload(
+        const std::uint8_t* payload,
+        std::size_t payloadSize,
+        std::uint32_t timestamp,
+        bool marker) {
+
+        std::vector<std::uint8_t> packet(12 + payloadSize);
+        packet[0] = 0x80;
+        packet[1] = static_cast<std::uint8_t>(
+            (marker ? 0x80 : 0x00) | (payloadType_ & 0x7f));
+        packet[2] = static_cast<std::uint8_t>((sequence_ >> 8) & 0xff);
+        packet[3] = static_cast<std::uint8_t>(sequence_ & 0xff);
+        packet[4] = static_cast<std::uint8_t>((timestamp >> 24) & 0xff);
+        packet[5] = static_cast<std::uint8_t>((timestamp >> 16) & 0xff);
+        packet[6] = static_cast<std::uint8_t>((timestamp >> 8) & 0xff);
+        packet[7] = static_cast<std::uint8_t>(timestamp & 0xff);
+        packet[8] = static_cast<std::uint8_t>((ssrc_ >> 24) & 0xff);
+        packet[9] = static_cast<std::uint8_t>((ssrc_ >> 16) & 0xff);
+        packet[10] = static_cast<std::uint8_t>((ssrc_ >> 8) & 0xff);
+        packet[11] = static_cast<std::uint8_t>(ssrc_ & 0xff);
+        std::copy(payload, payload + payloadSize, packet.begin() + 12);
+
+        rtc::binary binary;
+        binary.reserve(packet.size());
+        for (const auto byte : packet) binary.push_back(static_cast<std::byte>(byte));
+        track_->send(binary);
+        ++sequence_;
+    }
+
+    void sendVp8Software(const SoftwareEncodedFrame& frame) {
+        if (!canSend_.load() || !track_ || !track_->isOpen()) return;
+
+        constexpr std::size_t maxRtpPayload = 1200;
+        std::size_t offset = 0;
+        bool first = true;
+        std::lock_guard<std::mutex> lock(sendMutex_);
+
+        while (offset < frame.data.size()) {
+            const std::size_t chunk =
+                std::min(frame.data.size() - offset, maxRtpPayload - 1);
+            const bool marker = offset + chunk >= frame.data.size();
+
+            std::vector<std::uint8_t> payload(1 + chunk);
+            payload[0] = first ? 0x10 : 0x00;
+            std::copy(
+                frame.data.begin() + static_cast<std::ptrdiff_t>(offset),
+                frame.data.begin() + static_cast<std::ptrdiff_t>(offset + chunk),
+                payload.begin() + 1);
+
+            sendRtpPayload(
+                payload.data(),
+                payload.size(),
+                frame.rtpTimestamp,
+                marker);
+
+            offset += chunk;
+            first = false;
+        }
+    }
+
+    void sendVp9(const SoftwareEncodedFrame& frame) {
+        if (!canSend_.load() || !track_ || !track_->isOpen()) return;
+
+        // RFC 7741 permits a one-byte descriptor when Picture ID, layer
+        // information and scalability structure are omitted. P marks an
+        // inter-picture predicted frame; B/E delimit this frame.
+        constexpr std::size_t maxRtpPayload = 1200;
+        std::size_t offset = 0;
+        bool first = true;
+        std::lock_guard<std::mutex> lock(sendMutex_);
+
+        while (offset < frame.data.size()) {
+            const std::size_t chunk =
+                std::min(frame.data.size() - offset, maxRtpPayload - 1);
+            const bool marker = offset + chunk >= frame.data.size();
+
+            std::uint8_t descriptor = frame.keyframe ? 0x00 : 0x40;
+            if (first) descriptor |= 0x08;
+            if (marker) descriptor |= 0x04;
+
+            std::vector<std::uint8_t> payload(1 + chunk);
+            payload[0] = descriptor;
+            std::copy(
+                frame.data.begin() + static_cast<std::ptrdiff_t>(offset),
+                frame.data.begin() + static_cast<std::ptrdiff_t>(offset + chunk),
+                payload.begin() + 1);
+
+            sendRtpPayload(
+                payload.data(),
+                payload.size(),
+                frame.rtpTimestamp,
+                marker);
+
+            offset += chunk;
+            first = false;
+        }
+    }
+
+    void sendAv1(const SoftwareEncodedFrame& frame) {
+        if (!canSend_.load() || !track_ || !track_->isOpen() || !av1Packetizer_) return;
+
+        rtc::binary binary;
+        binary.reserve(frame.data.size());
+        for (const auto byte : frame.data) binary.push_back(static_cast<std::byte>(byte));
+
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        track_->sendFrame(std::move(binary), rtc::FrameInfo(frame.rtpTimestamp));
+    }
 #else
     void sendVp8(const EncodedFrame& frame) {
         if (!canSend_.load() || !track_ || !track_->isOpen()) return;
@@ -542,11 +870,16 @@ private:
 
     std::string sessionId_;
     std::vector<std::string> iceServers_;
+    std::string requestedCodec_ = "auto";
     SendFn send_;
 
+    VideoCodec activeCodec_ = VideoCodec::VP8;
     std::unique_ptr<RemotePlatform> platform_;
 #if defined(__APPLE__)
     std::unique_ptr<H264VideoToolboxEncoder> h264Encoder_;
+    std::unique_ptr<SoftwareVideoEncoder> softwareEncoder_;
+    std::shared_ptr<rtc::RtpPacketizationConfig> av1RtpConfig_;
+    std::shared_ptr<rtc::AV1RtpPacketizer> av1Packetizer_;
 #else
     std::unique_ptr<Vp8Encoder> encoder_;
 #endif
@@ -566,8 +899,8 @@ private:
     std::uint32_t ssrc_ = 0;
     std::uint16_t sequence_ = 0;
     const int payloadType_ = 96;
-    const int fps_ = 30;
-    const int bitrateKbps_ = 12000;
+    int fps_ = 30;
+    int bitrateKbps_ = 12000;
 };
 
 RemoteDesktopManager::RemoteDesktopManager(SendFn send) : send_(std::move(send)) {}
@@ -594,8 +927,25 @@ bool RemoteDesktopManager::handleMessage(const json& message) {
             return true;
         }
 
+        const std::string requestedCodec =
+            message.value("video_codec", message.value("codec", "auto"));
+
+        // A codec change/reconnect for the same authorised session must never
+        // leave two macOS capture pipelines running at once.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto existing = sessions_.find(sessionId);
+            if (existing != sessions_.end()) {
+                existing->second->stop();
+                sessions_.erase(existing);
+            }
+        }
+
         auto session = std::make_unique<RemoteWebRtcSession>(
-            sessionId, iceServersFromMessage(message), send_);
+            sessionId,
+            iceServersFromMessage(message),
+            requestedCodec,
+            send_);
         std::string error;
         if (!session->start(error)) {
             send_({
@@ -608,8 +958,6 @@ bool RemoteDesktopManager::handleMessage(const json& message) {
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
-        auto existing = sessions_.find(sessionId);
-        if (existing != sessions_.end()) existing->second->stop();
         sessions_[sessionId] = std::move(session);
         return true;
     }

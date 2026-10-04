@@ -53,21 +53,62 @@ set(HI5_REMOTE_LIBRARIES)
 
 if(APPLE)
   enable_language(OBJCXX)
+  pkg_check_modules(HI5_VPX REQUIRED vpx)
+  find_file(HI5_VPX_STATIC_ARCHIVE
+    NAMES libvpx.a
+    PATHS ${HI5_VPX_LIBRARY_DIRS}
+    NO_DEFAULT_PATH
+  )
+
+  set(HI5_AOM_INCLUDE_DIR "" CACHE PATH "Path containing aom/aom_encoder.h")
+  set(HI5_AOM_STATIC_ARCHIVE "" CACHE FILEPATH "Path to static libaom.a")
+  if(NOT HI5_AOM_INCLUDE_DIR OR NOT HI5_AOM_STATIC_ARCHIVE)
+    pkg_check_modules(HI5_AOM REQUIRED aom)
+    if(NOT HI5_AOM_INCLUDE_DIR)
+      list(GET HI5_AOM_INCLUDE_DIRS 0 HI5_AOM_INCLUDE_DIR)
+    endif()
+    find_file(HI5_AOM_STATIC_ARCHIVE
+      NAMES libaom.a
+      PATHS ${HI5_AOM_LIBRARY_DIRS}
+      NO_DEFAULT_PATH
+    )
+  endif()
+
+  if(NOT HI5_VPX_STATIC_ARCHIVE)
+    message(FATAL_ERROR "Static libvpx archive is required for the macOS Remote Helper.")
+  endif()
+  if(NOT HI5_AOM_INCLUDE_DIR OR NOT EXISTS "${HI5_AOM_INCLUDE_DIR}/aom/aom_encoder.h")
+    message(FATAL_ERROR "libaom headers are required for the macOS Remote Helper.")
+  endif()
+  if(NOT HI5_AOM_STATIC_ARCHIVE)
+    message(FATAL_ERROR "Static libaom archive is required for the macOS Remote Helper.")
+  endif()
   list(APPEND HI5_REMOTE_SOURCES
     src/remote_webrtc_parent_macos.cpp
   )
 elseif(UNIX)
-  pkg_check_modules(VPX REQUIRED IMPORTED_TARGET vpx)
-  pkg_check_modules(HI5_X11 REQUIRED IMPORTED_TARGET x11 xext xtst)
-  list(APPEND HI5_REMOTE_SOURCES
-    src/remote_vp8_encoder.cpp
-    src/remote_webrtc.cpp
-    src/remote_platform_linux.cpp
+  pkg_check_modules(VPX REQUIRED vpx)
+  find_file(HI5_VPX_STATIC_ARCHIVE
+    NAMES libvpx.a
+    PATHS
+      ${VPX_LIBRARY_DIRS}
+      /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+      /usr/local/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+      /usr/lib64
+      /usr/local/lib64
+      /usr/lib
+      /usr/local/lib
+    NO_DEFAULT_PATH
   )
-  list(APPEND HI5_REMOTE_LIBRARIES
-    LibDataChannel::LibDataChannelStatic
-    PkgConfig::VPX
-    PkgConfig::HI5_X11
+  if(NOT HI5_VPX_STATIC_ARCHIVE)
+    message(FATAL_ERROR "Static libvpx archive is required for the Linux Remote Helper.")
+  endif()
+
+  pkg_check_modules(HI5_X11 REQUIRED IMPORTED_TARGET x11 xext xtst)
+  pkg_check_modules(HI5_GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
+  pkg_check_modules(HI5_PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+  list(APPEND HI5_REMOTE_SOURCES
+    src/remote_webrtc_parent_linux.cpp
   )
 else()
   message(FATAL_ERROR "The portable Agent target currently supports macOS and Linux only.")
@@ -84,6 +125,7 @@ add_executable(Hi5CentralAgent
   src/portable_live_tools.cpp
   src/software_inventory.cpp
   src/software_actions.cpp
+  src/os_updates.cpp
   ${HI5_REMOTE_SOURCES}
 )
 
@@ -117,10 +159,15 @@ if(APPLE)
   add_executable(Hi5CentralRemoteHelper
     src/remote_helper_main_macos.mm
     src/remote_h264_vt_encoder.mm
+    src/remote_software_video_encoder.cpp
     src/remote_webrtc.cpp
     src/remote_platform_macos.mm
   )
-  target_include_directories(Hi5CentralRemoteHelper PRIVATE src)
+  target_include_directories(Hi5CentralRemoteHelper PRIVATE
+    src
+    ${HI5_VPX_INCLUDE_DIRS}
+    ${HI5_AOM_INCLUDE_DIR}
+  )
   target_compile_definitions(Hi5CentralRemoteHelper PRIVATE
     HI5_PLATFORM_MACOS=1
     HI5CENTRAL_AGENT_VERSION="${HI5CENTRAL_AGENT_VERSION}"
@@ -136,6 +183,8 @@ if(APPLE)
     LibDataChannel::LibDataChannelStatic
     OpenSSL::SSL
     OpenSSL::Crypto
+    ${HI5_VPX_STATIC_ARCHIVE}
+    ${HI5_AOM_STATIC_ARCHIVE}
     Threads::Threads
     "-framework ApplicationServices"
     "-framework Cocoa"
@@ -147,9 +196,35 @@ if(APPLE)
   )
 elseif(UNIX)
   target_compile_definitions(Hi5CentralAgent PRIVATE HI5_PLATFORM_LINUX=1)
+
+  add_executable(Hi5CentralRemoteHelper
+    src/remote_helper_main_linux.cpp
+    src/remote_vp8_encoder.cpp
+    src/remote_webrtc.cpp
+    src/remote_platform_linux.cpp
+    src/remote_platform_wayland.cpp
+  )
+  target_include_directories(Hi5CentralRemoteHelper PRIVATE
+    src
+    ${VPX_INCLUDE_DIRS}
+  )
+  target_compile_definitions(Hi5CentralRemoteHelper PRIVATE
+    HI5_PLATFORM_LINUX=1
+    HI5CENTRAL_AGENT_VERSION="${HI5CENTRAL_AGENT_VERSION}"
+  )
+  target_link_libraries(Hi5CentralRemoteHelper PRIVATE
+    nlohmann_json::nlohmann_json
+    LibDataChannel::LibDataChannelStatic
+    ${HI5_VPX_STATIC_ARCHIVE}
+    PkgConfig::HI5_X11
+    PkgConfig::HI5_GIO
+    PkgConfig::HI5_PIPEWIRE
+    Threads::Threads
+    m
+  )
 endif()
 
 install(TARGETS Hi5CentralAgent RUNTIME DESTINATION bin)
-if(APPLE)
+if(APPLE OR UNIX)
   install(TARGETS Hi5CentralRemoteHelper RUNTIME DESTINATION bin)
 endif()

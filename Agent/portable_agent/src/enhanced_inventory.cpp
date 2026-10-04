@@ -164,13 +164,22 @@ uid_t activeUid() {
 std::string activeSessionType() {
     const auto user = activeUser();
     if (user.empty() || !commandExists("loginctl")) return {};
+    const auto quotedUser = "'" + user + "'";
     const auto session = runCommand(
-        "loginctl list-sessions --no-legend 2>/dev/null | "
-        "awk '$3==\"" + user + "\" && ($5==\"seat0\" || $4==\"seat0\") {print $1; exit} "
-        "$3==\"" + user + "\" {fallback=$1} END {if (fallback) print fallback}' | head -1");
+        "fallback=''; for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do "
+        "name=$(loginctl show-session \"$s\" -p Name --value 2>/dev/null); "
+        "active=$(loginctl show-session \"$s\" -p Active --value 2>/dev/null); "
+        "class=$(loginctl show-session \"$s\" -p Class --value 2>/dev/null); "
+        "type=$(loginctl show-session \"$s\" -p Type --value 2>/dev/null); "
+        "seat=$(loginctl show-session \"$s\" -p Seat --value 2>/dev/null); "
+        "if [ \"$name\" = " + quotedUser + " ] && [ \"$active\" = yes ] && "
+        "[ \"$class\" = user ] && { [ \"$type\" = wayland ] || [ \"$type\" = x11 ]; }; then "
+        "if [ \"$seat\" = seat0 ]; then printf '%s\\n' \"$s\"; exit; fi; "
+        "[ -z \"$fallback\" ] && fallback=\"$s\"; fi; "
+        "done; [ -n \"$fallback\" ] && printf '%s\\n' \"$fallback\"");
     if (session.empty()) return {};
     auto type = runCommand("loginctl show-session " + session + " -p Type --value 2>/dev/null");
-    std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    std::transform(type.begin(), type.end(), type.begin(), [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
     return type;
 }
 
@@ -230,7 +239,7 @@ json linuxRemoteCapabilities() {
 
     return {
         {"available", (waylandReady || x11)},
-        {"implementation_ready", x11},
+        {"implementation_ready", waylandReady || x11},
         {"backend", backend},
         {"session_type", sessionType.empty() ? (wayland ? "wayland" : (x11 ? "x11" : "none")) : sessionType},
         {"desktop_session", graphical},
@@ -247,7 +256,7 @@ json linuxRemoteCapabilities() {
         }},
         {"input_control", {
             {"available", wayland ? (waylandReady && (libeiInstalled || portalInstalled)) : x11},
-            {"provider", wayland ? (libeiInstalled ? "xdg-remote-desktop+eis" : "xdg-remote-desktop") : (x11 ? "x11" : "none")},
+            {"provider", wayland ? "xdg-remote-desktop-dbus" : (x11 ? "x11" : "none")},
             {"requires_user_consent", wayland}
         }},
         {"wayland", {
@@ -547,7 +556,14 @@ json macRemoteCapabilities() {
         {"available", desktopSession},
         {"implementation_ready", true},
         {"backend", "macos_screencapturekit"},
-        {"codec", "h264_videotoolbox"},
+        {"codec", "adaptive"},
+        {"preferred_codec", "h264_videotoolbox"},
+        {"codecs", json::array({
+            "h264_videotoolbox",
+            "vp8_libvpx",
+            "vp9_libvpx",
+            "av1_libaom"
+        })},
         {"session_type", "aqua"},
         {"desktop_session", desktopSession},
         {"headless", !desktopSession},
