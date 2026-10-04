@@ -284,14 +284,23 @@ if (-not $SkipBuild) {
         -ErrorMessage "CMake build failed."
 }
 
-$agentExe = Join-Path $buildPath "native_vp8_stream.exe"
+$agentCandidates = @(
+    (Join-Path $buildPath "Hi5CentralAgent.exe"),
+    (Join-Path (Join-Path $buildPath $Configuration) "Hi5CentralAgent.exe"),
+    (Join-Path $buildPath "native_vp8_stream.exe"),
+    (Join-Path (Join-Path $buildPath $Configuration) "native_vp8_stream.exe")
+)
 
-if (-not (Test-Path $agentExe)) {
-    $agentExe = Join-Path (Join-Path $buildPath $Configuration) "native_vp8_stream.exe"
+$agentExe = ""
+foreach ($candidate in $agentCandidates) {
+    if (Test-Path $candidate) {
+        $agentExe = $candidate
+        break
+    }
 }
 
-if (-not (Test-Path $agentExe)) {
-    throw "Agent executable not found. Checked: $buildPath\native_vp8_stream.exe and $buildPath\$Configuration\native_vp8_stream.exe"
+if ([string]::IsNullOrWhiteSpace($agentExe)) {
+    throw ("Agent executable not found. Checked: " + ($agentCandidates -join ", "))
 }
 
 Assert-NoDynamicVcRuntimeDependency -ExePath $agentExe
