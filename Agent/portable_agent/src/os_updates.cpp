@@ -5,6 +5,7 @@
 #include "software_inventory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <filesystem>
@@ -24,6 +25,7 @@ std::mutex g_cacheMutex;
 json g_cachedInventory;
 std::chrono::steady_clock::time_point g_cachedAt{};
 constexpr auto kCacheTtl = std::chrono::minutes(30);
+std::atomic<std::uint64_t> g_privilegedUpdateCounter{0};
 
 std::string trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -88,6 +90,36 @@ json baseInventory(const std::string& provider) {
 }
 
 #if defined(__linux__)
+
+CommandResult runPrivilegedLinuxUpdate(const std::string& nativeCommand) {
+    const auto serial = g_privilegedUpdateCounter.fetch_add(1);
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const std::string unit =
+        "hi5central-os-update-" + std::to_string(stamp) + "-" + std::to_string(serial);
+    const std::string service = unit + ".service";
+
+    // The main Agent service intentionally runs with ProtectSystem=full, which
+    // makes /usr read-only in its mount namespace. Ask PID 1 to create a fresh
+    // transient unit for the package transaction instead of weakening the
+    // long-running Agent sandbox.
+    const std::string command =
+        "/usr/bin/systemd-run --no-block --unit=" + shellQuote(unit) +
+        " --property=Type=oneshot --property=RuntimeMaxSec=3500" +
+        " /bin/sh -c " + shellQuote(nativeCommand) +
+        " && while true; do " +
+        "state=$(/usr/bin/systemctl show " + shellQuote(service) +
+        " --property=ActiveState --value 2>/dev/null || true); " +
+        "case \"$state\" in inactive|failed) break ;; esac; " +
+        "/bin/sleep 1; done; " +
+        "status=$(/usr/bin/systemctl show " + shellQuote(service) +
+        " --property=ExecMainStatus --value 2>/dev/null || true); " +
+        "/usr/bin/journalctl -u " + shellQuote(service) +
+        " --no-pager -o cat 2>/dev/null || true; " +
+        "case \"$status\" in ''|*[!0-9]*) exit 1 ;; *) exit \"$status\" ;; esac";
+
+    return runShellCommand(command, 3600, 2 * 1024 * 1024, "root");
+}
 
 std::map<std::string, json> linuxPackageClassification(const std::string& manager) {
     std::map<std::string, json> result;
@@ -699,8 +731,15 @@ OsUpdateActionResult installOsUpdates(const json& payload) {
     return out;
 #endif
 
+#if defined(__linux__)
+    const auto execution = runPrivilegedLinuxUpdate(command);
+#else
     const auto execution = runShellCommand(command, 3600, 2 * 1024 * 1024, "root");
+#endif
     out.result = buildCommandResultJson(command, execution);
+#if defined(__linux__)
+    out.result["execution_transport"] = "systemd_transient";
+#endif
     out.result["selected_updates"] = selected;
     out.result["requested_count"] = ids.size();
 
