@@ -65,6 +65,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Windows Agent installer build failed with exit code $LASTEXITCODE." }
           $built = 'Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe'
           if (-not (Test-Path $built)) { throw 'Windows Agent installer output is missing.' }
+          $patchHost = Get-ChildItem 'Agent/chatpass_agent/build' -Filter 'Hi5CentralPatchHost.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $patchHost) { throw 'Windows PatchHost build output is missing.' }
+          Write-Host "PatchHost: $($patchHost.FullName) ($($patchHost.Length) bytes)"
           $payloadDir = 'Agent/tenant_installer/windows/payload'
           New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
           Copy-Item $built "$payloadDir/Hi5CentralAgentSetup.exe"
