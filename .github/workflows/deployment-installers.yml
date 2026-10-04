@@ -7,6 +7,7 @@ on:
       - '.github/workflows/deployment-installers.yml'
       - 'Agent/tenant_installer/**'
       - 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss'
+      - 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1'
       - 'Agent/chatpass_agent/src/service/service_main.cpp'
   push:
     branches:
@@ -15,6 +16,7 @@ on:
       - '.github/workflows/deployment-installers.yml'
       - 'Agent/tenant_installer/**'
       - 'Agent/chatpass_agent/installer/windows/Hi5CentralAgentSetup.iss'
+      - 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1'
       - 'Agent/chatpass_agent/src/service/service_main.cpp'
 
 permissions:
