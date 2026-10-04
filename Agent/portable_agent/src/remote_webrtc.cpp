@@ -131,7 +131,11 @@ int codecFps(VideoCodec codec) {
 
 int codecBitrateKbps(VideoCodec codec) {
     switch (codec) {
+#if defined(__APPLE__)
         case VideoCodec::VP8: return 7000;
+#else
+        case VideoCodec::VP8: return 10000;
+#endif
         case VideoCodec::VP9: return 5500;
         case VideoCodec::AV1: return 3500;
         case VideoCodec::H264: return 12000;
@@ -290,9 +294,21 @@ public:
 
     void handleInput(const json& message) {
         if (!platform_) return;
+        const std::string kind =
+            message.value("kind", message.value("type", std::string()));
         std::string error;
-        if (!platform_->handleInput(message, error) && !error.empty()) {
-            sendError("input_failed", error);
+        if (!platform_->handleInput(message, error)) {
+            std::cerr << "[remote-input] rejected session=" << sessionId_
+                      << " kind=" << kind
+                      << " error=" << (error.empty() ? "unknown" : error) << "\n";
+            if (!error.empty()) sendError("input_failed", error);
+            return;
+        }
+        const auto accepted = ++acceptedInputEvents_;
+        if (accepted <= 8) {
+            std::cerr << "[remote-input] accepted session=" << sessionId_
+                      << " kind=" << kind
+                      << " count=" << accepted << "\n";
         }
     }
 
@@ -508,7 +524,7 @@ private:
                         encoderHeight_ = captured.frame.height;
                         encoder_ = std::make_unique<Vp8Encoder>(
                             encoderWidth_, encoderHeight_, fps_, bitrateKbps_,
-                            6, 4, 36, std::max(2, std::min(6, static_cast<int>(std::thread::hardware_concurrency()))));
+                            5, 4, 32, std::max(2, std::min(6, static_cast<int>(std::thread::hardware_concurrency()))));
                         forceKeyframe_.store(true);
                     }
 
@@ -874,6 +890,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> canSend_{false};
     std::atomic<bool> answerHandled_{false};
+    std::atomic<std::uint64_t> acceptedInputEvents_{0};
     std::atomic<bool> forceKeyframe_{true};
     std::mutex sendMutex_;
 
