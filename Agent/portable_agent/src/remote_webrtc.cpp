@@ -131,7 +131,11 @@ int codecFps(VideoCodec codec) {
 
 int codecBitrateKbps(VideoCodec codec) {
     switch (codec) {
+#if defined(__APPLE__)
         case VideoCodec::VP8: return 7000;
+#else
+        case VideoCodec::VP8: return 10000;
+#endif
         case VideoCodec::VP9: return 5500;
         case VideoCodec::AV1: return 3500;
         case VideoCodec::H264: return 12000;
@@ -252,7 +256,11 @@ public:
                 return;
             }
             try {
+                std::cerr << "[remote-webrtc] applying remote description type=" << sdpType
+                          << " bytes=" << sdp.size()
+                          << " session=" << sessionId_ << "\n";
                 pc_->setRemoteDescription(rtc::Description(sdp, sdpType));
+                std::cerr << "[remote-webrtc] remote description applied session=" << sessionId_ << "\n";
             } catch (const std::exception& ex) {
                 sendError("answer_failed", ex.what());
             }
@@ -275,6 +283,9 @@ public:
             if (candidate.empty()) return;
             try {
                 pc_->addRemoteCandidate(rtc::Candidate(candidate, mid));
+                std::cerr << "[remote-webrtc] remote candidate accepted mid=" << mid
+                          << " bytes=" << candidate.size()
+                          << " session=" << sessionId_ << "\n";
             } catch (const std::exception& ex) {
                 sendError("candidate_failed", ex.what());
             }
@@ -283,9 +294,21 @@ public:
 
     void handleInput(const json& message) {
         if (!platform_) return;
+        const std::string kind =
+            message.value("kind", message.value("type", std::string()));
         std::string error;
-        if (!platform_->handleInput(message, error) && !error.empty()) {
-            sendError("input_failed", error);
+        if (!platform_->handleInput(message, error)) {
+            std::cerr << "[remote-input] rejected session=" << sessionId_
+                      << " kind=" << kind
+                      << " error=" << (error.empty() ? "unknown" : error) << "\n";
+            if (!error.empty()) sendError("input_failed", error);
+            return;
+        }
+        const auto accepted = ++acceptedInputEvents_;
+        if (accepted <= 8) {
+            std::cerr << "[remote-input] accepted session=" << sessionId_
+                      << " kind=" << kind
+                      << " count=" << accepted << "\n";
         }
     }
 
@@ -349,6 +372,7 @@ private:
 #endif
 
         track_->onOpen([this]() {
+            std::cerr << "[remote-webrtc] track open session=" << sessionId_ << "\n";
             canSend_.store(true);
             sendState("connected", {
                 {"backend", platform_ ? platform_->backendName() : "unknown"},
@@ -364,6 +388,8 @@ private:
         });
 
         pc_->onStateChange([this](rtc::PeerConnection::State state) {
+            std::cerr << "[remote-webrtc] peer state=" << static_cast<int>(state)
+                      << " session=" << sessionId_ << "\n";
             if (state == rtc::PeerConnection::State::Disconnected ||
                 state == rtc::PeerConnection::State::Failed ||
                 state == rtc::PeerConnection::State::Closed) {
@@ -374,7 +400,15 @@ private:
             }
         });
 
+        pc_->onGatheringStateChange([this](rtc::PeerConnection::GatheringState state) {
+            std::cerr << "[remote-webrtc] gathering state=" << static_cast<int>(state)
+                      << " session=" << sessionId_ << "\n";
+        });
+
         pc_->onLocalDescription([this](rtc::Description description) {
+            std::cerr << "[remote-webrtc] local description type=" << description.typeString()
+                      << " bytes=" << std::string(description).size()
+                      << " session=" << sessionId_ << "\n";
             json payload = {
                 {"type", "webrtc_offer"},
                 {"session_id", sessionId_},
@@ -385,6 +419,9 @@ private:
         });
 
         pc_->onLocalCandidate([this](rtc::Candidate candidate) {
+            std::cerr << "[remote-webrtc] local candidate mid=" << candidate.mid()
+                      << " bytes=" << std::string(candidate).size()
+                      << " session=" << sessionId_ << "\n";
             send_({
                 {"type", "ice_candidate"},
                 {"session_id", sessionId_},
@@ -394,6 +431,8 @@ private:
             });
         });
 
+        std::cerr << "[remote-webrtc] setLocalDescription session=" << sessionId_
+                  << " ice_servers=" << iceServers_.size() << "\n";
         pc_->setLocalDescription();
     }
 
@@ -405,6 +444,9 @@ private:
     void streamLoop() {
         const auto interval = std::chrono::milliseconds(1000 / fps_);
         std::uint64_t frameCounter = 0;
+        std::uint64_t capturePolls = 0;
+        bool loggedCapture = false;
+        bool loggedEncoded = false;
 
         while (running_.load()) {
             const auto started = std::chrono::steady_clock::now();
@@ -414,8 +456,20 @@ private:
             }
 
             try {
+                ++capturePolls;
                 auto captured = platform_->capture();
+                if (!captured.hasFrame && capturePolls % 150 == 0) {
+                    std::cerr << "[remote-webrtc] capture waiting polls=" << capturePolls
+                              << " session=" << sessionId_ << "\n";
+                }
                 if (captured.hasFrame && captured.frame.width > 0 && captured.frame.height > 0) {
+                    if (!loggedCapture) {
+                        loggedCapture = true;
+                        std::cerr << "[remote-webrtc] first captured frame size="
+                                  << captured.frame.width << "x" << captured.frame.height
+                                  << " frame_id=" << captured.frameId
+                                  << " session=" << sessionId_ << "\n";
+                    }
                     const bool periodicKeyframe = (frameCounter % static_cast<std::uint64_t>(fps_ * 3)) == 0;
                     const bool force = forceKeyframe_.exchange(false) || periodicKeyframe;
 
@@ -470,18 +524,44 @@ private:
                         encoderHeight_ = captured.frame.height;
                         encoder_ = std::make_unique<Vp8Encoder>(
                             encoderWidth_, encoderHeight_, fps_, bitrateKbps_,
-                            6, 4, 36, std::max(2, std::min(6, static_cast<int>(std::thread::hardware_concurrency()))));
+                            5, 4, 32, std::max(2, std::min(6, static_cast<int>(std::thread::hardware_concurrency()))));
                         forceKeyframe_.store(true);
                     }
 
                     const auto encoded = encoder_->encode(captured.frame, force);
                     if (!encoded.data.empty()) {
+                        if (!loggedEncoded) {
+                            loggedEncoded = true;
+                            std::cerr << "[remote-webrtc] first VP8 frame bytes="
+                                      << encoded.data.size()
+                                      << " keyframe=" << (encoded.keyframe ? 1 : 0)
+                                      << " session=" << sessionId_ << "\n";
+                        }
                         sendVp8(encoded);
                         ++frameCounter;
+                        if (pc_ && frameCounter % static_cast<std::uint64_t>(std::max(1, fps_ * 5)) == 0) {
+                            std::cerr << "[remote-quality] session=" << sessionId_
+                                      << " frames=" << frameCounter
+                                      << " bytes_sent=" << pc_->bytesSent();
+                            if (const auto latency = pc_->rtt(); latency.has_value()) {
+                                std::cerr << " rtt_ms=" << latency->count();
+                            } else {
+                                std::cerr << " rtt_ms=unknown";
+                            }
+                            rtc::Candidate localCandidate;
+                            rtc::Candidate remoteCandidate;
+                            if (pc_->getSelectedCandidatePair(&localCandidate, &remoteCandidate)) {
+                                std::cerr << " local_candidate=" << localCandidate
+                                          << " remote_candidate=" << remoteCandidate;
+                            }
+                            std::cerr << "\n";
+                        }
                     }
 #endif
                 }
             } catch (const std::exception& ex) {
+                std::cerr << "[remote-webrtc] stream exception session="
+                          << sessionId_ << " error=" << ex.what() << "\n";
                 sendError("capture_failed", ex.what());
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             }
@@ -827,6 +907,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> canSend_{false};
     std::atomic<bool> answerHandled_{false};
+    std::atomic<std::uint64_t> acceptedInputEvents_{0};
     std::atomic<bool> forceKeyframe_{true};
     std::mutex sendMutex_;
 

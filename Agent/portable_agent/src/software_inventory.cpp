@@ -144,6 +144,41 @@ std::set<std::string> visibleDesktopPackageOwners() {
     return owners;
 }
 
+std::set<std::string> visibleDesktopRpmOwners() {
+    std::set<std::string> owners;
+    const auto output = runCommand(
+        "for f in /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop; do "
+        "[ -f \"$f\" ] || continue; "
+        "owner=$(rpm -qf \"$f\" --qf '%{NAME}' 2>/dev/null) || continue; "
+        "printf '%s\\t%s\\n' \"$owner\" \"$f\"; done");
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const auto f = tabs(line);
+        if (f.size() < 2) continue;
+        const auto owner = trim(f[0]);
+        const auto path = trim(f[1]);
+        if (owner.empty() || path.empty() || !desktopFileVisible(path)) continue;
+        owners.insert(owner);
+    }
+    return owners;
+}
+
+bool criticalRpmComponent(const std::string& packageName) {
+    const auto name = lower(packageName);
+    static const char* protectedPrefixes[] = {
+        "kernel", "systemd", "glibc", "rpm", "dnf", "libdnf", "fedora-release",
+        "fedora-repos", "grub", "shim", "dracut", "selinux", "policycoreutils",
+        "filesystem", "setup", "bash", "coreutils", "util-linux", "dbus",
+        "NetworkManager", "linux-firmware", "crypto-policies"
+    };
+    for (const auto* raw : protectedPrefixes) {
+        const auto prefix = lower(raw);
+        if (name == prefix || name.rfind(prefix + "-", 0) == 0) return true;
+    }
+    return false;
+}
+
 bool criticalDpkgComponent(const std::string& packageName, const std::string& section, const std::string& priority, const std::string& essential) {
     const auto normalizedSection = baseSection(section);
     const auto normalizedPriority = lower(trim(priority));
@@ -230,6 +265,80 @@ void collectDpkg(json& items) {
         });
     }
 }
+
+void collectRpm(json& items) {
+    if (!fs::exists("/usr/bin/rpm")) return;
+    const auto desktopOwners = visibleDesktopRpmOwners();
+    const auto output = runCommand(
+        "rpm -qa --qf '%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{VENDOR}\\t%{SIZE}\\t%{ARCH}\\t%{GROUP}\\n' 2>/dev/null");
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const auto f = tabs(line);
+        if (f.size() < 6 || trim(f[0]).empty()) continue;
+        const auto name = trim(f[0]);
+        const auto arch = trim(f[4]);
+        std::uint64_t sizeBytes = 0;
+        try { sizeBytes = std::stoull(trim(f[3])); } catch (...) {}
+        const bool desktopApplication = desktopOwners.count(name) > 0;
+        const bool criticalComponent = criticalRpmComponent(name);
+        const bool protectedProduct = protectedManagedProduct(name);
+        const bool visibleApplication = desktopApplication && !criticalComponent;
+        items.push_back({
+            {"name", name},
+            {"version", trim(f[1])},
+            {"publisher", trim(f[2])},
+            {"install_date", ""},
+            {"install_location", "/"},
+            {"estimated_size_kb", sizeBytes ? json(sizeBytes / 1024ULL) : json(nullptr)},
+            {"scope", "system"},
+            {"registry_key", "rpm:" + name + ":" + arch},
+            {"package_manager", "dnf"},
+            {"package_id", name},
+            {"architecture", arch},
+            {"group", trim(f[5])},
+            {"classification", visibleApplication ? "application" : "system_component"},
+            {"classification_reason", criticalComponent ? "critical_os_component" : (desktopApplication ? "desktop_application" : "non_application_package")},
+            {"display_in_installed_software", visibleApplication},
+            {"system_component", !visibleApplication},
+            {"native_actionable", visibleApplication && !protectedProduct},
+            {"native_update_actionable", visibleApplication && !protectedProduct},
+            {"native_uninstall_actionable", false},
+            {"update_available", false},
+            {"latest_version", ""}
+        });
+    }
+}
+
+void applyDnfUpdates(json& items) {
+    if (!fs::exists("/usr/bin/dnf") && !fs::exists("/usr/bin/dnf5")) return;
+    const std::string dnf = fs::exists("/usr/bin/dnf") ? "/usr/bin/dnf" : "/usr/bin/dnf5";
+    const auto output = runCommand(dnf + " -q check-upgrade 2>/dev/null");
+    std::map<std::string, std::string> latest;
+
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty() || line == "Upgrades" || line.rfind("Last metadata", 0) == 0) continue;
+        std::istringstream row(line);
+        std::string packageArch, version, repository;
+        if (!(row >> packageArch >> version >> repository)) continue;
+        const auto dot = packageArch.rfind('.');
+        const auto packageId = dot == std::string::npos ? packageArch : packageArch.substr(0, dot);
+        if (!packageId.empty() && !version.empty()) latest[packageId] = version;
+    }
+
+    for (auto& item : items) {
+        if (!item.is_object() || item.value("package_manager", "") != "dnf") continue;
+        const auto packageId = item.value("package_id", "");
+        const auto found = latest.find(packageId);
+        if (found == latest.end()) continue;
+        item["update_available"] = true;
+        item["latest_version"] = found->second;
+    }
+}
+
 void collectSnap(json& items) {
     if (!fs::exists("/usr/bin/snap")) return;
     const auto output = runCommand("snap list --unicode=never 2>/dev/null | tail -n +2");
@@ -314,10 +423,14 @@ void applyAptUpdates(json& items) {
 
 json linuxInventory() {
     json components = json::array();
-    collectDpkg(components);
+    const bool hasDpkg = fs::exists("/usr/bin/dpkg-query");
+    const bool hasRpm = fs::exists("/usr/bin/rpm");
+    if (hasDpkg) collectDpkg(components);
+    if (hasRpm) collectRpm(components);
     collectSnap(components);
     collectFlatpak(components);
-    applyAptUpdates(components);
+    if (hasDpkg) applyAptUpdates(components);
+    if (hasRpm) applyDnfUpdates(components);
     sortItems(components);
 
     json applications = json::array();
@@ -338,7 +451,9 @@ json linuxInventory() {
         {"recently_installed", json::array()},
         {"recently_installed_count", 0},
         {"providers", {
-            {"dpkg", true},
+            {"dpkg", hasDpkg},
+            {"rpm", hasRpm},
+            {"dnf", fs::exists("/usr/bin/dnf") || fs::exists("/usr/bin/dnf5")},
             {"snap", fs::exists("/usr/bin/snap")},
             {"flatpak", fs::exists("/usr/bin/flatpak")}
         }}
