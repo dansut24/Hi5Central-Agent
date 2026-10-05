@@ -514,6 +514,7 @@ AgentIdentity loadAgentIdentityFromDir(
         AgentIdentity ident;
         ident.deviceId = state.deviceId;
         ident.deviceKey = state.deviceKey;
+        ident.apiBaseUrl = state.apiBaseUrl;
         ident.agentWsBaseUrl = state.agentWsBaseUrl;
         return ident;
     }
@@ -534,6 +535,7 @@ AgentIdentity loadAgentIdentityFromDir(
             AgentIdentity ident;
             ident.deviceId = jsonState.deviceId;
             ident.deviceKey = jsonState.deviceKey;
+            ident.apiBaseUrl = jsonState.apiBaseUrl;
             ident.agentWsBaseUrl = jsonState.agentWsBaseUrl;
             return ident;
         }
@@ -588,6 +590,7 @@ AgentIdentity loadAgentIdentityFromDir(
         AgentIdentity ident;
         ident.deviceId = directState.deviceId;
         ident.deviceKey = directState.deviceKey;
+        ident.apiBaseUrl = directState.apiBaseUrl;
         ident.agentWsBaseUrl = directState.agentWsBaseUrl;
         return ident;
     }
@@ -621,6 +624,7 @@ AgentIdentity loadAgentIdentityFromDir(
     AgentIdentity ident;
     ident.deviceId = newState.deviceId;
     ident.deviceKey = newState.deviceKey;
+    ident.apiBaseUrl = newState.apiBaseUrl;
     ident.agentWsBaseUrl = newState.agentWsBaseUrl;
     return ident;
 }

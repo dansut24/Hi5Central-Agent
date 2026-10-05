@@ -12,6 +12,7 @@ on:
       - 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp'
       - 'Agent/chatpass_agent/src/patching/patch_host_main.cpp'
       - 'Agent/chatpass_agent/src/agent_identity.cpp'
+      - 'Agent/chatpass_agent/src/agent_identity.h'
       - 'Agent/chatpass_agent/src/agent_version.h'
       - 'Agent/chatpass_agent/CMakeLists.txt'
   push:
@@ -26,6 +27,7 @@ on:
       - 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp'
       - 'Agent/chatpass_agent/src/patching/patch_host_main.cpp'
       - 'Agent/chatpass_agent/src/agent_identity.cpp'
+      - 'Agent/chatpass_agent/src/agent_identity.h'
       - 'Agent/chatpass_agent/src/agent_version.h'
       - 'Agent/chatpass_agent/CMakeLists.txt'
 
