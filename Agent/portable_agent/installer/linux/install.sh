@@ -4,6 +4,8 @@ set -euo pipefail
 TOKEN=""
 DEPLOYMENT_ID=""
 DEPLOYMENT_SECRET=""
+DEPLOYMENT_CONFIG_SOURCE=""
+DEPLOYMENT_CONFIG_FILE="/etc/hi5central/deployment.json"
 API_BASE="https://api.hi5central.com"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALL_DIR="/opt/hi5central/agent"
@@ -23,6 +25,7 @@ while [[ $# -gt 0 ]]; do
     --enrollment-token) TOKEN="${2:-}"; shift 2 ;;
     --deployment-id) DEPLOYMENT_ID="${2:-}"; shift 2 ;;
     --deployment-secret) DEPLOYMENT_SECRET="${2:-}"; shift 2 ;;
+    --deployment-config) DEPLOYMENT_CONFIG_SOURCE="${2:-}"; shift 2 ;;
     --api-base) API_BASE="${2:-}"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -55,6 +58,15 @@ install -d -m 0755 "$INSTALL_DIR"
 install -d -m 0700 "$STATE_DIR"
 install -d -m 0755 "$PORTAL_STATE_ROOT"
 install -d -m 0755 /usr/share/applications
+
+if [[ -n "$DEPLOYMENT_CONFIG_SOURCE" ]]; then
+  if [[ ! -f "$DEPLOYMENT_CONFIG_SOURCE" ]]; then
+    echo "Deployment configuration was not found: $DEPLOYMENT_CONFIG_SOURCE" >&2
+    exit 2
+  fi
+  install -d -m 0700 "$(dirname "$DEPLOYMENT_CONFIG_FILE")"
+  install -m 0600 "$DEPLOYMENT_CONFIG_SOURCE" "$DEPLOYMENT_CONFIG_FILE"
+fi
 
 PORTAL_DESKTOP_TMP="$(mktemp /tmp/hi5central-remote-helper-XXXXXX.desktop)"
 cat > "$PORTAL_DESKTOP_TMP" <<EOF
@@ -95,9 +107,11 @@ install -m 0755 "$SOURCE_DIR/Hi5CentralRemoteHelper" "$REMOTE_HELPER"
 
 if [[ -s "$STATE_FILE" ]]; then
   echo "Existing Hi5Central Agent identity found; preserving enrollment."
+elif [[ -s "$DEPLOYMENT_CONFIG_FILE" ]]; then
+  echo "Deployment bootstrap installed; enrollment will complete when the Agent service reaches Hi5Central."
 else
   if [[ -z "$TOKEN" && -z "$DEPLOYMENT_ID" ]]; then
-    echo "--deployment-id or --enrollment-token is required for a new installation." >&2
+    echo "--deployment-id, --enrollment-token, or --deployment-config is required for a new installation." >&2
     if [[ "$HAD_EXISTING_BINARY" == true && -x "$BACKUP_BINARY" ]]; then
       install -m 0755 "$BACKUP_BINARY" "$BINARY"
     fi
@@ -158,7 +172,7 @@ ProtectHome=read-only
 PrivateTmp=true
 RuntimeDirectory=hi5central
 RuntimeDirectoryMode=0755
-ReadWritePaths=$STATE_DIR $PORTAL_STATE_ROOT /run/hi5central
+ReadWritePaths=$STATE_DIR $PORTAL_STATE_ROOT /run/hi5central /etc/hi5central
 
 [Install]
 WantedBy=multi-user.target
@@ -206,7 +220,9 @@ if ! systemctl restart "$SERVICE_NAME"; then
 fi
 
 sleep 1
-if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+if [[ -s "$DEPLOYMENT_CONFIG_FILE" && ! -s "$STATE_FILE" ]]; then
+  echo "Hi5Central Agent service installed. Enrollment is pending network connectivity."
+elif ! systemctl is-active --quiet "$SERVICE_NAME"; then
   echo "Hi5Central Agent did not remain active after restart." >&2
   systemctl --no-pager --full status "$SERVICE_NAME" >&2 || true
   journalctl -u "$SERVICE_NAME" -n 50 --no-pager >&2 || true
