@@ -50,6 +50,14 @@ struct Identity {
     std::string apiBase;
 };
 
+struct DeploymentBootstrap {
+    std::filesystem::path source;
+    std::string apiBase;
+    std::string deploymentId;
+    std::string deploymentSecret;
+    bool present = false;
+};
+
 struct JobQueue {
     std::mutex mutex;
     std::condition_variable cv;
@@ -87,6 +95,51 @@ bool hasArg(int argc, char* argv[], const std::string& name) {
         if (argv[i] && name == argv[i]) return true;
     }
     return false;
+}
+
+std::filesystem::path defaultDeploymentConfigPath() {
+#if defined(HI5_PLATFORM_MACOS)
+    return "/Library/Application Support/Hi5Central/Deployment.json";
+#else
+    return "/etc/hi5central/deployment.json";
+#endif
+}
+
+DeploymentBootstrap loadDeploymentBootstrap(const std::filesystem::path& path) {
+    DeploymentBootstrap bootstrap;
+    bootstrap.source = path;
+
+    std::error_code existsError;
+    if (path.empty() || !std::filesystem::exists(path, existsError) || existsError) {
+        return bootstrap;
+    }
+
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Unable to read deployment bootstrap configuration");
+    }
+
+    const auto value = json::parse(in, nullptr, false);
+    if (!value.is_object()) {
+        throw std::runtime_error("Deployment bootstrap configuration is invalid");
+    }
+
+    bootstrap.apiBase = trimSlash(value.value("apiBase", value.value("api_base", "")));
+    bootstrap.deploymentId = value.value("deploymentId", value.value("deployment_id", ""));
+    bootstrap.deploymentSecret = value.value("deploymentSecret", value.value("deployment_secret", ""));
+    bootstrap.present = true;
+    return bootstrap;
+}
+
+void removeDeploymentBootstrap(const DeploymentBootstrap& bootstrap) {
+    if (!bootstrap.present || bootstrap.source.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove(bootstrap.source, ec);
+    if (ec) {
+        logLine("WARN", "Unable to remove deployment bootstrap configuration: " + ec.message());
+    } else {
+        logLine("INFO", "Deployment bootstrap credential removed after enrollment");
+    }
 }
 
 std::string urlEncode(const std::string& value) {
@@ -812,8 +865,17 @@ int main(int argc, char* argv[]) {
         const auto customState = argValue(argc, argv, "--state-dir");
         if (!customState.empty()) stateDir = customState;
 
+        std::filesystem::path deploymentConfigPath = argValue(argc, argv, "--deployment-config");
+        if (deploymentConfigPath.empty()) {
+            const auto configuredPath = getenvString("HI5_DEPLOYMENT_CONFIG");
+            if (!configuredPath.empty()) deploymentConfigPath = configuredPath;
+        }
+        if (deploymentConfigPath.empty()) deploymentConfigPath = defaultDeploymentConfigPath();
+        const auto deploymentBootstrap = loadDeploymentBootstrap(deploymentConfigPath);
+
         std::string apiBase = argValue(argc, argv, "--api-base");
         if (apiBase.empty()) apiBase = getenvString("HI5_API_BASE");
+        if (apiBase.empty() && deploymentBootstrap.present) apiBase = deploymentBootstrap.apiBase;
         if (apiBase.empty()) apiBase = "https://api.hi5central.com";
         apiBase = trimSlash(apiBase);
 
@@ -826,17 +888,23 @@ int main(int argc, char* argv[]) {
             if (token.empty()) token = getenvString("HI5_ENROLLMENT_TOKEN");
             std::string deploymentId = argValue(argc, argv, "--deployment-id");
             if (deploymentId.empty()) deploymentId = getenvString("HI5_DEPLOYMENT_ID");
+            if (deploymentId.empty() && deploymentBootstrap.present) {
+                deploymentId = deploymentBootstrap.deploymentId;
+            }
             std::string deploymentSecret = argValue(argc, argv, "--deployment-secret");
             if (deploymentSecret.empty()) deploymentSecret = getenvString("HI5_DEPLOYMENT_SECRET");
+            if (deploymentSecret.empty() && deploymentBootstrap.present) {
+                deploymentSecret = deploymentBootstrap.deploymentSecret;
+            }
 
             if (token.empty() && deploymentId.empty()) {
                 throw std::runtime_error(
                     "Agent is not enrolled. Supply --deployment-id <id>, HI5_DEPLOYMENT_ID, "
-                    "--enrollment-token <token>, or HI5_ENROLLMENT_TOKEN.");
+                    "--enrollment-token <token>, HI5_ENROLLMENT_TOKEN, or a deployment configuration.");
             }
             if (!deploymentId.empty() && deploymentSecret.empty()) {
                 throw std::runtime_error(
-                    "Persistent deployment enrollment requires --deployment-secret or HI5_DEPLOYMENT_SECRET.");
+                    "Persistent deployment enrollment requires a deployment secret.");
             }
 
             logLine(
@@ -847,6 +915,10 @@ int main(int argc, char* argv[]) {
             identity = enroll(http, apiBase, token, deploymentId, deploymentSecret);
             saveIdentity(stateDir, identity);
             logLine("INFO", "Enrollment succeeded device_id=" + identity.deviceId);
+            removeDeploymentBootstrap(deploymentBootstrap);
+        } else if (deploymentBootstrap.present) {
+            // An already-enrolled Agent never needs to retain a bootstrap credential.
+            removeDeploymentBootstrap(deploymentBootstrap);
         }
 
         if (hasArg(argc, argv, "--enroll-only")) return 0;
