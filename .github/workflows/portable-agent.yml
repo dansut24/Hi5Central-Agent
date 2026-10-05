@@ -27,7 +27,9 @@ concurrency:
 
 jobs:
   linux:
-    runs-on: ubuntu-24.04
+    # Build against an older glibc baseline so the same Agent runs on
+    # Debian 12 as well as current Ubuntu/Fedora-family desktops.
+    runs-on: ubuntu-22.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
