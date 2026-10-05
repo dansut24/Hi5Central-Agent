@@ -1,6 +1,7 @@
 #define MyAppName "Hi5Central Agent"
 #define MyAppPublisher "Hi5Central"
 #define MyAppExeName "Hi5CentralAgent.exe"
+#define MyPatchHostExeName "Hi5CentralPatchHost.exe"
 #define MyServiceName "Hi5CentralAgent"
 #define MyAppVersion GetEnv("HI5_AGENT_VERSION")
 #if MyAppVersion == ""
@@ -17,6 +18,9 @@
 
 #ifndef AgentExePath
   #define AgentExePath SourceDir + "\" + MyAppExeName
+#endif
+#ifndef PatchHostExePath
+  #define PatchHostExePath SourceDir + "\" + MyPatchHostExeName
 #endif
 
 
@@ -49,6 +53,7 @@ Name: "{commonappdata}\Hi5Central\Agent\ChatLogs"; Permissions: users-readexec a
 
 [Files]
 Source: "{#AgentExePath}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
+Source: "{#PatchHostExePath}"; DestDir: "{app}"; DestName: "{#MyPatchHostExeName}"; Flags: ignoreversion
 
 [InstallDelete]
 Type: files; Name: "{app}\hi5tech_cad_winlogon_helper.exe"

@@ -243,6 +243,7 @@ $cmakeArgs += @(
     "-DCMAKE_BUILD_TYPE=$Configuration",
     "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
     "-DHI5_REQUIRE_STATIC_CRT=ON",
+    "-DHI5_AGENT_VERSION=$AgentVersion",
     "-DVCPKG_TARGET_TRIPLET=$VcpkgTriplet",
     "-DLIBDATACHANNEL_ROOT=$LibDataChannelRoot"
 )
@@ -274,7 +275,7 @@ if (-not $SkipBuild) {
     $buildArgs = @(
         "--build", $buildPath,
         "--config", $Configuration,
-        "--target", "native_vp8_stream",
+        "--target", "native_vp8_stream", "hi5central_patch_host",
         "-j"
     )
 
@@ -303,7 +304,14 @@ if ([string]::IsNullOrWhiteSpace($agentExe)) {
     throw ("Agent executable not found. Checked: " + ($agentCandidates -join ", "))
 }
 
+$patchHostExe = Get-ChildItem -Path $buildPath -Filter "Hi5CentralPatchHost.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $patchHostExe) {
+    throw "Hi5CentralPatchHost.exe not found under build directory: $buildPath"
+}
+$patchHostExe = $patchHostExe.FullName
+
 Assert-NoDynamicVcRuntimeDependency -ExePath $agentExe
+Assert-NoDynamicVcRuntimeDependency -ExePath $patchHostExe
 
 New-Item -ItemType Directory -Force -Path $distPath | Out-Null
 
@@ -337,6 +345,7 @@ $isccArgs = @(
     "/DSourceDir=$buildPath",
     "/DOutputDir=$distPath",
     "/DAgentExePath=$agentExe",
+    "/DPatchHostExePath=$patchHostExe",
     $issPath
 )
 

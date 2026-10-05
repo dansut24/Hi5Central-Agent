@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(HI5_REQUIRE_STATIC_CRT "Require static MSVC runtime (/MT) for agent builds" ON)
+set(HI5_AGENT_VERSION "1.0.0" CACHE STRING "Hi5Central Agent runtime version reported to the control plane")
 
 if(MSVC AND HI5_REQUIRE_STATIC_CRT)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -152,7 +153,6 @@ add_executable(native_vp8_stream
   src/webrtc_sender.cpp
   src/codec_policy.cpp
   src/agent_identity.cpp
-  src/patching/patch_worker.cpp
   src/session/session_bridge.cpp
   src/ipc/session_launcher.cpp
   src/ipc/named_pipe.cpp
@@ -209,6 +209,7 @@ if(HI5_ENABLE_CEF_BROWSER)
 endif()
 
 target_compile_definitions(native_vp8_stream PRIVATE
+  HI5_AGENT_VERSION="${HI5_AGENT_VERSION}"
   RTC_ENABLE_MEDIA=1
   RTC_ENABLE_WEBSOCKET=1
   RTC_STATIC
@@ -258,3 +259,20 @@ endif()
 set_target_properties(native_vp8_stream PROPERTIES
     OUTPUT_NAME "Hi5CentralAgent"
 )
+
+if(WIN32)
+  # Short-lived PatchHost. The long-lived Agent owns platform authentication
+  # and hands PatchHost only device/job-scoped software patch work.
+  add_executable(hi5central_patch_host
+    src/patching/patch_host_main.cpp
+  )
+  hi5_use_static_msvc_runtime(hi5central_patch_host)
+  target_include_directories(hi5central_patch_host PRIVATE src)
+  target_compile_definitions(hi5central_patch_host PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
+  target_link_libraries(hi5central_patch_host PRIVATE
+    nlohmann_json::nlohmann_json
+    crypt32 bcrypt winhttp wintrust version msi
+    advapi32 user32 shell32
+  )
+  set_target_properties(hi5central_patch_host PROPERTIES OUTPUT_NAME "Hi5CentralPatchHost")
+endif()

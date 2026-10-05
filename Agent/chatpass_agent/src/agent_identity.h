@@ -5,6 +5,7 @@
 struct AgentIdentity {
     std::string deviceId;
     std::string deviceKey;
+    std::string apiBaseUrl;
     std::string agentWsBaseUrl;
 };
 
