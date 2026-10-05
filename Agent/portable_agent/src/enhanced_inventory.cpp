@@ -591,26 +591,50 @@ json macRemoteCapabilities() {
     };
 }
 
+void appendMacStorageDevice(const json& device, const char* source, const std::string& inheritedProtocol, json& disks) {
+    if (!device.is_object()) return;
+    const auto bsdName = jsonString(device, "bsd_name");
+    const auto sizeBytes = jsonUInt(device, "size_in_bytes");
+    const auto model = jsonString(device, "device_model");
+    const auto name = jsonString(device, "_name");
+    const auto lowerModel = [&]() {
+        std::string value = model.empty() ? name : model;
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+        return value;
+    }();
+    const bool optical = lowerModel.find("cdrom") != std::string::npos ||
+        lowerModel.find("cdrw") != std::string::npos ||
+        lowerModel.find("dvd") != std::string::npos;
+    if (optical || (bsdName.empty() && sizeBytes == 0)) return;
+
+    disks.push_back({
+        {"name", name.empty() ? (model.empty() ? bsdName : model) : name},
+        {"device", bsdName},
+        {"model", model},
+        {"vendor", jsonString(device, "device_manufacturer")},
+        {"serial_number", jsonString(device, "device_serial")},
+        {"size", jsonString(device, "size")},
+        {"size_bytes", sizeBytes},
+        {"protocol", jsonString(device, "physical_interconnect").empty() ? inheritedProtocol : jsonString(device, "physical_interconnect")},
+        {"medium_type", jsonString(device, "spsata_medium_type")},
+        {"removable", jsonString(device, "removable_media") == "yes"},
+        {"source", source}
+    });
+}
+
 void appendMacStorage(const json& root, const char* key, json& disks) {
     auto it = root.find(key);
     if (it == root.end() || !it->is_array()) return;
     for (const auto& controller : *it) {
         if (!controller.is_object()) continue;
-        const auto controllerName = jsonString(controller, "_name");
-        const auto pciModel = jsonString(controller, "sppci_model");
-        json disk = {
-            {"name", controllerName.empty() ? pciModel : controllerName},
-            {"model", jsonString(controller, "device_model").empty() ? controllerName : jsonString(controller, "device_model")},
-            {"vendor", jsonString(controller, "device_manufacturer")},
-            {"serial_number", jsonString(controller, "device_serial")},
-            {"size", jsonString(controller, "size")},
-            {"protocol", jsonString(controller, "physical_interconnect")},
-            {"source", key}
-        };
+        const auto protocol = jsonString(controller, "physical_interconnect");
         if (controller.contains("_items") && controller["_items"].is_array()) {
-            disk["items"] = controller["_items"];
+            for (const auto& device : controller["_items"]) {
+                appendMacStorageDevice(device, key, protocol, disks);
+            }
+        } else {
+            appendMacStorageDevice(controller, key, protocol, disks);
         }
-        disks.push_back(std::move(disk));
     }
 }
 
