@@ -132,9 +132,17 @@ std::string waylandRestoreTokenPath() {
         return std::string(managedStateDir) + "/wayland-remote-desktop.token";
     }
 
-    const gchar* stateDir = g_get_user_state_dir();
-    if (!stateDir || !*stateDir) return {};
-    return std::string(stateDir) + "/hi5central/wayland-remote-desktop.token";
+    // Keep this compatible with GLib 2.68 / RHEL 9. g_get_user_state_dir()
+    // is newer than the oldest Linux baseline we support, so resolve the
+    // XDG state directory directly instead.
+    const char* stateDir = std::getenv("XDG_STATE_HOME");
+    if (stateDir && *stateDir) {
+        return std::string(stateDir) + "/hi5central/wayland-remote-desktop.token";
+    }
+
+    const gchar* homeDir = g_get_home_dir();
+    if (!homeDir || !*homeDir) return {};
+    return std::string(homeDir) + "/.local/state/hi5central/wayland-remote-desktop.token";
 }
 
 std::string loadWaylandRestoreToken() {

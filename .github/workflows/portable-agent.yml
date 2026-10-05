@@ -27,24 +27,61 @@ concurrency:
 
 jobs:
   linux:
+    # Build inside a RHEL 9 compatible userspace (glibc 2.34). This keeps the
+    # same Linux payload runnable on RHEL/Rocky/Alma 9, Debian 12 and newer
+    # Ubuntu/Fedora distributions instead of inheriting the hosted runner's
+    # newer glibc ABI.
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    container:
+      image: rockylinux:9
+    timeout-minutes: 35
     steps:
+      - name: Prepare Linux compatibility build environment
+        run: |
+          dnf -qy install dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf -qy install \
+            binutils ca-certificates cmake diffutils gcc-c++ git gzip make nasm ninja-build \
+            libcurl-devel openssl-devel libX11-devel libXext-devel libXtst-devel \
+            glib2-devel gtk3-devel pipewire-devel pkgconf-pkg-config \
+            systemd tar
       - uses: actions/checkout@v4
-      - name: Install build dependencies
+      - name: Build static libvpx
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libcurl4-openssl-dev libssl-dev libvpx-dev libx11-dev libxext-dev libxtst-dev libglib2.0-dev libgtk-3-dev libpipewire-0.3-dev pkg-config
+          git clone --depth 1 --branch v1.15.2 https://chromium.googlesource.com/webm/libvpx /tmp/hi5central-libvpx
+          cd /tmp/hi5central-libvpx
+          ./configure \
+            --prefix=/opt/hi5central-libvpx \
+            --target=x86_64-linux-gcc \
+            --disable-shared \
+            --enable-static \
+            --disable-examples \
+            --disable-tools \
+            --disable-docs \
+            --disable-unit-tests
+          make -j2
+          make install
+          test -f /opt/hi5central-libvpx/lib/libvpx.a
       - name: Configure
+        env:
+          PKG_CONFIG_PATH: /opt/hi5central-libvpx/lib/pkgconfig
         run: |
-          cmake -S Agent/portable_agent -B build/portable-linux -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
+          cmake -S Agent/portable_agent -B build/portable-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHI5CENTRAL_AGENT_VERSION=0.3.${{ github.run_number }}
       - name: Build
         run: cmake --build build/portable-linux
-      - name: Verify Linux codec linkage
+      - name: Verify Linux compatibility and codec linkage
         run: |
+          ldd build/portable-linux/Hi5CentralAgent | tee /tmp/hi5-linux-agent-ldd.txt
           ldd build/portable-linux/Hi5CentralRemoteHelper | tee /tmp/hi5-linux-helper-ldd.txt
           if grep -E 'libvpx\.so' /tmp/hi5-linux-helper-ldd.txt; then
             echo "Linux Remote Helper must statically link libvpx to avoid distro ABI mismatches." >&2
+            exit 1
+          fi
+          if objdump -T build/portable-linux/Hi5CentralAgent build/portable-linux/Hi5CentralRemoteHelper \
+              | grep -Eq 'GLIBC_2\.(3[5-9]|[4-9][0-9])'; then
+            echo "Linux binaries require a glibc version newer than the RHEL 9 / Debian 12 compatibility baseline." >&2
             exit 1
           fi
       - name: Runtime self-test
