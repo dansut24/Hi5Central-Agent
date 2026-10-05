@@ -5,7 +5,7 @@
 #define MyServiceName "Hi5CentralAgent"
 #define MyAppVersion GetEnv("HI5_AGENT_VERSION")
 #if MyAppVersion == ""
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "1.0.0"
 #endif
 
 #ifndef SourceDir

@@ -3,7 +3,7 @@ param(
     [string]$BuildDir = "build",
     [string]$Configuration = "Release",
     [switch]$SkipBuild,
-    [string]$AgentVersion = "0.1.0",
+    [string]$AgentVersion = "1.0.0",
 
     # Static CRT build settings
     [string]$Generator = "Visual Studio 18 2026",

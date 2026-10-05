@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(HI5_REQUIRE_STATIC_CRT "Require static MSVC runtime (/MT) for agent builds" ON)
-set(HI5_AGENT_VERSION "0.1.0" CACHE STRING "Hi5Central Agent runtime version reported to the control plane")
+set(HI5_AGENT_VERSION "1.0.0" CACHE STRING "Hi5Central Agent runtime version reported to the control plane")
 
 if(MSVC AND HI5_REQUIRE_STATIC_CRT)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
