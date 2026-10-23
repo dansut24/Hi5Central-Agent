@@ -2402,7 +2402,20 @@ LogI(
                             StopPresenceBanner(sessionId);
                         }
                         auto iceServers = parseIceServers(msg);
-                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode);
+                        std::vector<std::string> viewerVideoCodecs;
+                        if (msg.contains("viewer_video_codecs") && msg["viewer_video_codecs"].is_array()) {
+                            for (const auto& value : msg["viewer_video_codecs"]) {
+                                if (value.is_string()) viewerVideoCodecs.push_back(value.get<std::string>());
+                            }
+                        }
+                        std::vector<std::string> excludedVideoCodecs;
+                        if (msg.contains("excluded_video_codecs") && msg["excluded_video_codecs"].is_array()) {
+                            for (const auto& value : msg["excluded_video_codecs"]) {
+                                if (value.is_string()) excludedVideoCodecs.push_back(value.get<std::string>());
+                            }
+                        }
+                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps,
+                            sessionMode, viewerVideoCodecs, excludedVideoCodecs);
                         // Keep the portal responsive without running expensive WMI/PowerShell
                         // collectors during live remote control. The WebSocket/session state
                         // is already live; full inventory can still be requested manually.
@@ -6460,7 +6473,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 int height,
                 int fps,
                 int bitrateKbps,
-                SessionMode sessionMode) {
+                SessionMode sessionMode,
+                const std::vector<std::string>& viewerVideoCodecs,
+                const std::vector<std::string>& excludedVideoCodecs) {
                 StopSession(sessionId);
 
                 auto ctx = std::make_unique<SessionContext>();
@@ -6566,6 +6581,70 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
                     });
 
+                // Intersect supported WebRTC decoders with actual Windows
+                // encoders before the offer is generated. The scanner alone
+                // is not a codec decision; only implemented senders qualify.
+                auto normalizedCodec = [](std::string codec) {
+                    std::transform(codec.begin(), codec.end(), codec.begin(), [](unsigned char ch) {
+                        return static_cast<char>(std::tolower(ch));
+                    });
+                    return codec;
+                };
+                std::vector<std::string> offeredCodecs;
+                for (const auto& codec : viewerVideoCodecs) offeredCodecs.push_back(normalizedCodec(codec));
+                std::vector<std::string> excludedCodecs;
+                for (const auto& codec : excludedVideoCodecs) excludedCodecs.push_back(normalizedCodec(codec));
+                const auto permitted = [&](const std::string& codec) {
+                    return (offeredCodecs.empty()
+                            ? codec == "vp8"
+                            : std::find(offeredCodecs.begin(), offeredCodecs.end(), codec) != offeredCodecs.end())
+                        && std::find(excludedCodecs.begin(), excludedCodecs.end(), codec) == excludedCodecs.end();
+                };
+                std::string selectedCodecMode;
+                const std::string requestedCodec = normalizedCodec(ReadConfigString("HI5_CODEC", "auto"));
+                if (requestedCodec != "auto" && !requestedCodec.empty()) {
+                    const std::string family = requestedCodec.substr(0, requestedCodec.find('_'));
+                    if (permitted(family) && (family == "vp8" || family == "vp9" || family == "h264")) {
+                        selectedCodecMode = requestedCodec;
+                    }
+                }
+                if (selectedCodecMode.empty()) {
+                    const auto capabilities = hi5::ProbeCodecCapabilitiesAndSelect("auto").capabilities;
+                    const auto encoderAvailable = [&](const std::string& codec, bool hardware) {
+                        for (const auto& capability : capabilities) {
+                            if (capability.codec == codec)
+                                return hardware ? capability.hardwareEncodeAvailable : capability.softwareEncodeAvailable;
+                        }
+                        return false;
+                    };
+                    // Prefer efficient, implemented hardware senders when both
+                    // sides support them. Software VP9/H.264 are lower-ranked;
+                    // bundled VP8 is the interoperability fallback. AV1 is not
+                    // selected because the current AV1 sender is only a stub.
+                    if (permitted("vp9") && encoderAvailable("vp9", true)) selectedCodecMode = "vp9_hw";
+                    else if (permitted("h264") && encoderAvailable("h264", true)) selectedCodecMode = "h264_hw";
+                    else if (permitted("vp9") && encoderAvailable("vp9", false)) selectedCodecMode = "vp9_sw";
+                    else if (permitted("h264") && encoderAvailable("h264", false)) selectedCodecMode = "h264_sw";
+                    else if (permitted("vp8")) selectedCodecMode = "vp8";
+                }
+                if (selectedCodecMode.empty()) {
+                    LogE("No mutually supported operational codec for session=" + sessionId);
+                    ctx->chatPipeServer->Stop();
+                    CloseHandle(ctx->secureStopEvent);
+                    CloseHandle(ctx->normalStopEvent);
+                    ctx->secureStopEvent = nullptr;
+                    ctx->normalStopEvent = nullptr;
+                    ctx->secureInputPipe.Close();
+                    ctx->normalInputPipe.Close();
+                    ctx->secureShmem.Close();
+                    ctx->normalShmem.Close();
+                    return;
+                }
+                LogI("dynamic codec session=" + sessionId + " mode=" + selectedCodecMode +
+                    " viewer_decoders=" + std::to_string(offeredCodecs.size()) +
+                    " excluded=" + std::to_string(excludedCodecs.size()) +
+                    " true_lossless_available=false");
+
                 ctx->sender = std::make_unique<WebRtcSender>(
                     sessionId,
                     iceServers,
@@ -6575,16 +6654,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     fps,
                     bitrateKbps,
                     WebRtcSender::Mode::ExternalFeed,
-                    ([&]() {
-                        const std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
-                        if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw") return requestedCodec;
-                        if (requestedCodec == "h264_hw" || requestedCodec == "h264" || requestedCodec == "h264_sw") return requestedCodec;
-                        // Until encoder capability and successful first-video-frame are
-                        // confirmed per endpoint, prefer the battle-tested VP8 path.
-                        // An H.264 Media Foundation failure after SDP negotiation
-                        // otherwise produces a connected but permanently black track.
-                        return std::string("vp8");
-                        })()
+                    selectedCodecMode
                 );
 
                 ctx->sender->setConnectionClosedHandler([this, sid = sessionId](const std::string& reason) {
