@@ -502,8 +502,70 @@ AgentIdentity loadAgentIdentityFromDir(
         !getenvString("HI5_WSS_URL").empty() ? getenvString("HI5_WSS_URL") : getenvString("HI5_AGENT_WS_BASE_URL")
     );
 
+    // A tenant installer writes a fresh, credentialed deployment to config.ini.
+    // state.dat survives upgrades, so a different tenant installer must not silently
+    // continue using the former tenant's device key and WebSocket endpoint.
+    auto applyFreshInstallerEnrollment = [&](AgentState& existing) {
+        const auto installerConfig = parseIniIfExists(legacyConfigPath);
+        const std::string deploymentId = getFirst(installerConfig, { "deployment_id", "deploymentid" });
+        const std::string packageId = getFirst(installerConfig, { "package_id", "packageid", "enrollment_package_id" });
+        const std::string deploymentSecret = getFirst(installerConfig, { "deployment_secret", "deploymentsecret" });
+        const std::string enrollmentToken = getFirst(installerConfig, { "enrollment_token", "provision_token", "token" });
+        const std::string requestedId = !deploymentId.empty() ? deploymentId : packageId;
+        if (requestedId.empty() || (deploymentSecret.empty() && enrollmentToken.empty())) return;
+
+        if (!deploymentId.empty() && !packageId.empty() && deploymentId != packageId) {
+            throw std::runtime_error("installer deployment and package IDs disagree");
+        }
+
+        std::string apiBase = envApiBase;
+        if (apiBase.empty()) {
+            apiBase = normalizedUrlNoTrailingSlash(getFirst(installerConfig,
+                { "api_base_url", "api_base", "apibase", "api_url" }));
+        }
+        if (apiBase.empty()) apiBase = kDefaultApiBase;
+
+        std::string wsBase = envWsBase;
+        if (wsBase.empty()) {
+            wsBase = getFirst(installerConfig,
+                { "agent_ws_base_url", "agent_ws_base", "wss_url", "ws_url", "control_url" });
+        }
+        if (wsBase.empty()) wsBase = defaultAgentWsBaseUrl.empty() ? kDefaultAgentWsBase : defaultAgentWsBaseUrl;
+
+        if (requestedId == existing.enrollmentPackageId &&
+            apiBase == existing.apiBaseUrl && wsBase == existing.agentWsBaseUrl) {
+            return;
+        }
+
+        const std::string fingerprint = existing.fingerprint.empty()
+            ? getMachineFingerprint() : existing.fingerprint;
+        std::string hostname = getFirst(installerConfig, { "hostname", "host_name", "computer_name" });
+        if (hostname.empty()) hostname = hi5::GetPlatformHostname();
+
+        // Validate the destination deployment first. Never send the former tenant's
+        // device credentials or replace its saved identity on a failed enrollment.
+        const EnrollResult enrolled = enrollWindowsDevice(
+            apiBase, enrollmentToken, hostname, fingerprint, "", "", installerConfig);
+
+        AgentState replacement = existing;
+        replacement.deviceId = enrolled.deviceId;
+        replacement.deviceKey = enrolled.deviceKey;
+        replacement.apiBaseUrl = apiBase;
+        replacement.agentWsBaseUrl = wsBase;
+        replacement.tenantId = enrolled.tenantId;
+        replacement.groupId = enrolled.groupId;
+        replacement.enrollmentPackageId = enrolled.enrollmentPackageId.empty()
+            ? requestedId : enrolled.enrollmentPackageId;
+        replacement.fingerprint = fingerprint;
+        writeState(statePath, replacement);
+        moveAsideIfExists(legacyConfigPath, ".migrated");
+        moveAsideIfExists(legacySecretsPath, ".migrated");
+        existing = replacement;
+    };
+
     AgentState state = readStateIfExists(statePath);
     if (isValidState(state)) {
+        applyFreshInstallerEnrollment(state);
         if (!envApiBase.empty()) state.apiBaseUrl = envApiBase;
         if (!envWsBase.empty()) state.agentWsBaseUrl = envWsBase;
         if (state.apiBaseUrl.empty()) state.apiBaseUrl = kDefaultApiBase;
@@ -523,6 +585,7 @@ AgentIdentity loadAgentIdentityFromDir(
     if (!agentJsonBytes.empty()) {
         AgentState jsonState = parseStateJson(std::string(agentJsonBytes.begin(), agentJsonBytes.end()));
         if (isValidState(jsonState)) {
+            applyFreshInstallerEnrollment(jsonState);
             if (!envApiBase.empty()) jsonState.apiBaseUrl = envApiBase;
             if (!envWsBase.empty()) jsonState.agentWsBaseUrl = envWsBase;
             if (jsonState.apiBaseUrl.empty()) jsonState.apiBaseUrl = kDefaultApiBase;
