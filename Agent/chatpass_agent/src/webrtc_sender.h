@@ -2,6 +2,7 @@
 
 #include "vp8_encoder.h"
 #include "vp9_mf_encoder.h"
+#include "vp9_vpx_encoder.h"
 #include "h264_mf_encoder.h"
 #include "input_injector.h"
 
@@ -142,6 +143,7 @@ private:
     std::unique_ptr<Vp8Encoder> m_encoder;
     std::unique_ptr<H264MfEncoder> m_h264Encoder;
     std::unique_ptr<Vp9MfEncoder> m_vp9Encoder;
+    std::unique_ptr<Vp9VpxEncoder> m_vp9VpxEncoder;
     bool m_vp9Failed = false;
     VideoCodec m_videoCodec = VideoCodec::VP8;
     bool m_h264Attempted = false;
@@ -182,6 +184,7 @@ private:
     std::atomic<int> m_viewerTargetFps{ 0 };
     std::atomic<int> m_viewerTargetBitrateKbps{ 0 };
     std::atomic<bool> m_viewerSharpQuality{ false };
+    std::atomic<bool> m_viewerSupportsVp9Lossless{ false };
     std::atomic<int> m_externalLastNonIdleMode{ 2 };
     std::atomic<bool> m_externalHintBackstage{ false };
     std::atomic<bool> m_externalHintSecure{ false };
