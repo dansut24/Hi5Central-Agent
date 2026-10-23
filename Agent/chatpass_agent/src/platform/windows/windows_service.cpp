@@ -2604,10 +2604,15 @@ LogI(
                         StopSession(nextId);
                     }
                     CleanupOrphanStreamerProcesses();
-                    stop_.store(true);
+                    reconnectRequested_.store(true);
                     });
 
-                signaling_->connect();
+                try {
+                    signaling_->connect();
+                } catch (...) {
+                    LogW("websocket initial connect failed; retry scheduled");
+                    reconnectRequested_.store(true);
+                }
                 StartInventoryLoop(ident);
 
                 StartPatchDiscoveryLoop(ident);
@@ -2616,6 +2621,20 @@ LogI(
                 auto nextUiCleanupSweep = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                 while (!stop_.load()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    if (reconnectRequested_.exchange(false) && !stop_.load()) {
+                        LogI("websocket disconnected; retrying in 5 seconds");
+                        for (int attempt = 0; attempt < 50 && !stop_.load(); ++attempt) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        if (!stop_.load() && signaling_) {
+                            try {
+                                signaling_->connect();
+                            } catch (...) {
+                                LogW("websocket reconnect failed; another retry scheduled");
+                                reconnectRequested_.store(true);
+                            }
+                        }
+                    }
                     const auto now = std::chrono::steady_clock::now();
                     if (now >= nextUiCleanupSweep) {
                         nextUiCleanupSweep = now + std::chrono::seconds(5);
@@ -7020,6 +7039,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             AgentPresenceController presenceController_;
             ChatController chatController_;
             std::unique_ptr<SignalingClient> signaling_;
+            std::atomic<bool> reconnectRequested_{ false };
             std::thread inventoryThread_;
 
             std::mutex sessionsMu_;
