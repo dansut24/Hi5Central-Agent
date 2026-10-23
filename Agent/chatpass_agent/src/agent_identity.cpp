@@ -211,6 +211,7 @@ namespace {
         std::string groupId;
         std::string enrollmentPackageId;
         std::string fingerprint;
+        bool endpointPinned = false;
     };
 
     bool isValidState(const AgentState& s) {
@@ -239,6 +240,7 @@ namespace {
                 s.enrollmentPackageId = trim(j.value("enrollment_package_id", std::string()));
         if (s.enrollmentPackageId.empty()) s.enrollmentPackageId = trim(j.value("enrollmentPackageId", std::string()));
         s.fingerprint = trim(j.value("fingerprint", std::string()));
+        s.endpointPinned = j.value("installer_endpoint_pinned", false);
         return s;
     }
 
@@ -259,6 +261,7 @@ namespace {
             {"group_id", state.groupId},
             {"enrollment_package_id", state.enrollmentPackageId},
             {"fingerprint", state.fingerprint},
+            {"installer_endpoint_pinned", state.endpointPinned},
             {"updated_at", nowIsoUtc()}
         };
 
@@ -502,10 +505,71 @@ AgentIdentity loadAgentIdentityFromDir(
         !getenvString("HI5_WSS_URL").empty() ? getenvString("HI5_WSS_URL") : getenvString("HI5_AGENT_WS_BASE_URL")
     );
 
+    // A tenant installer writes a fresh, credentialed deployment to config.ini.
+    // state.dat survives upgrades, so a different tenant installer must not silently
+    // continue using the former tenant's device key and WebSocket endpoint.
+    auto applyFreshInstallerEnrollment = [&](AgentState& existing) {
+        const auto installerConfig = parseIniIfExists(legacyConfigPath);
+        const std::string deploymentId = getFirst(installerConfig, { "deployment_id", "deploymentid" });
+        const std::string packageId = getFirst(installerConfig, { "package_id", "packageid", "enrollment_package_id" });
+        const std::string deploymentSecret = getFirst(installerConfig, { "deployment_secret", "deploymentsecret" });
+        const std::string enrollmentToken = getFirst(installerConfig, { "enrollment_token", "provision_token", "token" });
+        const std::string requestedId = !deploymentId.empty() ? deploymentId : packageId;
+        if (requestedId.empty() || (deploymentSecret.empty() && enrollmentToken.empty())) return;
+
+        if (!deploymentId.empty() && !packageId.empty() && deploymentId != packageId) {
+            throw std::runtime_error("installer deployment and package IDs disagree");
+        }
+
+        // A credentialed tenant installer is authoritative over any old Dev
+        // service-level HI5_API_BASE / HI5_WSS_URL environment overrides.
+        std::string apiBase = normalizedUrlNoTrailingSlash(getFirst(installerConfig,
+            { "api_base_url", "api_base", "apibase", "api_url" }));
+        if (apiBase.empty()) apiBase = envApiBase;
+        if (apiBase.empty()) apiBase = kDefaultApiBase;
+
+        std::string wsBase = getFirst(installerConfig,
+            { "agent_ws_base_url", "agent_ws_base", "wss_url", "ws_url", "control_url" });
+        if (wsBase.empty()) wsBase = envWsBase;
+        if (wsBase.empty()) wsBase = defaultAgentWsBaseUrl.empty() ? kDefaultAgentWsBase : defaultAgentWsBaseUrl;
+
+        if (existing.endpointPinned && requestedId == existing.enrollmentPackageId &&
+            apiBase == existing.apiBaseUrl && wsBase == existing.agentWsBaseUrl) {
+            return;
+        }
+
+        const std::string fingerprint = existing.fingerprint.empty()
+            ? getMachineFingerprint() : existing.fingerprint;
+        std::string hostname = getFirst(installerConfig, { "hostname", "host_name", "computer_name" });
+        if (hostname.empty()) hostname = hi5::GetPlatformHostname();
+
+        // Validate the destination deployment first. Never send the former tenant's
+        // device credentials or replace its saved identity on a failed enrollment.
+        const EnrollResult enrolled = enrollWindowsDevice(
+            apiBase, enrollmentToken, hostname, fingerprint, "", "", installerConfig);
+
+        AgentState replacement = existing;
+        replacement.deviceId = enrolled.deviceId;
+        replacement.deviceKey = enrolled.deviceKey;
+        replacement.apiBaseUrl = apiBase;
+        replacement.agentWsBaseUrl = wsBase;
+        replacement.tenantId = enrolled.tenantId;
+        replacement.groupId = enrolled.groupId;
+        replacement.enrollmentPackageId = enrolled.enrollmentPackageId.empty()
+            ? requestedId : enrolled.enrollmentPackageId;
+        replacement.fingerprint = fingerprint;
+        replacement.endpointPinned = true;
+        writeState(statePath, replacement);
+        moveAsideIfExists(legacyConfigPath, ".migrated");
+        moveAsideIfExists(legacySecretsPath, ".migrated");
+        existing = replacement;
+    };
+
     AgentState state = readStateIfExists(statePath);
     if (isValidState(state)) {
-        if (!envApiBase.empty()) state.apiBaseUrl = envApiBase;
-        if (!envWsBase.empty()) state.agentWsBaseUrl = envWsBase;
+        applyFreshInstallerEnrollment(state);
+        if (!state.endpointPinned && !envApiBase.empty()) state.apiBaseUrl = envApiBase;
+        if (!state.endpointPinned && !envWsBase.empty()) state.agentWsBaseUrl = envWsBase;
         if (state.apiBaseUrl.empty()) state.apiBaseUrl = kDefaultApiBase;
         if (state.agentWsBaseUrl.empty()) state.agentWsBaseUrl = defaultAgentWsBaseUrl.empty() ? kDefaultAgentWsBase : defaultAgentWsBaseUrl;
 
@@ -523,8 +587,9 @@ AgentIdentity loadAgentIdentityFromDir(
     if (!agentJsonBytes.empty()) {
         AgentState jsonState = parseStateJson(std::string(agentJsonBytes.begin(), agentJsonBytes.end()));
         if (isValidState(jsonState)) {
-            if (!envApiBase.empty()) jsonState.apiBaseUrl = envApiBase;
-            if (!envWsBase.empty()) jsonState.agentWsBaseUrl = envWsBase;
+            applyFreshInstallerEnrollment(jsonState);
+            if (!jsonState.endpointPinned && !envApiBase.empty()) jsonState.apiBaseUrl = envApiBase;
+            if (!jsonState.endpointPinned && !envWsBase.empty()) jsonState.agentWsBaseUrl = envWsBase;
             if (jsonState.apiBaseUrl.empty()) jsonState.apiBaseUrl = kDefaultApiBase;
             if (jsonState.agentWsBaseUrl.empty()) {
                 jsonState.agentWsBaseUrl = defaultAgentWsBaseUrl.empty() ? kDefaultAgentWsBase : defaultAgentWsBaseUrl;
@@ -542,12 +607,23 @@ AgentIdentity loadAgentIdentityFromDir(
     }
 
     const auto legacyConfig = parseIniIfExists(legacyConfigPath);
+    const bool credentialedInstaller =
+        (!getFirst(legacyConfig, { "deployment_id", "deploymentid" }).empty() &&
+         !getFirst(legacyConfig, { "deployment_secret", "deploymentsecret" }).empty()) ||
+        (!getFirst(legacyConfig, { "package_id", "packageid", "enrollment_package_id" }).empty() &&
+         !getFirst(legacyConfig, { "enrollment_token", "provision_token", "token" }).empty());
 
-    std::string apiBase = envApiBase;
+    std::string apiBase = credentialedInstaller
+        ? normalizedUrlNoTrailingSlash(getFirst(legacyConfig, { "api_base_url", "api_base", "apibase", "api_url" }))
+        : envApiBase;
+    if (apiBase.empty()) apiBase = envApiBase;
     if (apiBase.empty()) apiBase = normalizedUrlNoTrailingSlash(getFirst(legacyConfig, { "api_base_url", "api_base", "apibase", "api_url" }));
     if (apiBase.empty()) apiBase = kDefaultApiBase;
 
-    std::string agentWsBase = envWsBase;
+    std::string agentWsBase = credentialedInstaller
+        ? getFirst(legacyConfig, { "agent_ws_base_url", "agent_ws_base", "wss_url", "ws_url", "control_url" })
+        : envWsBase;
+    if (agentWsBase.empty()) agentWsBase = envWsBase;
     if (agentWsBase.empty()) agentWsBase = getFirst(legacyConfig, { "agent_ws_base_url", "agent_ws_base", "wss_url", "ws_url", "control_url" });
     if (agentWsBase.empty()) agentWsBase = defaultAgentWsBaseUrl.empty() ? kDefaultAgentWsBase : defaultAgentWsBaseUrl;
 
@@ -613,6 +689,7 @@ AgentIdentity loadAgentIdentityFromDir(
     newState.groupId = enrolled.groupId.empty() ? getFirst(legacyConfig, { "group_id", "groupid" }) : enrolled.groupId;
     newState.enrollmentPackageId = enrolled.enrollmentPackageId.empty() ? getFirst(legacyConfig, { "package_id", "packageid", "enrollment_package_id" }) : enrolled.enrollmentPackageId;
     newState.fingerprint = fingerprint;
+    newState.endpointPinned = credentialedInstaller;
 
     writeState(statePath, newState);
 

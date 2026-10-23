@@ -221,7 +221,7 @@ begin
   ConfigPath := ExpandConstant('{commonappdata}\Hi5Central\Agent\config.ini');
 
   ApiBaseUrl := TrimSlashRight(FirstNonEmpty(ParamValue('API_BASE_URL', ''), ParamValue('API_URL', '')));
-  AgentWsBaseUrl := FirstNonEmpty(ParamValue('AGENT_WS_BASE_URL', ''), ParamValue('WSS_URL', 'wss://rmm.hi5central.com/agent/ws'));
+  AgentWsBaseUrl := FirstNonEmpty(ParamValue('AGENT_WS_BASE_URL', ''), ParamValue('WSS_URL', ''));
 
   EnrollmentToken := FirstNonEmpty(ParamValue('ENROLLMENT_TOKEN', ''), ParamValue('ENROLL_TOKEN', ''));
   TenantId := ParamValue('TENANT_ID', '');
@@ -237,6 +237,20 @@ begin
     ApiBaseUrl := 'https://rmm.hi5central.com';
 
   ApiBaseUrl := TrimSlashRight(ApiBaseUrl);
+
+  { Tenant installers supply the correct API base. Use the same tenant host
+    for agent WebSocket signaling unless the operator explicitly overrides it.
+    The global rmm.hi5central.com host may not be deployed on a pilot system. }
+  if AgentWsBaseUrl = '' then
+  begin
+    if Pos('https://', Lowercase(ApiBaseUrl)) = 1 then
+      AgentWsBaseUrl := 'wss://' + Copy(ApiBaseUrl, 9, Length(ApiBaseUrl)) + '/agent/ws'
+    else if Pos('http://', Lowercase(ApiBaseUrl)) = 1 then
+      AgentWsBaseUrl := 'ws://' + Copy(ApiBaseUrl, 8, Length(ApiBaseUrl)) + '/agent/ws'
+    else
+      RaiseException('Unsupported Hi5Central Agent API URL scheme.');
+  end;
+
   PackageId := FirstNonEmpty(ParamValue('PACKAGE_ID', ''), DeploymentId);
 
   if InstallSource = '' then
