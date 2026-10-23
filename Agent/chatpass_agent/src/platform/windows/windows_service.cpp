@@ -5827,14 +5827,17 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 const hi5::StreamStats& stats,
                 uint64_t framesForwarded,
                 DesktopMode activeMode,
-                bool backstageMode) {
+                bool backstageMode,
+                const WebRtcSender* sender) {
                 if (!signaling_) return;
 
                 json msg = {
                     {"type", "stream_diagnostics"},
                     {"session_id", sessionId},
                     {"source", source},
-                    {"codec", "VP8"},
+                    {"codec", sender ? sender->activeVideoCodec() : "unknown"},
+                    {"encoder", sender ? sender->activeVideoEncoder() : "unknown"},
+                    {"fidelity", sender ? sender->activeFidelityMode() : "unknown"},
                     {"transport", "WebRTC"},
                     {"mode", StreamModeName(stats.streamMode)},
                     {"target_fps", stats.targetFps},
@@ -6968,14 +6971,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             if (ctx.sender) {
                                 ctx.sender->setExternalStreamHint(stats.streamMode, stats.targetFps, ctx.backstageMode, stats.secureDesktopActive != 0);
                             }
-                            SendStreamDiagnostics(ctx.sessionId, "normal", stats, framesForwarded, ctx.activeMode, ctx.backstageMode);
+                            SendStreamDiagnostics(ctx.sessionId, "normal", stats, framesForwarded, ctx.activeMode, ctx.backstageMode, ctx.sender.get());
                         }
                         if (ctx.secureInputPipe.ReadStreamStats(lastSecureStatsSeq, stats)) {
                             lastSecureStatsSeq = stats.seq;
                             if (ctx.sender) {
                                 ctx.sender->setExternalStreamHint(stats.streamMode, stats.targetFps, ctx.backstageMode, stats.secureDesktopActive != 0);
                             }
-                            SendStreamDiagnostics(ctx.sessionId, "secure", stats, framesForwarded, ctx.activeMode, ctx.backstageMode);
+                            SendStreamDiagnostics(ctx.sessionId, "secure", stats, framesForwarded, ctx.activeMode, ctx.backstageMode, ctx.sender.get());
                         }
                         nextDiagnosticsPoll = now + std::chrono::seconds(1);
                     }
