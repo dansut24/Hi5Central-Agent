@@ -6578,8 +6578,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ([&]() {
                         const std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
                         if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw") return requestedCodec;
-                        if (requestedCodec == "vp8") return std::string("vp8");
-                        return std::string("h264_hw");
+                        if (requestedCodec == "h264_hw" || requestedCodec == "h264" || requestedCodec == "h264_sw") return requestedCodec;
+                        // Until encoder capability and successful first-video-frame are
+                        // confirmed per endpoint, prefer the battle-tested VP8 path.
+                        // An H.264 Media Foundation failure after SDP negotiation
+                        // otherwise produces a connected but permanently black track.
+                        return std::string("vp8");
                         })()
                 );
 
