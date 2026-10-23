@@ -351,6 +351,28 @@ void WebRtcSender::stop() {
     m_pc.reset();
 }
 
+std::string WebRtcSender::activeVideoCodec() const {
+    switch (m_videoCodec) {
+    case VideoCodec::VP9: return "VP9";
+    case VideoCodec::H264: return "H264";
+    default: return "VP8";
+    }
+}
+std::string WebRtcSender::activeVideoEncoder() const {
+    if (m_videoCodec == VideoCodec::VP9 && m_vp9VpxEncoder)
+        return "libvpx-vp9-sw";
+    if (m_videoCodec == VideoCodec::VP9 && m_vp9Encoder)
+        return m_vp9Encoder->encoderName();
+    if (m_videoCodec == VideoCodec::H264 && m_h264Encoder)
+        return m_h264Encoder->encoderName();
+    return m_videoCodec == VideoCodec::VP8 ? "libvpx-vp8-sw" : "initializing";
+}
+std::string WebRtcSender::activeFidelityMode() const {
+    if (m_videoCodec == VideoCodec::VP9 && m_vp9VpxEncoder &&
+        m_vp9VpxEncoder->losslessActive()) return "lossless_i420";
+    return m_viewerSharpQuality.load() ? "high_fidelity_lossy" : "lossy";
+}
+
 bool WebRtcSender::switchMonitor(int index) {
     if (m_mode != Mode::DirectCapture) {
         return false;
