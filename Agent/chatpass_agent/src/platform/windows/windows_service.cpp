@@ -2183,6 +2183,7 @@ namespace hi5 {
         }
         struct SessionContext {
             std::string sessionId;
+            uint64_t generation = 0;
             std::vector<std::string> iceServers;
 
             std::unique_ptr<WebRtcSender> sender;
@@ -6480,6 +6481,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 auto ctx = std::make_unique<SessionContext>();
                 ctx->sessionId = sessionId;
+                ctx->generation = ++nextSessionGeneration_;
                 ctx->iceServers = iceServers;
                 ctx->displayIndex = 0;
                 ctx->fps = fps;
@@ -6657,12 +6659,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     selectedCodecMode
                 );
 
-                ctx->sender->setConnectionClosedHandler([this, sid = sessionId](const std::string& reason) {
-                    LogW("WebRTC connection closed/failed session=" + sid + " reason=" + reason + "; scheduling cleanup");
-                    std::thread([this, sid]() {
+                ctx->sender->setConnectionClosedHandler([this, sid = sessionId,
+                    generation = ctx->generation](const std::string& reason) {
+                    LogW("WebRTC closed/failed session=" + sid + " generation=" +
+                        std::to_string(generation) + " reason=" + reason);
+                    std::thread([this, sid, generation]() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                        StopSession(sid);
-                        CleanupOrphanStreamerProcesses(sid);
+                        // Do not tear down a new codec negotiation using the
+                        // same session ID after a previous peer is replaced.
+                        StopSession(sid, generation);
                         }).detach();
                     });
 
@@ -7003,32 +7008,35 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 LogI("frame pump stop session=" + ctx.sessionId);
             }
 
-            void StopSession(const std::string& sessionId) {
-                LogI("stopping session=" + sessionId);
-
-                // Always clean user-facing helpers first. In the real world the viewer can
-                // disconnect after the WebRTC/session map has already been removed, or the
-                // control server can deliver a duplicate end message. The old code returned
-                // early when the session context was missing, leaving the banner/chat helper
-                // orphaned. UI cleanup must therefore not depend on sessions_ containing the id.
-                StopChatOverlay(sessionId);
-                StopPresenceBanner(sessionId);
-                CleanupOrphanUiHelperProcesses();
-
+            void StopSession(const std::string& sessionId, uint64_t expectedGeneration = 0) {
                 std::unique_ptr<SessionContext> ctx;
-
                 {
                     std::lock_guard<std::mutex> lock(sessionsMu_);
                     auto it = sessions_.find(sessionId);
-                    if (it == sessions_.end()) {
-                        LogW("StopSession: no active stream context for session=" + sessionId + "; UI cleanup already completed, cleaning possible streamer orphan");
-                        CleanupOrphanStreamerProcesses(sessionId);
+                    if (expectedGeneration != 0 &&
+                        (it == sessions_.end() || it->second->generation != expectedGeneration)) {
+                        LogI("ignoring stale peer cleanup session=" + sessionId +
+                            " generation=" + std::to_string(expectedGeneration));
                         return;
                     }
-                    ctx = std::move(it->second);
-                    sessions_.erase(it);
+                    if (it != sessions_.end()) {
+                        ctx = std::move(it->second);
+                        sessions_.erase(it);
+                    }
                 }
 
+                // Explicit stops still clean orphan UI helpers even when a
+                // session was already erased. A stale generation must not.
+                StopChatOverlay(sessionId);
+                StopPresenceBanner(sessionId);
+                CleanupOrphanUiHelperProcesses();
+                if (!ctx) {
+                    CleanupOrphanStreamerProcesses(sessionId);
+                    return;
+                }
+
+                LogI("stopping session=" + sessionId +
+                    " generation=" + std::to_string(ctx->generation));
                 ctx->framePumpStop.store(true);
 
                 if (ctx->normalStopEvent) SetEvent(ctx->normalStopEvent);
@@ -7117,6 +7125,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             std::thread inventoryThread_;
 
             std::mutex sessionsMu_;
+            std::atomic<uint64_t> nextSessionGeneration_{ 0 };
             std::unordered_map<std::string, std::unique_ptr<SessionContext>> sessions_;
         };
 
