@@ -1642,7 +1642,14 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
     if (m_videoCodec == VideoCodec::VP9 && !m_vp9Failed) {
         bool vp9Scaled = false;
-        const I420Frame vp9Frame = scaleI420ForH264WebRtc(frame, &vp9Scaled);
+        // Preserve source resolution for verified software VP9 I420-lossless.
+        // Enlarged displays still use the existing scaled lossy policy.
+        const bool vp9FullResolution = m_codecMode == "vp9_sw" &&
+            frame.width > 0 && frame.height > 0 &&
+            frame.width <= 1920 && frame.height <= 1080 &&
+            frame.width % 2 == 0 && frame.height % 2 == 0;
+        const I420Frame vp9Frame = vp9FullResolution
+            ? frame : scaleI420ForH264WebRtc(frame, &vp9Scaled);
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
 
         // Software VP9 uses the bundled libvpx encoder. It can change from
@@ -1657,7 +1664,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 m_viewerSharpQuality.load() &&
                 requestedBitrate >= 8000 &&
                 effectiveMode == 0 &&
-                vp9Frame.width <= 1920 && vp9Frame.height <= 1080 &&
+                vp9FullResolution &&
                 !m_externalHintBackstage.load();
             const int targetFps = useLossless ? std::min(2, profile.fps) : profile.fps;
             const int targetBitrate = useLossless
