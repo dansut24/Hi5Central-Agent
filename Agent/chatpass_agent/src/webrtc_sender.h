@@ -63,6 +63,9 @@ public:
     nlohmann::json buildMonitorInfoMessage() const;
 
     bool isExternalFeedMode() const { return m_mode == Mode::ExternalFeed; }
+    std::string activeVideoCodec() const;
+    std::string activeVideoEncoder() const;
+    std::string activeFidelityMode() const;
 
     void setInputEventHandler(InputEventFn fn);
     void setDirectMouseMoveHandler(DirectMouseMoveFn fn);
