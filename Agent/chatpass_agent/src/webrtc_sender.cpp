@@ -425,6 +425,20 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                     // native cursor path responsive, but do not force the expensive
                     // full-motion VP8 profile for every single mouse packet. Clicks,
                     // wheel and keyboard still boost to motion immediately.
+                    if (kind == "viewer_stream_profile") {
+                        // The viewer measures RTT/loss/jitter and adjusts its
+                        // target. Apply encoder settings rather than treating
+                        // this as a keyboard/mouse event.
+                        const int bitrate = msg.value("target_bitrate_kbps", 0);
+                        const int fps = msg.value("target_fps", 0);
+                        if (bitrate >= 500 && bitrate <= 20000)
+                            m_viewerTargetBitrateKbps = bitrate;
+                        if (fps >= 5 && fps <= 60)
+                            m_viewerTargetFps = fps;
+                        const std::string target = msg.value("quality_target", std::string("balanced"));
+                        m_viewerSharpQuality = (target == "sharp");
+                        return;
+                    }
                     if (kind == "mouse_move") {
                         m_externalHintMode = std::max(m_externalHintMode.load(), 1);
                     }
@@ -1534,6 +1548,19 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         m_externalHintSecure.load(),
         std::max(1, m_fps),
         std::max(250, m_bitrateKbps));
+
+    // Link adaptation changes encoder parameters without interrupting the
+    // negotiated video track. Remain lossy on current WebRTC senders; a true
+    // lossless mode needs a separately verified lossless encoder/decoder path.
+    const int requestedFps = m_viewerTargetFps.load();
+    const int requestedBitrate = m_viewerTargetBitrateKbps.load();
+    if (requestedFps > 0) profile.fps = std::min(profile.fps, requestedFps);
+    if (requestedBitrate > 0) profile.bitrateKbps = std::min(profile.bitrateKbps, requestedBitrate);
+    if (m_viewerSharpQuality.load() && requestedBitrate >= 6000) {
+        // Improve fine-text clarity only when the viewer reports a good link.
+        // Still bound by the chosen bitrate and normal congestion safeguards.
+        profile.maxQuantizer = std::min(profile.maxQuantizer, 30);
+    }
 
     const bool sizeChanged = frame.width != m_externalEncoderWidth || frame.height != m_externalEncoderHeight;
     const bool profileChanged = profile.fps != m_externalConfiguredFps ||
