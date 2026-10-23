@@ -55,6 +55,8 @@ bool Vp9VpxEncoder::reconfigure(int fps, int bitrateKbps) {
     if (!m_impl || !m_impl->initialized) return false;
     fps = std::max(1,fps);
     bitrateKbps = std::max(500,bitrateKbps);
+    // vpx_codec_enc_config_set() is expensive and must not run for every frame.
+    if (fps == m_impl->fps && bitrateKbps == m_impl->bitrateKbps) return true;
     auto next = m_impl->cfg;
     next.rc_target_bitrate = bitrateKbps;
     next.kf_max_dist = std::max(3,fps*10);
