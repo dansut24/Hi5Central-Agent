@@ -179,6 +179,9 @@ private:
 
     std::atomic<int> m_externalHintMode{ 0 };       // 0=idle, 1=active, 2=motion
     std::atomic<int> m_externalHintFps{ 0 };
+    std::atomic<int> m_viewerTargetFps{ 0 };
+    std::atomic<int> m_viewerTargetBitrateKbps{ 0 };
+    std::atomic<bool> m_viewerSharpQuality{ false };
     std::atomic<int> m_externalLastNonIdleMode{ 2 };
     std::atomic<bool> m_externalHintBackstage{ false };
     std::atomic<bool> m_externalHintSecure{ false };
