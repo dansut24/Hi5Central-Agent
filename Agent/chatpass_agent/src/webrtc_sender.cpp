@@ -1651,7 +1651,9 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         // sustained excellent link, idle screen, at least 8 Mbps available,
         // and no more than 1080p to avoid excessive memory/CPU spikes.
         if (m_codecMode == "vp9_sw") {
-            const bool useLossless = m_viewerSupportsVp9Lossless.load() &&
+            if (effectiveMode != 0) m_vp9LastMotionAt = nowForProfile;
+            const bool steadyStatic = nowForProfile - m_vp9LastMotionAt >= std::chrono::seconds(5);
+            const bool useLossless = steadyStatic && m_viewerSupportsVp9Lossless.load() &&
                 m_viewerSharpQuality.load() &&
                 requestedBitrate >= 8000 &&
                 effectiveMode == 0 &&
