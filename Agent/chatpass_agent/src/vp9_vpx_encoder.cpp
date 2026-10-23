@@ -33,7 +33,11 @@ struct Vp9VpxEncoder::Impl {
         cfg.rc_max_quantizer = 45;
         cfg.kf_mode = VPX_KF_AUTO;
         cfg.kf_max_dist = std::max(3, fps*10);
+        #ifdef VPX_ERROR_RESILIENT_DEFAULT
         cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
+        #else
+        cfg.g_error_resilient = 1;
+        #endif
         if (vpx_codec_enc_init(&codec, vpx_codec_vp9_cx(), &cfg, 0) != VPX_CODEC_OK)
             throw std::runtime_error("libvpx VP9 codec init failed");
         initialized = true;
