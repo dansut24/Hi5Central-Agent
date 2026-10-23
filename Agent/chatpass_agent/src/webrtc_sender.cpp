@@ -809,8 +809,19 @@ void WebRtcSender::createPeerConnection() {
     m_pc->onStateChange([this](rtc::PeerConnection::State state) {
         std::cout << "[pc] state=" << static_cast<int>(state)
             << " session=" << m_sessionId << "\n";
-        if (state == rtc::PeerConnection::State::Disconnected ||
-            state == rtc::PeerConnection::State::Failed ||
+        if (state == rtc::PeerConnection::State::Connected) {
+            // Resume with a keyframe after an ICE transport interruption.
+            // Do not restart the desktop capture pipeline.
+            m_forceKeyframe = true;
+        }
+        if (state == rtc::PeerConnection::State::Disconnected) {
+            // ICE Disconnected is transient. Retain active sender/desktop
+            // helpers and allow libdatachannel to recover the selected path.
+            // Only terminal Failed/Closed states require service cleanup.
+            LogInfo("[pc] transient disconnect; retaining media session=" + m_sessionId);
+            return;
+        }
+        if (state == rtc::PeerConnection::State::Failed ||
             state == rtc::PeerConnection::State::Closed) {
             m_canSend = false;
             if (m_connectionClosedFn) {
