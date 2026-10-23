@@ -3815,7 +3815,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 }
 
                 HttpPostJsonWithAgentAuth(
-                    "https://api.hi5central.com/api/v1/agent/devices/jobs/" + jobId + "/result",
+                    (ident.apiBaseUrl.empty() ? std::string("https://api.hi5central.com") : ident.apiBaseUrl) + "/api/v1/agent/devices/jobs/" + jobId + "/result",
                     body.dump(),
                     ident
                 );
@@ -3997,7 +3997,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                         try {
                             const std::string response = HttpGetJsonWithAgentAuth(
-                                "https://api.hi5central.com/api/v1/agent/devices/jobs",
+                                (ident.apiBaseUrl.empty() ? std::string("https://api.hi5central.com") : ident.apiBaseUrl) + "/api/v1/agent/devices/jobs",
                                 ident
                             );
 
@@ -5394,7 +5394,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 try {
                     HttpPostJsonWithAgentAuth(
-                        "https://api.hi5central.com/api/v1/agent/devices/patch-discovery",
+                        (ident.apiBaseUrl.empty() ? std::string("https://api.hi5central.com") : ident.apiBaseUrl) + "/api/v1/agent/devices/patch-discovery",
                         payload.dump(),
                         ident
                     );
@@ -5457,7 +5457,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             json payload = BuildTelemetryPayload(previousCpu, hasPreviousCpu);
 
                             HttpPostJsonWithAgentAuth(
-                                "https://api.hi5central.com/api/v1/agent/devices/telemetry",
+                                (ident.apiBaseUrl.empty() ? std::string("https://api.hi5central.com") : ident.apiBaseUrl) + "/api/v1/agent/devices/telemetry",
                                 payload.dump(),
                                 ident
                             );
