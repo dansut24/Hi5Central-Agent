@@ -144,6 +144,7 @@ private:
     std::unique_ptr<H264MfEncoder> m_h264Encoder;
     std::unique_ptr<Vp9MfEncoder> m_vp9Encoder;
     std::unique_ptr<Vp9VpxEncoder> m_vp9VpxEncoder;
+    std::chrono::steady_clock::time_point m_vp9LastMotionAt = std::chrono::steady_clock::now();
     bool m_vp9Failed = false;
     VideoCodec m_videoCodec = VideoCodec::VP8;
     bool m_h264Attempted = false;
