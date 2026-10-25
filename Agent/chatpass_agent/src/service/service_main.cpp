@@ -6418,7 +6418,20 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 SetServiceState(SERVICE_RUNNING);
                 LogI("service state -> RUNNING service=" + g_serviceName);
 
-                g_worker->Run();
+                // A transient WebSocket disconnection must not stop the
+                // Windows Agent service. Reconnect until SCM requests a stop.
+                while (!g_stopRequested.load()) {
+                    g_worker->Run();
+                    g_worker.reset();
+                    if (g_stopRequested.load()) break;
+
+                    LogW("signalling worker ended; reconnect in 3 seconds");
+                    for (int i = 0; i < 30 && !g_stopRequested.load(); ++i) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                    if (g_stopRequested.load()) break;
+                    g_worker = std::make_unique<Worker>(g_serviceName);
+                }
 
                 g_worker.reset();
                 SetServiceState(SERVICE_STOPPED);
