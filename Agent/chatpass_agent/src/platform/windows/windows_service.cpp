@@ -2183,6 +2183,7 @@ namespace hi5 {
         }
         struct SessionContext {
             std::string sessionId;
+            uint64_t generation = 0;
             std::vector<std::string> iceServers;
 
             std::unique_ptr<WebRtcSender> sender;
@@ -2402,7 +2403,20 @@ LogI(
                             StopPresenceBanner(sessionId);
                         }
                         auto iceServers = parseIceServers(msg);
-                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode);
+                        std::vector<std::string> viewerVideoCodecs;
+                        if (msg.contains("viewer_video_codecs") && msg["viewer_video_codecs"].is_array()) {
+                            for (const auto& value : msg["viewer_video_codecs"]) {
+                                if (value.is_string()) viewerVideoCodecs.push_back(value.get<std::string>());
+                            }
+                        }
+                        std::vector<std::string> excludedVideoCodecs;
+                        if (msg.contains("excluded_video_codecs") && msg["excluded_video_codecs"].is_array()) {
+                            for (const auto& value : msg["excluded_video_codecs"]) {
+                                if (value.is_string()) excludedVideoCodecs.push_back(value.get<std::string>());
+                            }
+                        }
+                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps,
+                            sessionMode, viewerVideoCodecs, excludedVideoCodecs);
                         // Keep the portal responsive without running expensive WMI/PowerShell
                         // collectors during live remote control. The WebSocket/session state
                         // is already live; full inventory can still be requested manually.
@@ -2604,10 +2618,15 @@ LogI(
                         StopSession(nextId);
                     }
                     CleanupOrphanStreamerProcesses();
-                    stop_.store(true);
+                    reconnectRequested_.store(true);
                     });
 
-                signaling_->connect();
+                try {
+                    signaling_->connect();
+                } catch (...) {
+                    LogW("websocket initial connect failed; retry scheduled");
+                    reconnectRequested_.store(true);
+                }
                 StartInventoryLoop(ident);
 
                 StartPatchDiscoveryLoop(ident);
@@ -2616,6 +2635,20 @@ LogI(
                 auto nextUiCleanupSweep = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                 while (!stop_.load()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    if (reconnectRequested_.exchange(false) && !stop_.load()) {
+                        LogI("websocket disconnected; retrying in 5 seconds");
+                        for (int attempt = 0; attempt < 50 && !stop_.load(); ++attempt) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        if (!stop_.load() && signaling_) {
+                            try {
+                                signaling_->connect();
+                            } catch (...) {
+                                LogW("websocket reconnect failed; another retry scheduled");
+                                reconnectRequested_.store(true);
+                            }
+                        }
+                    }
                     const auto now = std::chrono::steady_clock::now();
                     if (now >= nextUiCleanupSweep) {
                         nextUiCleanupSweep = now + std::chrono::seconds(5);
@@ -3796,7 +3829,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 }
 
                 HttpPostJsonWithAgentAuth(
-                    "https://api.hi5central.com/api/v1/agent/devices/jobs/" + jobId + "/result",
+                    (ident.apiBaseUrl.empty() ? std::string("https://api.hi5central.com") : ident.apiBaseUrl) + "/api/v1/agent/devices/jobs/" + jobId + "/result",
                     body.dump(),
                     ident
                 );
@@ -3978,7 +4011,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                         try {
                             const std::string response = HttpGetJsonWithAgentAuth(
-                                "https://api.hi5central.com/api/v1/agent/devices/jobs",
+                                (ident.apiBaseUrl.empty() ? std::string("https://api.hi5central.com") : ident.apiBaseUrl) + "/api/v1/agent/devices/jobs",
                                 ident
                             );
 
@@ -5375,7 +5408,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 try {
                     HttpPostJsonWithAgentAuth(
-                        "https://api.hi5central.com/api/v1/agent/devices/patch-discovery",
+                        (ident.apiBaseUrl.empty() ? std::string("https://api.hi5central.com") : ident.apiBaseUrl) + "/api/v1/agent/devices/patch-discovery",
                         payload.dump(),
                         ident
                     );
@@ -5438,7 +5471,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             json payload = BuildTelemetryPayload(previousCpu, hasPreviousCpu);
 
                             HttpPostJsonWithAgentAuth(
-                                "https://api.hi5central.com/api/v1/agent/devices/telemetry",
+                                (ident.apiBaseUrl.empty() ? std::string("https://api.hi5central.com") : ident.apiBaseUrl) + "/api/v1/agent/devices/telemetry",
                                 payload.dump(),
                                 ident
                             );
@@ -5794,14 +5827,17 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 const hi5::StreamStats& stats,
                 uint64_t framesForwarded,
                 DesktopMode activeMode,
-                bool backstageMode) {
+                bool backstageMode,
+                const WebRtcSender* sender) {
                 if (!signaling_) return;
 
                 json msg = {
                     {"type", "stream_diagnostics"},
                     {"session_id", sessionId},
                     {"source", source},
-                    {"codec", "VP8"},
+                    {"codec", sender ? sender->activeVideoCodec() : "unknown"},
+                    {"encoder", sender ? sender->activeVideoEncoder() : "unknown"},
+                    {"fidelity", sender ? sender->activeFidelityMode() : "unknown"},
                     {"transport", "WebRTC"},
                     {"mode", StreamModeName(stats.streamMode)},
                     {"target_fps", stats.targetFps},
@@ -6441,11 +6477,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 int height,
                 int fps,
                 int bitrateKbps,
-                SessionMode sessionMode) {
+                SessionMode sessionMode,
+                const std::vector<std::string>& viewerVideoCodecs,
+                const std::vector<std::string>& excludedVideoCodecs) {
                 StopSession(sessionId);
 
                 auto ctx = std::make_unique<SessionContext>();
                 ctx->sessionId = sessionId;
+                ctx->generation = ++nextSessionGeneration_;
                 ctx->iceServers = iceServers;
                 ctx->displayIndex = 0;
                 ctx->fps = fps;
@@ -6547,6 +6586,70 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
                     });
 
+                // Intersect supported WebRTC decoders with actual Windows
+                // encoders before the offer is generated. The scanner alone
+                // is not a codec decision; only implemented senders qualify.
+                auto normalizedCodec = [](std::string codec) {
+                    std::transform(codec.begin(), codec.end(), codec.begin(), [](unsigned char ch) {
+                        return static_cast<char>(std::tolower(ch));
+                    });
+                    return codec;
+                };
+                std::vector<std::string> offeredCodecs;
+                for (const auto& codec : viewerVideoCodecs) offeredCodecs.push_back(normalizedCodec(codec));
+                std::vector<std::string> excludedCodecs;
+                for (const auto& codec : excludedVideoCodecs) excludedCodecs.push_back(normalizedCodec(codec));
+                const auto permitted = [&](const std::string& codec) {
+                    return (offeredCodecs.empty()
+                            ? codec == "vp8"
+                            : std::find(offeredCodecs.begin(), offeredCodecs.end(), codec) != offeredCodecs.end())
+                        && std::find(excludedCodecs.begin(), excludedCodecs.end(), codec) == excludedCodecs.end();
+                };
+                std::string selectedCodecMode;
+                const std::string requestedCodec = normalizedCodec(ReadConfigString("HI5_CODEC", "auto"));
+                if (requestedCodec != "auto" && !requestedCodec.empty()) {
+                    const std::string family = requestedCodec.substr(0, requestedCodec.find('_'));
+                    if (permitted(family) && (family == "vp8" || family == "vp9" || family == "h264")) {
+                        selectedCodecMode = requestedCodec;
+                    }
+                }
+                if (selectedCodecMode.empty()) {
+                    const auto capabilities = hi5::ProbeCodecCapabilitiesAndSelect("auto").capabilities;
+                    const auto encoderAvailable = [&](const std::string& codec, bool hardware) {
+                        for (const auto& capability : capabilities) {
+                            if (capability.codec == codec)
+                                return hardware ? capability.hardwareEncodeAvailable : capability.softwareEncodeAvailable;
+                        }
+                        return false;
+                    };
+                    // Prefer efficient, implemented hardware senders when both
+                    // sides support them. Software VP9/H.264 are lower-ranked;
+                    // bundled VP8 is the interoperability fallback. AV1 is not
+                    // selected because the current AV1 sender is only a stub.
+                    if (permitted("vp9") && encoderAvailable("vp9", true)) selectedCodecMode = "vp9_hw";
+                    else if (permitted("h264") && encoderAvailable("h264", true)) selectedCodecMode = "h264_hw";
+                    else if (permitted("vp9") && encoderAvailable("vp9", false)) selectedCodecMode = "vp9_sw";
+                    else if (permitted("h264") && encoderAvailable("h264", false)) selectedCodecMode = "h264_sw";
+                    else if (permitted("vp8")) selectedCodecMode = "vp8";
+                }
+                if (selectedCodecMode.empty()) {
+                    LogE("No mutually supported operational codec for session=" + sessionId);
+                    ctx->chatPipeServer->Stop();
+                    CloseHandle(ctx->secureStopEvent);
+                    CloseHandle(ctx->normalStopEvent);
+                    ctx->secureStopEvent = nullptr;
+                    ctx->normalStopEvent = nullptr;
+                    ctx->secureInputPipe.Close();
+                    ctx->normalInputPipe.Close();
+                    ctx->secureShmem.Close();
+                    ctx->normalShmem.Close();
+                    return;
+                }
+                LogI("dynamic codec session=" + sessionId + " mode=" + selectedCodecMode +
+                    " viewer_decoders=" + std::to_string(offeredCodecs.size()) +
+                    " excluded=" + std::to_string(excludedCodecs.size()) +
+                    " true_lossless_available=false");
+
                 ctx->sender = std::make_unique<WebRtcSender>(
                     sessionId,
                     iceServers,
@@ -6556,20 +6659,18 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     fps,
                     bitrateKbps,
                     WebRtcSender::Mode::ExternalFeed,
-                    ([&]() {
-                        const std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
-                        if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw") return requestedCodec;
-                        if (requestedCodec == "vp8") return std::string("vp8");
-                        return std::string("h264_hw");
-                        })()
+                    selectedCodecMode
                 );
 
-                ctx->sender->setConnectionClosedHandler([this, sid = sessionId](const std::string& reason) {
-                    LogW("WebRTC connection closed/failed session=" + sid + " reason=" + reason + "; scheduling cleanup");
-                    std::thread([this, sid]() {
+                ctx->sender->setConnectionClosedHandler([this, sid = sessionId,
+                    generation = ctx->generation](const std::string& reason) {
+                    LogW("WebRTC closed/failed session=" + sid + " generation=" +
+                        std::to_string(generation) + " reason=" + reason);
+                    std::thread([this, sid, generation]() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                        StopSession(sid);
-                        CleanupOrphanStreamerProcesses(sid);
+                        // Do not tear down a new codec negotiation using the
+                        // same session ID after a previous peer is replaced.
+                        StopSession(sid, generation);
                         }).detach();
                     });
 
@@ -6870,14 +6971,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             if (ctx.sender) {
                                 ctx.sender->setExternalStreamHint(stats.streamMode, stats.targetFps, ctx.backstageMode, stats.secureDesktopActive != 0);
                             }
-                            SendStreamDiagnostics(ctx.sessionId, "normal", stats, framesForwarded, ctx.activeMode, ctx.backstageMode);
+                            SendStreamDiagnostics(ctx.sessionId, "normal", stats, framesForwarded, ctx.activeMode, ctx.backstageMode, ctx.sender.get());
                         }
                         if (ctx.secureInputPipe.ReadStreamStats(lastSecureStatsSeq, stats)) {
                             lastSecureStatsSeq = stats.seq;
                             if (ctx.sender) {
                                 ctx.sender->setExternalStreamHint(stats.streamMode, stats.targetFps, ctx.backstageMode, stats.secureDesktopActive != 0);
                             }
-                            SendStreamDiagnostics(ctx.sessionId, "secure", stats, framesForwarded, ctx.activeMode, ctx.backstageMode);
+                            SendStreamDiagnostics(ctx.sessionId, "secure", stats, framesForwarded, ctx.activeMode, ctx.backstageMode, ctx.sender.get());
                         }
                         nextDiagnosticsPoll = now + std::chrono::seconds(1);
                     }
@@ -6910,32 +7011,35 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 LogI("frame pump stop session=" + ctx.sessionId);
             }
 
-            void StopSession(const std::string& sessionId) {
-                LogI("stopping session=" + sessionId);
-
-                // Always clean user-facing helpers first. In the real world the viewer can
-                // disconnect after the WebRTC/session map has already been removed, or the
-                // control server can deliver a duplicate end message. The old code returned
-                // early when the session context was missing, leaving the banner/chat helper
-                // orphaned. UI cleanup must therefore not depend on sessions_ containing the id.
-                StopChatOverlay(sessionId);
-                StopPresenceBanner(sessionId);
-                CleanupOrphanUiHelperProcesses();
-
+            void StopSession(const std::string& sessionId, uint64_t expectedGeneration = 0) {
                 std::unique_ptr<SessionContext> ctx;
-
                 {
                     std::lock_guard<std::mutex> lock(sessionsMu_);
                     auto it = sessions_.find(sessionId);
-                    if (it == sessions_.end()) {
-                        LogW("StopSession: no active stream context for session=" + sessionId + "; UI cleanup already completed, cleaning possible streamer orphan");
-                        CleanupOrphanStreamerProcesses(sessionId);
+                    if (expectedGeneration != 0 &&
+                        (it == sessions_.end() || it->second->generation != expectedGeneration)) {
+                        LogI("ignoring stale peer cleanup session=" + sessionId +
+                            " generation=" + std::to_string(expectedGeneration));
                         return;
                     }
-                    ctx = std::move(it->second);
-                    sessions_.erase(it);
+                    if (it != sessions_.end()) {
+                        ctx = std::move(it->second);
+                        sessions_.erase(it);
+                    }
                 }
 
+                // Explicit stops still clean orphan UI helpers even when a
+                // session was already erased. A stale generation must not.
+                StopChatOverlay(sessionId);
+                StopPresenceBanner(sessionId);
+                CleanupOrphanUiHelperProcesses();
+                if (!ctx) {
+                    CleanupOrphanStreamerProcesses(sessionId);
+                    return;
+                }
+
+                LogI("stopping session=" + sessionId +
+                    " generation=" + std::to_string(ctx->generation));
                 ctx->framePumpStop.store(true);
 
                 if (ctx->normalStopEvent) SetEvent(ctx->normalStopEvent);
@@ -7020,9 +7124,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             AgentPresenceController presenceController_;
             ChatController chatController_;
             std::unique_ptr<SignalingClient> signaling_;
+            std::atomic<bool> reconnectRequested_{ false };
             std::thread inventoryThread_;
 
             std::mutex sessionsMu_;
+            std::atomic<uint64_t> nextSessionGeneration_{ 0 };
             std::unordered_map<std::string, std::unique_ptr<SessionContext>> sessions_;
         };
 

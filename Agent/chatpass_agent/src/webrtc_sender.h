@@ -2,6 +2,7 @@
 
 #include "vp8_encoder.h"
 #include "vp9_mf_encoder.h"
+#include "vp9_vpx_encoder.h"
 #include "h264_mf_encoder.h"
 #include "input_injector.h"
 
@@ -62,6 +63,9 @@ public:
     nlohmann::json buildMonitorInfoMessage() const;
 
     bool isExternalFeedMode() const { return m_mode == Mode::ExternalFeed; }
+    std::string activeVideoCodec() const;
+    std::string activeVideoEncoder() const;
+    std::string activeFidelityMode() const;
 
     void setInputEventHandler(InputEventFn fn);
     void setDirectMouseMoveHandler(DirectMouseMoveFn fn);
@@ -142,6 +146,8 @@ private:
     std::unique_ptr<Vp8Encoder> m_encoder;
     std::unique_ptr<H264MfEncoder> m_h264Encoder;
     std::unique_ptr<Vp9MfEncoder> m_vp9Encoder;
+    std::unique_ptr<Vp9VpxEncoder> m_vp9VpxEncoder;
+    std::chrono::steady_clock::time_point m_vp9LastMotionAt = std::chrono::steady_clock::now();
     bool m_vp9Failed = false;
     VideoCodec m_videoCodec = VideoCodec::VP8;
     bool m_h264Attempted = false;
@@ -179,6 +185,10 @@ private:
 
     std::atomic<int> m_externalHintMode{ 0 };       // 0=idle, 1=active, 2=motion
     std::atomic<int> m_externalHintFps{ 0 };
+    std::atomic<int> m_viewerTargetFps{ 0 };
+    std::atomic<int> m_viewerTargetBitrateKbps{ 0 };
+    std::atomic<bool> m_viewerSharpQuality{ false };
+    std::atomic<bool> m_viewerSupportsVp9Lossless{ false };
     std::atomic<int> m_externalLastNonIdleMode{ 2 };
     std::atomic<bool> m_externalHintBackstage{ false };
     std::atomic<bool> m_externalHintSecure{ false };

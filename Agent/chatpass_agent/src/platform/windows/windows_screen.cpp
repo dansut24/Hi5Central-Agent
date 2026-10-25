@@ -1,4 +1,5 @@
 #include "frame_source.h"
+#include "util/log.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -436,6 +437,7 @@ struct DesktopFrameSource::Impl {
 
     int width = 0;
     int height = 0;
+    bool useGdi = false;
 
     I420Frame lastFrame;
     std::chrono::steady_clock::time_point lastGdiRefresh{};
@@ -444,7 +446,8 @@ struct DesktopFrameSource::Impl {
     Impl() {
         refreshDisplaysLocked();
         if (targets.empty()) {
-            throw std::runtime_error("No displays found for desktop capture");
+            currentIndex = -1;
+            LogWarn("[capture] No DXGI outputs; using virtual desktop capture");
         }
         initForCurrentLocked();
     }
@@ -508,7 +511,7 @@ struct DesktopFrameSource::Impl {
         return nullptr;
     }
 
-    void initForCurrentLocked() {
+    void initDxgiForCurrentLocked() {
         refreshDisplaysLocked();
 
         if (currentIndex == -1) {
@@ -582,6 +585,16 @@ struct DesktopFrameSource::Impl {
 
         if (FAILED(device->CreateTexture2D(&desc, nullptr, &staging))) {
             throw std::runtime_error("CreateTexture2D(staging) failed");
+        }
+    }
+
+    void initForCurrentLocked() {
+        if (useGdi) { resetD3DLocked(); return; }
+        try { initDxgiForCurrentLocked(); }
+        catch (const std::exception& e) {
+            useGdi = true;
+            resetD3DLocked();
+            LogWarn(std::string("[capture] DXGI setup failed; GDI fallback: ") + e.what());
         }
     }
 
@@ -680,6 +693,7 @@ struct DesktopFrameSource::Impl {
 
     FrameCaptureResult captureOneLocked() {
         refreshDisplaysLocked();
+        if (useGdi) return currentIndex == -1 ? captureAllMonitorsGdiLocked() : captureCurrentDisplayGdiLocked();
 
         if (currentIndex == -1) {
             return captureAllMonitorsGdiLocked();

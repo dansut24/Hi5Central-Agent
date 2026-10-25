@@ -351,6 +351,28 @@ void WebRtcSender::stop() {
     m_pc.reset();
 }
 
+std::string WebRtcSender::activeVideoCodec() const {
+    switch (m_videoCodec) {
+    case VideoCodec::VP9: return "VP9";
+    case VideoCodec::H264: return "H264";
+    default: return "VP8";
+    }
+}
+std::string WebRtcSender::activeVideoEncoder() const {
+    if (m_videoCodec == VideoCodec::VP9 && m_vp9VpxEncoder)
+        return "libvpx-vp9-sw";
+    if (m_videoCodec == VideoCodec::VP9 && m_vp9Encoder)
+        return m_vp9Encoder->encoderName();
+    if (m_videoCodec == VideoCodec::H264 && m_h264Encoder)
+        return m_h264Encoder->encoderName();
+    return m_videoCodec == VideoCodec::VP8 ? "libvpx-vp8-sw" : "initializing";
+}
+std::string WebRtcSender::activeFidelityMode() const {
+    if (m_videoCodec == VideoCodec::VP9 && m_vp9VpxEncoder &&
+        m_vp9VpxEncoder->losslessActive()) return "lossless_i420";
+    return m_viewerSharpQuality.load() ? "high_fidelity_lossy" : "lossy";
+}
+
 bool WebRtcSender::switchMonitor(int index) {
     if (m_mode != Mode::DirectCapture) {
         return false;
@@ -425,6 +447,21 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                     // native cursor path responsive, but do not force the expensive
                     // full-motion VP8 profile for every single mouse packet. Clicks,
                     // wheel and keyboard still boost to motion immediately.
+                    if (kind == "viewer_stream_profile") {
+                        // The viewer measures RTT/loss/jitter and adjusts its
+                        // target. Apply encoder settings rather than treating
+                        // this as a keyboard/mouse event.
+                        const int bitrate = msg.value("target_bitrate_kbps", 0);
+                        const int fps = msg.value("target_fps", 0);
+                        if (bitrate >= 500 && bitrate <= 20000)
+                            m_viewerTargetBitrateKbps = bitrate;
+                        if (fps >= 5 && fps <= 60)
+                            m_viewerTargetFps = fps;
+                        const std::string target = msg.value("quality_target", std::string("balanced"));
+                        m_viewerSharpQuality = (target == "sharp");
+                        m_viewerSupportsVp9Lossless = msg.value("lossless_supported", false);
+                        return;
+                    }
                     if (kind == "mouse_move") {
                         m_externalHintMode = std::max(m_externalHintMode.load(), 1);
                     }
@@ -809,8 +846,19 @@ void WebRtcSender::createPeerConnection() {
     m_pc->onStateChange([this](rtc::PeerConnection::State state) {
         std::cout << "[pc] state=" << static_cast<int>(state)
             << " session=" << m_sessionId << "\n";
-        if (state == rtc::PeerConnection::State::Disconnected ||
-            state == rtc::PeerConnection::State::Failed ||
+        if (state == rtc::PeerConnection::State::Connected) {
+            // Resume with a keyframe after an ICE transport interruption.
+            // Do not restart the desktop capture pipeline.
+            m_forceKeyframe = true;
+        }
+        if (state == rtc::PeerConnection::State::Disconnected) {
+            // ICE Disconnected is transient. Retain active sender/desktop
+            // helpers and allow libdatachannel to recover the selected path.
+            // Only terminal Failed/Closed states require service cleanup.
+            LogInfo("[pc] transient disconnect; retaining media session=" + m_sessionId);
+            return;
+        }
+        if (state == rtc::PeerConnection::State::Failed ||
             state == rtc::PeerConnection::State::Closed) {
             m_canSend = false;
             if (m_connectionClosedFn) {
@@ -1524,6 +1572,19 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         std::max(1, m_fps),
         std::max(250, m_bitrateKbps));
 
+    // Link adaptation changes encoder parameters without replacing the RTP
+    // track. Only libvpx VP9 software supports bit-exact I420 lossless here;
+    // H.264/VP9 Media Foundation and VP8 remain lossy.
+    const int requestedFps = m_viewerTargetFps.load();
+    const int requestedBitrate = m_viewerTargetBitrateKbps.load();
+    if (requestedFps > 0) profile.fps = std::min(profile.fps, requestedFps);
+    if (requestedBitrate > 0) profile.bitrateKbps = std::min(profile.bitrateKbps, requestedBitrate);
+    if (m_viewerSharpQuality.load() && requestedBitrate >= 6000) {
+        // Improve fine-text clarity only when the viewer reports a good link.
+        // Still bound by the chosen bitrate and normal congestion safeguards.
+        profile.maxQuantizer = std::min(profile.maxQuantizer, 30);
+    }
+
     const bool sizeChanged = frame.width != m_externalEncoderWidth || frame.height != m_externalEncoderHeight;
     const bool profileChanged = profile.fps != m_externalConfiguredFps ||
         profile.bitrateKbps != m_externalConfiguredBitrateKbps ||
@@ -1603,8 +1664,76 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
     if (m_videoCodec == VideoCodec::VP9 && !m_vp9Failed) {
         bool vp9Scaled = false;
-        const I420Frame vp9Frame = scaleI420ForH264WebRtc(frame, &vp9Scaled);
+        // Preserve source resolution for verified software VP9 I420-lossless.
+        // Enlarged displays still use the existing scaled lossy policy.
+        const bool vp9FullResolution = m_codecMode == "vp9_sw" &&
+            frame.width > 0 && frame.height > 0 &&
+            frame.width <= 1920 && frame.height <= 1080 &&
+            frame.width % 2 == 0 && frame.height % 2 == 0;
+        const I420Frame vp9Frame = vp9FullResolution
+            ? frame : scaleI420ForH264WebRtc(frame, &vp9Scaled);
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
+
+        // Software VP9 uses the bundled libvpx encoder. It can change from
+        // normal lossy to I420-lossless without changing SDP/payload type.
+        // The lossless setting is conservative: VP9 decoder advertised,
+        // sustained excellent link, idle screen, at least 8 Mbps available,
+        // and no more than 1080p to avoid excessive memory/CPU spikes.
+        if (m_codecMode == "vp9_sw") {
+            if (effectiveMode != 0) m_vp9LastMotionAt = nowForProfile;
+            const bool steadyStatic = nowForProfile - m_vp9LastMotionAt >= std::chrono::seconds(5);
+            const bool useLossless = steadyStatic && m_viewerSupportsVp9Lossless.load() &&
+                m_viewerSharpQuality.load() &&
+                requestedBitrate >= 8000 &&
+                effectiveMode == 0 &&
+                vp9FullResolution &&
+                !m_externalHintBackstage.load();
+            const int targetFps = useLossless ? std::min(2, profile.fps) : profile.fps;
+            const int targetBitrate = useLossless
+                ? std::min(12000, requestedBitrate) : profile.bitrateKbps;
+            if (!m_vp9VpxEncoder || sizeChangedVp9) {
+                try {
+                    m_vp9VpxEncoder = std::make_unique<Vp9VpxEncoder>(
+                        vp9Frame.width, vp9Frame.height, targetFps, targetBitrate);
+                    m_externalEncoderWidth = vp9Frame.width;
+                    m_externalEncoderHeight = vp9Frame.height;
+                    m_externalConfiguredFps = targetFps;
+                    m_externalConfiguredBitrateKbps = targetBitrate;
+                    m_forceKeyframe = true;
+                    LogInfo("[vp9] libvpx software sender ready session=" + m_sessionId);
+                } catch (const std::exception& ex) {
+                    LogInfo("[vp9] software init failed session=" + m_sessionId +
+                        " error=" + ex.what());
+                    m_vp9Failed = true;
+                    m_vp9VpxEncoder.reset();
+                    return;
+                }
+            }
+            if (!m_vp9VpxEncoder->reconfigure(targetFps, targetBitrate)) {
+                LogInfo("[vp9] libvpx reconfigure failed session=" + m_sessionId);
+                m_vp9Failed = true;
+                m_vp9VpxEncoder.reset();
+                return;
+            }
+            try {
+                const bool qualityChanged = m_vp9VpxEncoder->losslessActive() != useLossless;
+                Vp9EncodedFrame encoded = m_vp9VpxEncoder->encode(
+                    vp9Frame, keyframe || qualityChanged || sizeChangedVp9, useLossless);
+                if (qualityChanged) {
+                    LogInfo("[vp9] fidelity transition session=" + m_sessionId +
+                        " mode=" + (useLossless ? "lossless-i420" : "lossy"));
+                }
+                if (!encoded.data.empty()) {
+                    sendRtpVp9Frame(encoded);
+                }
+            } catch (const std::exception& ex) {
+                LogInfo("[vp9] libvpx encode failed session=" + m_sessionId +
+                    " error=" + ex.what());
+                m_vp9Failed = true;
+                m_vp9VpxEncoder.reset();
+            }
+            return;
+        }
 
         if (!m_vp9Encoder || sizeChangedVp9) {
             m_externalEncoderWidth = vp9Frame.width;
