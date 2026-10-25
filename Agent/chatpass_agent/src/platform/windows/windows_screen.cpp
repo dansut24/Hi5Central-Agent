@@ -443,10 +443,23 @@ struct DesktopFrameSource::Impl {
 
     Impl() {
         refreshDisplaysLocked();
-        if (targets.empty()) {
-            throw std::runtime_error("No displays found for desktop capture");
+        // On secure desktops, locked screens and some virtual displays, DXGI
+        // enumeration or DuplicateOutput can fail. Keep the streamer alive
+        // and capture the virtual desktop through the existing GDI path.
+        try {
+            initForCurrentLocked();
+        } catch (const std::exception&) {
+            useGdiFallbackLocked();
         }
-        initForCurrentLocked();
+    }
+
+    void useGdiFallbackLocked() {
+        resetD3DLocked();
+        currentIndex = -1;
+        currentName.clear();
+        const auto desktop = buildAllMonitorsInfo();
+        width = desktop.width;
+        height = desktop.height;
     }
 
     void resetD3DLocked() {
@@ -604,7 +617,11 @@ struct DesktopFrameSource::Impl {
 
         currentIndex = it->info.index;
         currentName = it->info.name;
-        initForCurrentLocked();
+        try {
+            initForCurrentLocked();
+        } catch (const std::exception&) {
+            useGdiFallbackLocked();
+        }
         return true;
     }
 
@@ -686,7 +703,12 @@ struct DesktopFrameSource::Impl {
         }
 
         if (!duplication || !findCurrentTargetLocked()) {
-            initForCurrentLocked();
+            try {
+                initForCurrentLocked();
+            } catch (const std::exception&) {
+                useGdiFallbackLocked();
+                return captureAllMonitorsGdiLocked();
+            }
         }
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo{};
@@ -769,6 +791,17 @@ struct DesktopFrameSource::Impl {
 
 DesktopFrameSource::DesktopFrameSource() : m_impl(new Impl()) {}
 DesktopFrameSource::~DesktopFrameSource() { delete m_impl; }
+DesktopFrameSource::DesktopFrameSource(DesktopFrameSource&& other) noexcept : m_impl(other.m_impl) {
+    other.m_impl = nullptr;
+}
+DesktopFrameSource& DesktopFrameSource::operator=(DesktopFrameSource&& other) noexcept {
+    if (this != &other) {
+        delete m_impl;
+        m_impl = other.m_impl;
+        other.m_impl = nullptr;
+    }
+    return *this;
+}
 
 I420Frame DesktopFrameSource::nextFrame() {
     FrameCaptureResult r = nextFrameEx();
