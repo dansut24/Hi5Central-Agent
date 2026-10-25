@@ -784,6 +784,9 @@ namespace hi5 {
 
         DesktopFrameSource source;
         source.setDisplayIndex(args.display);
+        LogInfo("[streamer] capture source ready session=" + args.sessionId +
+            " selected_display=" + std::to_string(source.currentDisplayIndex()) +
+            " gdi_fallback=" + std::string(source.currentDisplayIndex() == -1 ? "1" : "0"));
         if (inputPipeOk) {
             PublishMonitorInfo(inputPipe, source);
         }
