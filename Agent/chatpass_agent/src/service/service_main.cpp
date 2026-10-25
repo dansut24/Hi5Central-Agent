@@ -6183,7 +6183,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         }
                         sent = true;
                     }
-                    else if (gotNormal) {
+                    // A normal frame can still arrive while Windows UAC has requested the secure desktop.
+                    // Do not tear down the secure streamer before its first frame, or the 25 ms
+                    // poll launches and stops a new helper repeatedly (capture/reconnect churn).
+                    else if (gotNormal && !ctx.uacRequested) {
                         const bool wasSecure = ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess != nullptr;
                         if (wasSecure) {
                             if (ctx.handoffStateAnnounced) {
