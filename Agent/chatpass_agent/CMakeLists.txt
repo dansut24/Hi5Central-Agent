@@ -123,6 +123,7 @@ if(WIN32)
     src/platform/windows/windows_service.cpp
     src/platform/windows/windows_input.cpp
     src/platform/windows/windows_screen.cpp
+    src/platform/windows/windows_wgc_capture.cpp
     src/platform/windows/windows_inventory.cpp
     src/platform/windows/windows_identity.cpp
     src/platform/windows/windows_codec.cpp	
@@ -227,6 +228,7 @@ target_link_libraries(native_vp8_stream PRIVATE
   ${VPX_LIBRARIES}
   d3d11
   dxgi
+  windowsapp
   windowscodecs
   mf
   mfplat
