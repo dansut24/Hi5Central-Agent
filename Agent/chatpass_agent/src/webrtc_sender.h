@@ -143,6 +143,8 @@ private:
     std::unique_ptr<H264MfEncoder> m_h264Encoder;
     std::unique_ptr<Vp9MfEncoder> m_vp9Encoder;
     bool m_vp9Failed = false;
+    bool m_vp9NativeFailed = false; // Only downgrade native resolution, never discard the stream.
+    int m_vp9SlowNativeFrames = 0;
     VideoCodec m_videoCodec = VideoCodec::VP8;
     bool m_h264Attempted = false;
     bool m_h264Failed = false;
@@ -182,6 +184,13 @@ private:
     std::atomic<int> m_externalLastNonIdleMode{ 2 };
     std::atomic<bool> m_externalHintBackstage{ false };
     std::atomic<bool> m_externalHintSecure{ false };
+
+    // WebRTC viewer_stream_profile: -1=not supplied, 0=native, >0=bounded.
+    // Atomic: SCTP data-channel callbacks run independently of capture/encoding.
+    std::atomic<int> m_viewerMaxWidth{ -1 };
+    std::atomic<int> m_viewerMaxHeight{ -1 };
+    std::atomic<int> m_viewerTargetFps{ 0 };
+    std::atomic<int> m_viewerTargetBitrateKbps{ 0 };
 
     int m_externalConfiguredFps = 0;
     int m_externalConfiguredBitrateKbps = 0;

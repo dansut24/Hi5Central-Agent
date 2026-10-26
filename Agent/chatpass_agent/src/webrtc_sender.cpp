@@ -423,6 +423,31 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                 const auto msg = json::parse(*s, nullptr, false);
                 if (!msg.is_discarded()) {
                     const std::string kind = msg.value("kind", msg.value("type", ""));
+                    // Apply viewer resolution over WebRTC control; it was
+                    // previously mistaken for a keyboard/mouse input event.
+                    if (kind == "viewer_stream_profile" && msg.is_object()) {
+                        const std::string pref = msg.value("preference", std::string("auto"));
+                        int w = -1, h = -1; // no preference
+                        if (pref == "native") { w = 0; h = 0; }
+                        else if (pref == "1080p") { w = 1920; h = 1080; }
+                        else if (pref == "720p") { w = 1280; h = 720; }
+                        const int fps = std::clamp(msg.value("target_fps", 0), 0, 60);
+                        const int kbps = std::clamp(msg.value("target_bitrate_kbps", 0), 0, 20000);
+                        const int prevW = m_viewerMaxWidth.exchange(w);
+                        const int prevH = m_viewerMaxHeight.exchange(h);
+                        m_viewerTargetFps = fps;
+                        m_viewerTargetBitrateKbps = kbps;
+                        if (prevW != w || prevH != h) {
+                            m_forceKeyframe = true;
+                            LogInfo("[quality] viewer=" + pref +
+                                " cap=" + std::to_string(w) + "x" + std::to_string(h) +
+                                " target=" + std::to_string(fps) + "fps/" + std::to_string(kbps) +
+                                "kbps session=" + m_sessionId);
+                        }
+                        return;
+                    }
+                    // Do not mark the desktop active for periodic diagnostics.
+                    if (kind == "viewer_diagnostics") return;
 
                     // Mouse movement is high frequency and best-effort. Keep the
                     // native cursor path responsive, but do not force the expensive
@@ -1549,6 +1574,14 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             readEnvInt("HI5_VP9_DESKTOP_KBPS", 6000, 500, 20000)));
     }
 
+    if (m_videoCodec == VideoCodec::VP9 && !m_externalHintBackstage.load()) {
+        // Honour the viewer's lower adaptive limits, not exceeding Agent caps.
+        const int reqFps = m_viewerTargetFps.load();
+        const int reqKbps = m_viewerTargetBitrateKbps.load();
+        if (reqFps > 0) profile.fps = std::min(profile.fps, reqFps);
+        if (reqKbps > 0) profile.bitrateKbps = std::min(profile.bitrateKbps, reqKbps);
+    }
+
     const bool sizeChanged = frame.width != m_externalEncoderWidth || frame.height != m_externalEncoderHeight;
     const bool profileChanged = profile.fps != m_externalConfiguredFps ||
         profile.bitrateKbps != m_externalConfiguredBitrateKbps ||
@@ -1628,14 +1661,35 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
     if (m_videoCodec == VideoCodec::VP9 && !m_vp9Failed) {
         bool vp9Scaled = false;
-        // Hardening-v2 allowed VP9 up to 1920x1080; a 2560x1600 desktop
-        // becomes 1728x1080 instead of the H.264-limited 1152x720.
-        const int vp9MaxW = readEnvInt("HI5_VP9_MAX_WIDTH", 1920, 0, 7680);
-        const int vp9MaxH = readEnvInt("HI5_VP9_MAX_HEIGHT", 1080, 0, 4320);
-        const I420Frame vp9Frame = scaleI420ToWebRtcBounds(frame, vp9MaxW, vp9MaxH, &vp9Scaled);
+        // Default remains 1080p. An explicit Native request preserves the
+        // real desktop pixels up to a bounded 2560x1600. Native falls back
+        // to 1080p on encoder failure or sustained overload.
+        const int reqW = m_viewerMaxWidth.load(), reqH = m_viewerMaxHeight.load();
+        const bool nativeRequested = reqW == 0 && reqH == 0 && !m_vp9NativeFailed;
+        int vp9MaxW = readEnvInt("HI5_VP9_MAX_WIDTH", 1920, 0, 7680);
+        int vp9MaxH = readEnvInt("HI5_VP9_MAX_HEIGHT", 1080, 0, 4320);
+        if (nativeRequested) {
+            vp9MaxW = readEnvInt("HI5_VP9_NATIVE_MAX_WIDTH", 2560, 2, 7680);
+            vp9MaxH = readEnvInt("HI5_VP9_NATIVE_MAX_HEIGHT", 1600, 2, 4320);
+        } else if (reqW > 0 && reqH > 0) {
+            vp9MaxW = std::min(vp9MaxW, reqW);
+            vp9MaxH = std::min(vp9MaxH, reqH);
+        }
+        // Native resolution can reuse the already-captured I420 planes as-is.
+        // Avoid a redundant multi-megabyte copy on every 2560x1600 frame.
+        I420Frame vp9Resized;
+        const I420Frame* vp9Input = &frame;
+        if (vp9MaxW > 0 && vp9MaxH > 0 &&
+            (frame.width > vp9MaxW || frame.height > vp9MaxH)) {
+            vp9Resized = scaleI420ToWebRtcBounds(frame, vp9MaxW, vp9MaxH, &vp9Scaled);
+            vp9Input = &vp9Resized;
+        }
+        const I420Frame& vp9Frame = *vp9Input;
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
+        const bool rateChangedVp9 = profile.fps != m_externalConfiguredFps ||
+            profile.bitrateKbps != m_externalConfiguredBitrateKbps;
 
-        if (!m_vp9Encoder || sizeChangedVp9) {
+        if (!m_vp9Encoder || sizeChangedVp9 || rateChangedVp9) {
             m_externalEncoderWidth = vp9Frame.width;
             m_externalEncoderHeight = vp9Frame.height;
             m_externalConfiguredFps = profile.fps;
@@ -1649,6 +1703,13 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             if (!enc->init(vp9Frame.width, vp9Frame.height, profile.fps, profile.bitrateKbps, preferHardware, &vp9Err)) {
                 LogInfo("[vp9] init failed session=" + m_sessionId +
                     " error=" + vp9Err);
+                if (nativeRequested) {
+                    m_vp9NativeFailed = true;
+                    m_vp9Encoder.reset();
+                    m_forceKeyframe = true;
+                    LogWarn("[quality] native VP9 init failed, reverting to 1080p session=" + m_sessionId);
+                    return;
+                }
                 m_vp9Failed = true;
                 m_vp9Encoder.reset();
             }
@@ -1662,7 +1723,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     " scaled=" + std::string(vp9Scaled ? "1" : "0") +
                     " fps=" + std::to_string(profile.fps) +
                     " bitrate=" + std::to_string(profile.bitrateKbps) +
-                    " hw_preferred=" + std::string(preferHardware ? "1" : "0")
+                    " hw_preferred=" + std::string(preferHardware ? "1" : "0") +
+                    " native_requested=" + std::string(nativeRequested ? "1" : "0")
                 );
             }
 
@@ -1713,6 +1775,13 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                             " error=" + swErr);
                     }
 
+                    if (nativeRequested) {
+                        m_vp9NativeFailed = true;
+                        m_vp9Encoder.reset();
+                        m_forceKeyframe = true;
+                        LogWarn("[quality] native VP9 encode failed, reverting to 1080p session=" + m_sessionId);
+                        return;
+                    }
                     m_vp9Failed = true;
                     m_vp9Encoder.reset();
                     return;
@@ -1721,6 +1790,19 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 const auto encodeEnd = std::chrono::steady_clock::now();
 
                 const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
+                if (nativeRequested) {
+                    m_vp9SlowNativeFrames = encodeMs > 180.0
+                        ? m_vp9SlowNativeFrames + 1
+                        : std::max(0, m_vp9SlowNativeFrames - 2);
+                    if (m_vp9SlowNativeFrames >= 12) {
+                        m_vp9NativeFailed = true;
+                        m_vp9Encoder.reset();
+                        m_forceKeyframe = true;
+                        LogWarn("[quality] native VP9 too slow, falling back to 1080p encode_ms=" +
+                            std::to_string(encodeMs) + " session=" + m_sessionId);
+                        return;
+                    }
+                }
                 m_externalEncodeMsTotal += encodeMs;
                 m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
                 ++m_externalEncodedFrames;
