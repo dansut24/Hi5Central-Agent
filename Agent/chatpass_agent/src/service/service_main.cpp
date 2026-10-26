@@ -1942,6 +1942,19 @@ class Worker {
                         auto it = sessions_.find(sessionId);
                         if (it != sessions_.end() && it->second->sender) {
                             it->second->sender->handleSignalingMessage(text);
+                        } else {
+                            // The local offer may be sent during WebRtcSender::start()
+                            // before StartStreamerSession registers its context.
+                            // Preserve early answers and trickled ICE rather than
+                            // dropping them and leaving the peer unable to connect.
+                            auto& pending = pendingSessionSignals_[sessionId];
+                            if (pending.size() < 96) {
+                                pending.push_back(text);
+                                LogI("queued early WebRTC signal type=" + type +
+                                    " session=" + sessionId);
+                            } else {
+                                LogW("early WebRTC signal queue full session=" + sessionId);
+                            }
                         }
                         FlushBridgeOutgoing();
                         return;
@@ -5958,6 +5971,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 {
                     std::lock_guard<std::mutex> lock(sessionsMu_);
                     sessions_[sessionId] = std::move(ctx);
+                    const auto pending = pendingSessionSignals_.find(sessionId);
+                    if (pending != pendingSessionSignals_.end()) {
+                        LogI("flushing early WebRTC signals count=" +
+                            std::to_string(pending->second.size()) + " session=" + sessionId);
+                        for (const auto& signal : pending->second) {
+                            sessions_[sessionId]->sender->handleSignalingMessage(signal);
+                        }
+                        pendingSessionSignals_.erase(pending);
+                    }
                 }
 
                 LogI("session fully registered session=" + sessionId);
@@ -6281,6 +6303,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 {
                     std::lock_guard<std::mutex> lock(sessionsMu_);
+                    pendingSessionSignals_.erase(sessionId);
                     auto it = sessions_.find(sessionId);
                     if (it == sessions_.end()) {
                         LogW("StopSession: no active stream context for session=" + sessionId + "; UI cleanup already completed, cleaning possible streamer orphan");
@@ -6380,6 +6403,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
             std::mutex sessionsMu_;
             std::unordered_map<std::string, std::unique_ptr<SessionContext>> sessions_;
+            // Protected by sessionsMu_; bounded per-session early ICE/answer inbox.
+            std::unordered_map<std::string, std::vector<std::string>> pendingSessionSignals_;
         };
 
         static std::unique_ptr<Worker> g_worker;
