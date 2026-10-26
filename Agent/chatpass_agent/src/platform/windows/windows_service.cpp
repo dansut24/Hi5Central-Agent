@@ -2249,6 +2249,11 @@ namespace hi5 {
             HANDLE secureStopEvent = nullptr;
 
             HANDLE normalStreamerProcess = nullptr;
+            // Single-session, opt-in DXGI access test. A failed interactive
+            // helper reverts to the unchanged elevated normal helper.
+            bool normalInteractiveTrial = false;
+            bool normalInteractiveFallbackUsed = false;
+            std::chrono::steady_clock::time_point normalInteractiveStarted{};
             HANDLE secureStreamerProcess = nullptr;
             HANDLE backstageHostProcess = nullptr;
             bool backstageMode = false;
@@ -6262,6 +6267,19 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " requested=" + std::to_string(requested));
             }
 
+            // This is only enabled on explicitly opted-in test machines via
+            // HKLM\SOFTWARE\Hi5Central\Agent\InteractiveCaptureTrial=1.
+            // Reading at launch makes the switch reversible without an Agent
+            // upgrade, and keeps default production behaviour unchanged.
+            static bool InteractiveCaptureTrialEnabled() {
+                DWORD enabled = 0;
+                DWORD bytes = sizeof(enabled);
+                const LSTATUS status = RegGetValueA(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Hi5Central\\Agent", "InteractiveCaptureTrial",
+                    RRF_RT_REG_DWORD, nullptr, &enabled, &bytes);
+                return status == ERROR_SUCCESS && enabled == 1;
+            }
+
             bool LaunchNormalStreamer(SessionContext& ctx) {
                 const DWORD consoleSession = ActiveConsoleSessionId();
                 if (consoleSession == 0xFFFFFFFF) {
@@ -6289,13 +6307,34 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 LogI("launch normal streamer [NORMAL_SHMEM_EXPECTED_NO_UAC] session=" + ctx.sessionId + " cmd=" + cmdLine);
 
-                ctx.normalStreamerProcess = LaunchInElevatedDefaultSession(std::string(exePath), cmdLine);
+                ctx.normalInteractiveTrial = false;
+                const bool tryInteractive = InteractiveCaptureTrialEnabled() &&
+                    !ctx.normalInteractiveFallbackUsed && !ctx.backstageMode;
+                if (tryInteractive) {
+                    LogI("[capture-test] launching normal streamer as interactive user session=" +
+                        ctx.sessionId + " console=" + SessionIdToString(consoleSession));
+                    ctx.normalStreamerProcess = LaunchInInteractiveSession(
+                        std::string(exePath), cmdLine);
+                    if (ctx.normalStreamerProcess) {
+                        ctx.normalInteractiveTrial = true;
+                        ctx.normalInteractiveStarted = std::chrono::steady_clock::now();
+                    } else {
+                        ctx.normalInteractiveFallbackUsed = true;
+                        LogW("[capture-test] interactive launch failed; falling back to elevated normal helper session=" +
+                            ctx.sessionId);
+                    }
+                }
+                if (!ctx.normalStreamerProcess) {
+                    ctx.normalStreamerProcess = LaunchInElevatedDefaultSession(
+                        std::string(exePath), cmdLine);
+                }
                 if (!ctx.normalStreamerProcess) {
                     LogE("launch normal streamer FAILED session=" + ctx.sessionId);
                     return false;
                 }
 
                 LogI("launch normal streamer ok session=" + ctx.sessionId +
+                    " token=" + std::string(ctx.normalInteractiveTrial ? "interactive" : "system-elevated") +
                     " pid=" + std::to_string(GetProcessId(ctx.normalStreamerProcess)) +
                     " console=" + SessionIdToString(ctx.activeConsoleSessionId));
 
@@ -6754,6 +6793,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             GetExitCodeProcess(ctx.normalStreamerProcess, &exitCode);
                             LogW("normal streamer exited session=" + ctx.sessionId +
                                 " exitCode=" + std::to_string(exitCode));
+                            if (ctx.normalInteractiveTrial) {
+                                ctx.normalInteractiveTrial = false;
+                                ctx.normalInteractiveFallbackUsed = true;
+                                LogW("[capture-test] user-token helper exited; reverting to elevated next launch session=" +
+                                    ctx.sessionId);
+                            }
                             CloseHandle(ctx.normalStreamerProcess);
                             ctx.normalStreamerProcess = nullptr;
                             ctx.lastNormalFrameAt = {};
@@ -6889,6 +6934,21 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
                     if (gotNormal) {
                         ctx.lastNormalFrameAt = now;
+                    }
+                    // A working user-token process must first prove it can
+                    // read/write the existing shared-memory IPC. Prevent a
+                    // black remote viewer if session permissions block it.
+                    if (ctx.normalInteractiveTrial &&
+                        ctx.normalStreamerProcess &&
+                        ctx.lastNormalFrameAt.time_since_epoch().count() == 0 &&
+                        now - ctx.normalInteractiveStarted >= std::chrono::seconds(6)) {
+                        LogW("[capture-test] user-token helper produced no frames in 6s; reverting elevated helper session=" +
+                            ctx.sessionId);
+                        ctx.normalInteractiveFallbackUsed = true;
+                        ctx.normalInteractiveTrial = false;
+                        StopNormalStreamer(ctx);
+                        ctx.lastNormalLaunchAttempt = now;
+                        LaunchNormalStreamer(ctx);
                     }
 
                     if (ctx.secureStreamerProcess) {
