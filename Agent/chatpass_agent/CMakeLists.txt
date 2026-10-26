@@ -128,6 +128,15 @@ if(WIN32)
     src/platform/windows/windows_identity.cpp
     src/platform/windows/windows_codec.cpp	
   )
+  # C++/WinRT's generated capture headers require standard coroutines on
+  # VS 2026. Compile ONLY the new WGC implementation as C++20: do not
+  # alter coroutine ABI or language mode of the established Agent modules.
+  if(MSVC)
+    set_source_files_properties(
+      src/platform/windows/windows_wgc_capture.cpp
+      PROPERTIES COMPILE_OPTIONS "/std:c++20"
+    )
+  endif()
 elseif(APPLE)
   list(APPEND HI5_PLATFORM_SOURCES
     src/platform/macos/macos_platform.cpp
