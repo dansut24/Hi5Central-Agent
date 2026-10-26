@@ -2392,7 +2392,17 @@ LogI(
                         const SessionMode sessionMode = ParseSessionMode(msg.value("mode", std::string("console")));
                         LogI("start_webrtc session=" + sessionId + " mode=" + SessionModeName(sessionMode));
                         sessionBridge_.SetActiveSession(sessionId);
-                        if (sessionMode == SessionMode::Console) {
+                        auto iceServers = parseIceServers(msg);
+                        // StartStreamerSession() calls StopSession(sessionId) as its first
+                        // step. Start the consent/connected banner AFTER that cleanup:
+                        // otherwise it is immediately closed, leaving no visible notice.
+                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode);
+                        bool sessionStarted = false;
+                        {
+                            std::lock_guard<std::mutex> lock(sessionsMu_);
+                            sessionStarted = sessions_.find(sessionId) != sessions_.end();
+                        }
+                        if (sessionMode == SessionMode::Console && sessionStarted) {
                             const std::string technicianName = msg.value("technician_name", msg.value("technician", std::string("Technician")));
                             presenceController_.ShowConnected(technicianName, true);
                             StartPresenceBanner(sessionId, technicianName);
@@ -2401,8 +2411,6 @@ LogI(
                             presenceController_.Hide();
                             StopPresenceBanner(sessionId);
                         }
-                        auto iceServers = parseIceServers(msg);
-                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode);
                         // Keep the portal responsive without running expensive WMI/PowerShell
                         // collectors during live remote control. The WebSocket/session state
                         // is already live; full inventory can still be requested manually.
@@ -6616,6 +6624,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 auto nextMonitorPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                 auto nextSecurePoll = std::chrono::steady_clock::now() + std::chrono::milliseconds(25);
+                // Require a stable return to the normal desktop before releasing
+                // the secure capture process. CAD/UAC can flicker UACActive every
+                // frame, while the normal GDI streamer still produces stale frames.
+                std::chrono::steady_clock::time_point secureExitCandidateAt{};
                 uint64_t framesForwarded = 0;
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
@@ -6736,6 +6748,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         }
                         else {
                             ctx.uacRequested = ctx.normalInputPipe.GetUACActive();
+                            if (ctx.uacRequested) {
+                                secureExitCandidateAt = {};
+                            }
+                            else if ((ctx.secureStateAnnounced || ctx.secureStreamerProcess ||
+                                      ctx.activeMode == DesktopMode::Secure) &&
+                                     secureExitCandidateAt.time_since_epoch().count() == 0) {
+                                secureExitCandidateAt = now;
+                            }
 
                             if (ctx.uacRequested) {
                                 if (!ctx.secureStateAnnounced) {
@@ -6757,7 +6777,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 }
                             }
 
-                            if (!ctx.uacRequested && normalFresh) {
+                            const bool stableNormalDesktop = !ctx.uacRequested && normalFresh &&
+                                secureExitCandidateAt.time_since_epoch().count() != 0 &&
+                                now - secureExitCandidateAt >= std::chrono::milliseconds(1500);
+                            if (stableNormalDesktop) {
                                 if (ctx.handoffStateAnnounced) {
                                     SendSessionState(ctx.sessionId, "desktop_handoff_ready");
                                     ctx.handoffStateAnnounced = false;
@@ -6815,7 +6838,13 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     bool sent = false;
-                    const bool useSecure = ctx.uacRequested || (!gotNormal && ctx.secureStreamerProcess);
+                    // Keep forwarding secure frames while the secure desktop is active or
+                    // its exit is being debounced. A normal GDI frame is not proof
+                    // that CAD/UAC has ended: it may still be a stale desktop frame.
+                    const bool secureCaptureActive = ctx.secureReady &&
+                        (ctx.secureStateAnnounced || ctx.activeMode == DesktopMode::Secure ||
+                         ctx.secureStreamerProcess != nullptr);
+                    const bool useSecure = ctx.uacRequested || secureCaptureActive;
 
                     if (useSecure && gotSecure) {
                         ++framesForwarded;
@@ -6831,7 +6860,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         }
                         sent = true;
                     }
-                    else if (gotNormal) {
+                    else if (gotNormal &&
+                             (!(ctx.uacRequested || ctx.secureStateAnnounced ||
+                                ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess) ||
+                              (!ctx.uacRequested &&
+                               secureExitCandidateAt.time_since_epoch().count() != 0 &&
+                               now - secureExitCandidateAt >= std::chrono::milliseconds(1500)))) {
+                        // Do not stop secure capture just because a normal frame
+                        // arrived: normal GDI frames continue during UAC/CAD and
+                        // previously caused ~80 desktop-mode flips in 3 minutes.
                         const bool wasSecure = ctx.activeMode == DesktopMode::Secure || ctx.secureStreamerProcess != nullptr;
                         if (wasSecure) {
                             if (ctx.handoffStateAnnounced) {
