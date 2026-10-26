@@ -88,17 +88,13 @@ namespace {
         }
     }
 
-    static I420Frame scaleI420ForH264WebRtc(const I420Frame& src, bool* scaledOut = nullptr) {
+    static I420Frame scaleI420ToWebRtcBounds(const I420Frame& src, int maxW, int maxH,
+        bool* scaledOut = nullptr) {
         if (scaledOut) *scaledOut = false;
         if (src.width <= 0 || src.height <= 0) return src;
 
-        // Browsers frequently answer H.264 Baseline/Constrained-Baseline level 3.1
-        // (profile-level-id=42e01f). Level 3.1 is safe at 1280x720, but not at
-        // desktop sizes such as 2560x1600. If we send oversized frames after an
-        // answer at 42e01f, Chromium/WebView can connect and keep the data channel
-        // alive but render a black video surface. Cap H.264 to 720p by default.
-        const int maxW = readEnvInt("HI5_H264_MAX_WIDTH", 1280, 0, 7680);
-        const int maxH = readEnvInt("HI5_H264_MAX_HEIGHT", 720, 0, 4320);
+        // Preserve aspect ratio with a per-codec ceiling; the 720p H.264
+        // level-3.1 restriction must not be applied to VP9.
         if (maxW <= 0 || maxH <= 0) return src;
         if (src.width <= maxW && src.height <= maxH) return src;
 
@@ -125,6 +121,13 @@ namespace {
 
         if (scaledOut) *scaledOut = true;
         return dst;
+    }
+
+    static I420Frame scaleI420ForH264WebRtc(const I420Frame& src, bool* scaledOut = nullptr) {
+        // Browser H.264 Constrained Baseline level 3.1 requires 720p.
+        return scaleI420ToWebRtcBounds(src,
+            readEnvInt("HI5_H264_MAX_WIDTH", 1280, 0, 7680),
+            readEnvInt("HI5_H264_MAX_HEIGHT", 720, 0, 4320), scaledOut);
     }
 
     struct Vp8RuntimeProfile {
@@ -1533,6 +1536,19 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         std::max(1, m_fps),
         std::max(250, m_bitrateKbps));
 
+    // The present Media Foundation VP9 encoder starts only once and does not
+    // retune its parameters across subsequent idle/active/motion profiles.
+    // The first wake frame previously froze a remote session at 8 FPS/2 Mbps.
+    // Provide a stable, higher initial VP9 ceiling; existing dirty-frame/idle
+    // capture controls still limit actual CPU and network use.
+    if (m_videoCodec == VideoCodec::VP9 && !m_externalHintBackstage.load()) {
+        profile.name = "vp9-desktop-clarity";
+        profile.fps = std::max(1, std::min(m_fps,
+            readEnvInt("HI5_VP9_DESKTOP_FPS", 20, 1, 60)));
+        profile.bitrateKbps = std::max(250, std::min(m_bitrateKbps,
+            readEnvInt("HI5_VP9_DESKTOP_KBPS", 6000, 500, 20000)));
+    }
+
     const bool sizeChanged = frame.width != m_externalEncoderWidth || frame.height != m_externalEncoderHeight;
     const bool profileChanged = profile.fps != m_externalConfiguredFps ||
         profile.bitrateKbps != m_externalConfiguredBitrateKbps ||
@@ -1612,7 +1628,11 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
     if (m_videoCodec == VideoCodec::VP9 && !m_vp9Failed) {
         bool vp9Scaled = false;
-        const I420Frame vp9Frame = scaleI420ForH264WebRtc(frame, &vp9Scaled);
+        // Hardening-v2 allowed VP9 up to 1920x1080; a 2560x1600 desktop
+        // becomes 1728x1080 instead of the H.264-limited 1152x720.
+        const int vp9MaxW = readEnvInt("HI5_VP9_MAX_WIDTH", 1920, 0, 7680);
+        const int vp9MaxH = readEnvInt("HI5_VP9_MAX_HEIGHT", 1080, 0, 4320);
+        const I420Frame vp9Frame = scaleI420ToWebRtcBounds(frame, vp9MaxW, vp9MaxH, &vp9Scaled);
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
 
         if (!m_vp9Encoder || sizeChangedVp9) {
