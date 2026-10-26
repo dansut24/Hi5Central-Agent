@@ -827,14 +827,19 @@ void WebRtcSender::createPeerConnection() {
         std::cout << "[pc] gathering=" << static_cast<int>(state)
             << " session=" << m_sessionId << "\n";
 
-        if (state == rtc::PeerConnection::GatheringState::InProgress ||
-            state == rtc::PeerConnection::GatheringState::Complete) {
+        // Media m-lines can still have port 0 while ICE gathering is in
+        // progress. Sending that premature offer rejects desktop video in
+        // browsers, even when TURN/STUN candidates later become available.
+        if (state == rtc::PeerConnection::GatheringState::Complete) {
             signalLocalOfferIfReady();
         }
         });
 
+    // Do not signal from onLocalDescription: it fires before ICE gathering
+    // completes and can expose an unusable m=video 0 offer. The Complete
+    // callback above emits one fully gathered offer instead.
     m_pc->onLocalDescription([this](rtc::Description) {
-        signalLocalOfferIfReady();
+        LogInfo("[pc] local SDP prepared; waiting for ICE gathering completion session=" + m_sessionId);
         });
 
     m_pc->onLocalCandidate([this](rtc::Candidate cand) {
