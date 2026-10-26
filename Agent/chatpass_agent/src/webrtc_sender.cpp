@@ -790,7 +790,7 @@ void WebRtcSender::createPeerConnection() {
     createInputDataChannel();
 
     m_track->onOpen([this]() {
-        std::cout << "[track] open session=" << m_sessionId << "\n";
+        LogInfo("[track] open session=" + m_sessionId);
         m_canSend = true;
 
         if (m_mode == Mode::DirectCapture) {
@@ -799,7 +799,7 @@ void WebRtcSender::createPeerConnection() {
         });
 
     m_track->onClosed([this]() {
-        std::cout << "[track] closed session=" << m_sessionId << "\n";
+        LogWarn("[track] closed session=" + m_sessionId);
         m_canSend = false;
         if (m_connectionClosedFn) {
             m_connectionClosedFn("track_closed");
@@ -807,10 +807,14 @@ void WebRtcSender::createPeerConnection() {
         });
 
     m_pc->onStateChange([this](rtc::PeerConnection::State state) {
-        std::cout << "[pc] state=" << static_cast<int>(state)
-            << " session=" << m_sessionId << "\n";
-        if (state == rtc::PeerConnection::State::Disconnected ||
-            state == rtc::PeerConnection::State::Failed ||
+        LogInfo("[pc] state=" + std::to_string(static_cast<int>(state)) +
+            " session=" + m_sessionId);
+        // Disconnected is transient in WebRTC. Leave the sender alive so ICE
+        // can recover; terminal Failed/Closed states still trigger cleanup.
+        if (state == rtc::PeerConnection::State::Disconnected) {
+            LogWarn("[pc] ICE temporarily disconnected, awaiting recovery session=" + m_sessionId);
+        }
+        if (state == rtc::PeerConnection::State::Failed ||
             state == rtc::PeerConnection::State::Closed) {
             m_canSend = false;
             if (m_connectionClosedFn) {
@@ -909,17 +913,17 @@ void WebRtcSender::handleSignalingMessage(const std::string& jsonText) {
         }
 
         try {
-            std::cout << "[signal] got answer session=" << m_sessionId
-                << " sdp_len=" << sdp.size()
-                << " type=" << sdpType << "\n";
+            LogInfo("[signal] got answer session=" + m_sessionId +
+                " sdp_len=" + std::to_string(sdp.size()) +
+                " type=" + sdpType);
 
             m_pc->setRemoteDescription(rtc::Description(sdp, sdpType));
 
-            std::cout << "[signal] set remote description ok session=" << m_sessionId << "\n";
+            LogInfo("[signal] set remote description ok session=" + m_sessionId);
         }
         catch (const std::exception& ex) {
-            std::cerr << "[signal] set remote description failed session=" << m_sessionId
-                << " error=" << ex.what() << "\n";
+            LogError("[signal] set remote description failed session=" + m_sessionId +
+                " error=" + ex.what());
         }
 
         return;
@@ -958,12 +962,12 @@ void WebRtcSender::handleSignalingMessage(const std::string& jsonText) {
 
             m_pc->addRemoteCandidate(rtc::Candidate(cand, mid));
 
-            std::cout << "[signal] add remote candidate ok session=" << m_sessionId << "\n";
+            LogInfo("[signal] add remote candidate ok session=" + m_sessionId +
+                " mid=" + mid);
         }
         catch (const std::exception& ex) {
-            std::cerr << "[signal] add remote candidate failed session=" << m_sessionId
-                << " error=" << ex.what()
-                << " candidate=" << cand.substr(0, 200) << "\n";
+            LogWarn("[signal] add remote candidate failed session=" + m_sessionId +
+                " mid=" + mid + " error=" + ex.what());
         }
 
         return;
