@@ -6838,7 +6838,13 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     bool sent = false;
-                    const bool useSecure = ctx.uacRequested || (!gotNormal && ctx.secureStreamerProcess);
+                    // Keep forwarding secure frames while the secure desktop is active or
+                    // its exit is being debounced. A normal GDI frame is not proof
+                    // that CAD/UAC has ended: it may still be a stale desktop frame.
+                    const bool secureCaptureActive = ctx.secureReady &&
+                        (ctx.secureStateAnnounced || ctx.activeMode == DesktopMode::Secure ||
+                         ctx.secureStreamerProcess != nullptr);
+                    const bool useSecure = ctx.uacRequested || secureCaptureActive;
 
                     if (useSecure && gotSecure) {
                         ++framesForwarded;
