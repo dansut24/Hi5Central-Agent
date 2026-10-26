@@ -1675,7 +1675,16 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             vp9MaxW = std::min(vp9MaxW, reqW);
             vp9MaxH = std::min(vp9MaxH, reqH);
         }
-        const I420Frame vp9Frame = scaleI420ToWebRtcBounds(frame, vp9MaxW, vp9MaxH, &vp9Scaled);
+        // Native resolution can reuse the already-captured I420 planes as-is.
+        // Avoid a redundant multi-megabyte copy on every 2560x1600 frame.
+        I420Frame vp9Resized;
+        const I420Frame* vp9Input = &frame;
+        if (vp9MaxW > 0 && vp9MaxH > 0 &&
+            (frame.width > vp9MaxW || frame.height > vp9MaxH)) {
+            vp9Resized = scaleI420ToWebRtcBounds(frame, vp9MaxW, vp9MaxH, &vp9Scaled);
+            vp9Input = &vp9Resized;
+        }
+        const I420Frame& vp9Frame = *vp9Input;
         const bool sizeChangedVp9 = vp9Frame.width != m_externalEncoderWidth || vp9Frame.height != m_externalEncoderHeight;
         const bool rateChangedVp9 = profile.fps != m_externalConfiguredFps ||
             profile.bitrateKbps != m_externalConfiguredBitrateKbps;
