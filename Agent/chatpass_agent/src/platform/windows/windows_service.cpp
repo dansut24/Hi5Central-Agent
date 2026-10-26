@@ -1682,6 +1682,15 @@ namespace hi5 {
             return "Global\\Hi5BannerStop_" + SafeFilePart(ShortSessionPrefixForOverlay(sessionId));
         }
 
+        // Original agent-hardening-v2 edge-panel commands, scoped to this remote session.
+        static std::string SessionBannerChatEventName(const std::string& sessionId) {
+            return "Global\\Hi5BannerChat_" + SafeFilePart(ShortSessionPrefixForOverlay(sessionId));
+        }
+
+        static std::string SessionBannerEndEventName(const std::string& sessionId) {
+            return "Global\\Hi5BannerEnd_" + SafeFilePart(ShortSessionPrefixForOverlay(sessionId));
+        }
+
         static std::string SessionChatStopEventName(const std::string& sessionId) {
             return "Global\\Hi5ChatOverlayStop_" + SafeFilePart(ShortSessionPrefixForOverlay(sessionId));
         }
@@ -1838,6 +1847,8 @@ namespace hi5 {
             std::string sessionId;
             HANDLE process = nullptr;
             HANDLE stopEvent = nullptr;
+            HANDLE chatEvent = nullptr;
+            HANDLE endEvent = nullptr;
             std::string stopEventName;
         };
 
@@ -1871,6 +1882,8 @@ namespace hi5 {
                 CloseHandle(state.process);
             }
             if (state.stopEvent) CloseHandle(state.stopEvent);
+            if (state.chatEvent) CloseHandle(state.chatEvent);
+            if (state.endEvent) CloseHandle(state.endEvent);
         }
 
         static void StopPresenceBanners() {
@@ -1882,9 +1895,8 @@ namespace hi5 {
             for (const auto& id : ids) StopPresenceBanner(id);
         }
 
-        static void StartPresenceBanner(const std::string& sessionId, const std::string& technicianName) {
+        static void StartPresenceBanner(const std::string& sessionId, const std::string& technicianName, bool notifyOnStart = true) {
             if (sessionId.empty()) return;
-
             StopPresenceBanner(sessionId);
 
             const std::string exe = CurrentExePath();
@@ -1894,18 +1906,39 @@ namespace hi5 {
             }
 
             const std::string safeTech = technicianName.empty() ? "Technician" : technicianName;
-            const std::string stopEventName = SessionBannerStopEventName(sessionId);
-            HANDLE stopEvent = CreateOrOpenManualResetEventA(stopEventName, false);
-            if (stopEvent) ResetEvent(stopEvent);
+            const std::string stopName = SessionBannerStopEventName(sessionId);
+            const std::string chatName = SessionBannerChatEventName(sessionId);
+            const std::string endName = SessionBannerEndEventName(sessionId);
+            HANDLE stopEvent = CreateOrOpenManualResetEventA(stopName, false);
+            HANDLE chatEvent = CreateOrOpenManualResetEventA(chatName, false);
+            HANDLE endEvent = CreateOrOpenManualResetEventA(endName, false);
+            if (!stopEvent || !chatEvent || !endEvent) {
+                if (stopEvent) CloseHandle(stopEvent);
+                if (chatEvent) CloseHandle(chatEvent);
+                if (endEvent) CloseHandle(endEvent);
+                LogE("[presence] original edge-panel events could not be created session=" + sessionId);
+                return;
+            }
+            ResetEvent(stopEvent);
+            ResetEvent(chatEvent);
+            ResetEvent(endEvent);
+
             const std::string args = "--mode banner --session " + QuoteArg(sessionId) +
                 " --technician " + QuoteArg(safeTech) +
-                " --stop-event " + QuoteArg(stopEventName);
+                " --stop-event " + QuoteArg(stopName) +
+                " --chat-event " + QuoteArg(chatName) +
+                " --end-event " + QuoteArg(endName) +
+                " --notify " + std::string(notifyOnStart ? "1" : "0");
 
-            LogI("[presence] launching connected banner session=" + sessionId + " technician=" + safeTech + " stop_event=" + stopEventName);
+            // Preserve current per-session interactive helper launch and CAD/WebRTC lifecycle.
+            // Only the original presence surface and its local-user actions are restored.
+            LogI("[presence] launching original right-edge support panel session=" + sessionId);
             HANDLE proc = LaunchInInteractiveSession(exe, args);
             if (!proc) {
-                LogE("[presence] banner launch failed session=" + sessionId);
-                if (stopEvent) CloseHandle(stopEvent);
+                LogE("[presence] support panel launch failed session=" + sessionId);
+                CloseHandle(stopEvent);
+                CloseHandle(chatEvent);
+                CloseHandle(endEvent);
                 return;
             }
 
@@ -1913,13 +1946,24 @@ namespace hi5 {
             state.sessionId = sessionId;
             state.process = proc;
             state.stopEvent = stopEvent;
-            state.stopEventName = stopEventName;
+            state.chatEvent = chatEvent;
+            state.endEvent = endEvent;
+            state.stopEventName = stopName;
             {
                 std::lock_guard<std::mutex> lock(g_presenceBannerMu);
                 g_presenceBanners[sessionId] = state;
             }
         }
 
+        static bool ConsumePresenceBannerAction(const std::string& sessionId, bool chatAction) {
+            std::lock_guard<std::mutex> lock(g_presenceBannerMu);
+            auto it = g_presenceBanners.find(sessionId);
+            if (it == g_presenceBanners.end()) return false;
+            HANDLE h = chatAction ? it->second.chatEvent : it->second.endEvent;
+            if (!h || WaitForSingleObject(h, 0) != WAIT_OBJECT_0) return false;
+            ResetEvent(h);
+            return true;
+        }
 
         static bool WriteLineToPipe(HANDLE pipe, const std::string& line) {
             if (!pipe || pipe == INVALID_HANDLE_VALUE) return false;
@@ -6638,6 +6682,35 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 while (!ctx.framePumpStop.load()) {
                     const auto now = std::chrono::steady_clock::now();
+
+                    // Restore original edge-panel Chat and End session actions.
+                    // Keep them outside the WebRTC and desktop-switching implementation.
+                    if (ConsumePresenceBannerAction(ctx.sessionId, true)) {
+                        LogI("[presence] local user opened Chat session=" + ctx.sessionId);
+                        EnsureChatOverlay(ctx.sessionId, [this](const std::string& sid, const std::string& body) {
+                            AppendChatTranscript(sid, "user", "Remote user", body);
+                            if (signaling_) {
+                                signaling_->send(json{
+                                    {"type", "chat_message"}, {"session_id", sid},
+                                    {"sender", "user"}, {"display_name", "Remote user"},
+                                    {"body", body}, {"unix_ms", NowUnixMs()}
+                                }.dump());
+                            }
+                        });
+                    }
+                    if (ConsumePresenceBannerAction(ctx.sessionId, false)) {
+                        const std::string sid = ctx.sessionId;
+                        LogI("[presence] local user ended remote session=" + sid);
+                        if (signaling_) {
+                            signaling_->send(json{
+                                {"type", "viewer_disconnected"}, {"session_id", sid},
+                                {"reason", "user_ended_session"}, {"ended_by", "user"}
+                            }.dump());
+                        }
+                        // Do not destroy/join the current frame-pump thread from itself.
+                        std::thread([this, sid]() { StopSession(sid); }).detach();
+                        return;
+                    }
 
                     // Detect console-session churn, but do not block secure/winlogon bridging.
                     // Secure must be allowed to start immediately during sign-out, otherwise the
