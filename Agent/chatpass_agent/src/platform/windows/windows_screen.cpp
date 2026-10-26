@@ -826,7 +826,7 @@ struct DesktopFrameSource::Impl {
             return result;
         }
         if (FAILED(hr)) {
-            LogWarn("[capture] DXGI acquire failed: " + DxgiError("AcquireNextFrame", hr).what() +
+            LogWarn(std::string("[capture] DXGI acquire failed: ") + DxgiError("AcquireNextFrame", hr).what() +
                 " action=gdi_fallback");
             lastDxgiRetry = std::chrono::steady_clock::now();
             useGdiFallbackLocked();
