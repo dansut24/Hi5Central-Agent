@@ -69,6 +69,9 @@ struct BannerState {
     float reveal = 0.0f;
     bool showInfo = false;
     bool notifyOnStart = true;
+    // Classic GDI is reliable on remote desktops, software sessions and older WDDM
+    // drivers where the original Direct2D HWND target can paint as solid black.
+    bool preferD2D = false;
     float scale = 1.0f;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 
@@ -344,6 +347,133 @@ void PaintExpanded(BannerState& state) {
         D2D1::RectF(16.0f, footerTop, 328.0f, footerTop + 22.0f), 10.5f,
         DWRITE_FONT_WEIGHT_NORMAL, 0x64748b, DWRITE_TEXT_ALIGNMENT_CENTER);
 }
+// Render the original panel geometry using an ordinary opaque GDI window.
+// D2D previously produced an all-black window on some supported desktops while
+// notification, hit-testing and session events kept working. The GDI renderer
+// does not require GPU render-target creation or DWM glass composition.
+void PaintGdiBanner(HWND hwnd, BannerState& state, HDC output) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    const int width = rc.right - rc.left;
+    const int height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0) return;
+
+    HDC buffer = CreateCompatibleDC(output);
+    HBITMAP bitmap = buffer ? CreateCompatibleBitmap(output, width, height) : nullptr;
+    const bool buffered = buffer && bitmap;
+    HGDIOBJ oldBitmap = buffered ? SelectObject(buffer, bitmap) : nullptr;
+    if (!buffered && buffer) { DeleteDC(buffer); buffer = nullptr; }
+    HDC dc = buffered ? buffer : output;
+    SetBkMode(dc, TRANSPARENT);
+    const float scale = state.scale;
+    const auto rgb = [](unsigned int color) -> COLORREF {
+        return RGB((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+    };
+    const auto bounds = [&](float l, float t, float r, float b) -> RECT {
+        return RECT{ Px(l, scale), Px(t, scale), Px(r, scale), Px(b, scale) };
+    };
+    const auto fill = [&](float l, float t, float r, float b, unsigned int color) {
+        RECT area = bounds(l, t, r, b);
+        HBRUSH brush = CreateSolidBrush(rgb(color));
+        if (brush) { FillRect(dc, &area, brush); DeleteObject(brush); }
+    };
+    const auto rounded = [&](float l, float t, float r, float b, float radius, unsigned int color) {
+        HBRUSH brush = CreateSolidBrush(rgb(color));
+        if (!brush) return;
+        HGDIOBJ oldBrush = SelectObject(dc, brush);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, Px(l, scale), Px(t, scale), Px(r, scale), Px(b, scale),
+            Px(radius * 2.0f, scale), Px(radius * 2.0f, scale));
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        DeleteObject(brush);
+    };
+    const auto circle = [&](float x, float y, float radius, unsigned int color) {
+        HBRUSH brush = CreateSolidBrush(rgb(color));
+        if (!brush) return;
+        HGDIOBJ oldBrush = SelectObject(dc, brush);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, Px(x-radius, scale), Px(y-radius, scale),
+            Px(x+radius, scale), Px(y+radius, scale));
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        DeleteObject(brush);
+    };
+    const auto label = [&](const std::wstring& content,
+        float l, float t, float r, float b, float size,
+        bool heavy, unsigned int color, bool center = false) {
+        HFONT font = CreateFontW(-Px(size, scale), 0, 0, 0,
+            heavy ? FW_SEMIBOLD : FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+        SetTextColor(dc, rgb(color));
+        RECT area = bounds(l, t, r, b);
+        DrawTextW(dc, content.c_str(), static_cast<int>(content.size()), &area,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX |
+                (center ? DT_CENTER : DT_LEFT));
+        if (oldFont) SelectObject(dc, oldFont);
+        if (font) DeleteObject(font);
+    };
+    const auto button = [&](float top, const wchar_t* glyph,
+        const wchar_t* caption, bool destructive) {
+        rounded(16, top, 328, top + 44, 10, destructive ? 0xfff5f5 : 0xf8fafc);
+        const unsigned int accent = destructive ? 0xdc2626 : 0x172033;
+        label(glyph, 27, top, 59, top + 44, 16, true, accent, true);
+        label(caption, 64, top, 316, top + 44, 14, true, accent);
+    };
+
+    if (state.reveal < 0.22f) {
+        fill(0, 0, kCollapsedWidth, kCollapsedHeight, 0x111827);
+        circle(20, 18, 5, state.remoteControlActive ? 0x22c55e : 0xf59e0b);
+        label(L"\u2039", 0, 27, 40, 58, 25, true, 0xffffff, true);
+        rounded(10, 61, 30, 77, 5, 0x2563eb);
+        label(L"H5", 9, 61, 31, 77, 9, true, 0xffffff, true);
+    } else {
+        fill(0, 0, kExpandedWidth, ExpandedHeight(state), 0xf8fafc);
+        rounded(16, 14, 48, 46, 9, 0x2563eb);
+        label(L"H5", 16, 14, 48, 46, 12, true, 0xffffff, true);
+        label(L"Hi5Central Remote Support", 58, 12, 304, 48, 16, true, 0x111827);
+        label(L"\u00d7", 306, 10, 336, 42, 20, false, 0x64748b, true);
+        circle(24, 61, 4.5f, state.remoteControlActive ? 0x22c55e : 0xf59e0b);
+        label(state.statusText.empty() ? L"Connected" : state.statusText,
+            34, 50, 264, 72, 13, true, state.remoteControlActive ? 0x15803d : 0xb45309);
+        fill(16, 78, 328, 79, 0xe5eaf0);
+
+        circle(42, 112, 26, 0xe8eef7);
+        label(Initials(state.technician), 16, 86, 68, 138, 15, true, 0x2457a6, true);
+        label(state.technician.empty() ? L"Technician" : state.technician,
+            82, 87, 324, 113, 16, true, 0x111827);
+        label(L"Support technician", 82, 112, 324, 136, 12.5f, false, 0x64748b);
+        label(L"\u25f7", 18, 146, 42, 176, 15, false, 0x64748b, true);
+        label(DurationText(state), 48, 146, 324, 176, 13, false, 0x475569);
+
+        button(186, L"\u2709", L"Chat", false);
+        button(238, L"i", L"Session info", false);
+        button(290, L"\u25a0", L"End session", true);
+        if (state.showInfo) {
+            rounded(16, 342, 328, 388, 9, 0xf1f5f9);
+            label(state.remoteControlActive
+                ? L"Encrypted connection  \u2022  Remote control active"
+                : L"Secure support app ready  \u2022  Waiting for technician",
+                28, 344, 316, 366, 11.5f, true, 0x334155);
+            label(L"The local user can end this session at any time.",
+                28, 365, 316, 388, 10.5f, false, 0x64748b);
+        }
+        const float footer = state.showInfo ? 392.0f : 340.0f;
+        label(state.remoteControlActive
+            ? L"Your screen may be viewed and controlled"
+            : L"Remote control has not started yet",
+            16, footer, 328, footer + 22, 10.5f, false, 0x64748b, true);
+    }
+    if (buffered) {
+        BitBlt(output, 0, 0, width, height, dc, 0, 0, SRCCOPY);
+        SelectObject(buffer, oldBitmap);
+        DeleteObject(bitmap);
+        DeleteDC(buffer);
+    }
+}
+
 void PaintBanner(HWND hwnd, BannerState& state) {
     if (!EnsureDeviceResources(hwnd, state)) return;
 
@@ -420,8 +550,8 @@ void ConfigureDwm(HWND hwnd) {
 
     BOOL dark = FALSE;
     DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark)); // DWMWA_USE_IMMERSIVE_DARK_MODE
-    MARGINS margins{ 1, 1, 1, 1 };
-    DwmExtendFrameIntoClientArea(hwnd, &margins);
+    // Do not extend glass into the client area: it can composite an otherwise
+    // successful HWND render target as black on remote/virtual displays.
 }
 LRESULT CALLBACK BannerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* state = reinterpret_cast<BannerState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -557,7 +687,10 @@ LRESULT CALLBACK BannerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         BeginPaint(hwnd, &ps);
-        if (state) PaintBanner(hwnd, *state);
+        if (state) {
+            if (state->preferD2D) PaintBanner(hwnd, *state);
+            else PaintGdiBanner(hwnd, *state, ps.hdc);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -652,6 +785,11 @@ void NativeBanner::ThreadMain() {
         technicianLog = technicianName_;
     }
     state.started = std::chrono::steady_clock::now();
+    wchar_t renderChoice[8]{};
+    state.preferD2D = GetEnvironmentVariableW(L"HI5_BANNER_D2D", renderChoice, 8) > 0 &&
+        renderChoice[0] == L'1';
+    LogInfo(std::string("[banner] support panel renderer=") +
+        (state.preferD2D ? "direct2d-opt-in" : "gdi-opaque-default"));
 
     if (!chatEventName.empty()) {
         state.chatEvent = OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, chatEventName.c_str());
@@ -708,7 +846,10 @@ void NativeBanner::ThreadMain() {
     PositionBanner(hwnd, state);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd);
-    if (state.expanded) SetTimer(hwnd, kCollapseTimer, 5000, nullptr);
+    if (state.expanded) {
+        SetTimer(hwnd, kSlideTimer, 15, nullptr);
+        SetTimer(hwnd, kCollapseTimer, 5000, nullptr);
+    }
     ShowConnectionNotification(hwnd, state);
 
     LogInfo("[banner] native edge support panel shown technician=" + technicianLog +
