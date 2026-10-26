@@ -1,4 +1,5 @@
 #include "frame_source.h"
+#include "util/log.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,6 +39,15 @@ namespace {
         }();
         return enabled;
     }
+    // Retain the actual DXGI HRESULT so diagnostics can distinguish no adapter,
+    // driver access-denied, secure desktop and duplication-session limits.
+    static std::runtime_error DxgiError(const char* operation, HRESULT result) {
+        std::ostringstream detail;
+        detail << operation << " hr=0x" << std::hex
+               << static_cast<unsigned long>(result);
+        return std::runtime_error(detail.str());
+    }
+
     struct OutputTarget {
         int index = 0;
         UINT adapterIndex = 0;
@@ -427,7 +438,11 @@ struct DesktopFrameSource::Impl {
 
     std::vector<OutputTarget> targets;
     int currentIndex = 0;
+    // Keep the requested monitor even when the safe GDI fallback sets -1.
+    // An explicit All Monitors selection (-1) must never trigger DXGI retries.
+    int requestedIndex = 0;
     std::string currentName;
+    std::chrono::steady_clock::time_point lastDxgiRetry{};
 
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -443,12 +458,18 @@ struct DesktopFrameSource::Impl {
 
     Impl() {
         refreshDisplaysLocked();
-        // On secure desktops, locked screens and some virtual displays, DXGI
-        // enumeration or DuplicateOutput can fail. Keep the streamer alive
-        // and capture the virtual desktop through the existing GDI path.
+        // Keep capturing through GDI if DXGI enumeration/duplication is not
+        // available at helper startup. Unlike before, preserve the requested
+        // display so the normal desktop can recover later without reconnecting.
         try {
             initForCurrentLocked();
-        } catch (const std::exception&) {
+            if (currentIndex == -1 && requestedIndex != -1) {
+                LogWarn("[capture] no DXGI display at startup; using GDI until recovery");
+                lastDxgiRetry = std::chrono::steady_clock::now();
+            }
+        } catch (const std::exception& ex) {
+            LogWarn("[capture] DXGI startup failed: " + std::string(ex.what()) +
+                " action=gdi_fallback");
             useGdiFallbackLocked();
         }
     }
@@ -460,6 +481,40 @@ struct DesktopFrameSource::Impl {
         const auto desktop = buildAllMonitorsInfo();
         width = desktop.width;
         height = desktop.height;
+    }
+
+    // Called only while the DesktopFrameSource mutex is held.
+    void retryDxgiIfDueLocked() {
+        if (requestedIndex < 0 || currentIndex != -1) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (lastDxgiRetry.time_since_epoch().count() != 0 &&
+            now - lastDxgiRetry < std::chrono::seconds(30)) return;
+        lastDxgiRetry = now;
+
+        refreshDisplaysLocked();
+        const auto target = std::find_if(targets.begin(), targets.end(),
+            [this](const OutputTarget& entry) { return entry.info.index == requestedIndex; });
+        if (target == targets.end()) {
+            LogWarn("[capture] DXGI retry: requested display not enumerated; retaining GDI");
+            return;
+        }
+        currentIndex = target->info.index;
+        currentName = target->info.name;
+        try {
+            initForCurrentLocked();
+            if (duplication) {
+                lastFrame = {};
+                LogInfo("[capture] DXGI restored display=" + std::to_string(currentIndex) +
+                    " resolution=" + std::to_string(width) + "x" + std::to_string(height));
+            } else {
+                useGdiFallbackLocked();
+                LogWarn("[capture] DXGI retry returned no duplication; retaining GDI");
+            }
+        } catch (const std::exception& ex) {
+            LogWarn("[capture] DXGI retry failed: " + std::string(ex.what()) +
+                " action=continue_gdi");
+            useGdiFallbackLocked();
+        }
     }
 
     void resetD3DLocked() {
@@ -540,19 +595,19 @@ struct DesktopFrameSource::Impl {
         resetD3DLocked();
 
         ComPtr<IDXGIFactory1> factory;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
-            throw std::runtime_error("CreateDXGIFactory1 failed");
+        if (const HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory)); FAILED(hr)) {
+            throw DxgiError("CreateDXGIFactory1", hr);
         }
 
         ComPtr<IDXGIAdapter1> adapter;
-        if (FAILED(factory->EnumAdapters1(target->adapterIndex, &adapter))) {
-            throw std::runtime_error("EnumAdapters1 failed");
+        if (const HRESULT hr = factory->EnumAdapters1(target->adapterIndex, &adapter); FAILED(hr)) {
+            throw DxgiError("EnumAdapters1", hr);
         }
 
         D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
         const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
-        if (FAILED(D3D11CreateDevice(
+        if (const HRESULT hr = D3D11CreateDevice(
             adapter.Get(),
             D3D_DRIVER_TYPE_UNKNOWN,
             nullptr,
@@ -562,22 +617,22 @@ struct DesktopFrameSource::Impl {
             D3D11_SDK_VERSION,
             &device,
             nullptr,
-            &context))) {
-            throw std::runtime_error("D3D11CreateDevice failed");
+            &context); FAILED(hr)) {
+            throw DxgiError("D3D11CreateDevice", hr);
         }
 
         ComPtr<IDXGIOutput> output;
-        if (FAILED(adapter->EnumOutputs(target->outputIndex, &output))) {
-            throw std::runtime_error("EnumOutputs failed");
+        if (const HRESULT hr = adapter->EnumOutputs(target->outputIndex, &output); FAILED(hr)) {
+            throw DxgiError("EnumOutputs", hr);
         }
 
         ComPtr<IDXGIOutput1> output1;
-        if (FAILED(output.As(&output1))) {
-            throw std::runtime_error("Query IDXGIOutput1 failed");
+        if (const HRESULT hr = output.As(&output1); FAILED(hr)) {
+            throw DxgiError("Query IDXGIOutput1", hr);
         }
 
-        if (FAILED(output1->DuplicateOutput(device.Get(), &duplication))) {
-            throw std::runtime_error("DuplicateOutput failed");
+        if (const HRESULT hr = output1->DuplicateOutput(device.Get(), &duplication); FAILED(hr)) {
+            throw DxgiError("DuplicateOutput", hr);
         }
 
         width = target->info.width;
@@ -593,8 +648,8 @@ struct DesktopFrameSource::Impl {
         desc.Usage = D3D11_USAGE_STAGING;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-        if (FAILED(device->CreateTexture2D(&desc, nullptr, &staging))) {
-            throw std::runtime_error("CreateTexture2D(staging) failed");
+        if (const HRESULT hr = device->CreateTexture2D(&desc, nullptr, &staging); FAILED(hr)) {
+            throw DxgiError("CreateTexture2D(staging)", hr);
         }
     }
 
@@ -602,6 +657,7 @@ struct DesktopFrameSource::Impl {
         refreshDisplaysLocked();
 
         if (index == -1) {
+            requestedIndex = -1;
             currentIndex = -1;
             currentName.clear();
             initForCurrentLocked();
@@ -615,11 +671,20 @@ struct DesktopFrameSource::Impl {
             return false;
         }
 
+        requestedIndex = it->info.index;
         currentIndex = it->info.index;
         currentName = it->info.name;
         try {
             initForCurrentLocked();
-        } catch (const std::exception&) {
+            if (duplication) {
+                lastFrame = {};
+                LogInfo("[capture] DXGI selected display=" + std::to_string(currentIndex) +
+                    " resolution=" + std::to_string(width) + "x" + std::to_string(height));
+            }
+        } catch (const std::exception& ex) {
+            LogWarn("[capture] DXGI display selection failed: " + std::string(ex.what()) +
+                " display=" + std::to_string(index) + " action=gdi_fallback");
+            lastDxgiRetry = std::chrono::steady_clock::now();
             useGdiFallbackLocked();
         }
         return true;
@@ -699,13 +764,19 @@ struct DesktopFrameSource::Impl {
         refreshDisplaysLocked();
 
         if (currentIndex == -1) {
+            retryDxgiIfDueLocked();
+        }
+        if (currentIndex == -1) {
             return captureAllMonitorsGdiLocked();
         }
 
         if (!duplication || !findCurrentTargetLocked()) {
             try {
                 initForCurrentLocked();
-            } catch (const std::exception&) {
+            } catch (const std::exception& ex) {
+                LogWarn("[capture] DXGI reinitialization failed: " + std::string(ex.what()) +
+                    " action=gdi_fallback");
+                lastDxgiRetry = std::chrono::steady_clock::now();
                 useGdiFallbackLocked();
                 return captureAllMonitorsGdiLocked();
             }
@@ -734,7 +805,15 @@ struct DesktopFrameSource::Impl {
             return result;
         }
         if (hr == DXGI_ERROR_ACCESS_LOST) {
-            initForCurrentLocked();
+            try {
+                initForCurrentLocked();
+            } catch (const std::exception& ex) {
+                LogWarn("[capture] DXGI access lost, restore failed: " +
+                    std::string(ex.what()) + " action=gdi_fallback");
+                lastDxgiRetry = std::chrono::steady_clock::now();
+                useGdiFallbackLocked();
+                return captureAllMonitorsGdiLocked();
+            }
             if (lastFrame.y.empty() || lastFrame.width <= 0 || lastFrame.height <= 0) {
                 return captureCurrentDisplayGdiLocked();
             }
@@ -747,7 +826,11 @@ struct DesktopFrameSource::Impl {
             return result;
         }
         if (FAILED(hr)) {
-            throw std::runtime_error("AcquireNextFrame failed");
+            LogWarn("[capture] DXGI acquire failed: " + DxgiError("AcquireNextFrame", hr).what() +
+                " action=gdi_fallback");
+            lastDxgiRetry = std::chrono::steady_clock::now();
+            useGdiFallbackLocked();
+            return captureAllMonitorsGdiLocked();
         }
 
         const bool cursorOnly = frameInfo.TotalMetadataBufferSize == 0 && frameInfo.LastMouseUpdateTime.QuadPart != 0;
