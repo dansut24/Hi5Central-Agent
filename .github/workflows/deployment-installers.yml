@@ -62,8 +62,15 @@ jobs:
           nuget install Microsoft.Web.WebView2 -OutputDirectory Agent/chatpass_agent/external -NonInteractive
           $vcpkg = 'C:\vcpkg\vcpkg.exe'
           if (-not (Test-Path $vcpkg)) { throw 'GitHub runner vcpkg was not found at C:\vcpkg.' }
-          & $vcpkg install openssl:x64-windows-static nlohmann-json:x64-windows-static libvpx:x64-windows-static libdatachannel:x64-windows-static
+          # The srtp feature is REQUIRED: vcpkg maps its absence to
+          # -DNO_MEDIA=ON in libdatachannel. That builds data channels but
+          # rejects the video m-line (m=video 0) in every WebRTC offer.
+          & $vcpkg install openssl:x64-windows-static nlohmann-json:x64-windows-static libvpx:x64-windows-static 'libdatachannel[srtp,ws]:x64-windows-static'
           if ($LASTEXITCODE -ne 0) { throw "vcpkg dependency install failed with exit code $LASTEXITCODE." }
+          $ports = & $vcpkg list
+          if ($LASTEXITCODE -ne 0 -or -not ($ports -match 'libdatachannel\[srtp\]:x64-windows-static')) {
+            throw "Windows WebRTC build blocked: libdatachannel[srtp] not installed (would disable video media)."
+          }
 
       - name: Build current Windows Agent setup
         shell: pwsh
