@@ -1,5 +1,6 @@
 #include "frame_source.h"
 #include "util/log.h"
+#include "windows_wgc_capture.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -443,6 +445,10 @@ struct DesktopFrameSource::Impl {
     int requestedIndex = 0;
     std::string currentName;
     std::chrono::steady_clock::time_point lastDxgiRetry{};
+    std::unique_ptr<WgcMonitorCapture> wgc;
+    bool wgcAttempted = false;
+    bool wgcReceivedFrame = false;
+    std::chrono::steady_clock::time_point wgcStarted{};
 
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -470,8 +476,60 @@ struct DesktopFrameSource::Impl {
         } catch (const std::exception& ex) {
             LogWarn("[capture] DXGI startup failed: " + std::string(ex.what()) +
                 " action=gdi_fallback");
+            tryStartWgcLocked();
             useGdiFallbackLocked();
         }
+    }
+
+    // A registry opt-in, absent on every other customer. WGC respects its
+    // mandatory capture border; it is never started for Winlogon/UAC.
+    static bool WgcTrialEnabled() {
+        DWORD enabled = 0;
+        DWORD length = sizeof(enabled);
+        return RegGetValueA(HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Hi5Central\\Agent", "WgcCaptureTrial",
+            RRF_RT_REG_DWORD, nullptr, &enabled, &length) == ERROR_SUCCESS &&
+            enabled == 1;
+    }
+
+    void tryStartWgcLocked() {
+        if (wgcAttempted || requestedIndex < 0 || !WgcTrialEnabled()) return;
+        wgcAttempted = true;
+
+        wchar_t desktopName[96]{};
+        DWORD nameBytes = 0;
+        const HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+        if (!desktop || !GetUserObjectInformationW(
+                desktop, UOI_NAME, desktopName, sizeof(desktopName), &nameBytes) ||
+            _wcsicmp(desktopName, L"Default") != 0) {
+            LogWarn("[capture] WGC trial skipped: current thread is not on Default desktop");
+            return;
+        }
+
+        const auto target = std::find_if(targets.begin(), targets.end(),
+            [this](const OutputTarget& t) {
+                return t.info.index == requestedIndex;
+            });
+        if (target == targets.end()) {
+            LogWarn("[capture] WGC trial skipped: requested monitor missing");
+            return;
+        }
+        std::string failure;
+        auto candidate = std::make_unique<WgcMonitorCapture>();
+        if (!candidate->Start(target->info.x, target->info.y,
+                              target->info.width, target->info.height, failure)) {
+            LogWarn("[capture] WGC trial start failed: " + failure +
+                    " action=gdi_fallback");
+            return;
+        }
+        wgc = std::move(candidate);
+        wgcReceivedFrame = false;
+        wgcStarted = std::chrono::steady_clock::now();
+        LogInfo("[capture] WGC trial started monitor=" +
+            std::to_string(requestedIndex) + " resolution=" +
+            std::to_string(target->info.width) + "x" +
+            std::to_string(target->info.height) +
+            " privacy_border=enabled waiting_for_first_frame");
     }
 
     void useGdiFallbackLocked() {
@@ -656,6 +714,10 @@ struct DesktopFrameSource::Impl {
     bool setDisplayIndexLocked(int index) {
         refreshDisplaysLocked();
 
+        // Switching monitors discards the old monitor's WGC capture item.
+        wgc.reset();
+        wgcAttempted = false;
+        wgcReceivedFrame = false;
         if (index == -1) {
             requestedIndex = -1;
             currentIndex = -1;
@@ -685,6 +747,7 @@ struct DesktopFrameSource::Impl {
             LogWarn("[capture] DXGI display selection failed: " + std::string(ex.what()) +
                 " display=" + std::to_string(index) + " action=gdi_fallback");
             lastDxgiRetry = std::chrono::steady_clock::now();
+            tryStartWgcLocked();
             useGdiFallbackLocked();
         }
         return true;
@@ -762,6 +825,57 @@ struct DesktopFrameSource::Impl {
 
     FrameCaptureResult captureOneLocked() {
         refreshDisplaysLocked();
+
+        if (wgc && wgc->IsRunning()) {
+            std::vector<uint8_t> bgra;
+            int w = 0, h = 0, pitch = 0;
+            std::string error;
+            if (wgc->TryReadBgra(bgra, w, h, pitch, error)) {
+                I420Frame frame;
+                // Use the proven desktop BGRA->I420 path; codec/transport unchanged.
+                const auto target = std::find_if(targets.begin(), targets.end(),
+                    [this](const OutputTarget& t) {
+                        return t.info.index == requestedIndex;
+                    });
+                if (target != targets.end()) {
+                    compositeCursorBgra(target->info.x, target->info.y,
+                                        w, h, bgra, pitch);
+                }
+                bgraToI420(bgra.data(), pitch, w, h, frame);
+                lastFrame = frame;
+                FrameCaptureResult result;
+                result.frame = std::move(frame);
+                result.hasFrame = true;
+                result.changed = true;
+                result.frameId = ++frameId;
+                if (!wgcReceivedFrame) {
+                    wgcReceivedFrame = true;
+                    LogInfo("[capture] WGC first frame monitor=" +
+                        std::to_string(requestedIndex) + " resolution=" +
+                        std::to_string(w) + "x" + std::to_string(h) +
+                        " backend=wgc");
+                }
+                return result;
+            }
+            if (!error.empty() ||
+                (!wgcReceivedFrame &&
+                 std::chrono::steady_clock::now() - wgcStarted > std::chrono::seconds(4))) {
+                LogWarn("[capture] WGC trial stopped: " +
+                    (error.empty() ? std::string("no first frame after 4s") : error) +
+                    " action=continue_gdi");
+                wgc.reset();
+                lastDxgiRetry = std::chrono::steady_clock::now();
+            } else if (wgcReceivedFrame && !lastFrame.y.empty()) {
+                FrameCaptureResult result;
+                result.frame = lastFrame;
+                result.hasFrame = true;
+                result.changed = false;
+                result.frameId = frameId;
+                return result;
+            }
+            // Before the first WGC compositor frame, continue live GDI.
+            return captureAllMonitorsGdiLocked();
+        }
 
         if (currentIndex == -1) {
             retryDxgiIfDueLocked();
