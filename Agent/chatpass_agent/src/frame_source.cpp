@@ -52,8 +52,9 @@ namespace {
         if (!w || !*w) return {};
         const int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
         if (len <= 1) return {};
-        std::string out(static_cast<size_t>(len - 1), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr);
+        std::string out(static_cast<size_t>(len), '\0');
+        if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr) != len) return {};
+        out.resize(static_cast<size_t>(len - 1));
         return out;
     }
 
@@ -172,57 +173,93 @@ namespace {
     static void compositeCursorBgra(int originX, int originY, int width, int height,
         std::vector<uint8_t>& bgra, int stride);
 
+    // A native-resolution GDI frame can be 16MB. Cache compatible DC and
+    // top-down DIB by capture thread, so only the display dimensions changing
+    // (or a failed blit) recreates the expensive GDI objects. Each Windows
+    // capture helper has its own capture thread/process and desktop.
+    struct GdiCaptureSurface {
+        HDC memDc = nullptr;
+        HBITMAP dib = nullptr;
+        HGDIOBJ original = nullptr;
+        uint8_t* bits = nullptr;
+        int width = 0;
+        int height = 0;
+
+        void reset() {
+            if (memDc && original && original != HGDI_ERROR) {
+                SelectObject(memDc, original);
+            }
+            if (dib) DeleteObject(dib);
+            if (memDc) DeleteDC(memDc);
+            memDc = nullptr;
+            dib = nullptr;
+            original = nullptr;
+            bits = nullptr;
+            width = 0;
+            height = 0;
+        }
+        ~GdiCaptureSurface() { reset(); }
+
+        bool prepare(HDC screenDc, int w, int h) {
+            if (memDc && dib && bits && width == w && height == h) return true;
+            reset();
+            memDc = CreateCompatibleDC(screenDc);
+            if (!memDc) return false;
+            BITMAPINFO bmi{};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            void* pixels = nullptr;
+            dib = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &pixels, nullptr, 0);
+            if (!dib || !pixels) { reset(); return false; }
+            original = SelectObject(memDc, dib);
+            if (!original || original == HGDI_ERROR) { reset(); return false; }
+            bits = static_cast<uint8_t*>(pixels);
+            width = w;
+            height = h;
+            return true;
+        }
+    };
+
     static bool captureRectBgraGdi(int x, int y, int srcW, int srcH, int dstW, int dstH,
         std::vector<uint8_t>& bgraOut, int& strideOut) {
+        if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return false;
         HDC screenDC = GetDC(nullptr);
         if (!screenDC) return false;
-
-        HDC memDC = CreateCompatibleDC(screenDC);
-        if (!memDC) {
+        static thread_local GdiCaptureSurface scratch;
+        if (!scratch.prepare(screenDC, dstW, dstH)) {
             ReleaseDC(nullptr, screenDC);
             return false;
         }
 
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = dstW;
-        bmi.bmiHeader.biHeight = -dstH;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-
-        void* bits = nullptr;
-        HBITMAP bmp = CreateDIBSection(screenDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!bmp || !bits) {
-            if (bmp) DeleteObject(bmp);
-            DeleteDC(memDC);
-            ReleaseDC(nullptr, screenDC);
+        // BitBlt avoids the HALFTONE scaler for full-resolution capture.
+        // StretchBlt remains available for bounded preview thumbnails.
+        BOOL copied = FALSE;
+        if (srcW == dstW && srcH == dstH) {
+            copied = BitBlt(scratch.memDc, 0, 0, dstW, dstH,
+                            screenDC, x, y, SRCCOPY | CAPTUREBLT);
+        } else {
+            SetStretchBltMode(scratch.memDc, HALFTONE);
+            copied = StretchBlt(scratch.memDc, 0, 0, dstW, dstH,
+                                screenDC, x, y, srcW, srcH, SRCCOPY | CAPTUREBLT);
+        }
+        ReleaseDC(nullptr, screenDC);
+        if (!copied) {
+            // A Windows desktop switch can invalidate old DC contents.
+            // Never serve stale pixels; rebuild the surface on next attempt.
+            scratch.reset();
             return false;
         }
-
-        HGDIOBJ old = SelectObject(memDC, bmp);
-        SetStretchBltMode(memDC, HALFTONE);
-
-        StretchBlt(
-            memDC,
-            0, 0, dstW, dstH,
-            screenDC,
-            x, y, srcW, srcH,
-            SRCCOPY | CAPTUREBLT
-        );
 
         strideOut = dstW * 4;
         bgraOut.resize(static_cast<size_t>(strideOut) * dstH);
-        std::memcpy(bgraOut.data(), bits, bgraOut.size());
+        std::memcpy(bgraOut.data(), scratch.bits, bgraOut.size());
         compositeCursorBgra(x, y, dstW, dstH, bgraOut, strideOut);
-
-        SelectObject(memDC, old);
-        DeleteObject(bmp);
-        DeleteDC(memDC);
-        ReleaseDC(nullptr, screenDC);
         return true;
     }
-
 
     static void compositeCursorBgra(int originX, int originY, int width, int height,
         std::vector<uint8_t>& bgra, int stride) {
@@ -438,6 +475,7 @@ struct DesktopFrameSource::Impl {
     int height = 0;
 
     I420Frame lastFrame;
+    std::vector<uint8_t> gdiBgra; // reusable BGRA buffer, not a 16MB allocation per frame
     std::chrono::steady_clock::time_point lastGdiRefresh{};
     uint64_t frameId = 0;
 
@@ -645,9 +683,8 @@ struct DesktopFrameSource::Impl {
             return result;
         }
 
-        std::vector<uint8_t> bgra;
         int stride = 0;
-        if (!captureRectBgraGdi(d.x, d.y, d.width, d.height, d.width, d.height, bgra, stride)) {
+        if (!captureRectBgraGdi(d.x, d.y, d.width, d.height, d.width, d.height, gdiBgra, stride)) {
             result.frame = lastFrame;
             result.hasFrame = !lastFrame.y.empty();
             result.frameId = frameId;
@@ -655,7 +692,7 @@ struct DesktopFrameSource::Impl {
         }
 
         I420Frame out;
-        bgraToI420(bgra.data(), stride, d.width, d.height, out);
+        bgraToI420(gdiBgra.data(), stride, d.width, d.height, out);
         lastFrame = out;
         lastGdiRefresh = std::chrono::steady_clock::now();
         result.frame = out;
@@ -675,9 +712,8 @@ struct DesktopFrameSource::Impl {
             return result;
         }
 
-        std::vector<uint8_t> bgra;
         int stride = 0;
-        if (!captureRectBgraGdi(d.x, d.y, d.width, d.height, d.width, d.height, bgra, stride)) {
+        if (!captureRectBgraGdi(d.x, d.y, d.width, d.height, d.width, d.height, gdiBgra, stride)) {
             result.frame = lastFrame;
             result.hasFrame = !lastFrame.y.empty();
             result.frameId = frameId;
@@ -685,7 +721,7 @@ struct DesktopFrameSource::Impl {
         }
 
         I420Frame out;
-        bgraToI420(bgra.data(), stride, d.width, d.height, out);
+        bgraToI420(gdiBgra.data(), stride, d.width, d.height, out);
         lastFrame = out;
         lastGdiRefresh = std::chrono::steady_clock::now();
         result.frame = out;
