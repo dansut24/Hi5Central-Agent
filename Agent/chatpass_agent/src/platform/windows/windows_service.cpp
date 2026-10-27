@@ -2868,9 +2868,22 @@ LogI(
                     }
                 }
 
+                // Do not block waiting for pipe EOF here. A timed-out
+                // PowerShell script may have launched a child (for example
+                // cdb.exe) that inherited the write handle even after the
+                // PowerShell process has been terminated. A blocking ReadFile
+                // would then strand the single Agent job polling thread.
                 for (;;) {
+                    DWORD available = 0;
+                    if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) ||
+                        available == 0) {
+                        break;
+                    }
                     DWORD bytesRead = 0;
-                    if (!ReadFile(readPipe, buffer, static_cast<DWORD>(sizeof(buffer) - 1), &bytesRead, nullptr) || bytesRead == 0) {
+                    const DWORD toRead = std::min<DWORD>(
+                        available, static_cast<DWORD>(sizeof(buffer) - 1));
+                    if (!ReadFile(readPipe, buffer, toRead, &bytesRead, nullptr) ||
+                        bytesRead == 0) {
                         break;
                     }
                     if (result.output.size() < kMaxOutput) {
