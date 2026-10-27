@@ -7,6 +7,7 @@
 #include <sddl.h>
 
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
