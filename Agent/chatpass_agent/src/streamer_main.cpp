@@ -894,7 +894,7 @@ namespace hi5 {
             }
 
             if (isSecureHelper && secureDesktopEnding &&
-                now >= secureDesktopEndedAt + std::chrono::milliseconds(250)) {
+                now >= secureDesktopEndedAt + std::chrono::milliseconds(900)) {
                 LogInfo("[streamer] secure desktop ended; exiting helper session=" + args.sessionId);
                 break;
             }
