@@ -6938,6 +6938,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                auto nextPipelineHealthLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                uint64_t pipelineFrames = 0;
+                double rawDeliveryAgeTotalMs = 0.0;
+                double rawDeliveryAgeMaxMs = 0.0;
+                double encodeAndQueueTotalMs = 0.0;
+                double encodeAndQueueMaxMs = 0.0;
                 ctx.lastNormalLaunchAttempt = std::chrono::steady_clock::now();
                 ctx.lastSecureLaunchAttempt = {};
                 ctx.lastConsoleSessionPoll = std::chrono::steady_clock::now();
@@ -7232,6 +7238,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     bool sent = false;
+                    // Capture produces a timestamp from GetTickCount64() in
+                    // the same Windows host. Age here measures helper->service
+                    // delivery, NOT Internet RTT or video decode time.
+                    uint64_t deliveredTsNs = 0;
+                    std::chrono::steady_clock::time_point sendBegin{};
+                    std::chrono::steady_clock::time_point sendEnd{};
                     // Keep forwarding secure frames while the secure desktop is active or
                     // its exit is being debounced. A normal GDI frame is not proof
                     // that CAD/UAC has ended: it may still be a stale desktop frame.
@@ -7253,8 +7265,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 " size=" + std::to_string(secureFrame.y.size() + secureFrame.u.size() + secureFrame.v.size()) +
                                 " mode=secure force_kf=" + std::to_string(forceKf ? 1 : 0));
                         }
+                        deliveredTsNs = secureTs;
                         if (ctx.sender) {
+                            sendBegin = std::chrono::steady_clock::now();
                             ctx.sender->sendExternalRawI420(secureFrame, forceKf);
+                            sendEnd = std::chrono::steady_clock::now();
                         }
                         sent = true;
                     }
@@ -7296,10 +7311,41 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 " size=" + std::to_string(normalFrame.y.size() + normalFrame.u.size() + normalFrame.v.size()) +
                                 " mode=normal force_kf=" + std::to_string(forceKf ? 1 : 0));
                         }
+                        deliveredTsNs = normalTs;
                         if (ctx.sender) {
+                            sendBegin = std::chrono::steady_clock::now();
                             ctx.sender->sendExternalRawI420(normalFrame, forceKf);
+                            sendEnd = std::chrono::steady_clock::now();
                         }
                         sent = true;
+                    }
+
+                    if (sent && sendEnd.time_since_epoch().count() != 0) {
+                        const uint64_t hostNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
+                        const double rawAgeMs = deliveredTsNs > 0 && hostNs >= deliveredTsNs
+                            ? static_cast<double>(hostNs - deliveredTsNs) / 1e6 : 0.0;
+                        const double pipelineMs = std::chrono::duration<double, std::milli>(
+                            sendEnd - sendBegin).count();
+                        ++pipelineFrames;
+                        rawDeliveryAgeTotalMs += rawAgeMs;
+                        rawDeliveryAgeMaxMs = std::max(rawDeliveryAgeMaxMs, rawAgeMs);
+                        encodeAndQueueTotalMs += pipelineMs;
+                        encodeAndQueueMaxMs = std::max(encodeAndQueueMaxMs, pipelineMs);
+                    }
+                    if (now >= nextPipelineHealthLog) {
+                        const double n = static_cast<double>(std::max<uint64_t>(1, pipelineFrames));
+                        LogI("[pipeline-health] session=" + ctx.sessionId +
+                            " frames=" + std::to_string(pipelineFrames) +
+                            " helper_to_service_avg_ms=" + std::to_string(rawDeliveryAgeTotalMs / n) +
+                            " helper_to_service_max_ms=" + std::to_string(rawDeliveryAgeMaxMs) +
+                            " encode_and_packetize_avg_ms=" + std::to_string(encodeAndQueueTotalMs / n) +
+                            " encode_and_packetize_max_ms=" + std::to_string(encodeAndQueueMaxMs));
+                        pipelineFrames = 0;
+                        rawDeliveryAgeTotalMs = 0.0;
+                        rawDeliveryAgeMaxMs = 0.0;
+                        encodeAndQueueTotalMs = 0.0;
+                        encodeAndQueueMaxMs = 0.0;
+                        nextPipelineHealthLog = now + std::chrono::seconds(5);
                     }
 
                     if (now >= nextDiagnosticsPoll) {
