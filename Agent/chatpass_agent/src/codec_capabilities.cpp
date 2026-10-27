@@ -40,8 +40,12 @@ static std::string WideToUtf8(const wchar_t* value) {
     if (!value || !*value) return {};
     int needed = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
     if (needed <= 1) return {};
-    std::string out(static_cast<size_t>(needed - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value, -1, out.data(), needed, nullptr, nullptr);
+    // The API writes the terminating NUL as well. Reserving needed - 1
+    // bytes while passing needed corrupts the heap during encoder probing.
+    std::string out(static_cast<size_t>(needed), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, value, -1, out.data(), needed, nullptr, nullptr) != needed)
+        return {};
+    out.resize(static_cast<size_t>(needed - 1));
     return out;
 }
 
