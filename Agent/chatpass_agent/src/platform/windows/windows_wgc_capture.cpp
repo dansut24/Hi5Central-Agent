@@ -81,6 +81,7 @@ struct WgcMonitorCapture::Impl {
             failure = "invalid selected monitor geometry";
             return false;
         }
+        std::string stage = "RoInitialize";
         try {
             const HRESULT initHr = RoInitialize(RO_INIT_MULTITHREADED);
             if (SUCCEEDED(initHr)) apartmentInitialized = true;
@@ -88,6 +89,7 @@ struct WgcMonitorCapture::Impl {
                 throw std::runtime_error(FormatError("RoInitialize", initHr));
             }
 
+            stage = "GraphicsCaptureSession.IsSupported";
             if (!WGC::GraphicsCaptureSession::IsSupported()) {
                 throw std::runtime_error("GraphicsCaptureSession::IsSupported=false");
             }
@@ -100,13 +102,16 @@ struct WgcMonitorCapture::Impl {
                 throw std::runtime_error("no HMONITOR for selected output");
             }
 
+            stage = "GraphicsCaptureItem activation";
             auto activation = winrt::get_activation_factory<WGC::GraphicsCaptureItem>();
             auto interop = activation.as<IGraphicsCaptureItemInterop>();
+            stage = "GraphicsCaptureItem.CreateForMonitor";
             winrt::check_hresult(interop->CreateForMonitor(
                 lookup.found,
                 winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
                 winrt::put_abi(item)));
 
+            stage = "D3D11CreateDevice";
             const HRESULT deviceHr = D3D11CreateDevice(
                 nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -126,19 +131,22 @@ struct WgcMonitorCapture::Impl {
             if (size.Width <= 0 || size.Height <= 0) {
                 throw std::runtime_error("WGC monitor has invalid size");
             }
+            stage = "Direct3D11CaptureFramePool.CreateFreeThreaded";
             pool = WGC::Direct3D11CaptureFramePool::CreateFreeThreaded(
                 winrtDevice,
                 winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 2, size);
+            stage = "CreateCaptureSession";
             session = pool.CreateCaptureSession(item);
             // Do not request borderless capture; the operating system's
             // privacy/consent indicator must remain visible.
+            stage = "GraphicsCaptureSession.StartCapture";
             session.StartCapture();
             return true;
         } catch (const winrt::hresult_error& ex) {
-            failure = FormatError("WGC WinRT initialization", ex.code());
+            failure = FormatError(stage.c_str(), ex.code());
         } catch (const std::exception& ex) {
-            failure = ex.what();
+            failure = stage + ": " + ex.what();
         }
         Stop();
         return false;
