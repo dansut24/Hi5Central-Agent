@@ -54,17 +54,20 @@ inline std::filesystem::path Hi5BackupLogPath(
     return result;
 }
 
-inline void Hi5TrimLegacyBackupIfNeeded(const std::filesystem::path& backup) {
+inline bool Hi5TrimLegacyBackupIfNeeded(const std::filesystem::path& backup) {
     // On the first upgraded run, the previous unbounded log may be much
     // larger than 5 MiB. Preserve only its most recent complete lines.
     std::error_code ec;
+    if (!std::filesystem::exists(backup, ec)) return !ec;
+    if (ec) return false;
     const auto bytes = std::filesystem::file_size(backup, ec);
-    if (ec || bytes <= kHi5MaxLogBytes) return;
+    if (ec) return false;
+    if (bytes <= kHi5MaxLogBytes) return true;
 
     auto temp = backup;
     temp += L".tmp";
     std::ifstream in(backup, std::ios::binary);
-    if (!in) return;
+    if (!in) return false;
     const auto skip = bytes - kHi5MaxLogBytes + 4096u;
     in.seekg(static_cast<std::streamoff>(skip), std::ios::beg);
     std::string partialLine;
@@ -72,15 +75,21 @@ inline void Hi5TrimLegacyBackupIfNeeded(const std::filesystem::path& backup) {
 
     {
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out) return;
+        if (!out) return false;
         out << in.rdbuf();
         out.flush();
-        if (!out) return;
+        if (!out) return false;
     }
-    std::filesystem::remove(backup, ec);
-    if (ec) return;
-    std::filesystem::rename(temp, backup, ec);
-    // On an I/O failure keep console output and retry rotation next time.
+    // The previous version attempted to delete an archive while this
+    // ifstream still held a Windows file handle, so its 11 MB legacy backup
+    // remained untrimmed. Close both streams before replacing the file.
+    in.close();
+    if (!MoveFileExW(temp.c_str(), backup.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::filesystem::remove(temp, ec);
+        return false; // Archive stays intact; retry on a later log write.
+    }
+    return true;
 }
 
 inline void Hi5RotateIfNeeded(const std::filesystem::path& active,
@@ -144,6 +153,18 @@ inline void Hi5WriteLogLine(const char* level, const std::string& msg) {
     if (!acquired) return; // Console output retained; never rotate unsafely.
 
     const auto active = Hi5GetLogPath();
+    // Check pre-existing backups on process startup, even when the active
+    // log is still small. If Windows temporarily holds an archive open,
+    // retry on the next line instead of waiting for a future 5 MB rotation.
+    static bool legacyBackupsChecked = false;
+    if (!legacyBackupsChecked) {
+        legacyBackupsChecked = true;
+        for (int n = 1; n <= kHi5LogBackups; ++n) {
+            if (!Hi5TrimLegacyBackupIfNeeded(Hi5BackupLogPath(active, n))) {
+                legacyBackupsChecked = false;
+            }
+        }
+    }
     Hi5RotateIfNeeded(active, s.size() + 2u);
     // Open and close on each message: a long-lived ofstream would continue
     // writing to a renamed backup after another helper rotates the file.
