@@ -65,8 +65,14 @@ namespace {
         if (!w || !*w) return {};
         const int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
         if (len <= 1) return {};
-        std::string out(static_cast<size_t>(len - 1), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr);
+        // The measured byte count includes the terminating NUL. Allocate
+        // all of it before asking WideCharToMultiByte to write `len` bytes:
+        // using len - 1 silently corrupts the heap on every enumeration.
+        std::string out(static_cast<size_t>(len), '\0');
+        const int written = WideCharToMultiByte(
+            CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr);
+        if (written != len) return {};
+        out.resize(static_cast<size_t>(written - 1));
         return out;
     }
 
@@ -94,20 +100,29 @@ namespace {
 
         for (UINT a = 0;; ++a) {
             ComPtr<IDXGIAdapter1> adapter;
-            if (factory->EnumAdapters1(a, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+            const HRESULT adapterHr = factory->EnumAdapters1(a, &adapter);
+            if (adapterHr == DXGI_ERROR_NOT_FOUND) break;
+            // Adapter/display enumeration can fail temporarily during lock,
+            // hot-plug and desktop changes. Never dereference a failed COM
+            // result or a null adapter.
+            if (FAILED(adapterHr) || !adapter) break;
 
             DXGI_ADAPTER_DESC1 ad{};
-            adapter->GetDesc1(&ad);
+            if (FAILED(adapter->GetDesc1(&ad))) continue;
             if (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
 
             for (UINT o = 0;; ++o) {
                 ComPtr<IDXGIOutput> output;
-                if (adapter->EnumOutputs(o, &output) == DXGI_ERROR_NOT_FOUND) break;
+                const HRESULT outputHr = adapter->EnumOutputs(o, &output);
+                if (outputHr == DXGI_ERROR_NOT_FOUND) break;
+                if (FAILED(outputHr) || !output) break;
 
                 DXGI_OUTPUT_DESC od{};
                 if (FAILED(output->GetDesc(&od))) continue;
 
                 RECT r = od.DesktopCoordinates;
+                if (!od.AttachedToDesktop || r.right <= r.left ||
+                    r.bottom <= r.top) continue;
 
                 OutputTarget t;
                 t.index = static_cast<int>(globalIndex++);
@@ -288,14 +303,35 @@ namespace {
             return;
         }
 
-        const size_t bytes = static_cast<size_t>(stride) * static_cast<size_t>(height);
-        std::memcpy(bits, bgra.data(), std::min(bytes, bgra.size()));
+        // A GPU texture's RowPitch can exceed width*4. The new GDI DIB
+        // always has tightly packed 32-bpp rows: copying RowPitch*height
+        // into it would overflow the bitmap and crash the helper.
+        const size_t rowBytes = static_cast<size_t>(width) * 4;
+        const size_t srcStride = static_cast<size_t>(stride);
+        if (srcStride < rowBytes ||
+            bgra.size() < srcStride * static_cast<size_t>(height)) {
+            DeleteObject(dib);
+            DeleteDC(memDC);
+            if (screenDC) ReleaseDC(nullptr, screenDC);
+            return;
+        }
+        for (int row = 0; row < height; ++row) {
+            std::memcpy(static_cast<uint8_t*>(bits) +
+                        static_cast<size_t>(row) * rowBytes,
+                        bgra.data() + static_cast<size_t>(row) * srcStride,
+                        rowBytes);
+        }
 
         HGDIOBJ old = SelectObject(memDC, dib);
         DrawIconEx(memDC, drawX, drawY, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
         SelectObject(memDC, old);
 
-        std::memcpy(bgra.data(), bits, std::min(bytes, bgra.size()));
+        for (int row = 0; row < height; ++row) {
+            std::memcpy(bgra.data() + static_cast<size_t>(row) * srcStride,
+                        static_cast<uint8_t*>(bits) +
+                            static_cast<size_t>(row) * rowBytes,
+                        rowBytes);
+        }
 
         DeleteObject(dib);
         DeleteDC(memDC);
