@@ -16,9 +16,12 @@
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <cwchar>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 using Microsoft::WRL::ComPtr;
 namespace WGC = winrt::Windows::Graphics::Capture;
@@ -29,6 +32,93 @@ std::string FormatError(const char* context, HRESULT hr) {
     std::ostringstream out;
     out << context << " hr=0x" << std::hex << static_cast<unsigned long>(hr);
     return out.str();
+}
+
+// CaptureService is a per-user, demand-start service required by
+// Windows.Graphics.Capture. On the test PC it existed but was Stopped; the
+// WinRT IsSupported call then returned 0x80070424. Start only the single
+// existing per-user instance, never change startup policy, and fall back to
+// GDI without entering WinRT if the service cannot become ready.
+bool EnsureCaptureServiceReady(std::string& failure) {
+    const SC_HANDLE manager = OpenSCManagerW(
+        nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE | SC_MANAGER_CONNECT);
+    if (!manager) {
+        failure = FormatError("OpenSCManager", HRESULT_FROM_WIN32(GetLastError()));
+        return false;
+    }
+
+    // Windows bounds an EnumServicesStatusEx result to 256 KiB. Do not walk
+    // the registry template or blindly start a different signed-in user's
+    // capture service on a multi-user Windows host.
+    std::vector<BYTE> bytes(256u * 1024u);
+    DWORD required = 0, count = 0, resume = 0;
+    const BOOL listed = EnumServicesStatusExW(manager, SC_ENUM_PROCESS_INFO,
+        SERVICE_WIN32, SERVICE_STATE_ALL, bytes.data(),
+        static_cast<DWORD>(bytes.size()), &required, &count, &resume, nullptr);
+    if (!listed) {
+        const DWORD code = GetLastError();
+        CloseServiceHandle(manager);
+        failure = FormatError("EnumServicesStatusEx", HRESULT_FROM_WIN32(code));
+        return false;
+    }
+
+    const auto* entries = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW*>(bytes.data());
+    std::wstring serviceName;
+    DWORD initialState = SERVICE_STOPPED;
+    unsigned matches = 0;
+    for (DWORD index = 0; index < count; ++index) {
+        const wchar_t* name = entries[index].lpServiceName;
+        if (!name || std::wcsncmp(name, L"CaptureService_", 15) != 0) continue;
+        ++matches;
+        serviceName = name;
+        initialState = entries[index].ServiceStatusProcess.dwCurrentState;
+    }
+    if (matches != 1) {
+        CloseServiceHandle(manager);
+        failure = matches == 0 ? "per-user CaptureService instance missing" :
+            "multiple per-user CaptureService instances; refusing ambiguous start";
+        return false;
+    }
+    if (initialState == SERVICE_RUNNING) {
+        CloseServiceHandle(manager);
+        return true;
+    }
+
+    const SC_HANDLE service = OpenServiceW(manager, serviceName.c_str(),
+        SERVICE_START | SERVICE_QUERY_STATUS);
+    if (!service) {
+        const DWORD code = GetLastError();
+        CloseServiceHandle(manager);
+        failure = FormatError("OpenService(CaptureService)", HRESULT_FROM_WIN32(code));
+        return false;
+    }
+    if (!StartServiceW(service, 0, nullptr)) {
+        const DWORD code = GetLastError();
+        if (code != ERROR_SERVICE_ALREADY_RUNNING) {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+            failure = FormatError("StartService(CaptureService)", HRESULT_FROM_WIN32(code));
+            return false;
+        }
+    }
+    bool ready = false;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        SERVICE_STATUS_PROCESS status{};
+        DWORD size = 0;
+        if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                reinterpret_cast<LPBYTE>(&status), sizeof(status), &size)) {
+            if (status.dwCurrentState == SERVICE_RUNNING) {
+                ready = true;
+                break;
+            }
+            if (status.dwCurrentState == SERVICE_STOPPED) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    if (!ready) failure = "per-user CaptureService did not reach Running";
+    return ready;
 }
 
 struct MonitorLookup {
@@ -81,8 +171,12 @@ struct WgcMonitorCapture::Impl {
             failure = "invalid selected monitor geometry";
             return false;
         }
-        std::string stage = "RoInitialize";
+        std::string stage = "CaptureService readiness";
         try {
+            // Avoid entering WinRT capture activation when the per-user
+            // CaptureService cannot be started. Normal GDI remains available.
+            if (!EnsureCaptureServiceReady(failure)) return false;
+            stage = "RoInitialize";
             const HRESULT initHr = RoInitialize(RO_INIT_MULTITHREADED);
             if (SUCCEEDED(initHr)) apartmentInitialized = true;
             else if (initHr != RPC_E_CHANGED_MODE) {
@@ -194,8 +288,19 @@ struct WgcMonitorCapture::Impl {
             D3D11_MAPPED_SUBRESOURCE mapped{};
             winrt::check_hresult(context->Map(
                 staging.Get(), 0, D3D11_MAP_READ, 0, &mapped));
+            // Validate GPU readback stride before copying or allocating.
+            // A corrupt or unexpectedly large RowPitch must never overwrite
+            // the frame buffer or bring down the remote-session helper.
+            const size_t pitch = static_cast<size_t>(mapped.RowPitch);
+            const size_t minimumPitch = static_cast<size_t>(width) * 4u;
+            const size_t byteCount = pitch * static_cast<size_t>(height);
+            if (!mapped.pData || pitch < minimumPitch ||
+                byteCount > 256u * 1024u * 1024u) {
+                context->Unmap(staging.Get(), 0);
+                throw std::runtime_error("WGC mapped texture invalid stride or size");
+            }
             stride = static_cast<int>(mapped.RowPitch);
-            bgra.resize(static_cast<size_t>(stride) * height);
+            bgra.resize(byteCount);
             std::memcpy(bgra.data(), mapped.pData, bgra.size());
             context->Unmap(staging.Get(), 0);
             return true;
