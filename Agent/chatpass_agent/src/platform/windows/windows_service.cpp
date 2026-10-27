@@ -2407,14 +2407,11 @@ if (codecDecision.requestedMode == "auto") {
             std::string vp9Error;
             {
                 Vp9MfEncoder encoder;
-                const bool preferHardware = [&]() {
-                    for (const auto& c : codecProbe.capabilities) {
-                        if (c.codec == "vp9") return c.hardwareEncodeAvailable;
-                    }
-                    return false;
-                }();
+                // Benchmark the same software encoder mode we will actually
+                // select in the session, rather than measuring a hardware
+                // path and then silently starting a different software path.
                 if (!encoder.init(testWidth, testHeight, testFps, 3500,
-                                  preferHardware, &vp9Error)) {
+                                  false, &vp9Error)) {
                     vp9Failed = true;
                 } else {
                     const auto benchmarkStart = std::chrono::steady_clock::now();
@@ -2426,6 +2423,10 @@ if (codecDecision.requestedMode == "auto") {
                         const double elapsed = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0).count();
                         if (!ok || encoded.data.empty()) {
+                            // Media Foundation may buffer its first one or
+                            // two input frames before producing an output.
+                            // Only tolerate that documented startup delay.
+                            if (i < 2 && error.empty()) continue;
                             vp9Error = error.empty() ?
                                 "VP9 encoder did not output complete frames" : error;
                             vp9Failed = true;
