@@ -822,6 +822,12 @@ namespace hi5 {
         std::chrono::steady_clock::time_point fastMouseNextLog{};
         const int cursorRefreshFps = 0; // disabled: mouse movement must not force video frames
         uint64_t resetCount = 0;
+        uint64_t measuredCaptures = 0;
+        uint64_t measuredWrites = 0;
+        double captureTotalMs = 0.0;
+        double captureWorstMs = 0.0;
+        double ipcWriteTotalMs = 0.0;
+        double ipcWriteWorstMs = 0.0;
         int lastTargetFps = idleFps;
         int lastStreamMode = 0;
 
@@ -902,7 +908,13 @@ namespace hi5 {
             try {
                 if (now >= nextCaptureAt) {
                     ++captureAttempts;
+                    const auto captureStart = std::chrono::steady_clock::now();
                     FrameCaptureResult captured = source.nextFrameEx();
+                    const double captureMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - captureStart).count();
+                    captureTotalMs += captureMs;
+                    captureWorstMs = std::max(captureWorstMs, captureMs);
+                    ++measuredCaptures;
                     const bool recentInput = (now - lastInputAt) <= activeHold;
                     const bool recentMotion = (now - lastChangedFrameAt) <= std::chrono::milliseconds(ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
                     const int targetFps = recentInput ? motionFps : (recentMotion ? activeFps : idleFps);
@@ -915,11 +927,17 @@ namespace hi5 {
                         ++changedFrames;
                         lastChangedFrameAt = now;
                         const uint64_t tsNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
-                        if (!shmem.WriteRawI420Frame(captured.frame, tsNs)) {
+                        const auto writeStart = std::chrono::steady_clock::now();
+                        const bool writeOk = shmem.WriteRawI420Frame(captured.frame, tsNs);
+                        const double writeMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - writeStart).count();
+                        ipcWriteTotalMs += writeMs;
+                        ipcWriteWorstMs = std::max(ipcWriteWorstMs, writeMs);
+                        ++measuredWrites;
+                        if (!writeOk) {
                             LogWarn("[streamer] WriteRawI420Frame failed session=" + args.sessionId +
                                 " bytes=" + std::to_string(captured.frame.y.size() + captured.frame.u.size() + captured.frame.v.size()));
-                        }
-                        else {
+                        } else {
                             ++writtenFrames;
                         }
                     }
@@ -969,7 +987,11 @@ namespace hi5 {
                     " written=" + std::to_string(writtenFrames) +
                     " input=" + std::to_string(inputEvents) +
                     " fps=" + std::to_string(lastTargetFps) +
-                    " mode=" + std::string(StreamModeName(lastStreamMode)));
+                    " mode=" + std::string(StreamModeName(lastStreamMode)) +
+                    " capture_avg_ms=" + std::to_string(captureTotalMs / std::max<uint64_t>(1, measuredCaptures)) +
+                    " capture_max_ms=" + std::to_string(captureWorstMs) +
+                    " shared_write_avg_ms=" + std::to_string(ipcWriteTotalMs / std::max<uint64_t>(1, measuredWrites)) +
+                    " shared_write_max_ms=" + std::to_string(ipcWriteWorstMs));
 
                 if (inputPipeOk) {
                     hi5::StreamStats stats{};
@@ -994,6 +1016,12 @@ namespace hi5 {
                 writtenFrames = 0;
                 inputEvents = 0;
                 resetCount = 0;
+                measuredCaptures = 0;
+                measuredWrites = 0;
+                captureTotalMs = 0.0;
+                captureWorstMs = 0.0;
+                ipcWriteTotalMs = 0.0;
+                ipcWriteWorstMs = 0.0;
                 nextStatsAt = currentTime + statsEvery;
             }
 
