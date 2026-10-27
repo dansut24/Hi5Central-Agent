@@ -41,6 +41,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -2336,13 +2337,192 @@ const int bitrateKbps = ReadConfigInt(
 hi5::CodecSelectionResult codecProbe =
     hi5::ProbeCodecCapabilitiesAndSelect(codecDecision.requestedMode);
 
+// Auto must not be a synonym for VP9. Media Foundation listing a codec or
+// successfully creating an encoder does NOT mean it will keep pace with the
+// display. Benchmark both existing RTP sender paths on the endpoint and select
+// VP8 whenever VP9 is too expensive, slow, or cannot emit real encoded frames.
+//
+// The initial codec remains fixed for each WebRTC SDP negotiation. Viewer-side
+// RTCP/WebRTC feedback adjusts the negotiated encoder's quality during a
+// session; a different codec needs a new negotiated session.
+std::string autoSessionCodec = "vp8";
+std::string autoSessionReason = "VP8 safe default";
+if (codecDecision.requestedMode == "auto") {
+    bool vp9Available = false;
+    for (const auto& capability : codecProbe.capabilities) {
+        if (capability.codec == "vp9") {
+            vp9Available = capability.softwareEncodeAvailable ||
+                capability.hardwareEncodeAvailable;
+            break;
+        }
+    }
+    const unsigned int cpuThreads = std::thread::hardware_concurrency();
+    if (!vp9Available) {
+        autoSessionReason = "VP9 encoder unavailable";
+    } else if (cpuThreads != 0 && cpuThreads < 4) {
+        autoSessionReason = "fewer than four logical CPUs; protecting endpoint performance";
+    } else {
+        try {
+            // Synthetic diagnostic frames; never read a customer's desktop,
+            // save captured images, or upload benchmark data.
+            // Test at the resolution normally used for a desktop remote
+            // session. A 720p-only probe greatly underestimates the
+            // CPU cost of 1080p VP9 on slower workstations.
+            constexpr int testWidth = 1920;
+            constexpr int testHeight = 1080;
+            constexpr int testFps = 20;
+            I420Frame test{};
+            test.width = testWidth;
+            test.height = testHeight;
+            test.y.resize(static_cast<size_t>(testWidth) * testHeight);
+            test.u.resize(static_cast<size_t>(testWidth / 2) * (testHeight / 2), 112);
+            test.v.resize(test.u.size(), 144);
+            for (int row = 0; row < testHeight; ++row) {
+                for (int col = 0; col < testWidth; ++col) {
+                    test.y[static_cast<size_t>(row) * testWidth + col] =
+                        static_cast<uint8_t>((col * 13 + row * 17 + (col / 32) * 31) & 255);
+                }
+            }
+
+            constexpr int testFrames = 8;
+            // Small deterministic changes model live desktop content. Testing
+            // identical static frames repeatedly would unfairly favour a
+            // codec that caches or compresses an unchanged picture.
+            const std::vector<uint8_t> baselineLuma = test.y;
+            auto varyDesktopFrame = [&](int index) {
+                for (int row = 0; row < testHeight; row += 12) {
+                    const int col = (index * 79 + row * 11) % (testWidth - 20);
+                    const size_t base = static_cast<size_t>(row) * testWidth + col;
+                    for (int px = 0; px < 20; ++px) {
+                        test.y[base + px] = static_cast<uint8_t>((index * 37 + row + px * 9) & 255);
+                    }
+                }
+            };
+            double vp8TotalMs = 0.0;
+            double vp8MaxMs = 0.0;
+            int vp8Count = 0;
+            {
+                Vp8Encoder encoder(testWidth, testHeight, testFps, 3500, 10, 4, 38, 2);
+                for (int i = 0; i < testFrames; ++i) {
+                    varyDesktopFrame(i);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const EncodedFrame frame = encoder.encode(test, i == 0);
+                    const auto elapsed = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    if (frame.data.empty()) {
+                        throw std::runtime_error("VP8 benchmark returned an empty frame");
+                    }
+                    if (i >= 2) {
+                        vp8TotalMs += elapsed;
+                        vp8MaxMs = std::max(vp8MaxMs, elapsed);
+                        ++vp8Count;
+                    }
+                }
+            }
+
+            // Replay exactly the same input pattern for the second encoder.
+            test.y = baselineLuma;
+            double vp9TotalMs = 0.0;
+            double vp9MaxMs = 0.0;
+            int vp9Count = 0;
+            bool vp9Failed = false;
+            std::string vp9Error;
+            {
+                Vp9MfEncoder encoder;
+                // Benchmark the same software encoder mode we will actually
+                // select in the session, rather than measuring a hardware
+                // path and then silently starting a different software path.
+                const auto benchmarkStart = std::chrono::steady_clock::now();
+                if (!encoder.init(testWidth, testHeight, testFps, 3500,
+                                  false, &vp9Error)) {
+                    vp9Failed = true;
+                } else if (std::chrono::steady_clock::now() - benchmarkStart >
+                           std::chrono::milliseconds(1250)) {
+                    vp9Failed = true;
+                    vp9Error = "VP9 initialisation exceeded 1.25s";
+                } else {
+                    for (int i = 0; i < testFrames; ++i) {
+                        varyDesktopFrame(i);
+                        Vp9EncodedFrame encoded{};
+                        std::string error;
+                        const auto t0 = std::chrono::steady_clock::now();
+                        const bool ok = encoder.encode(test, i == 0, encoded, &error);
+                        const double elapsed = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+                        if (!ok || encoded.data.empty()) {
+                            // Media Foundation may buffer its first one or
+                            // two input frames before producing an output.
+                            // Only tolerate that documented startup delay.
+                            if (i < 2 && error.empty()) continue;
+                            vp9Error = error.empty() ?
+                                "VP9 encoder did not output complete frames" : error;
+                            vp9Failed = true;
+                            break;
+                        }
+                        if (i >= 2) {
+                            vp9TotalMs += elapsed;
+                            vp9MaxMs = std::max(vp9MaxMs, elapsed);
+                            ++vp9Count;
+                        }
+                        // Do not let optional codec testing stall Agent startup.
+                        if (std::chrono::steady_clock::now() - benchmarkStart >
+                                std::chrono::milliseconds(1250)) {
+                            vp9Failed = true;
+                            vp9Error = "VP9 benchmark exceeded 1.25s";
+                            break;
+                        }
+                    }
+                }
+            }
+            const double vp8Ms = vp8Count ? vp8TotalMs / vp8Count : 1000.0;
+            const double vp9Ms = vp9Count ? vp9TotalMs / vp9Count : 1000.0;
+            // At 20fps there are 50ms for each complete frame, including
+            // capture, colour conversion, encoding, packetisation and input.
+            // Avoid consuming most of the budget in software VP9 alone.
+            // Give VP9 a modest quality/compression benefit allowance, but
+            // NEVER choose it merely because an encoder exists or because
+            // it can run as much as 3x slower than VP8.
+            constexpr double vp9AbsoluteCeilingMs = 22.0;
+            const double vp9RelativeCeilingMs = std::max(7.5, vp8Ms * 1.6);
+            const bool vp9Competitive = !vp9Failed && vp8Count >= 4 &&
+                vp9Count >= 4 && vp9Ms <= vp9AbsoluteCeilingMs &&
+                vp9Ms <= vp9RelativeCeilingMs && vp9MaxMs <= 40.0;
+            autoSessionCodec = vp9Competitive ? "vp9_sw" : "vp8";
+            autoSessionReason = vp9Competitive ?
+                "VP9 measured within real-time and relative CPU budgets at 1080p" :
+                (vp9Failed ? "VP9 encoder unavailable or unstable: " + vp9Error :
+                    "VP8 has better measured smoothness/CPU headroom at 1080p");
+            LogI("[codec-auto] benchmark cpu_threads=" + std::to_string(cpuThreads) +
+                " tested_resolution=1920x1080" +
+                " vp8_avg_ms=" + std::to_string(vp8Ms) +
+                " vp8_worst_ms=" + std::to_string(vp8MaxMs) +
+                " vp9_avg_ms=" + std::to_string(vp9Ms) +
+                " vp9_worst_ms=" + std::to_string(vp9MaxMs) +
+                " vp9_frames=" + std::to_string(vp9Count) +
+                " vp9_cpu_budget_ms=" + std::to_string(vp9RelativeCeilingMs) +
+                " selected=" + autoSessionCodec);
+        } catch (const std::exception& ex) {
+            autoSessionCodec = "vp8";
+            autoSessionReason = std::string("codec benchmark failed safely: ") + ex.what();
+        }
+    }
+}
+LogI("[codec-auto] requested=" + codecDecision.requestedMode +
+    " selected=" + autoSessionCodec +
+    " reason=" + autoSessionReason +
+    " h264_av1=explicit_only");
 LogI(
     "codec policy requested=" + codecDecision.requestedMode +
-    " selected=" + codecDecision.selectedCodec +
-    " encoder=" + codecDecision.encoder +
-    " hardware=" + std::string(codecDecision.hardware ? "true" : "false") +
+    " selected=" + (codecDecision.requestedMode == "auto" ?
+        autoSessionCodec : codecDecision.selectedCodec) +
+    " encoder=" + (codecDecision.requestedMode == "auto" ?
+        (autoSessionCodec == "vp8" ? "libvpx-vp8" : "mediafoundation-vp9-sw") :
+        codecDecision.encoder) +
+    " hardware=" + std::string(codecDecision.requestedMode == "auto" ?
+        "false" : (codecDecision.hardware ? "true" : "false")) +
     " stable=" + std::string(codecDecision.stable ? "true" : "false") +
-    " reason=" + codecDecision.reason
+    " reason=" + (codecDecision.requestedMode == "auto" ?
+        autoSessionReason : codecDecision.reason)
 );
 
 for (const auto& line : SplitLines(hi5::CodecCapabilitiesToLogString(codecProbe))) {
@@ -2350,11 +2530,14 @@ for (const auto& line : SplitLines(hi5::CodecCapabilitiesToLogString(codecProbe)
 }
 
 LogI(
-    "stream config codec=" + codecDecision.selectedCodec +
-    " encoder=" + codecDecision.encoder +
+    "stream config codec=" + (codecDecision.requestedMode == "auto" ?
+        autoSessionCodec : codecDecision.selectedCodec) +
+    " encoder=" + (codecDecision.requestedMode == "auto" ?
+        (autoSessionCodec == "vp8" ? "libvpx-vp8" : "mediafoundation-vp9-sw") :
+        codecDecision.encoder) +
     " fps=" + std::to_string(fps) +
     " bitrate_kbps=" + std::to_string(bitrateKbps) +
-    " note=dynamic codec policy selected stable sender path"
+    " note=endpoint-benchmarked-codec-with-viewer-network-quality-feedback"
 );
 
                 const std::string defaultAgentWsBase = "wss://rmm.hi5central.com/agent/ws";
@@ -2391,7 +2574,7 @@ LogI(
                     }
                     });
 
-                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident](const std::string& text) {
+                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident, autoSessionCodec](const std::string& text) {
                     sessionBridge_.HandleIncomingJson(text);
 
                     const auto msg = json::parse(text, nullptr, false);
@@ -2441,7 +2624,7 @@ LogI(
                         // StartStreamerSession() calls StopSession(sessionId) as its first
                         // step. Start the consent/connected banner AFTER that cleanup:
                         // otherwise it is immediately closed, leaving no visible notice.
-                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode);
+                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode, autoSessionCodec);
                         bool sessionStarted = false;
                         {
                             std::lock_guard<std::mutex> lock(sessionsMu_);
@@ -6555,7 +6738,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 int height,
                 int fps,
                 int bitrateKbps,
-                SessionMode sessionMode) {
+                SessionMode sessionMode,
+                const std::string& autoSessionCodec) {
                 StopSession(sessionId);
 
                 auto ctx = std::make_unique<SessionContext>();
@@ -6672,9 +6856,16 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     WebRtcSender::Mode::ExternalFeed,
                     ([&]() {
                         const std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
+                        // Explicit operator choices take precedence. Automatic
+                        // selection uses the successfully probed codec rather
+                        // than the previous hardcoded H.264 experimental path.
                         if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw") return requestedCodec;
                         if (requestedCodec == "vp8") return std::string("vp8");
-                        return std::string("h264_hw");
+                        if (requestedCodec == "h264" || requestedCodec == "h264_hw" ||
+                            requestedCodec == "h264_sw") return requestedCodec;
+                        LogI("[codec-auto] session=" + sessionId + " selected=" +
+                            autoSessionCodec + " reason=device-measured-encoder-performance");
+                        return autoSessionCodec;
                         })()
                 );
 

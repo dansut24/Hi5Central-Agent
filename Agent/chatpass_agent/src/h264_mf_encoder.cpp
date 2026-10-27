@@ -37,8 +37,12 @@ namespace {
         if (!w || !*w) return {};
         int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
         if (len <= 1) return {};
-        std::string out(static_cast<size_t>(len - 1), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr);
+        // Include the trailing NUL in the writable allocation. The old
+        // len - 1 allocation was a one-byte overwrite on every name probe.
+        std::string out(static_cast<size_t>(len), '\0');
+        if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr) != len)
+            return {};
+        out.resize(static_cast<size_t>(len - 1));
         return out;
     }
 
