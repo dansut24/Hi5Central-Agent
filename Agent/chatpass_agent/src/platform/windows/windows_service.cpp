@@ -2474,11 +2474,16 @@ LogI("[codec-auto] requested=" + codecDecision.requestedMode +
     " h264_av1=explicit_only");
 LogI(
     "codec policy requested=" + codecDecision.requestedMode +
-    " selected=" + codecDecision.selectedCodec +
-    " encoder=" + codecDecision.encoder +
-    " hardware=" + std::string(codecDecision.hardware ? "true" : "false") +
+    " selected=" + (codecDecision.requestedMode == "auto" ?
+        autoSessionCodec : codecDecision.selectedCodec) +
+    " encoder=" + (codecDecision.requestedMode == "auto" ?
+        (autoSessionCodec == "vp8" ? "libvpx-vp8" : "mediafoundation-vp9-sw") :
+        codecDecision.encoder) +
+    " hardware=" + std::string(codecDecision.requestedMode == "auto" ?
+        "false" : (codecDecision.hardware ? "true" : "false")) +
     " stable=" + std::string(codecDecision.stable ? "true" : "false") +
-    " reason=" + codecDecision.reason
+    " reason=" + (codecDecision.requestedMode == "auto" ?
+        autoSessionReason : codecDecision.reason)
 );
 
 for (const auto& line : SplitLines(hi5::CodecCapabilitiesToLogString(codecProbe))) {
@@ -2486,11 +2491,14 @@ for (const auto& line : SplitLines(hi5::CodecCapabilitiesToLogString(codecProbe)
 }
 
 LogI(
-    "stream config codec=" + codecDecision.selectedCodec +
-    " encoder=" + codecDecision.encoder +
+    "stream config codec=" + (codecDecision.requestedMode == "auto" ?
+        autoSessionCodec : codecDecision.selectedCodec) +
+    " encoder=" + (codecDecision.requestedMode == "auto" ?
+        (autoSessionCodec == "vp8" ? "libvpx-vp8" : "mediafoundation-vp9-sw") :
+        codecDecision.encoder) +
     " fps=" + std::to_string(fps) +
     " bitrate_kbps=" + std::to_string(bitrateKbps) +
-    " note=dynamic codec policy selected stable sender path"
+    " note=endpoint-benchmarked-codec-with-viewer-network-quality-feedback"
 );
 
                 const std::string defaultAgentWsBase = "wss://rmm.hi5central.com/agent/ws";
