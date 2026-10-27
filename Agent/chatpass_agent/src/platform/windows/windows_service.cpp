@@ -2365,8 +2365,11 @@ if (codecDecision.requestedMode == "auto") {
         try {
             // Synthetic diagnostic frames; never read a customer's desktop,
             // save captured images, or upload benchmark data.
-            constexpr int testWidth = 1280;
-            constexpr int testHeight = 720;
+            // Test at the resolution normally used for a desktop remote
+            // session. A 720p-only probe greatly underestimates the
+            // CPU cost of 1080p VP9 on slower workstations.
+            constexpr int testWidth = 1920;
+            constexpr int testHeight = 1080;
             constexpr int testFps = 20;
             I420Frame test{};
             test.width = testWidth;
@@ -2382,11 +2385,26 @@ if (codecDecision.requestedMode == "auto") {
             }
 
             constexpr int testFrames = 8;
+            // Small deterministic changes model live desktop content. Testing
+            // identical static frames repeatedly would unfairly favour a
+            // codec that caches or compresses an unchanged picture.
+            const std::vector<uint8_t> baselineLuma = test.y;
+            auto varyDesktopFrame = [&](int index) {
+                for (int row = 0; row < testHeight; row += 12) {
+                    const int col = (index * 79 + row * 11) % (testWidth - 20);
+                    const size_t base = static_cast<size_t>(row) * testWidth + col;
+                    for (int px = 0; px < 20; ++px) {
+                        test.y[base + px] = static_cast<uint8_t>((index * 37 + row + px * 9) & 255);
+                    }
+                }
+            };
             double vp8TotalMs = 0.0;
+            double vp8MaxMs = 0.0;
             int vp8Count = 0;
             {
                 Vp8Encoder encoder(testWidth, testHeight, testFps, 3500, 10, 4, 38, 2);
                 for (int i = 0; i < testFrames; ++i) {
+                    varyDesktopFrame(i);
                     const auto t0 = std::chrono::steady_clock::now();
                     const EncodedFrame frame = encoder.encode(test, i == 0);
                     const auto elapsed = std::chrono::duration<double, std::milli>(
@@ -2396,12 +2414,16 @@ if (codecDecision.requestedMode == "auto") {
                     }
                     if (i >= 2) {
                         vp8TotalMs += elapsed;
+                        vp8MaxMs = std::max(vp8MaxMs, elapsed);
                         ++vp8Count;
                     }
                 }
             }
 
+            // Replay exactly the same input pattern for the second encoder.
+            test.y = baselineLuma;
             double vp9TotalMs = 0.0;
+            double vp9MaxMs = 0.0;
             int vp9Count = 0;
             bool vp9Failed = false;
             std::string vp9Error;
@@ -2410,12 +2432,17 @@ if (codecDecision.requestedMode == "auto") {
                 // Benchmark the same software encoder mode we will actually
                 // select in the session, rather than measuring a hardware
                 // path and then silently starting a different software path.
+                const auto benchmarkStart = std::chrono::steady_clock::now();
                 if (!encoder.init(testWidth, testHeight, testFps, 3500,
                                   false, &vp9Error)) {
                     vp9Failed = true;
+                } else if (std::chrono::steady_clock::now() - benchmarkStart >
+                           std::chrono::milliseconds(1250)) {
+                    vp9Failed = true;
+                    vp9Error = "VP9 initialisation exceeded 1.25s";
                 } else {
-                    const auto benchmarkStart = std::chrono::steady_clock::now();
                     for (int i = 0; i < testFrames; ++i) {
+                        varyDesktopFrame(i);
                         Vp9EncodedFrame encoded{};
                         std::string error;
                         const auto t0 = std::chrono::steady_clock::now();
@@ -2434,6 +2461,7 @@ if (codecDecision.requestedMode == "auto") {
                         }
                         if (i >= 2) {
                             vp9TotalMs += elapsed;
+                            vp9MaxMs = std::max(vp9MaxMs, elapsed);
                             ++vp9Count;
                         }
                         // Do not let optional codec testing stall Agent startup.
@@ -2448,19 +2476,30 @@ if (codecDecision.requestedMode == "auto") {
             }
             const double vp8Ms = vp8Count ? vp8TotalMs / vp8Count : 1000.0;
             const double vp9Ms = vp9Count ? vp9TotalMs / vp9Count : 1000.0;
-            // 20fps has a 50ms frame budget. Use VP9 only with headroom
-            // and when it is not dramatically more CPU-expensive than VP8.
-            const bool vp9Fast = !vp9Failed && vp9Count >= 4 &&
-                vp9Ms <= 35.0 && vp9Ms <= std::max(5.0, vp8Ms * 3.2);
-            autoSessionCodec = vp9Fast ? "vp9_sw" : "vp8";
-            autoSessionReason = vp9Fast ?
-                "measured VP9 real-time encode with CPU headroom" :
+            // At 20fps there are 50ms for each complete frame, including
+            // capture, colour conversion, encoding, packetisation and input.
+            // Avoid consuming most of the budget in software VP9 alone.
+            // Give VP9 a modest quality/compression benefit allowance, but
+            // NEVER choose it merely because an encoder exists or because
+            // it can run as much as 3x slower than VP8.
+            constexpr double vp9AbsoluteCeilingMs = 22.0;
+            const double vp9RelativeCeilingMs = std::max(7.5, vp8Ms * 1.6);
+            const bool vp9Competitive = !vp9Failed && vp8Count >= 4 &&
+                vp9Count >= 4 && vp9Ms <= vp9AbsoluteCeilingMs &&
+                vp9Ms <= vp9RelativeCeilingMs && vp9MaxMs <= 40.0;
+            autoSessionCodec = vp9Competitive ? "vp9_sw" : "vp8";
+            autoSessionReason = vp9Competitive ?
+                "VP9 measured within real-time and relative CPU budgets at 1080p" :
                 (vp9Failed ? "VP9 encoder unavailable or unstable: " + vp9Error :
-                    "VP8 measured smoother or lower CPU than VP9");
+                    "VP8 has better measured smoothness/CPU headroom at 1080p");
             LogI("[codec-auto] benchmark cpu_threads=" + std::to_string(cpuThreads) +
+                " tested_resolution=1920x1080" +
                 " vp8_avg_ms=" + std::to_string(vp8Ms) +
+                " vp8_worst_ms=" + std::to_string(vp8MaxMs) +
                 " vp9_avg_ms=" + std::to_string(vp9Ms) +
+                " vp9_worst_ms=" + std::to_string(vp9MaxMs) +
                 " vp9_frames=" + std::to_string(vp9Count) +
+                " vp9_cpu_budget_ms=" + std::to_string(vp9RelativeCeilingMs) +
                 " selected=" + autoSessionCodec);
         } catch (const std::exception& ex) {
             autoSessionCodec = "vp8";
