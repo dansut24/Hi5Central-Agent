@@ -7242,6 +7242,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     // the same Windows host. Age here measures helper->service
                     // delivery, NOT Internet RTT or video decode time.
                     uint64_t deliveredTsNs = 0;
+                    uint64_t receivedAtNs = 0;
                     std::chrono::steady_clock::time_point sendBegin{};
                     std::chrono::steady_clock::time_point sendEnd{};
                     // Keep forwarding secure frames while the secure desktop is active or
@@ -7268,6 +7269,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         deliveredTsNs = secureTs;
                         if (ctx.sender) {
                             sendBegin = std::chrono::steady_clock::now();
+                            receivedAtNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
                             ctx.sender->sendExternalRawI420(secureFrame, forceKf);
                             sendEnd = std::chrono::steady_clock::now();
                         }
@@ -7314,6 +7316,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         deliveredTsNs = normalTs;
                         if (ctx.sender) {
                             sendBegin = std::chrono::steady_clock::now();
+                            receivedAtNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
                             ctx.sender->sendExternalRawI420(normalFrame, forceKf);
                             sendEnd = std::chrono::steady_clock::now();
                         }
@@ -7321,9 +7324,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     }
 
                     if (sent && sendEnd.time_since_epoch().count() != 0) {
-                        const uint64_t hostNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
-                        const double rawAgeMs = deliveredTsNs > 0 && hostNs >= deliveredTsNs
-                            ? static_cast<double>(hostNs - deliveredTsNs) / 1e6 : 0.0;
+                        const double rawAgeMs = deliveredTsNs > 0 && receivedAtNs >= deliveredTsNs
+                            ? static_cast<double>(receivedAtNs - deliveredTsNs) / 1e6 : 0.0;
                         const double pipelineMs = std::chrono::duration<double, std::milli>(
                             sendEnd - sendBegin).count();
                         ++pipelineFrames;
