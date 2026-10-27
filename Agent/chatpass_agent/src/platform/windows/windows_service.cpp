@@ -6308,7 +6308,21 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 LogI("launch normal streamer [NORMAL_SHMEM_EXPECTED_NO_UAC] session=" + ctx.sessionId + " cmd=" + cmdLine);
 
                 ctx.normalInteractiveTrial = false;
-                const bool tryInteractive = InteractiveCaptureTrialEnabled() &&
+                // WGC requires the logged-on user's capture service/context.
+                // LocalSystem's session-bound token fails WGC with 0x80070424.
+                // Keep the original system helper for CAD/secure desktop and
+                // switch back if the user helper cannot produce frames.
+                const bool userCaptureRequested =
+                    InteractiveCaptureTrialEnabled() ||
+                    []() {
+                        DWORD enabled = 0;
+                        DWORD bytes = sizeof(enabled);
+                        return RegGetValueA(HKEY_LOCAL_MACHINE,
+                            "SOFTWARE\\Hi5Central\\Agent", "WgcCaptureTrial",
+                            RRF_RT_REG_DWORD, nullptr, &enabled, &bytes) == ERROR_SUCCESS &&
+                            enabled == 1;
+                    }();
+                const bool tryInteractive = userCaptureRequested &&
                     !ctx.normalInteractiveFallbackUsed && !ctx.backstageMode;
                 if (tryInteractive) {
                     LogI("[capture-test] launching normal streamer as interactive user session=" +
