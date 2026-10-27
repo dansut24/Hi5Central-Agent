@@ -254,6 +254,10 @@ namespace {
             return false;
         }
 
+        // CreateDIBSection exposes direct CPU pixel memory. Windows GDI can
+        // batch drawing commands: flush BitBlt/StretchBlt before memcpy so a
+        // reused surface never yields pixels from the previous desktop frame.
+        GdiFlush();
         strideOut = dstW * 4;
         bgraOut.resize(static_cast<size_t>(strideOut) * dstH);
         std::memcpy(bgraOut.data(), scratch.bits, bgraOut.size());
