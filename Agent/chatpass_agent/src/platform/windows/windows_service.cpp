@@ -6933,6 +6933,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 // frame, while the normal GDI streamer still produces stale frames.
                 std::chrono::steady_clock::time_point secureExitCandidateAt{};
                 uint64_t framesForwarded = 0;
+                DesktopMode lastForwardedMode = DesktopMode::Normal;
+                bool hasForwardedSource = false;
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -7202,7 +7204,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                     if (useSecure && gotSecure) {
                         ++framesForwarded;
-                        const bool forceKf = ctx.activeMode != DesktopMode::Secure || !ctx.secureReady;
+                        const bool newSource = !hasForwardedSource || lastForwardedMode != DesktopMode::Secure;
+                        const bool forceKf = newSource || ctx.recoveryKeyframeRequested.exchange(false);
+                        lastForwardedMode = DesktopMode::Secure;
+                        hasForwardedSource = true;
+                        if (newSource) LogI("[video-recovery] first secure frame keyframe session=" + ctx.sessionId);
                         if (framesForwarded == 1 || (framesForwarded % 120) == 0) {
                             LogI("raw frame forwarded session=" + ctx.sessionId +
                                 " frames=" + std::to_string(framesForwarded) +
@@ -7241,7 +7247,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         }
 
                         ++framesForwarded;
-                        const bool forceKf = wasSecure || framesForwarded == 1;
+                        const bool newSource = !hasForwardedSource || lastForwardedMode != DesktopMode::Normal;
+                        const bool forceKf = wasSecure || newSource || ctx.recoveryKeyframeRequested.exchange(false);
+                        lastForwardedMode = DesktopMode::Normal;
+                        hasForwardedSource = true;
+                        if (newSource) LogI("[video-recovery] first normal frame keyframe session=" + ctx.sessionId);
                         if (framesForwarded == 1 || (framesForwarded % 120) == 0) {
                             LogI("raw frame forwarded session=" + ctx.sessionId +
                                 " frames=" + std::to_string(framesForwarded) +
