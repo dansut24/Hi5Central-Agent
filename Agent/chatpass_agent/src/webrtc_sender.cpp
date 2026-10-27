@@ -452,16 +452,43 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                     // The Windows service also receives the request to recover
                     // a capture helper when no raw frames are being produced.
                     if (kind == "request_keyframe") {
+                        const uint64_t ms = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
+                        uint64_t prev = m_lastViewerKeyframeRequestMs.load();
+                        if (prev != 0 && ms >= prev && ms - prev < 4000) return;
+                        if (!m_lastViewerKeyframeRequestMs.compare_exchange_strong(prev, ms)) return;
                         m_forceKeyframe = true;
                         m_externalHintMode = 2;
-                        LogInfo("[video-recovery] viewer keyframe requested session=" + m_sessionId);
+                        LogInfo("[video-recovery] viewer keyframe accepted session=" + m_sessionId);
                         if (m_mode == Mode::ExternalFeed && m_inputEventFn) {
                             m_inputEventFn(msg);
                         }
                         return;
                     }
-                    // Do not mark the desktop active for periodic diagnostics.
-                    if (kind == "viewer_diagnostics") return;
+                    // RTT/jitter/packet loss are receiver-side network/decode
+                    // measurements, not encoder timings. Sample at most once
+                    // per 10 seconds, separate from capture and VP8/VP9 logs.
+                    if (kind == "viewer_diagnostics") {
+                        const uint64_t ms = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
+                        uint64_t prev = m_lastViewerNetworkLogMs.load();
+                        if (prev != 0 && ms >= prev && ms - prev < 10000) return;
+                        if (!m_lastViewerNetworkLogMs.compare_exchange_strong(prev, ms)) return;
+                        const auto bounded = [&](const char* key, double limit) {
+                            const double n = msg.value(key, 0.0);
+                            return std::max(0.0, std::min(limit, n));
+                        };
+                        LogInfo("[network-health] session=" + m_sessionId +
+                            " viewer_rtt_ms=" + std::to_string(bounded("rtt_ms", 60000.0)) +
+                            " viewer_jitter_ms=" + std::to_string(bounded("jitter_ms", 60000.0)) +
+                            " viewer_playout_buffer_ms=" + std::to_string(bounded("jitter_buffer_ms", 60000.0)) +
+                            " viewer_decoded_fps=" + std::to_string(bounded("fps", 120.0)) +
+                            " viewer_receive_kbps=" + std::to_string(bounded("bitrate_kbps", 100000.0)) +
+                            " viewer_packets_lost=" + std::to_string(bounded("packets_lost", 1e9)));
+                        return;
+                    }
 
                     // Mouse movement is high frequency and best-effort. Keep the
                     // native cursor path responsive, but do not force the expensive
@@ -1859,6 +1886,30 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     }
                 }
 
+                const auto healthNow = std::chrono::steady_clock::now();
+                if (m_externalNextStatsLog.time_since_epoch().count() == 0) {
+                    m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
+                }
+                if (healthNow >= m_externalNextStatsLog) {
+                    const double encodedCount = static_cast<double>(std::max<uint64_t>(1, m_externalEncodedFrames));
+                    const double sentCount = static_cast<double>(std::max<uint64_t>(1, m_externalSentFrames));
+                    LogInfo("[encoder-health] codec=VP9 session=" + m_sessionId +
+                        " encoded=" + std::to_string(m_externalEncodedFrames) +
+                        " sent=" + std::to_string(m_externalSentFrames) +
+                        " encode_avg_ms=" + std::to_string(m_externalEncodeMsTotal / encodedCount) +
+                        " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+                        " rtp_enqueue_avg_ms=" + std::to_string(m_externalSendMsTotal / sentCount) +
+                        " rtp_enqueue_max_ms=" + std::to_string(m_externalSendMsMax) +
+                        " target_fps=" + std::to_string(m_externalConfiguredFps) +
+                        " bitrate_kbps=" + std::to_string(m_externalConfiguredBitrateKbps));
+                    m_externalEncodedFrames = 0;
+                    m_externalSentFrames = 0;
+                    m_externalEncodeMsTotal = 0.0;
+                    m_externalEncodeMsMax = 0.0;
+                    m_externalSendMsTotal = 0.0;
+                    m_externalSendMsMax = 0.0;
+                    m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
+                }
                 return;
             }
             catch (const std::exception& ex) {
@@ -2009,16 +2060,15 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 if (now >= m_externalNextStatsLog) {
                     const double encodedCount = std::max<uint64_t>(1, m_externalEncodedFrames);
                     const double sentCount = std::max<uint64_t>(1, m_externalSentFrames);
-                    std::cout << "[h264] encode health session=" << m_sessionId
-                        << " encoded=" << m_externalEncodedFrames
-                        << " sent=" << m_externalSentFrames
-                        << " encode_avg_ms=" << (m_externalEncodeMsTotal / encodedCount)
-                        << " encode_max_ms=" << m_externalEncodeMsMax
-                        << " send_avg_ms=" << (m_externalSendMsTotal / sentCount)
-                        << " send_max_ms=" << m_externalSendMsMax
-                        << " bitrate=" << m_externalConfiguredBitrateKbps
-                        << " target_fps=" << m_externalConfiguredFps
-                        << "\n";
+                    LogInfo("[encoder-health] codec=H264 session=" + m_sessionId +
+                        " encoded=" + std::to_string(m_externalEncodedFrames) +
+                        " sent=" + std::to_string(m_externalSentFrames) +
+                        " encode_avg_ms=" + std::to_string(m_externalEncodeMsTotal / encodedCount) +
+                        " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+                        " rtp_enqueue_avg_ms=" + std::to_string(m_externalSendMsTotal / sentCount) +
+                        " rtp_enqueue_max_ms=" + std::to_string(m_externalSendMsMax) +
+                        " target_fps=" + std::to_string(m_externalConfiguredFps) +
+                        " bitrate_kbps=" + std::to_string(m_externalConfiguredBitrateKbps));
 
                     m_externalEncodedFrames = 0;
                     m_externalSentFrames = 0;
@@ -2079,17 +2129,18 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             const double encodeAvgMs = m_externalEncodeMsTotal / encodedCount;
             const double sendAvgMs = m_externalSendMsTotal / sentCount;
 
-            std::cout << "[external] encode health session=" << m_sessionId
-                << " encoded=" << m_externalEncodedFrames
-                << " sent=" << m_externalSentFrames
-                << " encode_avg_ms=" << encodeAvgMs
-                << " encode_max_ms=" << m_externalEncodeMsMax
-                << " send_avg_ms=" << sendAvgMs
-                << " send_max_ms=" << m_externalSendMsMax
-                << " bitrate=" << m_externalConfiguredBitrateKbps
-                << " target_fps=" << m_externalConfiguredFps
-                << " keyframe_every=" << m_externalKeyframeEvery
-                << "\n";
+            // Windows services have no reliable stdout console. Use the
+            // Agent's structured logger so these measured encoder timings are
+            // actually retained alongside capture and Viewer RTT diagnostics.
+            LogInfo("[encoder-health] codec=VP8 session=" + m_sessionId +
+                " encoded=" + std::to_string(m_externalEncodedFrames) +
+                " sent=" + std::to_string(m_externalSentFrames) +
+                " encode_avg_ms=" + std::to_string(encodeAvgMs) +
+                " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+                " rtp_enqueue_avg_ms=" + std::to_string(sendAvgMs) +
+                " rtp_enqueue_max_ms=" + std::to_string(m_externalSendMsMax) +
+                " target_fps=" + std::to_string(m_externalConfiguredFps) +
+                " bitrate_kbps=" + std::to_string(m_externalConfiguredBitrateKbps));
 
             try {
                 json diag = {

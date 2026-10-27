@@ -158,6 +158,10 @@ private:
     std::atomic<bool> m_offerSignalSent{ false };
     std::atomic<bool> m_answerHandled{ false };
     std::atomic<bool> m_forceKeyframe{ false };
+    // Separate backoffs: frame recovery remains fast at true desktop changes
+    // (handled by the frame pump) but suppresses redundant remote IDR storms.
+    std::atomic<uint64_t> m_lastViewerKeyframeRequestMs{0};
+    std::atomic<uint64_t> m_lastViewerNetworkLogMs{0};
 
     int m_externalFrameCounter = 0;
     int m_externalEncoderWidth = 0;
