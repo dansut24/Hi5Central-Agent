@@ -2280,6 +2280,7 @@ namespace hi5 {
             DWORD activeConsoleSessionId = 0xFFFFFFFF;
             DWORD lastSeenConsoleSessionId = 0xFFFFFFFF;
             bool consoleSwitchInProgress = false;
+            std::atomic<bool> recoveryKeyframeRequested{false};
         };
 
 
