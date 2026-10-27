@@ -831,6 +831,53 @@ struct DesktopFrameSource::Impl {
             int w = 0, h = 0, pitch = 0;
             std::string error;
             if (wgc->TryReadBgra(bgra, w, h, pitch, error)) {
+                // Compare suspected empty compositor output against GDI.
+                // Truly dark desktops remain valid; nonempty GDI means WGC
+                // returned an unusable frame, so stop WGC for this session.
+                auto nonDarkSamples = [](const std::vector<uint8_t>& pixels,
+                                         int stride, int width, int height) {
+                    int count = 0;
+                    if (width <= 0 || height <= 0 ||
+                        stride < width * 4 ||
+                        pixels.size() < static_cast<size_t>(stride) * height)
+                        return count;
+                    for (int row = 0; row < 10; ++row) {
+                        const int y = ((2 * row + 1) * height) / 20;
+                        for (int col = 0; col < 16; ++col) {
+                            const int x = ((2 * col + 1) * width) / 32;
+                            const auto* p = pixels.data() +
+                                static_cast<size_t>(y) * stride + x * 4;
+                            if (std::max({p[0], p[1], p[2]}) > 24) ++count;
+                        }
+                    }
+                    return count;
+                };
+                const int wgcSamples = nonDarkSamples(bgra, pitch, w, h);
+                if (wgcSamples <= 1) {
+                    const auto target = std::find_if(targets.begin(), targets.end(),
+                        [this](const OutputTarget& t) {
+                            return t.info.index == requestedIndex;
+                        });
+                    if (target != targets.end() &&
+                        w == target->info.width && h == target->info.height) {
+                        std::vector<uint8_t> reference;
+                        int referenceStride = 0;
+                        if (captureRectBgraGdi(target->info.x, target->info.y,
+                            w, h, w, h, reference, referenceStride)) {
+                            const int gdiSamples = nonDarkSamples(
+                                reference, referenceStride, w, h);
+                            if (gdiSamples > 14) {
+                                LogWarn("[capture] WGC produced dark frames, GDI "
+                                    "still shows desktop; disabling WGC backend "
+                                    "wgc_samples=" + std::to_string(wgcSamples) +
+                                    " gdi_samples=" + std::to_string(gdiSamples));
+                                wgc.reset();
+                                lastDxgiRetry = std::chrono::steady_clock::now();
+                                return captureAllMonitorsGdiLocked();
+                            }
+                        }
+                    }
+                }
                 I420Frame frame;
                 // Use the proven desktop BGRA->I420 path; codec/transport unchanged.
                 const auto target = std::find_if(targets.begin(), targets.end(),
