@@ -2280,6 +2280,7 @@ namespace hi5 {
             DWORD activeConsoleSessionId = 0xFFFFFFFF;
             DWORD lastSeenConsoleSessionId = 0xFFFFFFFF;
             bool consoleSwitchInProgress = false;
+            std::atomic<bool> recoveryKeyframeRequested{false};
         };
 
 
@@ -5784,6 +5785,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 const std::string kind = msg.value("kind", "");
                 const std::string type = msg.value("type", "");
 
+                if (kind == "request_keyframe") {
+                    ctx.recoveryKeyframeRequested.store(true);
+                    LogI("[video-recovery] frame requested session=" + ctx.sessionId);
+                    return;
+                }
+
                 // Backstage mode commands can arrive over the WebRTC input data channel.
                 // This bypasses the control-server relay, which may not forward new message types.
                 if (kind == "backstage_start" || type == "backstage_start") {
@@ -6926,6 +6933,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 // frame, while the normal GDI streamer still produces stale frames.
                 std::chrono::steady_clock::time_point secureExitCandidateAt{};
                 uint64_t framesForwarded = 0;
+                DesktopMode lastForwardedMode = DesktopMode::Normal;
+                bool hasForwardedSource = false;
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -7024,7 +7033,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                             // Start Menu sign-out can kill the normal desktop before it sets UACActive.
                             // Do NOT throttle this path; otherwise the viewer stays black at Winlogon.
-                            if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress) {
+                            if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
+                                (ctx.lastSecureLaunchAttempt.time_since_epoch().count() == 0 ||
+                                 now - ctx.lastSecureLaunchAttempt >= std::chrono::seconds(2))) {
                                 LaunchSecureStreamer(ctx);
                             }
                         }
@@ -7070,7 +7081,41 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ctx.secureStreamerProcess = nullptr;
                             ctx.secureReady = false;
                             ctx.secureLaunchInProgress = false;
+                            ctx.lastSecureFrameAt = {};
                         }
+                    }
+
+                    // A capture helper may remain alive without producing a
+                    // fresh frame after Windows changes the active desktop.
+                    // Recycle only that helper, never the RTP peer or input
+                    // channel. Rate-limit restarts to avoid process storms.
+                    if (ctx.secureStreamerProcess &&
+                        (ctx.uacRequested || ctx.secureStateAnnounced ||
+                         ctx.activeMode == DesktopMode::Secure) &&
+                        now - ctx.lastSecureLaunchAttempt > std::chrono::seconds(7) &&
+                        (ctx.lastSecureFrameAt.time_since_epoch().count() == 0 ||
+                         now - ctx.lastSecureFrameAt > std::chrono::seconds(5))) {
+                        LogW("[video-recovery] secure helper stalled; restarting capture session=" + ctx.sessionId);
+                        StopSecureStreamer(ctx);
+                        ctx.lastSecureFrameAt = {};
+                        LaunchSecureStreamer(ctx);
+                    }
+
+                    // After sign-in/UAC, a normal helper can remain alive
+                    // but attached to a desktop that no longer produces frames.
+                    // Only recycle during a handoff and when the normal input
+                    // pipe no longer indicates the protected desktop.
+                    if (!ctx.backstageMode && ctx.normalStreamerProcess &&
+                        !ctx.uacRequested && !ctx.consoleSwitchInProgress &&
+                        (ctx.secureStateAnnounced || ctx.handoffStateAnnounced ||
+                         ctx.activeMode == DesktopMode::Secure) &&
+                        now - ctx.lastNormalLaunchAttempt > std::chrono::seconds(8) &&
+                        (ctx.lastNormalFrameAt.time_since_epoch().count() == 0 ||
+                         now - ctx.lastNormalFrameAt > std::chrono::seconds(6))) {
+                        LogW("[video-recovery] normal helper stalled after desktop change session=" + ctx.sessionId);
+                        StopNormalStreamer(ctx);
+                        ctx.lastNormalLaunchAttempt = now;
+                        LaunchNormalStreamer(ctx);
                     }
 
                     if (now >= nextSecurePoll) {
@@ -7094,7 +7139,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     SendSessionState(ctx.sessionId, "secure_desktop_entering");
                                     ctx.secureStateAnnounced = true;
                                 }
-                                if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress) {
+                                if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
+                                    (ctx.lastSecureLaunchAttempt.time_since_epoch().count() == 0 ||
+                                     now - ctx.lastSecureLaunchAttempt >= std::chrono::seconds(2))) {
                                     LaunchSecureStreamer(ctx);
                                 }
                             }
@@ -7195,7 +7242,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                     if (useSecure && gotSecure) {
                         ++framesForwarded;
-                        const bool forceKf = ctx.activeMode != DesktopMode::Secure || !ctx.secureReady;
+                        const bool newSource = !hasForwardedSource || lastForwardedMode != DesktopMode::Secure;
+                        const bool forceKf = newSource || ctx.recoveryKeyframeRequested.exchange(false);
+                        lastForwardedMode = DesktopMode::Secure;
+                        hasForwardedSource = true;
+                        if (newSource) LogI("[video-recovery] first secure frame keyframe session=" + ctx.sessionId);
                         if (framesForwarded == 1 || (framesForwarded % 120) == 0) {
                             LogI("raw frame forwarded session=" + ctx.sessionId +
                                 " frames=" + std::to_string(framesForwarded) +
@@ -7234,7 +7285,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         }
 
                         ++framesForwarded;
-                        const bool forceKf = wasSecure || framesForwarded == 1;
+                        const bool newSource = !hasForwardedSource || lastForwardedMode != DesktopMode::Normal;
+                        const bool forceKf = wasSecure || newSource || ctx.recoveryKeyframeRequested.exchange(false);
+                        lastForwardedMode = DesktopMode::Normal;
+                        hasForwardedSource = true;
+                        if (newSource) LogI("[video-recovery] first normal frame keyframe session=" + ctx.sessionId);
                         if (framesForwarded == 1 || (framesForwarded % 120) == 0) {
                             LogI("raw frame forwarded session=" + ctx.sessionId +
                                 " frames=" + std::to_string(framesForwarded) +

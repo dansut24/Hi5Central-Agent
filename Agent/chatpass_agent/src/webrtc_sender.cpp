@@ -446,6 +446,20 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         }
                         return;
                     }
+                    // The mobile and native Viewers ask for an IDR/keyframe
+                    // when a desktop source changes or decoded video stalls.
+                    // Handle it here, not as a keyboard/mouse command.
+                    // The Windows service also receives the request to recover
+                    // a capture helper when no raw frames are being produced.
+                    if (kind == "request_keyframe") {
+                        m_forceKeyframe = true;
+                        m_externalHintMode = 2;
+                        LogInfo("[video-recovery] viewer keyframe requested session=" + m_sessionId);
+                        if (m_mode == Mode::ExternalFeed && m_inputEventFn) {
+                            m_inputEventFn(msg);
+                        }
+                        return;
+                    }
                     // Do not mark the desktop active for periodic diagnostics.
                     if (kind == "viewer_diagnostics") return;
 
