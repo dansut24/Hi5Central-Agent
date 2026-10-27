@@ -5785,6 +5785,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 const std::string kind = msg.value("kind", "");
                 const std::string type = msg.value("type", "");
 
+                if (kind == "request_keyframe") {
+                    ctx.recoveryKeyframeRequested.store(true);
+                    LogI("[video-recovery] frame requested session=" + ctx.sessionId);
+                    return;
+                }
+
                 // Backstage mode commands can arrive over the WebRTC input data channel.
                 // This bypasses the control-server relay, which may not forward new message types.
                 if (kind == "backstage_start" || type == "backstage_start") {
