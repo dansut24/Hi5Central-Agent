@@ -7081,7 +7081,24 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             ctx.secureStreamerProcess = nullptr;
                             ctx.secureReady = false;
                             ctx.secureLaunchInProgress = false;
+                            ctx.lastSecureFrameAt = {};
                         }
+                    }
+
+                    // A capture helper may remain alive without producing a
+                    // fresh frame after Windows changes the active desktop.
+                    // Recycle only that helper, never the RTP peer or input
+                    // channel. Rate-limit restarts to avoid process storms.
+                    if (ctx.secureStreamerProcess &&
+                        (ctx.uacRequested || ctx.secureStateAnnounced ||
+                         ctx.activeMode == DesktopMode::Secure) &&
+                        now - ctx.lastSecureLaunchAttempt > std::chrono::seconds(7) &&
+                        (ctx.lastSecureFrameAt.time_since_epoch().count() == 0 ||
+                         now - ctx.lastSecureFrameAt > std::chrono::seconds(5))) {
+                        LogW("[video-recovery] secure helper stalled; restarting capture session=" + ctx.sessionId);
+                        StopSecureStreamer(ctx);
+                        ctx.lastSecureFrameAt = {};
+                        LaunchSecureStreamer(ctx);
                     }
 
                     if (now >= nextSecurePoll) {
