@@ -7101,6 +7101,23 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         LaunchSecureStreamer(ctx);
                     }
 
+                    // After sign-in/UAC, a normal helper can remain alive
+                    // but attached to a desktop that no longer produces frames.
+                    // Only recycle during a handoff and when the normal input
+                    // pipe no longer indicates the protected desktop.
+                    if (!ctx.backstageMode && ctx.normalStreamerProcess &&
+                        !ctx.uacRequested && !ctx.consoleSwitchInProgress &&
+                        (ctx.secureStateAnnounced || ctx.handoffStateAnnounced ||
+                         ctx.activeMode == DesktopMode::Secure) &&
+                        now - ctx.lastNormalLaunchAttempt > std::chrono::seconds(8) &&
+                        (ctx.lastNormalFrameAt.time_since_epoch().count() == 0 ||
+                         now - ctx.lastNormalFrameAt > std::chrono::seconds(6))) {
+                        LogW("[video-recovery] normal helper stalled after desktop change session=" + ctx.sessionId);
+                        StopNormalStreamer(ctx);
+                        ctx.lastNormalLaunchAttempt = now;
+                        LaunchNormalStreamer(ctx);
+                    }
+
                     if (now >= nextSecurePoll) {
                         if (ctx.backstageMode) {
                             ctx.uacRequested = false;
