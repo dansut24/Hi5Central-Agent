@@ -1771,7 +1771,6 @@ namespace hi5 {
                 L"Where-Object { $_.CommandLine -match '--mode\\\\s+(banner|chat-overlay)' } | "
                 L"ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
                 L"\"";
-            LogI("[ui-cleanup] killing orphan banner/chat-overlay helper processes");
             RunHiddenProcessAndWait(ps);
         }
 
@@ -1807,10 +1806,7 @@ namespace hi5 {
                 L"$procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
                 L"\"";
 
-            if (sessionId.empty()) {
-                LogI("[streamer-cleanup] killing orphan streamer helper processes");
-            }
-            else {
+            if (!sessionId.empty()) {
                 LogI("[streamer-cleanup] killing streamer helper processes for session=" + sessionId);
             }
             RunHiddenProcessAndWait(ps, 10000);
