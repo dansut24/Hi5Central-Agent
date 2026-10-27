@@ -1574,31 +1574,48 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             readEnvInt("HI5_VP9_DESKTOP_KBPS", 6000, 500, 20000)));
     }
 
-    if (m_videoCodec == VideoCodec::VP9 && !m_externalHintBackstage.load()) {
-        // Honour the viewer's lower adaptive limits, not exceeding Agent caps.
+    // The feedback-driven Viewer caps both VP8 and VP9. Previously these
+    // limits were applied only to VP9, which left VP8 at full resolution and
+    // bitrate on poor links even when Viewer requested 720p.
+    if ((m_videoCodec == VideoCodec::VP9 || m_videoCodec == VideoCodec::VP8) &&
+        !m_externalHintBackstage.load()) {
         const int reqFps = m_viewerTargetFps.load();
         const int reqKbps = m_viewerTargetBitrateKbps.load();
         if (reqFps > 0) profile.fps = std::min(profile.fps, reqFps);
         if (reqKbps > 0) profile.bitrateKbps = std::min(profile.bitrateKbps, reqKbps);
     }
 
-    const bool sizeChanged = frame.width != m_externalEncoderWidth || frame.height != m_externalEncoderHeight;
+    // Scale only when Viewer sent an explicit bounded resolution. Avoid
+    // copies on native/no-preference paths and preserve all monitor controls.
+    const int vp8RequestedW = m_viewerMaxWidth.load();
+    const int vp8RequestedH = m_viewerMaxHeight.load();
+    I420Frame vp8ScaledFrame;
+    const I420Frame* vp8Input = &frame;
+    if (m_videoCodec == VideoCodec::VP8 && !m_externalHintBackstage.load() &&
+        vp8RequestedW > 0 && vp8RequestedH > 0 &&
+        (frame.width > vp8RequestedW || frame.height > vp8RequestedH)) {
+        vp8ScaledFrame = scaleI420ToWebRtcBounds(frame, vp8RequestedW, vp8RequestedH);
+        vp8Input = &vp8ScaledFrame;
+    }
+    const I420Frame& vp8Frame = *vp8Input;
+    const bool sizeChanged = vp8Frame.width != m_externalEncoderWidth ||
+        vp8Frame.height != m_externalEncoderHeight;
     const bool profileChanged = profile.fps != m_externalConfiguredFps ||
         profile.bitrateKbps != m_externalConfiguredBitrateKbps ||
         profile.cpuUsed != m_externalConfiguredCpuUsed ||
         profile.maxQuantizer != m_externalConfiguredMaxQuantizer;
 
     if (((m_videoCodec == VideoCodec::VP8) || m_h264Failed) && (!m_encoder || sizeChanged)) {
-        m_externalEncoderWidth = frame.width;
-        m_externalEncoderHeight = frame.height;
+        m_externalEncoderWidth = vp8Frame.width;
+        m_externalEncoderHeight = vp8Frame.height;
         m_externalConfiguredFps = profile.fps;
         m_externalConfiguredBitrateKbps = profile.bitrateKbps;
         m_externalConfiguredCpuUsed = profile.cpuUsed;
         m_externalConfiguredMaxQuantizer = profile.maxQuantizer;
         m_externalProfileName = profile.name;
         m_encoder = std::make_unique<Vp8Encoder>(
-            frame.width,
-            frame.height,
+            vp8Frame.width,
+            vp8Frame.height,
             profile.fps,
             profile.bitrateKbps,
             profile.cpuUsed,
@@ -1609,7 +1626,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         forceKeyframe = true;
         m_externalLastProfileChange = nowForProfile;
         std::cout << "[external] service encoder created session=" << m_sessionId
-            << " -> " << frame.width << "x" << frame.height
+            << " -> " << vp8Frame.width << "x" << vp8Frame.height
             << " profile=" << m_externalProfileName
             << " fps=" << profile.fps
             << " bitrate=" << profile.bitrateKbps
@@ -2019,7 +2036,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
     try {
         const auto encodeStart = std::chrono::steady_clock::now();
-        EncodedFrame encoded = m_encoder->encode(frame, keyframe);
+        EncodedFrame encoded = m_encoder->encode(vp8Frame, keyframe);
         const auto encodeEnd = std::chrono::steady_clock::now();
 
         const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
