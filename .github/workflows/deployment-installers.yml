@@ -15,6 +15,8 @@ on:
       - 'Agent/chatpass_agent/src/frame_source.cpp'
       - 'Agent/chatpass_agent/src/util/log.h'
       - 'Agent/chatpass_agent/src/platform/windows/windows_screen.cpp'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_wgc_capture.cpp'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_wgc_capture.h'
       - 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp'
       - 'Agent/chatpass_agent/src/ui/native_banner.cpp'
       - 'Agent/chatpass_agent/src/ui/native_banner.h'
@@ -40,6 +42,8 @@ on:
       - 'Agent/chatpass_agent/src/frame_source.cpp'
       - 'Agent/chatpass_agent/src/util/log.h'
       - 'Agent/chatpass_agent/src/platform/windows/windows_screen.cpp'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_wgc_capture.cpp'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_wgc_capture.h'
       - 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp'
       - 'Agent/chatpass_agent/src/ui/native_banner.cpp'
       - 'Agent/chatpass_agent/src/ui/native_banner.h'
@@ -101,6 +105,39 @@ jobs:
           New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
           Copy-Item $built "$payloadDir/Hi5CentralAgentSetup.exe"
           Write-Host "Current Agent setup size: $((Get-Item $built).Length) bytes"
+
+      # The PR #60/Agent 1.0.77 WGC crash had only module+offset data because
+      # CI discarded the matching Release PDB. Retain exe+PDB from ONE build.
+      # Never include this PDB in the customer-facing installer.
+      - name: Preserve exact Windows Agent crash symbols
+        shell: pwsh
+        run: |
+          $exe = 'Agent/chatpass_agent/build/Release/Hi5CentralAgent.exe'
+          $pdb = 'Agent/chatpass_agent/build/Release/Hi5CentralAgent.pdb'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Agent EXE missing at $exe" }
+          if (-not (Test-Path -LiteralPath $pdb)) { throw "Matching Release PDB missing at $pdb" }
+          $out = 'dist/windows-agent-debug-symbols'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item -LiteralPath $exe -Destination $out -Force
+          Copy-Item -LiteralPath $pdb -Destination $out -Force
+          $manifest = [ordered]@{
+            agent_version = '1.0.${{ github.run_number }}'
+            commit = '${{ github.sha }}'
+            run_id = '${{ github.run_id }}'
+            executable = 'Hi5CentralAgent.exe'
+            exe_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+            symbols = 'Hi5CentralAgent.pdb'
+            pdb_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $pdb).Hash.ToLowerInvariant()
+          }
+          $manifest | ConvertTo-Json | Set-Content -Path "$out/build-manifest.json" -Encoding utf8
+          Write-Host "Matching Windows Agent Release symbols preserved for diagnostics"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-Windows-Agent-Crash-Symbols
+          path: dist/windows-agent-debug-symbols/
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Build native single-file Windows installer template
         shell: pwsh
