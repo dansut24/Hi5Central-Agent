@@ -67,7 +67,72 @@ let pendingRemoteIce = [];
 
 let statsTimer = null;
 let transitionWatchdogTimer = null;
-let lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0 };
+let lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, packetsReceived: 0 };
+// RTP codecs are fixed by SDP for the lifetime of one PeerConnection.
+// Adapt the already-negotiated encoder's resolution/rate from real receiver
+// metrics; do not relabel VP8 packets as VP9 or hot-swap an active track.
+const AUTO_QUALITY_LEVELS = [
+  { preference: "720p", target_fps: 12, target_bitrate_kbps: 1800 },
+  { preference: "1080p", target_fps: 18, target_bitrate_kbps: 3500 },
+  { preference: "native", target_fps: 20, target_bitrate_kbps: 6000 }
+];
+let autoQuality = { level: 1, badSamples: 0, goodSamples: 0, changedAtMs: 0, sentLevel: -1 };
+
+function resetAutoQuality() {
+  autoQuality = { level: 1, badSamples: 0, goodSamples: 0, changedAtMs: 0, sentLevel: -1 };
+}
+
+function sendAutoQualityProfile(reason) {
+  if (!inputDc || inputDc.readyState !== "open" || !currentSession) return false;
+  if (autoQuality.sentLevel === autoQuality.level) return true;
+  const profile = AUTO_QUALITY_LEVELS[autoQuality.level];
+  try {
+    inputDc.send(JSON.stringify({ kind: "viewer_stream_profile", ...profile }));
+    autoQuality.sentLevel = autoQuality.level;
+    console.log("[quality-auto] profile", { profile, reason });
+    return true;
+  } catch (error) {
+    console.warn("[quality-auto] could not send profile", error?.message || error);
+    return false;
+  }
+}
+
+// Three adverse intervals to downgrade; sustained healthy reception to
+// upgrade. Preserve a cooldown so the Media Foundation encoder does not
+// reinitialise repeatedly during brief congestion or desktop idleness.
+function updateAutoQuality({ received, lost, rttMs, jitterMs, nowMs }) {
+  if (pc?.connectionState !== "connected" || !Number.isFinite(received) || received < 1) return;
+  const loss = Number.isFinite(lost) && lost >= 0 ? lost / Math.max(1, received + lost) : 0;
+  const unhealthy = loss > 0.06 || (rttMs != null && rttMs > 320) ||
+    (jitterMs != null && jitterMs > 70);
+  const healthy = loss < 0.015 && (rttMs == null || rttMs < 140) &&
+    (jitterMs == null || jitterMs < 25);
+  if (unhealthy) {
+    autoQuality.badSamples += 1;
+    autoQuality.goodSamples = 0;
+  } else if (healthy) {
+    autoQuality.goodSamples += 1;
+    autoQuality.badSamples = 0;
+  } else {
+    autoQuality.badSamples = 0;
+    autoQuality.goodSamples = 0;
+  }
+  const cooled = nowMs - autoQuality.changedAtMs >= 15000;
+  if (cooled && autoQuality.badSamples >= 3 && autoQuality.level > 0) {
+    autoQuality.level -= 1;
+    autoQuality.changedAtMs = nowMs;
+    autoQuality.badSamples = 0;
+    autoQuality.goodSamples = 0;
+    sendAutoQualityProfile("sustained_packet_loss_or_latency");
+  } else if (cooled && autoQuality.goodSamples >= 30 &&
+             autoQuality.level < AUTO_QUALITY_LEVELS.length - 1) {
+    autoQuality.level += 1;
+    autoQuality.changedAtMs = nowMs;
+    autoQuality.badSamples = 0;
+    autoQuality.goodSamples = 0;
+    sendAutoQualityProfile("sustained_healthy_connection");
+  }
+}
 
 let inputBound = false;
 let controlActive = false;
@@ -747,7 +812,8 @@ function stopStatsPoll() {
     clearInterval(transitionWatchdogTimer);
     transitionWatchdogTimer = null;
   }
-  lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0 };
+  lastStats = { tsMs: 0, bytes: 0, frames: 0, packetsLost: 0, packetsReceived: 0 };
+  resetAutoQuality();
   lastFramesDecoded = 0;
 }
 
@@ -1118,11 +1184,19 @@ async function pollStatsOnce() {
   let fps = NaN;
   let framesDecoded = null;
   let packetsLost = null;
+  let receivedDelta = 0;
+  let lostDelta = 0;
+  let jitterMs = null;
 
   if (inbound) {
     const bytesReceived = Number(inbound.bytesReceived || 0);
     framesDecoded = Number(inbound.framesDecoded || 0);
     packetsLost = Number(inbound.packetsLost || 0);
+    const packetsReceived = Number(inbound.packetsReceived || 0);
+    receivedDelta = Math.max(0, packetsReceived - lastStats.packetsReceived);
+    lostDelta = Math.max(0, packetsLost - lastStats.packetsLost);
+    jitterMs = Number.isFinite(Number(inbound.jitter))
+      ? Math.round(Number(inbound.jitter) * 1000) : null;
 
     if (framesDecoded > lastFramesDecoded) {
       lastFramesDecoded = framesDecoded;
@@ -1147,12 +1221,14 @@ async function pollStatsOnce() {
     lastStats.bytes = bytesReceived;
     lastStats.frames = framesDecoded;
     lastStats.packetsLost = packetsLost;
+    lastStats.packetsReceived = packetsReceived;
   }
 
   const rttMs = selectedPair && isFinite(selectedPair.currentRoundTripTime)
     ? Math.round(selectedPair.currentRoundTripTime * 1000)
     : null;
 
+  updateAutoQuality({ received: receivedDelta, lost: lostDelta, rttMs, jitterMs, nowMs });
   const state = pc.connectionState || pc.iceConnectionState || "—";
   const brStr  = fmtKbps(bitrateKbps);
   const fpsStr = isFinite(fps) ? `${Math.round(fps)} fps` : "— fps";
@@ -1161,7 +1237,7 @@ async function pollStatsOnce() {
   const rttStr = (rttMs != null) ? `rtt ${rttMs}ms` : "rtt —";
 
   if (elStatState) {
-    elStatState.textContent = `${state} · ${brStr} · ${fpsStr} · ${frmStr} · ${lossStr} · ${rttStr}`;
+    elStatState.textContent = `${state} · Auto ${AUTO_QUALITY_LEVELS[autoQuality.level].preference} · ${brStr} · ${fpsStr} · ${frmStr} · ${lossStr} · ${rttStr}`;
   }
   if (elDiagIceState) elDiagIceState.textContent = pc.iceConnectionState || "—";
   if (elDiagConnState) elDiagConnState.textContent = pc.connectionState || "—";
@@ -1564,16 +1640,18 @@ async function handleOffer(msg) {
     const codecs = caps?.codecs || [];
 
     if (transceiver && transceiver.setCodecPreferences && codecs.length) {
-      // Prefer hardware-friendly H.264 from the agent, then fall back to VP8.
-      // Keep RTX/RED/ULPFEC after the primary codecs.
+      // Prefer VP9 desktop clarity if offered and supported; use H.264 for
+      // explicitly-selected hardware sessions and VP8 for compatibility.
+      // Only the codec actually offered by the Agent can be negotiated.
+      const vp9 = codecs.filter(c => String(c.mimeType).toLowerCase() === "video/vp9");
       const h264 = codecs.filter(c => String(c.mimeType).toLowerCase() === "video/h264");
       const vp8 = codecs.filter(c => String(c.mimeType).toLowerCase() === "video/vp8");
       const rest = codecs.filter(c => {
         const mt = String(c.mimeType).toLowerCase();
-        return mt !== "video/h264" && mt !== "video/vp8";
+        return mt !== "video/vp9" && mt !== "video/h264" && mt !== "video/vp8";
       });
-      console.log("[codec] viewer codec preference", { h264: h264.length, vp8: vp8.length, rest: rest.length });
-      transceiver.setCodecPreferences([...h264, ...vp8, ...rest]);
+      console.log("[codec] viewer codec preference", { vp9: vp9.length, h264: h264.length, vp8: vp8.length });
+      transceiver.setCodecPreferences([...vp9, ...h264, ...vp8, ...rest]);
     }
   } catch (e) {
     console.warn("[webrtc] codec preference step failed:", e?.message || e);
@@ -1585,7 +1663,12 @@ async function handleOffer(msg) {
     if (ev.channel.label === "input") {
       inputDc = ev.channel;
 
-      inputDc.onopen = () => {};
+      inputDc.onopen = () => {
+        // A conservative 1080p profile protects first-frame latency; auto
+        // quality can promote to native after sustained clean reception.
+        autoQuality.sentLevel = -1;
+        sendAutoQualityProfile("viewer_data_channel_open");
+      };
       inputDc.onclose = () => {
         inputDc = null;
       };
