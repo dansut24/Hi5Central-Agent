@@ -2336,6 +2336,36 @@ const int bitrateKbps = ReadConfigInt(
 hi5::CodecSelectionResult codecProbe =
     hi5::ProbeCodecCapabilitiesAndSelect(codecDecision.requestedMode);
 
+// Probe the real VP9 Media Foundation encoder before offering VP9 to a Viewer.
+// A codec cannot be swapped under an established RTP payload type without
+// SDP renegotiation: choose once per session, and never claim VP8 is a VP9
+// frame if the VP9 encoder later fails.
+std::string autoSessionCodec = "vp8";
+if (codecDecision.requestedMode == "auto") {
+    bool vp9Available = false;
+    for (const auto& capability : codecProbe.capabilities) {
+        if (capability.codec == "vp9") {
+            vp9Available = capability.softwareEncodeAvailable;
+            break;
+        }
+    }
+    if (vp9Available) {
+        Vp9MfEncoder probe;
+        std::string error;
+        if (probe.init(1280, 720, 20, 3500, false, &error)) {
+            autoSessionCodec = "vp9_sw";
+            LogI("[codec-auto] VP9 software encoder preflight succeeded; preferring desktop clarity");
+        } else {
+            LogW("[codec-auto] VP9 preflight failed: " + error + "; using compatible VP8");
+        }
+    } else {
+        LogI("[codec-auto] VP9 software encoder unavailable; using compatible VP8");
+    }
+}
+LogI("[codec-auto] requested=" + codecDecision.requestedMode +
+    " automatic=" + autoSessionCodec + " vp8_fallback=available" +
+    " h264_av1=explicit_only");
+
 LogI(
     "codec policy requested=" + codecDecision.requestedMode +
     " selected=" + codecDecision.selectedCodec +
@@ -2391,7 +2421,7 @@ LogI(
                     }
                     });
 
-                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident](const std::string& text) {
+                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident, autoSessionCodec](const std::string& text) {
                     sessionBridge_.HandleIncomingJson(text);
 
                     const auto msg = json::parse(text, nullptr, false);
@@ -2441,7 +2471,7 @@ LogI(
                         // StartStreamerSession() calls StopSession(sessionId) as its first
                         // step. Start the consent/connected banner AFTER that cleanup:
                         // otherwise it is immediately closed, leaving no visible notice.
-                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode);
+                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode, autoSessionCodec);
                         bool sessionStarted = false;
                         {
                             std::lock_guard<std::mutex> lock(sessionsMu_);
@@ -6555,7 +6585,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 int height,
                 int fps,
                 int bitrateKbps,
-                SessionMode sessionMode) {
+                SessionMode sessionMode,
+                const std::string& autoSessionCodec) {
                 StopSession(sessionId);
 
                 auto ctx = std::make_unique<SessionContext>();
@@ -6672,9 +6703,16 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     WebRtcSender::Mode::ExternalFeed,
                     ([&]() {
                         const std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
+                        // Explicit operator choices take precedence. Automatic
+                        // selection uses the successfully probed codec rather
+                        // than the previous hardcoded H.264 experimental path.
                         if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw") return requestedCodec;
                         if (requestedCodec == "vp8") return std::string("vp8");
-                        return std::string("h264_hw");
+                        if (requestedCodec == "h264" || requestedCodec == "h264_hw" ||
+                            requestedCodec == "h264_sw") return requestedCodec;
+                        LogI("[codec-auto] session=" + sessionId + " selected=" +
+                            autoSessionCodec + " reason=verified-local-encoder");
+                        return autoSessionCodec;
                         })()
                 );
 
