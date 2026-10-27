@@ -7033,7 +7033,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                             // Start Menu sign-out can kill the normal desktop before it sets UACActive.
                             // Do NOT throttle this path; otherwise the viewer stays black at Winlogon.
-                            if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress) {
+                            if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
+                                (ctx.lastSecureLaunchAttempt.time_since_epoch().count() == 0 ||
+                                 now - ctx.lastSecureLaunchAttempt >= std::chrono::seconds(2))) {
                                 LaunchSecureStreamer(ctx);
                             }
                         }
@@ -7103,7 +7105,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                     SendSessionState(ctx.sessionId, "secure_desktop_entering");
                                     ctx.secureStateAnnounced = true;
                                 }
-                                if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress) {
+                                if (!ctx.secureStreamerProcess && !ctx.secureLaunchInProgress &&
+                                    (ctx.lastSecureLaunchAttempt.time_since_epoch().count() == 0 ||
+                                     now - ctx.lastSecureLaunchAttempt >= std::chrono::seconds(2))) {
                                     LaunchSecureStreamer(ctx);
                                 }
                             }
