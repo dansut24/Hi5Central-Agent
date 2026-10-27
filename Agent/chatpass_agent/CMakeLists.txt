@@ -176,6 +176,14 @@ add_executable(native_vp8_stream
 
 hi5_use_static_msvc_runtime(native_vp8_stream)
 
+# Ship the optimized Release executable as before, but keep a matching PDB in
+# CI so Windows Error Reporting dumps can be resolved to exact source lines.
+# PDBs are not installed on customer machines or bundled into setup.
+if(MSVC)
+  target_compile_options(native_vp8_stream PRIVATE "$<$<CONFIG:Release>:/Zi>")
+  target_link_options(native_vp8_stream PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>")
+endif()
+
 target_include_directories(native_vp8_stream BEFORE PRIVATE
   ${WEBVIEW2_INCLUDE_DIR}
   src
