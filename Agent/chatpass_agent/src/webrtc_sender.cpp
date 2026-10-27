@@ -452,16 +452,43 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                     // The Windows service also receives the request to recover
                     // a capture helper when no raw frames are being produced.
                     if (kind == "request_keyframe") {
+                        const uint64_t ms = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
+                        uint64_t prev = m_lastViewerKeyframeRequestMs.load();
+                        if (prev != 0 && ms >= prev && ms - prev < 4000) return;
+                        if (!m_lastViewerKeyframeRequestMs.compare_exchange_strong(prev, ms)) return;
                         m_forceKeyframe = true;
                         m_externalHintMode = 2;
-                        LogInfo("[video-recovery] viewer keyframe requested session=" + m_sessionId);
+                        LogInfo("[video-recovery] viewer keyframe accepted session=" + m_sessionId);
                         if (m_mode == Mode::ExternalFeed && m_inputEventFn) {
                             m_inputEventFn(msg);
                         }
                         return;
                     }
-                    // Do not mark the desktop active for periodic diagnostics.
-                    if (kind == "viewer_diagnostics") return;
+                    // RTT/jitter/packet loss are receiver-side network/decode
+                    // measurements, not encoder timings. Sample at most once
+                    // per 10 seconds, separate from capture and VP8/VP9 logs.
+                    if (kind == "viewer_diagnostics") {
+                        const uint64_t ms = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
+                        uint64_t prev = m_lastViewerNetworkLogMs.load();
+                        if (prev != 0 && ms >= prev && ms - prev < 10000) return;
+                        if (!m_lastViewerNetworkLogMs.compare_exchange_strong(prev, ms)) return;
+                        const auto bounded = [&](const char* key, double limit) {
+                            const double n = msg.value(key, 0.0);
+                            return std::max(0.0, std::min(limit, n));
+                        };
+                        LogInfo("[network-health] session=" + m_sessionId +
+                            " viewer_rtt_ms=" + std::to_string(bounded("rtt_ms", 60000.0)) +
+                            " viewer_jitter_ms=" + std::to_string(bounded("jitter_ms", 60000.0)) +
+                            " viewer_playout_buffer_ms=" + std::to_string(bounded("jitter_buffer_ms", 60000.0)) +
+                            " viewer_decoded_fps=" + std::to_string(bounded("fps", 120.0)) +
+                            " viewer_receive_kbps=" + std::to_string(bounded("bitrate_kbps", 100000.0)) +
+                            " viewer_packets_lost=" + std::to_string(bounded("packets_lost", 1e9)));
+                        return;
+                    }
 
                     // Mouse movement is high frequency and best-effort. Keep the
                     // native cursor path responsive, but do not force the expensive
