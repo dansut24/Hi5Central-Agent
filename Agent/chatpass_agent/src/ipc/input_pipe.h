@@ -136,6 +136,12 @@ struct StreamStats {
     int32_t streamMode = 0; // 0=idle, 1=active-change, 2=recent-input/motion
     int32_t secureDesktopActive = 0;
     int32_t displayIndex = 0;
+    // Helper-side timing sampled over the same five-second reporting window.
+    // No video pixels or input content are sent with diagnostics.
+    double captureAvgMs = 0.0;
+    double captureMaxMs = 0.0;
+    double sharedWriteAvgMs = 0.0;
+    double sharedWriteMaxMs = 0.0;
 };
 
 // Latest-position fast mouse target. Unlike the normal input ring, this is

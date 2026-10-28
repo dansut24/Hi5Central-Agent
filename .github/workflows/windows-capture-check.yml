@@ -1,0 +1,32 @@
+name: Windows Capture Source Check
+
+on:
+  pull_request:
+    paths:
+      - 'Agent/chatpass_agent/src/frame_source.cpp'
+      - 'Agent/chatpass_agent/src/frame_source.h'
+      - '.github/workflows/windows-capture-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-capture:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile DXGI / GDI capture source against Windows SDK
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Windows C++ compiler unavailable" }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $command = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I Agent/chatpass_agent/src /c Agent/chatpass_agent/src/frame_source.cpp /Fodist\frame_source.obj'
+          cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw "DXGI/GDI capture compile failed" }
+          if (-not (Test-Path dist/frame_source.obj)) { throw "Capture object missing" }
+          Write-Host "Capture translation unit compiled successfully"
