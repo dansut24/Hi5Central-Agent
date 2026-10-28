@@ -268,45 +268,54 @@ namespace {
     static void compositeCursorBgra(int originX, int originY, int width, int height,
         std::vector<uint8_t>& bgra, int stride) {
         if (width <= 0 || height <= 0 || bgra.empty() || stride <= 0) return;
-
         CURSORINFO ci{};
         ci.cbSize = sizeof(ci);
-        if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) {
-            return;
-        }
+        if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
 
         ICONINFO ii{};
-        POINT hot{ 0, 0 };
+        POINT hot{0, 0};
+        int iconW = std::max(1, GetSystemMetrics(SM_CXCURSOR));
+        int iconH = std::max(1, GetSystemMetrics(SM_CYCURSOR));
         if (GetIconInfo(ci.hCursor, &ii)) {
             hot.x = static_cast<LONG>(ii.xHotspot);
             hot.y = static_cast<LONG>(ii.yHotspot);
+            BITMAP bmp{};
+            if (ii.hbmColor && GetObject(ii.hbmColor, sizeof(bmp), &bmp)) {
+                iconW = std::max(iconW, static_cast<int>(bmp.bmWidth));
+                iconH = std::max(iconH, static_cast<int>(bmp.bmHeight));
+            } else if (ii.hbmMask && GetObject(ii.hbmMask, sizeof(bmp), &bmp)) {
+                iconW = std::max(iconW, static_cast<int>(bmp.bmWidth));
+                iconH = std::max(iconH, static_cast<int>(bmp.bmHeight) / 2);
+            }
             if (ii.hbmMask) DeleteObject(ii.hbmMask);
             if (ii.hbmColor) DeleteObject(ii.hbmColor);
         }
-
         const int drawX = ci.ptScreenPos.x - originX - hot.x;
         const int drawY = ci.ptScreenPos.y - originY - hot.y;
+        const int left = std::max(0, drawX);
+        const int top = std::max(0, drawY);
+        const int right = std::min(width, drawX + iconW);
+        const int bottom = std::min(height, drawY + iconH);
+        if (right <= left || bottom <= top) return;
 
-        // Fast reject for the common case where the pointer is outside this monitor.
-        if (drawX > width || drawY > height || drawX < -128 || drawY < -128) {
-            return;
-        }
-
+        // Previously this built and copied a FULL-SCREEN DIB every frame just
+        // to draw a small cursor (8 MB at 1080p, 33 MB at 4K). Only copy the
+        // exact affected rectangle; the rest of the screenshot is unchanged.
+        const int roiW = right - left;
+        const int roiH = bottom - top;
         HDC screenDC = GetDC(nullptr);
-        HDC memDC = CreateCompatibleDC(screenDC ? screenDC : nullptr);
+        HDC memDC = CreateCompatibleDC(screenDC);
         if (!memDC) {
             if (screenDC) ReleaseDC(nullptr, screenDC);
             return;
         }
-
         BITMAPINFO bmi{};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = width;
-        bmi.bmiHeader.biHeight = -height; // top-down
+        bmi.bmiHeader.biWidth = roiW;
+        bmi.bmiHeader.biHeight = -roiH;
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
-
         void* bits = nullptr;
         HBITMAP dib = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
         if (!dib || !bits) {
@@ -315,16 +324,27 @@ namespace {
             if (screenDC) ReleaseDC(nullptr, screenDC);
             return;
         }
-
-        const size_t bytes = static_cast<size_t>(stride) * static_cast<size_t>(height);
-        std::memcpy(bits, bgra.data(), std::min(bytes, bgra.size()));
-
+        const size_t roiStride = static_cast<size_t>(roiW) * 4;
+        for (int row = 0; row < roiH; ++row) {
+            const size_t srcOffset = static_cast<size_t>(top + row) * stride +
+                                     static_cast<size_t>(left) * 4;
+            std::memcpy(static_cast<uint8_t*>(bits) + static_cast<size_t>(row) * roiStride,
+                        bgra.data() + srcOffset, roiStride);
+        }
         HGDIOBJ old = SelectObject(memDC, dib);
-        DrawIconEx(memDC, drawX, drawY, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+        const BOOL drawn = DrawIconEx(memDC, drawX - left, drawY - top,
+                                     ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+        GdiFlush();
+        if (drawn) {
+            for (int row = 0; row < roiH; ++row) {
+                const size_t dstOffset = static_cast<size_t>(top + row) * stride +
+                                         static_cast<size_t>(left) * 4;
+                std::memcpy(bgra.data() + dstOffset,
+                            static_cast<const uint8_t*>(bits) + static_cast<size_t>(row) * roiStride,
+                            roiStride);
+            }
+        }
         SelectObject(memDC, old);
-
-        std::memcpy(bgra.data(), bits, std::min(bytes, bgra.size()));
-
         DeleteObject(dib);
         DeleteDC(memDC);
         if (screenDC) ReleaseDC(nullptr, screenDC);
@@ -568,6 +588,7 @@ struct DesktopFrameSource::Impl {
         if (primaryIt != targets.end()) {
             currentIndex = primaryIt->info.index;
             currentName = primaryIt->info.name;
+            resetD3DLocked();
             return;
         }
 
