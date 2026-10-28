@@ -1,4 +1,5 @@
 #include "frame_source.h"
+#include <libyuv/convert.h>
 
 #include <windows.h>
 #include <d3d11.h>
@@ -117,57 +118,28 @@ namespace {
     }
 
     static void bgraToI420(const uint8_t* src, int srcStride, int width, int height, I420Frame& out) {
+        if (!src || width <= 0 || height <= 0 || srcStride < width * 4)
+            throw std::runtime_error("Invalid desktop frame for I420 conversion");
         out.width = width;
         out.height = height;
         out.y.resize(static_cast<size_t>(width) * height);
-        out.u.resize(static_cast<size_t>((width + 1) / 2) * ((height + 1) / 2));
-        out.v.resize(static_cast<size_t>((width + 1) / 2) * ((height + 1) / 2));
+        const int chromaWidth = (width + 1) / 2;
+        const int chromaHeight = (height + 1) / 2;
+        out.u.resize(static_cast<size_t>(chromaWidth) * chromaHeight);
+        out.v.resize(static_cast<size_t>(chromaWidth) * chromaHeight);
 
-        for (int y = 0; y < height; ++y) {
-            const uint8_t* row = src + y * srcStride;
-            for (int x = 0; x < width; ++x) {
-                const uint8_t b = row[x * 4 + 0];
-                const uint8_t g = row[x * 4 + 1];
-                const uint8_t r = row[x * 4 + 2];
-
-                const int Y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                out.y[static_cast<size_t>(y) * width + x] = clampByte(Y);
-            }
-        }
-
-        const int uvWidth = (width + 1) / 2;
-        const int uvHeight = (height + 1) / 2;
-
-        for (int by = 0; by < uvHeight; ++by) {
-            for (int bx = 0; bx < uvWidth; ++bx) {
-                int sumU = 0;
-                int sumV = 0;
-                int count = 0;
-
-                for (int dy = 0; dy < 2; ++dy) {
-                    for (int dx = 0; dx < 2; ++dx) {
-                        const int x = bx * 2 + dx;
-                        const int y = by * 2 + dy;
-                        if (x >= width || y >= height) continue;
-
-                        const uint8_t* px = src + y * srcStride + x * 4;
-                        const uint8_t b = px[0];
-                        const uint8_t g = px[1];
-                        const uint8_t r = px[2];
-
-                        const int U = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                        const int V = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-
-                        sumU += U;
-                        sumV += V;
-                        ++count;
-                    }
-                }
-
-                out.u[static_cast<size_t>(by) * uvWidth + bx] = clampByte(sumU / std::max(1, count));
-                out.v[static_cast<size_t>(by) * uvWidth + bx] = clampByte(sumV / std::max(1, count));
-            }
-        }
+        // DXGI_FORMAT_B8G8R8A8_UNORM and GDI 32-bit DIB are BGRA *bytes*
+        // (B,G,R,A), which libyuv calls ARGB on little-endian Windows.
+        // SIMD-enabled libyuv replaces the previous two full-frame scalar
+        // loops. This runs for every changed frame at native resolution.
+        const int result = libyuv::ARGBToI420(
+            src, srcStride,
+            out.y.data(), width,
+            out.u.data(), chromaWidth,
+            out.v.data(), chromaWidth,
+            width, height);
+        if (result != 0)
+            throw std::runtime_error("libyuv ARGBToI420 failed");
     }
 
     static void compositeCursorBgra(int originX, int originY, int width, int height,
