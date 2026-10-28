@@ -7,6 +7,7 @@
 #include <windows.h>
 #include "h264_mf_encoder.h"
 #include "av1_mf_encoder.h"
+#include "h265_mf_encoder.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfobjects.h>
@@ -231,6 +232,7 @@ int main() {
     print(run("AV1",subtype('A','V','0','1')));
     exerciseAgentEncoder<H264MfEncoder,H264EncodedFrame>("H264");
     exerciseAgentEncoder<Av1MfEncoder,Av1EncodedFrame>("AV1");
+    exerciseAgentEncoder<H265MfEncoder,H265EncodedFrame>("H265/HEVC");
     MFShutdown();
     if(SUCCEEDED(init)) CoUninitialize();
     return 0; // Hardware absence is a capability result, not CI failure.
