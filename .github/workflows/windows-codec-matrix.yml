@@ -40,8 +40,10 @@ jobs:
         shell: pwsh
         run: |
           & dist/windows_codec_matrix.exe | Tee-Object -FilePath dist/windows-codec-matrix.txt
-          if ($LASTEXITCODE -ne 0) { throw "Media Foundation codec matrix exited with error" }
-          $report = Get-Content dist/windows-codec-matrix.txt -Raw
+          if ($LASTEXITCODE -ne 0) { throw "640x360 codec matrix exited with error" }
+          & dist/windows_codec_matrix.exe --1080p | Tee-Object -FilePath dist/windows-codec-matrix-1080p.txt
+          if ($LASTEXITCODE -ne 0) { throw "1080p codec matrix exited with error" }
+          $report = (Get-Content dist/windows-codec-matrix.txt -Raw) + (Get-Content dist/windows-codec-matrix-1080p.txt -Raw)
           foreach ($codec in @('H264:', 'H265/HEVC:', 'VP9:', 'AV1:', 'VP8:')) {
             if (-not $report.Contains($codec)) { throw "Codec missing from report: $codec" }
           }
@@ -50,6 +52,7 @@ jobs:
           name: windows-codec-matrix
           path: |
             dist/windows-codec-matrix.txt
+            dist/windows-codec-matrix-1080p.txt
             dist/windows_codec_matrix.exe
           retention-days: 14
           if-no-files-found: error
