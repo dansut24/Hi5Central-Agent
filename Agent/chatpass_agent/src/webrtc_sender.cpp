@@ -311,6 +311,10 @@ void WebRtcSender::setConnectionClosedHandler(ConnectionClosedFn fn) {
     m_connectionClosedFn = std::move(fn);
 }
 
+void WebRtcSender::setEncoderOverloadHandler(EncoderOverloadFn fn) {
+    m_encoderOverloadFn = std::move(fn);
+}
+
 uint32_t WebRtcSender::randomU32() {
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -1747,7 +1751,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         const bool rateChangedVp9 = profile.fps != m_externalConfiguredFps ||
             profile.bitrateKbps != m_externalConfiguredBitrateKbps;
 
-        if (!m_vp9Encoder || sizeChangedVp9 || rateChangedVp9) {
+        // Media Foundation VP9 can take hundreds of milliseconds to reinit.
+        // FPS and bitrate changes must NOT reconstruct the encoder. FPS is a
+        // capture/cadence target; bitrate uses optional runtime ICodecAPI.
+        // Only a real resolution change needs a new MFT instance.
+        if (!m_vp9Encoder || sizeChangedVp9) {
+            m_vp9RejectedBitrateKbps = 0;
             m_externalEncoderWidth = vp9Frame.width;
             m_externalEncoderHeight = vp9Frame.height;
             m_externalConfiguredFps = profile.fps;
@@ -1787,6 +1796,30 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             }
 
             forceKeyframe = true;
+        }
+        else if (rateChangedVp9 && m_vp9Encoder && !m_vp9Failed) {
+            // Do not reinitialise Media Foundation simply to adjust fps.
+            // The capture helper already uses a paced, adaptive target FPS.
+            m_externalConfiguredFps = profile.fps;
+            if (profile.bitrateKbps != m_externalConfiguredBitrateKbps &&
+                profile.bitrateKbps != m_vp9RejectedBitrateKbps) {
+                std::string rateError;
+                if (m_vp9Encoder->setTargetBitrateKbps(profile.bitrateKbps, &rateError)) {
+                    m_externalConfiguredBitrateKbps = profile.bitrateKbps;
+                    m_vp9RejectedBitrateKbps = 0;
+                    LogInfo("[vp9] bitrate retuned without encoder restart session=" + m_sessionId +
+                        " kbps=" + std::to_string(profile.bitrateKbps));
+                }
+                else {
+                    // Some MFTs do not support dynamic bitrate. Keep the
+                    // picture alive; avoid retrying on every captured frame.
+                    m_vp9RejectedBitrateKbps = profile.bitrateKbps;
+                    LogInfo("[vp9] retaining stable encoder rate session=" + m_sessionId +
+                        " requested_kbps=" + std::to_string(profile.bitrateKbps) +
+                        " actual_kbps=" + std::to_string(m_externalConfiguredBitrateKbps) +
+                        " reason=" + rateError);
+                }
+            }
         }
 
         if (m_vp9Encoder && !m_vp9Failed) {
@@ -1893,6 +1926,18 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 if (healthNow >= m_externalNextStatsLog) {
                     const double encodedCount = static_cast<double>(std::max<uint64_t>(1, m_externalEncodedFrames));
                     const double sentCount = static_cast<double>(std::max<uint64_t>(1, m_externalSentFrames));
+                    // Two consecutive poor 5-second windows are stronger
+                    // evidence than a short startup codec benchmark. Inform
+                    // the owner to choose VP8 on a future Auto session only.
+                    // Never switch RTP codec without a new SDP negotiation.
+                    if (m_vp9Health.observeWindow(
+                            static_cast<unsigned int>(std::min<uint64_t>(m_externalEncodedFrames, 100000)),
+                            m_externalEncodeMsTotal, m_externalEncodeMsMax,
+                            m_externalConfiguredFps)) {
+                        LogWarn("[codec-auto] sustained VP9 overload session=" + m_sessionId +
+                            " next_auto_session=vp8");
+                        if (m_encoderOverloadFn) m_encoderOverloadFn();
+                    }
                     LogInfo("[encoder-health] codec=VP9 session=" + m_sessionId +
                         " encoded=" + std::to_string(m_externalEncodedFrames) +
                         " sent=" + std::to_string(m_externalSentFrames) +
