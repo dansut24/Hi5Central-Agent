@@ -1006,6 +1006,10 @@ namespace hi5 {
                     stats.streamMode = lastStreamMode;
                     stats.secureDesktopActive = lastSecureState ? 1 : 0;
                     stats.displayIndex = currentDisplay;
+                    stats.captureAvgMs = captureTotalMs / std::max<uint64_t>(1, measuredCaptures);
+                    stats.captureMaxMs = captureWorstMs;
+                    stats.sharedWriteAvgMs = ipcWriteTotalMs / std::max<uint64_t>(1, measuredWrites);
+                    stats.sharedWriteMaxMs = ipcWriteWorstMs;
                     inputPipe.PublishStreamStats(stats);
                 }
 
