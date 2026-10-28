@@ -2356,7 +2356,7 @@ std::string autoSessionCodec = "vp8";
 // with HI5_AUTO_ALLOW_SOFTWARE_VP9=1 when an endpoint has been proven stable.
 std::string autoSessionReason = "realtime-first VP8 default; experimental software VP9 Auto disabled";
 if (codecDecision.requestedMode == "auto" &&
-    ReadEnvInt("HI5_AUTO_ALLOW_SOFTWARE_VP9", 0, 0, 1) == 1) {
+    ReadConfigString("HI5_AUTO_ALLOW_SOFTWARE_VP9", "0") == "1") {
     bool vp9Available = false;
     for (const auto& capability : codecProbe.capabilities) {
         if (capability.codec == "vp9") {
