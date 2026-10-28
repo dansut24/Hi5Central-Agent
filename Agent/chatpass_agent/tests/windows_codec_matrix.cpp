@@ -5,6 +5,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "h264_mf_encoder.h"
+#include "av1_mf_encoder.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfobjects.h>
@@ -171,6 +173,44 @@ static Result run(const char* name, const GUID& outSubtype) {
     else if(r.note.empty())r.note="encoder MFT found but no encoded frame";
     return r;
 }
+
+template <class Encoder, class EncodedFrame>
+static void exerciseAgentEncoder(const char* codec) {
+    constexpr int width=640, height=360;
+    Encoder encoder;
+    std::string error;
+    if (!encoder.init(width,height,20,2500,false,&error)) {
+        std::cout << codec << " Agent encoder: unavailable: " << error << "\n";
+        return;
+    }
+    I420Frame frame{};
+    frame.width=width;
+    frame.height=height;
+    frame.y.assign(size_t(width)*height, 72);
+    frame.u.assign(size_t(width)*height/4, 128);
+    frame.v.assign(size_t(width)*height/4, 128);
+    unsigned int successes=0, empty=0;
+    double worstMs=0, totalMs=0;
+    for(int i=0;i<16;++i) {
+        std::fill(frame.y.begin(),frame.y.end(),uint8_t(60+i*7));
+        EncodedFrame sample{};
+        const auto started=std::chrono::steady_clock::now();
+        const bool ok=encoder.encode(frame,i==0,sample,&error);
+        const double ms=std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-started).count();
+        worstMs=std::max(worstMs,ms);
+        totalMs+=ms;
+        if(!ok && !error.empty()) break;
+        if(!sample.data.empty())++successes;
+        else ++empty;
+    }
+    std::cout << codec << " Agent encoder: emitted=" << successes
+        << " buffered=" << empty << " avg_ms=" << totalMs/16.0
+        << " max_ms=" << worstMs << " status="
+        << (successes>0?"sample-produced":error.empty()?"no-output":error) << "\n";
+    encoder.shutdown();
+}
+
 int main() {
     const HRESULT init=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(FAILED(MFStartup(MF_VERSION,MFSTARTUP_LITE))) {
@@ -189,6 +229,8 @@ int main() {
     print(run("H265/HEVC",subtype('H','E','V','C')));
     print(run("VP9",subtype('V','P','9','0')));
     print(run("AV1",subtype('A','V','0','1')));
+    exerciseAgentEncoder<H264MfEncoder,H264EncodedFrame>("H264");
+    exerciseAgentEncoder<Av1MfEncoder,Av1EncodedFrame>("AV1");
     MFShutdown();
     if(SUCCEEDED(init)) CoUninitialize();
     return 0; // Hardware absence is a capability result, not CI failure.
