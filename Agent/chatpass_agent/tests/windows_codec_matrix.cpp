@@ -29,6 +29,11 @@
 
 using Microsoft::WRL::ComPtr;
 
+// Default smoke runs quickly on a Windows CI runner. --1080p uses the
+// endpoint's actual Full HD workload and 40 frames, still synthetic.
+struct BenchmarkConfig { int width=640; int height=360; int fps=20; int frames=16; };
+static BenchmarkConfig config;
+
 static GUID subtype(char a, char b, char c, char d) {
     const uint32_t fourcc = uint32_t(uint8_t(a)) |
         (uint32_t(uint8_t(b)) << 8) | (uint32_t(uint8_t(c)) << 16) |
@@ -47,6 +52,7 @@ struct Result {
     bool configured = false;
     bool produced = false;
     int frames = 0;
+    int attempts = 0;
     double avgMs = 0;
     double worstMs = 0;
     std::string note;
@@ -55,7 +61,7 @@ struct Result {
 static Result run(const char* name, const GUID& outSubtype) {
     Result r{};
     r.name = name;
-    constexpr int width = 640, height = 360, fps = 20;
+    const int width=config.width, height=config.height, fps=config.fps;
     MFT_REGISTER_TYPE_INFO inInfo{MFMediaType_Video, MFVideoFormat_NV12};
     MFT_REGISTER_TYPE_INFO outInfo{MFMediaType_Video, outSubtype};
     IMFActivate** activates = nullptr;
@@ -83,7 +89,7 @@ static Result run(const char* name, const GUID& outSubtype) {
         if (FAILED(MFCreateMediaType(&output)) || FAILED(MFCreateMediaType(&input))) continue;
         output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         output->SetGUID(MF_MT_SUBTYPE, outSubtype);
-        output->SetUINT32(MF_MT_AVG_BITRATE, 2500000);
+        output->SetUINT32(MF_MT_AVG_BITRATE, config.width>=1920 ? 6000000 : 2500000);
         output->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
         input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         input->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
@@ -91,7 +97,7 @@ static Result run(const char* name, const GUID& outSubtype) {
         if (!dimensions(output.Get(),width,height,fps) || !dimensions(input.Get(),width,height,fps) ||
             FAILED(transform->SetOutputType(0,output.Get(),0)) ||
             FAILED(transform->SetInputType(0,input.Get(),0))) {
-            r.note = "MFT rejected 640x360 NV12 low-latency configuration";
+            r.note = "MFT rejected requested NV12 resolution/low-latency configuration";
             continue;
         }
         r.configured = true;
@@ -102,7 +108,7 @@ static Result run(const char* name, const GUID& outSubtype) {
         const size_t imageSize = size_t(width) * size_t(height) * 3 / 2;
         const auto wholeStart = std::chrono::steady_clock::now();
         double totalMs = 0, worst = 0;
-        for (int frame = 0; frame < 16; ++frame) {
+        for (int frame = 0; frame < config.frames; ++frame) {
             const auto tick = std::chrono::steady_clock::now();
             ComPtr<IMFSample> sample;
             ComPtr<IMFMediaBuffer> buffer;
@@ -110,14 +116,22 @@ static Result run(const char* name, const GUID& outSubtype) {
                 FAILED(MFCreateMemoryBuffer(DWORD(imageSize), &buffer))) break;
             BYTE* data = nullptr; DWORD capacity = 0, length = 0;
             if (FAILED(buffer->Lock(&data,&capacity,&length))) break;
-            // Synthetic moving 640x360 NV12 texture, not a desktop capture.
-            std::fill(data, data + width*height, BYTE(64 + (frame % 8) * 12));
+            // Changing synthetic blocks model window motion and text updates.
+            // No real desktop image is read; avoid a trivial uniform frame.
+            for (int row=0;row<height;++row) {
+                const int yoffset=row*width;
+                for(int col=0;col<width;++col) {
+                    const int block=(col/32 + row/24 + frame*3)%13;
+                    data[yoffset+col]=BYTE(28+block*15);
+                }
+            }
             std::fill(data + width*height, data + imageSize, BYTE(128));
             buffer->Unlock();
             buffer->SetCurrentLength(DWORD(imageSize));
             sample->AddBuffer(buffer.Get());
-            sample->SetSampleTime(LONGLONG(frame) * 500000);
-            sample->SetSampleDuration(500000);
+            const LONGLONG duration = 10000000LL / fps;
+            sample->SetSampleTime(LONGLONG(frame) * duration);
+            sample->SetSampleDuration(duration);
             if (FAILED(transform->ProcessInput(0,sample.Get(),0))) {
                 r.note = "MFT ProcessInput failed";
                 break;
@@ -158,13 +172,14 @@ static Result run(const char* name, const GUID& outSubtype) {
             }
             const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
             totalMs+=ms;
+            ++r.attempts;
             worst=std::max(worst,ms);
             if(std::chrono::steady_clock::now()-wholeStart>std::chrono::seconds(4)) {
                 r.note="encoder smoke budget exceeded";
                 break;
             }
         }
-        r.avgMs=totalMs/16.0;
+        r.avgMs=totalMs/std::max(1,r.attempts);
         r.worstMs=worst;
         transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING,0);
     }
@@ -177,10 +192,10 @@ static Result run(const char* name, const GUID& outSubtype) {
 
 template <class Encoder, class EncodedFrame>
 static void exerciseAgentEncoder(const char* codec) {
-    constexpr int width=640, height=360;
+    const int width=config.width, height=config.height;
     Encoder encoder;
     std::string error;
-    if (!encoder.init(width,height,20,2500,false,&error)) {
+    if (!encoder.init(width,height,config.fps,width>=1920?6000:2500,false,&error)) {
         std::cout << codec << " Agent encoder: unavailable: " << error << "\n";
         return;
     }
@@ -192,8 +207,14 @@ static void exerciseAgentEncoder(const char* codec) {
     frame.v.assign(size_t(width)*height/4, 128);
     unsigned int successes=0, empty=0;
     double worstMs=0, totalMs=0;
-    for(int i=0;i<16;++i) {
-        std::fill(frame.y.begin(),frame.y.end(),uint8_t(60+i*7));
+    int attempts=0;
+    for(int i=0;i<config.frames;++i) {
+        for (int row=0;row<height;++row) {
+            for(int col=0;col<width;++col) {
+                const int block=(col/32+row/24+i*3)%13;
+                frame.y[size_t(row)*width+col]=uint8_t(28+block*15);
+            }
+        }
         EncodedFrame sample{};
         const auto started=std::chrono::steady_clock::now();
         const bool ok=encoder.encode(frame,i==0,sample,&error);
@@ -201,18 +222,26 @@ static void exerciseAgentEncoder(const char* codec) {
             std::chrono::steady_clock::now()-started).count();
         worstMs=std::max(worstMs,ms);
         totalMs+=ms;
+        ++attempts;
         if(!ok && !error.empty()) break;
         if(!sample.data.empty())++successes;
         else ++empty;
     }
     std::cout << codec << " Agent encoder: emitted=" << successes
-        << " buffered=" << empty << " avg_ms=" << totalMs/16.0
+        << " buffered=" << empty << " attempts=" << attempts
+        << " avg_ms=" << totalMs/std::max(1,attempts)
         << " max_ms=" << worstMs << " status="
         << (successes>0?"sample-produced":error.empty()?"no-output":error) << "\n";
     encoder.shutdown();
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc==2 && std::string(argv[1])=="--1080p") {
+        config={1920,1080,20,40};
+    } else if(argc>1) {
+        std::cerr << "Usage: windows_codec_matrix.exe [--1080p]\\n";
+        return 2;
+    }
     const HRESULT init=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(FAILED(MFStartup(MF_VERSION,MFSTARTUP_LITE))) {
         std::cerr<<"Media Foundation unavailable\n";
@@ -221,10 +250,11 @@ int main() {
     const auto print=[](const Result& r) {
         std::cout<<r.name<<": detected="<<r.discovered
             <<" active="<<r.activated<<" configured="<<r.configured
-            <<" frames="<<r.frames<<" avg_ms="<<std::fixed<<std::setprecision(1)
+            <<" frames="<<r.frames<<" attempts="<<r.attempts<<" avg_ms="<<std::fixed<<std::setprecision(1)
             <<r.avgMs<<" max_ms="<<r.worstMs<<" note="<<r.note<<"\n";
     };
-    std::cout<<"Synthetic Windows MFT encoder qualification (not browser RTP validation)\n";
+    std::cout<<"Synthetic Windows MFT encoder qualification (not browser RTP validation) "
+        <<config.width<<"x"<<config.height<<" @"<<config.fps<<"fps frames="<<config.frames<<"\n";
     std::cout<<"VP8: existing libvpx production encoder; not benchmarked by this MFT-only test\n";
     print(run("H264",subtype('H','2','6','4')));
     print(run("H265/HEVC",subtype('H','E','V','C')));
