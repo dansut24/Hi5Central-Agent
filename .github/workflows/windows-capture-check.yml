@@ -5,6 +5,8 @@ on:
     paths:
       - 'Agent/chatpass_agent/src/frame_source.cpp'
       - 'Agent/chatpass_agent/src/frame_source.h'
+      - 'Agent/chatpass_agent/src/ipc/input_pipe.h'
+      - 'Agent/chatpass_agent/tests/stream_stats_ipc_test.cpp'
       - '.github/workflows/windows-capture-check.yml'
   workflow_dispatch:
 
@@ -17,6 +19,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Install optimized Windows capture dependency
+        shell: pwsh
+        run: |
+          & C:\vcpkg\vcpkg.exe install libyuv:x64-windows-static
+          if ($LASTEXITCODE -ne 0) { throw 'libyuv build failed' }
       - name: Compile DXGI / GDI capture source against Windows SDK
         shell: pwsh
         run: |
@@ -25,8 +32,18 @@ jobs:
           if (-not $vs) { throw "Windows C++ compiler unavailable" }
           $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          $command = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I Agent/chatpass_agent/src /c Agent/chatpass_agent/src/frame_source.cpp /Fodist\frame_source.obj'
+          $command = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I C:\vcpkg\installed\x64-windows-static\include /I Agent/chatpass_agent/src /c Agent/chatpass_agent/src/frame_source.cpp /Fodist\frame_source.obj'
           cmd.exe /d /s /c $command
           if ($LASTEXITCODE -ne 0) { throw "DXGI/GDI capture compile failed" }
           if (-not (Test-Path dist/frame_source.obj)) { throw "Capture object missing" }
           Write-Host "Capture translation unit compiled successfully"
+
+      - name: Windows helper IPC timing roundtrip
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN Agent/chatpass_agent/tests/stream_stats_ipc_test.cpp /Fe:dist\stream_stats_ipc_test.exe /link advapi32.lib && dist\stream_stats_ipc_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Windows capture IPC latency roundtrip failed" }

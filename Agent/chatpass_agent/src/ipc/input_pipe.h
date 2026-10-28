@@ -186,6 +186,13 @@ struct InputRingHeader {
     std::atomic<int32_t>  streamStatsMode;
     std::atomic<int32_t>  streamStatsSecureDesktopActive;
     std::atomic<int32_t>  streamStatsDisplayIndex;
+    // The helper owns capture timings. Publish integer microseconds using
+    // interprocess-safe lock-free atomics, and release sequence LAST.
+    // PR #75 extended StreamStats but forgot the actual shared ring fields.
+    std::atomic<uint64_t> streamStatsCaptureAvgUs;
+    std::atomic<uint64_t> streamStatsCaptureMaxUs;
+    std::atomic<uint64_t> streamStatsSharedWriteAvgUs;
+    std::atomic<uint64_t> streamStatsSharedWriteMaxUs;
 
     // Fast latest-position native mouse path, written by the service and read
     // by the interactive streamer. Store fastMouseSeq last using release
@@ -251,6 +258,10 @@ public:
         hdr->streamStatsMode.store(0);
         hdr->streamStatsSecureDesktopActive.store(0);
         hdr->streamStatsDisplayIndex.store(0);
+        hdr->streamStatsCaptureAvgUs.store(0);
+        hdr->streamStatsCaptureMaxUs.store(0);
+        hdr->streamStatsSharedWriteAvgUs.store(0);
+        hdr->streamStatsSharedWriteMaxUs.store(0);
         hdr->fastMouseSeq.store(0);
         hdr->fastMouseUnixMs.store(0);
         hdr->fastMouseClientTsMs.store(0);
@@ -340,6 +351,10 @@ public:
         out.streamMode = hdr->streamStatsMode.load(std::memory_order_acquire);
         out.secureDesktopActive = hdr->streamStatsSecureDesktopActive.load(std::memory_order_acquire);
         out.displayIndex = hdr->streamStatsDisplayIndex.load(std::memory_order_acquire);
+        out.captureAvgMs = hdr->streamStatsCaptureAvgUs.load(std::memory_order_relaxed) / 1000.0;
+        out.captureMaxMs = hdr->streamStatsCaptureMaxUs.load(std::memory_order_relaxed) / 1000.0;
+        out.sharedWriteAvgMs = hdr->streamStatsSharedWriteAvgUs.load(std::memory_order_relaxed) / 1000.0;
+        out.sharedWriteMaxMs = hdr->streamStatsSharedWriteMaxUs.load(std::memory_order_relaxed) / 1000.0;
         return true;
     }
 
@@ -467,6 +482,14 @@ public:
         hdr->streamStatsMode.store(stats.streamMode, std::memory_order_relaxed);
         hdr->streamStatsSecureDesktopActive.store(stats.secureDesktopActive, std::memory_order_relaxed);
         hdr->streamStatsDisplayIndex.store(stats.displayIndex, std::memory_order_relaxed);
+        const auto asMicroseconds = [](double milliseconds) -> uint64_t {
+            return milliseconds > 0.0 && milliseconds < 60000.0
+                ? static_cast<uint64_t>(milliseconds * 1000.0 + 0.5) : 0;
+        };
+        hdr->streamStatsCaptureAvgUs.store(asMicroseconds(stats.captureAvgMs), std::memory_order_relaxed);
+        hdr->streamStatsCaptureMaxUs.store(asMicroseconds(stats.captureMaxMs), std::memory_order_relaxed);
+        hdr->streamStatsSharedWriteAvgUs.store(asMicroseconds(stats.sharedWriteAvgMs), std::memory_order_relaxed);
+        hdr->streamStatsSharedWriteMaxUs.store(asMicroseconds(stats.sharedWriteMaxMs), std::memory_order_relaxed);
         hdr->streamStatsSeq.fetch_add(1, std::memory_order_acq_rel);
     }
 
