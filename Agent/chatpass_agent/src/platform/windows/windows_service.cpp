@@ -2347,8 +2347,16 @@ hi5::CodecSelectionResult codecProbe =
 // RTCP/WebRTC feedback adjusts the negotiated encoder's quality during a
 // session; a different codec needs a new negotiated session.
 std::string autoSessionCodec = "vp8";
-std::string autoSessionReason = "VP8 safe default";
-if (codecDecision.requestedMode == "auto") {
+// A short 1080p encoder benchmark cannot predict sustained end-to-end
+// throughput at the actual user's resolution. Field telemetry observed only
+// ~5-6 forwarded FPS against a requested 20 FPS on an Auto session: the
+// conservative default must prioritise realtime responsiveness and avoid
+// choosing software VP9 just because it passed a short synthetic benchmark.
+// Explicit HI5_CODEC=vp9/vp9_sw still works; opt in to experimental Auto VP9
+// with HI5_AUTO_ALLOW_SOFTWARE_VP9=1 when an endpoint has been proven stable.
+std::string autoSessionReason = "realtime-first VP8 default; experimental software VP9 Auto disabled";
+if (codecDecision.requestedMode == "auto" &&
+    ReadEnvInt("HI5_AUTO_ALLOW_SOFTWARE_VP9", 0, 0, 1) == 1) {
     bool vp9Available = false;
     for (const auto& capability : codecProbe.capabilities) {
         if (capability.codec == "vp9") {
