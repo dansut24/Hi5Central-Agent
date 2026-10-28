@@ -1949,6 +1949,30 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                         " rtp_enqueue_max_ms=" + std::to_string(m_externalSendMsMax) +
                         " target_fps=" + std::to_string(m_externalConfiguredFps) +
                         " bitrate_kbps=" + std::to_string(m_externalConfiguredBitrateKbps));
+                    // VPS-side diagnostics for real-time comparisons. Keep
+                    // the exact same five-second interval as local logging.
+                    // Never include screen pixels, keyboard/mouse contents or identifiers.
+                    try {
+                        json diag = {
+                            {"type", "stream_encoder_diagnostics"},
+                            {"session_id", m_sessionId},
+                            {"codec", "VP9"},
+                            {"encoded_frames", m_externalEncodedFrames},
+                            {"sent_frames", m_externalSentFrames},
+                            {"encode_avg_ms", m_externalEncodeMsTotal / encodedCount},
+                            {"encode_max_ms", m_externalEncodeMsMax},
+                            {"send_avg_ms", m_externalSendMsTotal / sentCount},
+                            {"send_max_ms", m_externalSendMsMax},
+                            {"target_fps", m_externalConfiguredFps},
+                            {"bitrate_kbps", m_externalConfiguredBitrateKbps},
+                            {"width", m_externalEncoderWidth},
+                            {"height", m_externalEncoderHeight}
+                        };
+                        m_signalSend(diag.dump());
+                    } catch (...) {
+                        // Metrics are best effort, never interrupt a stream.
+                    }
+
                     m_externalEncodedFrames = 0;
                     m_externalSentFrames = 0;
                     m_externalEncodeMsTotal = 0.0;
@@ -2117,6 +2141,30 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                         " rtp_enqueue_max_ms=" + std::to_string(m_externalSendMsMax) +
                         " target_fps=" + std::to_string(m_externalConfiguredFps) +
                         " bitrate_kbps=" + std::to_string(m_externalConfiguredBitrateKbps));
+
+                    // VPS-side diagnostics for real-time comparisons. Keep
+                    // the exact same five-second interval as local logging.
+                    // Never include screen pixels, keyboard/mouse contents or identifiers.
+                    try {
+                        json diag = {
+                            {"type", "stream_encoder_diagnostics"},
+                            {"session_id", m_sessionId},
+                            {"codec", "H264"},
+                            {"encoded_frames", m_externalEncodedFrames},
+                            {"sent_frames", m_externalSentFrames},
+                            {"encode_avg_ms", m_externalEncodeMsTotal / encodedCount},
+                            {"encode_max_ms", m_externalEncodeMsMax},
+                            {"send_avg_ms", m_externalSendMsTotal / sentCount},
+                            {"send_max_ms", m_externalSendMsMax},
+                            {"target_fps", m_externalConfiguredFps},
+                            {"bitrate_kbps", m_externalConfiguredBitrateKbps},
+                            {"width", m_externalEncoderWidth},
+                            {"height", m_externalEncoderHeight}
+                        };
+                        m_signalSend(diag.dump());
+                    } catch (...) {
+                        // Metrics are best effort, never interrupt a stream.
+                    }
 
                     m_externalEncodedFrames = 0;
                     m_externalSentFrames = 0;
