@@ -35,6 +35,11 @@ set(LIBDATACHANNEL_ROOT "" CACHE PATH "Optional path to a manual static libdatac
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+if(WIN32)
+  # The desktop capture pipeline converts native BGRA frames to I420.
+  # libyuv uses SIMD-optimised x86 paths instead of per-pixel scalar loops.
+  find_package(libyuv CONFIG REQUIRED)
+endif()
 
 find_path(VPX_INCLUDE_DIRS "vpx/vpx_encoder.h")
 find_library(VPX_LIBRARIES NAMES vpx libvpx)
@@ -176,6 +181,10 @@ add_executable(native_vp8_stream
 )
 
 hi5_use_static_msvc_runtime(native_vp8_stream)
+
+if(WIN32)
+  target_link_libraries(native_vp8_stream PRIVATE yuv)
+endif()
 
 # Ship the optimized Release executable as before, but keep a matching PDB in
 # CI so Windows Error Reporting dumps can be resolved to exact source lines.
