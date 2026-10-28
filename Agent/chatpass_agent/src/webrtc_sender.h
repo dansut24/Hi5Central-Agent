@@ -2,6 +2,7 @@
 
 #include "vp8_encoder.h"
 #include "vp9_mf_encoder.h"
+#include "encoding/sustained_encoder_health.h"
 #include "h264_mf_encoder.h"
 #include "input_injector.h"
 
@@ -27,6 +28,7 @@ public:
     using InputEventFn = std::function<void(const nlohmann::json&)>;
     using DirectMouseMoveFn = std::function<bool(double xNorm, double yNorm, uint64_t seq, double clientTsMs)>;
     using ConnectionClosedFn = std::function<void(const std::string& reason)>;
+    using EncoderOverloadFn = std::function<void()>;
 
     enum class Mode {
         DirectCapture,
@@ -66,6 +68,7 @@ public:
     void setInputEventHandler(InputEventFn fn);
     void setDirectMouseMoveHandler(DirectMouseMoveFn fn);
     void setConnectionClosedHandler(ConnectionClosedFn fn);
+    void setEncoderOverloadHandler(EncoderOverloadFn fn);
 
     bool sendControlMessage(const nlohmann::json& msg);
     bool sendControlMessageText(const std::string& text);
@@ -120,6 +123,7 @@ private:
     InputEventFn m_inputEventFn;
     DirectMouseMoveFn m_directMouseMoveFn;
     ConnectionClosedFn m_connectionClosedFn;
+    EncoderOverloadFn m_encoderOverloadFn;
 
     int m_width = 0;
     int m_height = 0;
@@ -145,6 +149,8 @@ private:
     bool m_vp9Failed = false;
     bool m_vp9NativeFailed = false; // Only downgrade native resolution, never discard the stream.
     int m_vp9SlowNativeFrames = 0;
+    int m_vp9RejectedBitrateKbps = 0;
+    SustainedEncoderHealth m_vp9Health;
     VideoCodec m_videoCodec = VideoCodec::VP8;
     bool m_h264Attempted = false;
     bool m_h264Failed = false;
