@@ -6870,11 +6870,29 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         if (requestedCodec == "vp8") return std::string("vp8");
                         if (requestedCodec == "h264" || requestedCodec == "h264_hw" ||
                             requestedCodec == "h264_sw") return requestedCodec;
+                        // Sustained per-session encoder health has priority
+                        // over a short benchmark for this Agent lifetime.
+                        // The prior session stays on its negotiated VP9 SDP.
+                        if (autoSessionCodec == "vp9_sw" && autoVp9Overloaded_.load()) {
+                            LogW("[codec-auto] session=" + sessionId +
+                                " selected=vp8 reason=prior-session-sustained-vp9-overload");
+                            return std::string("vp8");
+                        }
                         LogI("[codec-auto] session=" + sessionId + " selected=" +
                             autoSessionCodec + " reason=device-measured-encoder-performance");
                         return autoSessionCodec;
                         })()
                 );
+
+                if (ReadConfigString("HI5_CODEC", "auto") == "auto" &&
+                    autoSessionCodec == "vp9_sw") {
+                    ctx->sender->setEncoderOverloadHandler([this, sid = sessionId]() {
+                        if (!autoVp9Overloaded_.exchange(true)) {
+                            LogW("[codec-auto] future sessions will select VP8 after " +
+                                sid + " demonstrated sustained VP9 overload");
+                        }
+                    });
+                }
 
                 ctx->sender->setConnectionClosedHandler([this, sid = sessionId](const std::string& reason) {
                     LogW("WebRTC connection closed/failed session=" + sid + " reason=" + reason + "; scheduling cleanup");
@@ -7502,6 +7520,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             std::map<std::string, std::shared_ptr<TerminalSession>> terminals_;
 
             std::atomic<bool> stop_{ false };
+            // Next-session Auto codec fallback only; explicit codec requests
+            // remain honoured. Never change codec on an existing RTP track.
+            std::atomic<bool> autoVp9Overloaded_{ false };
 
             SessionBridge sessionBridge_;
             AgentPresenceController presenceController_;
