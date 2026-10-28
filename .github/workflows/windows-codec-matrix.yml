@@ -1,0 +1,49 @@
+name: Windows Multi-Codec Encoder Qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Agent/chatpass_agent/tests/windows_codec_matrix.cpp'
+      - '.github/workflows/windows-codec-matrix.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Agent/chatpass_agent/tests/windows_codec_matrix.cpp'
+      - '.github/workflows/windows-codec-matrix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  media-foundation:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Windows MFT codec qualifier using native SDK
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio C++ tools unavailable" }
+          $vcvars = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $command = 'call "' + $vcvars + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /MT /DNOMINMAX /I Agent/chatpass_agent/src Agent/chatpass_agent/tests/windows_codec_matrix.cpp Agent/chatpass_agent/src/h264_mf_encoder.cpp Agent/chatpass_agent/src/av1_mf_encoder.cpp /link mfplat.lib mf.lib mfuuid.lib ole32.lib /OUT:dist\windows_codec_matrix.exe'
+          cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw "codec matrix compile failed" }
+      - name: Probe H264 HEVC VP9 AV1 synthetic encoding
+        shell: pwsh
+        run: |
+          & dist/windows_codec_matrix.exe | Tee-Object -FilePath dist/windows-codec-matrix.txt
+          if ($LASTEXITCODE -ne 0) { throw "Media Foundation codec matrix exited with error" }
+          $report = Get-Content dist/windows-codec-matrix.txt -Raw
+          foreach ($codec in @('H264:', 'H265/HEVC:', 'VP9:', 'AV1:', 'VP8:')) {
+            if (-not $report.Contains($codec)) { throw "Codec missing from report: $codec" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-codec-matrix
+          path: dist/windows-codec-matrix.txt
+          retention-days: 14
+          if-no-files-found: error
