@@ -1,0 +1,195 @@
+// Windows-only synthetic Media Foundation encoder qualification.
+// Never reads the real desktop or uploads video. The production RTP codec
+// MUST NOT be enabled solely because a Media Foundation MFT is enumerated.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfobjects.h>
+#include <mftransform.h>
+#include <mferror.h>
+#include <wrl/client.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mf.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "ole32.lib")
+
+using Microsoft::WRL::ComPtr;
+
+static GUID subtype(char a, char b, char c, char d) {
+    const uint32_t fourcc = uint32_t(uint8_t(a)) |
+        (uint32_t(uint8_t(b)) << 8) | (uint32_t(uint8_t(c)) << 16) |
+        (uint32_t(uint8_t(d)) << 24);
+    return GUID{fourcc, 0, 0x0010, {0x80,0,0,0xAA,0,0x38,0x9B,0x71}};
+}
+static bool dimensions(IMFMediaType* type, int w, int h, int fps) {
+    return type && SUCCEEDED(MFSetAttributeSize(type, MF_MT_FRAME_SIZE, w, h)) &&
+        SUCCEEDED(MFSetAttributeRatio(type, MF_MT_FRAME_RATE, fps, 1)) &&
+        SUCCEEDED(MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
+}
+struct Result {
+    std::string name;
+    bool discovered = false;
+    bool activated = false;
+    bool configured = false;
+    bool produced = false;
+    int frames = 0;
+    double avgMs = 0;
+    double worstMs = 0;
+    std::string note;
+};
+
+static Result run(const char* name, const GUID& outSubtype) {
+    Result r{};
+    r.name = name;
+    constexpr int width = 640, height = 360, fps = 20;
+    MFT_REGISTER_TYPE_INFO inInfo{MFMediaType_Video, MFVideoFormat_NV12};
+    MFT_REGISTER_TYPE_INFO outInfo{MFMediaType_Video, outSubtype};
+    IMFActivate** activates = nullptr;
+    UINT32 count = 0;
+    const UINT32 flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_LOCALMFT |
+        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
+    const HRESULT found = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags,
+        &inInfo, &outInfo, &activates, &count);
+    if (FAILED(found) || count == 0 || !activates) {
+        r.note = "no suitable NV12 encoder MFT registered";
+        if (activates) CoTaskMemFree(activates);
+        return r;
+    }
+    r.discovered = true;
+    for (UINT32 i = 0; i < count && !r.produced; ++i) {
+        ComPtr<IMFTransform> transform;
+        if (!activates[i] || FAILED(activates[i]->ActivateObject(IID_PPV_ARGS(&transform))) || !transform) continue;
+        r.activated = true;
+        ComPtr<IMFAttributes> attrs;
+        if (SUCCEEDED(transform->GetAttributes(&attrs)) && attrs) {
+            attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+        }
+        ComPtr<IMFMediaType> output, input;
+        if (FAILED(MFCreateMediaType(&output)) || FAILED(MFCreateMediaType(&input))) continue;
+        output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        output->SetGUID(MF_MT_SUBTYPE, outSubtype);
+        output->SetUINT32(MF_MT_AVG_BITRATE, 2500000);
+        output->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        input->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+        input->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (!dimensions(output.Get(),width,height,fps) || !dimensions(input.Get(),width,height,fps) ||
+            FAILED(transform->SetOutputType(0,output.Get(),0)) ||
+            FAILED(transform->SetInputType(0,input.Get(),0))) {
+            r.note = "MFT rejected 640x360 NV12 low-latency configuration";
+            continue;
+        }
+        r.configured = true;
+        MFT_OUTPUT_STREAM_INFO outputInfo{};
+        transform->GetOutputStreamInfo(0, &outputInfo);
+        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,0);
+        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM,0);
+        const size_t imageSize = size_t(width) * size_t(height) * 3 / 2;
+        const auto wholeStart = std::chrono::steady_clock::now();
+        double totalMs = 0, worst = 0;
+        for (int frame = 0; frame < 16; ++frame) {
+            const auto tick = std::chrono::steady_clock::now();
+            ComPtr<IMFSample> sample;
+            ComPtr<IMFMediaBuffer> buffer;
+            if (FAILED(MFCreateSample(&sample)) ||
+                FAILED(MFCreateMemoryBuffer(DWORD(imageSize), &buffer))) break;
+            BYTE* data = nullptr; DWORD capacity = 0, length = 0;
+            if (FAILED(buffer->Lock(&data,&capacity,&length))) break;
+            // Synthetic moving 640x360 NV12 texture, not a desktop capture.
+            std::fill(data, data + width*height, BYTE(64 + (frame % 8) * 12));
+            std::fill(data + width*height, data + imageSize, BYTE(128));
+            buffer->Unlock();
+            buffer->SetCurrentLength(DWORD(imageSize));
+            sample->AddBuffer(buffer.Get());
+            sample->SetSampleTime(LONGLONG(frame) * 500000);
+            sample->SetSampleDuration(500000);
+            if (FAILED(transform->ProcessInput(0,sample.Get(),0))) {
+                r.note = "MFT ProcessInput failed";
+                break;
+            }
+            for (int poll=0;poll<2;++poll) {
+                ComPtr<IMFSample> outSample;
+                ComPtr<IMFMediaBuffer> outBuffer;
+                MFT_OUTPUT_DATA_BUFFER packet{};
+                if (!(outputInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
+                    if (FAILED(MFCreateSample(&outSample)) ||
+                        FAILED(MFCreateMemoryBuffer(std::max<DWORD>(outputInfo.cbSize,1024*1024),&outBuffer))) break;
+                    outSample->AddBuffer(outBuffer.Get());
+                    packet.pSample=outSample.Get();
+                }
+                DWORD status=0;
+                HRESULT hr=transform->ProcessOutput(0,1,&packet,&status);
+                if (hr==MF_E_TRANSFORM_NEED_MORE_INPUT) break;
+                if (hr==MF_E_TRANSFORM_STREAM_CHANGE) {
+                    transform->GetOutputStreamInfo(0,&outputInfo);
+                    continue;
+                }
+                if (FAILED(hr)) {
+                    r.note="MFT ProcessOutput failed";
+                    break;
+                }
+                ComPtr<IMFSample> got=packet.pSample;
+                if(!got && outSample)got=outSample;
+                ComPtr<IMFMediaBuffer> result;
+                DWORD encoded=0;
+                if(got && SUCCEEDED(got->ConvertToContiguousBuffer(&result)) && result)
+                    result->GetCurrentLength(&encoded);
+                if(packet.pEvents) packet.pEvents->Release();
+                if(encoded>0) {
+                    r.produced=true;
+                    ++r.frames;
+                }
+                break;
+            }
+            const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
+            totalMs+=ms;
+            worst=std::max(worst,ms);
+            if(std::chrono::steady_clock::now()-wholeStart>std::chrono::seconds(4)) {
+                r.note="encoder smoke budget exceeded";
+                break;
+            }
+        }
+        r.avgMs=totalMs/16.0;
+        r.worstMs=worst;
+        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING,0);
+    }
+    for(UINT32 i=0;i<count;++i)if(activates[i])activates[i]->Release();
+    CoTaskMemFree(activates);
+    if(r.produced)r.note="encoded nonempty samples; WebRTC RTP/decode not yet verified";
+    else if(r.note.empty())r.note="encoder MFT found but no encoded frame";
+    return r;
+}
+int main() {
+    const HRESULT init=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+    if(FAILED(MFStartup(MF_VERSION,MFSTARTUP_LITE))) {
+        std::cerr<<"Media Foundation unavailable\n";
+        return 1;
+    }
+    const auto print=[](const Result& r) {
+        std::cout<<r.name<<": detected="<<r.discovered
+            <<" active="<<r.activated<<" configured="<<r.configured
+            <<" frames="<<r.frames<<" avg_ms="<<std::fixed<<std::setprecision(1)
+            <<r.avgMs<<" max_ms="<<r.worstMs<<" note="<<r.note<<"\n";
+    };
+    std::cout<<"Synthetic Windows MFT encoder qualification (not browser RTP validation)\n";
+    std::cout<<"VP8: existing libvpx production encoder; not benchmarked by this MFT-only test\n";
+    print(run("H264",subtype('H','2','6','4')));
+    print(run("H265/HEVC",subtype('H','E','V','C')));
+    print(run("VP9",subtype('V','P','9','0')));
+    print(run("AV1",subtype('A','V','0','1')));
+    MFShutdown();
+    if(SUCCEEDED(init)) CoUninitialize();
+    return 0; // Hardware absence is a capability result, not CI failure.
+}
