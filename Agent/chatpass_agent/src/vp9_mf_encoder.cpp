@@ -11,6 +11,7 @@
 #include <mftransform.h>
 #include <mferror.h>
 #include <codecapi.h>
+#include <icodecapi.h>
 #include <wrl/client.h>
 
 #include <algorithm>
