@@ -224,6 +224,29 @@ namespace {
         }
     };
 
+    static void compositeCursorOnGdiSurface(HDC targetDc, int originX, int originY,
+                                            int width, int height) {
+        if (!targetDc || width <= 0 || height <= 0) return;
+        CURSORINFO ci{};
+        ci.cbSize = sizeof(ci);
+        if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
+        ICONINFO info{};
+        POINT hotspot{0, 0};
+        if (GetIconInfo(ci.hCursor, &info)) {
+            hotspot.x = static_cast<LONG>(info.xHotspot);
+            hotspot.y = static_cast<LONG>(info.yHotspot);
+            if (info.hbmMask) DeleteObject(info.hbmMask);
+            if (info.hbmColor) DeleteObject(info.hbmColor);
+        }
+        const int drawX = ci.ptScreenPos.x - originX - hotspot.x;
+        const int drawY = ci.ptScreenPos.y - originY - hotspot.y;
+        if (drawX > width || drawY > height || drawX < -256 || drawY < -256) return;
+        // GDI source already has a compatible, writable 32-bit DIB. Compose
+        // directly onto that cached surface instead of constructing/copying
+        // a second full-frame bitmap solely to draw the pointer.
+        DrawIconEx(targetDc, drawX, drawY, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+    }
+
     static bool captureRectBgraGdi(int x, int y, int srcW, int srcH, int dstW, int dstH,
         std::vector<uint8_t>& bgraOut, int& strideOut) {
         if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return false;
@@ -257,11 +280,11 @@ namespace {
         // CreateDIBSection exposes direct CPU pixel memory. Windows GDI can
         // batch drawing commands: flush BitBlt/StretchBlt before memcpy so a
         // reused surface never yields pixels from the previous desktop frame.
+        compositeCursorOnGdiSurface(scratch.memDc, x, y, dstW, dstH);
         GdiFlush();
         strideOut = dstW * 4;
         bgraOut.resize(static_cast<size_t>(strideOut) * dstH);
         std::memcpy(bgraOut.data(), scratch.bits, bgraOut.size());
-        compositeCursorBgra(x, y, dstW, dstH, bgraOut, strideOut);
         return true;
     }
 
