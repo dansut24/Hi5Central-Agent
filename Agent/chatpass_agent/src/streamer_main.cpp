@@ -1005,7 +1005,9 @@ namespace hi5 {
                     stats.targetFps = lastTargetFps;
                     stats.streamMode = lastStreamMode;
                     stats.secureDesktopActive = lastSecureState ? 1 : 0;
-                    stats.displayIndex = currentDisplay;
+                    // Report the actual capture provider: -1 indicates GDI
+                    // fallback even if the requested monitor was index 0.
+                    stats.displayIndex = source.currentDisplayIndex();
                     stats.captureAvgMs = captureTotalMs / std::max<uint64_t>(1, measuredCaptures);
                     stats.captureMaxMs = captureWorstMs;
                     stats.sharedWriteAvgMs = ipcWriteTotalMs / std::max<uint64_t>(1, measuredWrites);
