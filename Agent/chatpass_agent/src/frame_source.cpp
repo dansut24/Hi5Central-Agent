@@ -467,6 +467,9 @@ struct DesktopFrameSource::Impl {
     mutable std::mutex mu;
 
     std::vector<OutputTarget> targets;
+    // Rebuilding DXGI factories/adapters on every video frame is expensive.
+    // Refresh at most once per second, but allow explicit monitor switches.
+    std::chrono::steady_clock::time_point nextDisplayProbeAt{};
     int currentIndex = 0;
     std::string currentName;
 
@@ -480,6 +483,7 @@ struct DesktopFrameSource::Impl {
 
     I420Frame lastFrame;
     std::vector<uint8_t> gdiBgra; // reusable BGRA buffer, not a 16MB allocation per frame
+    std::vector<uint8_t> dxgiBgra; // reuse mapped DXGI staging buffer across frames
     std::chrono::steady_clock::time_point lastGdiRefresh{};
     uint64_t frameId = 0;
 
@@ -513,9 +517,21 @@ struct DesktopFrameSource::Impl {
         height = 0;
     }
 
-    void refreshDisplaysLocked() {
+    void refreshDisplaysLocked(bool force = false) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now < nextDisplayProbeAt) return;
+        nextDisplayProbeAt = now + std::chrono::seconds(1);
         const int previousIndex = currentIndex;
         const std::string previousName = currentName;
+        // Preserve the existing duplication when the monitor is unchanged.
+        // On a display resize/adapter move, rebuild before capturing again.
+        const auto* previousTarget = findCurrentTargetLocked();
+        const int oldWidth = previousTarget ? previousTarget->info.width : 0;
+        const int oldHeight = previousTarget ? previousTarget->info.height : 0;
+        const int oldX = previousTarget ? previousTarget->info.x : 0;
+        const int oldY = previousTarget ? previousTarget->info.y : 0;
+        const UINT oldAdapter = previousTarget ? previousTarget->adapterIndex : 0;
+        const UINT oldOutput = previousTarget ? previousTarget->outputIndex : 0;
 
         targets = enumerateTargets();
 
@@ -538,6 +554,11 @@ struct DesktopFrameSource::Impl {
         if (it != targets.end()) {
             currentIndex = it->info.index;
             currentName = it->info.name;
+            if (oldWidth != it->info.width || oldHeight != it->info.height ||
+                oldX != it->info.x || oldY != it->info.y ||
+                oldAdapter != it->adapterIndex || oldOutput != it->outputIndex) {
+                resetD3DLocked();
+            }
             return;
         }
 
@@ -552,6 +573,7 @@ struct DesktopFrameSource::Impl {
 
         currentIndex = targets.front().info.index;
         currentName = targets.front().info.name;
+        resetD3DLocked();
     }
 
     const OutputTarget* findCurrentTargetLocked() const {
@@ -641,7 +663,7 @@ struct DesktopFrameSource::Impl {
     }
 
     bool setDisplayIndexLocked(int index) {
-        refreshDisplaysLocked();
+        refreshDisplaysLocked(true);
 
         if (index == -1) {
             currentIndex = -1;
@@ -807,15 +829,15 @@ struct DesktopFrameSource::Impl {
         }
 
         const int rowPitch = static_cast<int>(mapped.RowPitch);
-        std::vector<uint8_t> bgra(static_cast<size_t>(rowPitch) * static_cast<size_t>(height));
-        std::memcpy(bgra.data(), mapped.pData, bgra.size());
+        dxgiBgra.resize(static_cast<size_t>(rowPitch) * static_cast<size_t>(height));
+        std::memcpy(dxgiBgra.data(), mapped.pData, dxgiBgra.size());
         context->Unmap(staging.Get(), 0);
 
         const DisplayInfo d = currentDisplayInfoLocked();
-        compositeCursorBgra(d.x, d.y, width, height, bgra, rowPitch);
+        compositeCursorBgra(d.x, d.y, width, height, dxgiBgra, rowPitch);
 
         I420Frame out;
-        bgraToI420(bgra.data(), rowPitch, width, height, out);
+        bgraToI420(dxgiBgra.data(), rowPitch, width, height, out);
 
         lastFrame = out;
 
