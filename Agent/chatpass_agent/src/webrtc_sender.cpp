@@ -1778,6 +1778,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     return;
                 }
                 m_vp9Failed = true;
+                if (m_encoderOverloadFn) m_encoderOverloadFn();
                 m_vp9Encoder.reset();
             }
             else {
@@ -1874,6 +1875,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                         return;
                     }
                     m_vp9Failed = true;
+                    if (m_encoderOverloadFn) m_encoderOverloadFn();
                     m_vp9Encoder.reset();
                     return;
                 }
@@ -1961,6 +1963,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 LogInfo("[vp9] exception session=" + m_sessionId +
                     " error=" + std::string(ex.what()));
                 m_vp9Failed = true;
+                if (m_encoderOverloadFn) m_encoderOverloadFn();
                 m_vp9Encoder.reset();
                 return;
             }
