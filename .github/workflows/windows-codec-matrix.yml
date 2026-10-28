@@ -48,6 +48,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-codec-matrix
-          path: dist/windows-codec-matrix.txt
+          path: |
+            dist/windows-codec-matrix.txt
+            dist/windows_codec_matrix.exe
           retention-days: 14
           if-no-files-found: error
