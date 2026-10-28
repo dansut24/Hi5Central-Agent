@@ -20,6 +20,9 @@ public:
 
     bool init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error = nullptr);
     bool encode(const I420Frame& frame, bool forceKeyframe, Vp9EncodedFrame& out, std::string* error = nullptr);
+    // Best-effort dynamic MFT bitrate update; never tears down the encoder.
+    // Unsupported encoders return false and retain the current configuration.
+    bool setTargetBitrateKbps(int bitrateKbps, std::string* error = nullptr);
     void shutdown();
 
     std::string encoderName() const { return m_encoderName; }
