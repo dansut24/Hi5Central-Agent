@@ -10,6 +10,7 @@
 #include <mfreadwrite.h>
 #include <mftransform.h>
 #include <mferror.h>
+#include <codecapi.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -280,6 +281,34 @@ bool Vp9MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool pr
     return true;
 }
 
+bool Vp9MfEncoder::setTargetBitrateKbps(int bitrateKbps, std::string* error) {
+    if (!m_open || !m_impl || !m_impl->transform) {
+        if (error) *error = "encoder not open";
+        return false;
+    }
+    const int requested = std::max(300, std::min(20000, bitrateKbps));
+    if (requested == m_bitrateKbps) return true;
+
+    // ICodecAPI is optional on Media Foundation VP9 MFTs. If unsupported,
+    // retain the existing encoder/rate instead of forcing a costly teardown.
+    ComPtr<ICodecAPI> api;
+    HRESULT hr = m_impl->transform.As(&api);
+    if (FAILED(hr) || !api) {
+        if (error) *error = "dynamic bitrate ICodecAPI unavailable";
+        return false;
+    }
+    VARIANT value{};
+    value.vt = VT_UI4;
+    value.ulVal = static_cast<ULONG>(requested * 1000);
+    hr = api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &value);
+    if (FAILED(hr)) {
+        if (error) *error = "dynamic bitrate SetValue failed " + HrToString(hr);
+        return false;
+    }
+    m_bitrateKbps = requested;
+    return true;
+}
+
 bool Vp9MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Vp9EncodedFrame& out, std::string* error) {
     (void)forceKeyframe;
 
@@ -377,7 +406,9 @@ bool Vp9MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Vp9Encoded
         hr = m_impl->transform->ProcessOutput(0, 1, &output, &status);
 
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            return !out.data.empty();
+            // A media transform is allowed to buffer initial frames. Empty
+            // output is NOT an encoder failure; the next input may emit it.
+            return true;
         }
 
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
