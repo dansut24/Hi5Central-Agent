@@ -62,6 +62,7 @@ struct Result {
     double p95Ms = 0;
     std::string encoderName;
     std::string deviceManagerStatus;
+    std::string asyncEventStatus;
     std::string note;
 };
 
@@ -95,6 +96,52 @@ struct HardwareMfContext {
         if (SUCCEEDED(managerHr)) managerHr = manager->ResetDevice(device.Get(), resetToken);
     }
 };
+// Hardware video MFTs are usually asynchronous. They must request an
+// input sample (METransformNeedInput) before ProcessInput is legal, and
+// signal METransformHaveOutput before ProcessOutput. A synthetic qualifier
+// that ignores those events can falsely report a broken GPU encoder.
+struct AsyncMfEventState {
+    ComPtr<IMFMediaEventGenerator> generator;
+    unsigned int needInput = 0;
+    unsigned int haveOutput = 0;
+    bool waitFor(bool input, DWORD timeoutMs, std::string& diagnostic) {
+        if (!generator) { diagnostic = "asynchronous MFT has no event generator"; return false; }
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeoutMs);
+        for (;;) {
+            auto& pending = input ? needInput : haveOutput;
+            if (pending != 0) { --pending; return true; }
+            ComPtr<IMFMediaEvent> event;
+            const HRESULT hr = generator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+            if (SUCCEEDED(hr) && event) {
+                MediaEventType type = MEUnknown;
+                if (FAILED(event->GetType(&type))) {
+                    diagnostic = "async MFT GetType failed"; return false;
+                }
+                if (type == METransformNeedInput) ++needInput;
+                else if (type == METransformHaveOutput) ++haveOutput;
+                else if (type == MEError) {
+                    HRESULT status = S_OK;
+                    event->GetStatus(&status);
+                    diagnostic = "async MFT reported MEError " + formatHr(status);
+                    return false;
+                }
+                continue;
+            }
+            if (hr != MF_E_NO_EVENTS_AVAILABLE) {
+                diagnostic = "async MFT GetEvent failed " + formatHr(hr);
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                diagnostic = input ? "timeout waiting for METransformNeedInput"
+                                   : "timeout waiting for METransformHaveOutput";
+                return false;
+            }
+            Sleep(2);
+        }
+    }
+};
+
 static Result run(const char* name, const GUID& outSubtype,
                   HardwareMfContext* hardware) {
     Result r{};
@@ -148,6 +195,21 @@ static Result run(const char* name, const GUID& outSubtype,
             attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
             attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
         }
+        // Hardware MFTs normally require event-driven input/output.
+        DWORD asyncFlag = FALSE;
+        if (attrs) attrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag);
+        const bool asynchronous = asyncFlag != FALSE;
+        AsyncMfEventState asyncEvents;
+        if (asynchronous) {
+            const HRESULT hr = transform.As(&asyncEvents.generator);
+            r.asyncEventStatus = "async=1 generator=" + formatHr(hr);
+            if (FAILED(hr) || !asyncEvents.generator) {
+                r.note = "async MFT without accessible IMFMediaEventGenerator";
+                continue;
+            }
+        } else {
+            r.asyncEventStatus = "async=0 (synchronous MFT)";
+        }
         ComPtr<IMFMediaType> output, input;
         if (FAILED(MFCreateMediaType(&output)) || FAILED(MFCreateMediaType(&input))) continue;
         output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -198,12 +260,30 @@ static Result run(const char* name, const GUID& outSubtype,
             sample->SetSampleDuration(duration);
             DWORD inputFlags=0;
             const HRESULT ready = transform->GetInputStatus(0,&inputFlags);
+            // Calling ProcessInput before METransformNeedInput is a documented
+            // MF_E_NOTACCEPTING failure for async hardware MFTs.
+            if (asynchronous) {
+                std::string waitStatus;
+                if (!asyncEvents.waitFor(true, 750, waitStatus)) {
+                    r.note = "MFT input event: " + waitStatus;
+                    break;
+                }
+            }
             const HRESULT inputHr = transform->ProcessInput(0,sample.Get(),0);
             if (FAILED(inputHr)) {
                 r.note = "MFT ProcessInput failed hr=" + formatHr(inputHr) +
                          " input_status=" + formatHr(ready) +
                          " flags=" + std::to_string(inputFlags);
                 break;
+            }
+            if (asynchronous) {
+                std::string waitStatus;
+                if (!asyncEvents.waitFor(false, 250, waitStatus)) {
+                    // An encoder may buffer frames; keep gathering inputs,
+                    // but report the missing event if no frame is produced.
+                    if (!r.produced) r.note = "MFT output event: " + waitStatus;
+                    continue;
+                }
             }
             for (int poll=0;poll<2;++poll) {
                 ComPtr<IMFSample> outSample;
@@ -337,6 +417,7 @@ int main(int argc, char** argv) {
             <<r.avgMs<<" p95_ms="<<r.p95Ms<<" max_ms="<<r.worstMs
             <<" encoder="<<r.encoderName
             <<" d3d_manager="<<r.deviceManagerStatus
+            <<" events="<<r.asyncEventStatus
             <<" note="<<r.note<<"\n";
     };
     std::cout<<"Synthetic Windows MFT encoder qualification (not browser RTP validation) "
