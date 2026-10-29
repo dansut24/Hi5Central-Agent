@@ -128,7 +128,10 @@ inline bool probeIdleHardwareH264(const std::string& version,
         c.backend="h264_hw";
         c.hardware=true;
         c.emittedFrames=true;
-        c.keyframeRecovery=idr;
+        // Synthetic encoder IDR output proves only keyframe *production*.
+        // Playback recovery requires two distinct decoded keyframes from an
+        // authenticated Viewer and must never be inferred offline.
+        c.keyframeRecovery=false;
         c.decodedFrames=false;        // cannot prove playback without Viewer
         c.packetizationVerified=false;
         c.testedFrames=produced;
