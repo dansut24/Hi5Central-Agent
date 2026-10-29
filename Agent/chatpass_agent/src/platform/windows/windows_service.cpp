@@ -6,6 +6,8 @@
 #include "webrtc_sender.h"
 #include "codec_capabilities.h"
 #include "codec_policy.h"
+#include "codec_universal_connection.h"
+#include "codec_windows_qual_identity.h"
 #include "ipc/input_pipe.h"
 #include "ipc/session_launcher.h"
 #include "ipc/shmem_ring.h"
@@ -38,6 +40,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -2632,7 +2635,75 @@ LogI(
                         // StartStreamerSession() calls StopSession(sessionId) as its first
                         // step. Start the consent/connected banner AFTER that cleanup:
                         // otherwise it is immediately closed, leaving no visible notice.
-                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode, autoSessionCodec);
+                        std::string connectionCodec = autoSessionCodec;
+                        if (codecDecision.requestedMode == "auto" &&
+                            ReadConfigInt("HI5_UNIVERSAL_CODEC_AUTO", 0, 0, 1) == 1 &&
+                            msg.value("viewer_caps_v1", false) &&
+                            msg.contains("viewer_codecs") &&
+                            msg["viewer_codecs"].is_array()) {
+                            hi5::universal_codec::Viewer viewer{};
+                            viewer.h264Level4 = msg.value("viewer_h264_level4", false);
+                            for (const auto& entry : msg["viewer_codecs"]) {
+                                if (!entry.is_string() ||
+                                    viewer.receiveCodecs.size() >= 6) continue;
+                                const std::string codec = entry.get<std::string>();
+                                if (codec != "vp8" && codec != "vp9" && codec != "h264")
+                                    continue;
+                                if (std::find(viewer.receiveCodecs.begin(),
+                                              viewer.receiveCodecs.end(), codec) ==
+                                    viewer.receiveCodecs.end())
+                                    viewer.receiveCodecs.push_back(codec);
+                            }
+                            // No device-model preference: previously verified
+                            // output, browser decode and cache identity must all
+                            // match. A missing/stale cache cannot qualify GPU.
+                            const auto nowUtc = static_cast<std::int64_t>(std::time(nullptr));
+                            const auto identity =
+                                hi5::universal_codec::windowsCacheIdentity(
+                                    kAgentVersion, nowUtc);
+                            const std::filesystem::path cachePath =
+                                L"C:\\ProgramData\\Hi5Central\\Agent\\codec-qualification-v1.cache";
+                            const auto candidates =
+                                hi5::universal_codec::loadQualificationCache(
+                                    cachePath, identity, nowUtc);
+                            const bool asyncHw = ReadConfigInt(
+                                "HI5_H264_ASYNC_HW", 0, 0, 1) == 1;
+                            // Some older browsers only answer H264 L3.1.
+                            // Never offer native 1080p to one when this Agent
+                            // explicitly requests sharp L4.0 streaming.
+                            if (!viewer.h264Level4 &&
+                                ReadConfigInt("HI5_H264_SHARP_TEXT", 0, 0, 1) == 1)
+                                viewer.receiveCodecs.erase(std::remove(
+                                    viewer.receiveCodecs.begin(),
+                                    viewer.receiveCodecs.end(), "h264"),
+                                    viewer.receiveCodecs.end());
+                            const auto selection =
+                                hi5::universal_codec::chooseForConnection(
+                                    true, "auto",
+                                    autoVp9Overloaded_.load() ? "vp8" :
+                                        autoSessionCodec,
+                                    viewer, candidates,
+                                    hi5::universal_codec::Link{}, asyncHw);
+                            if (!selection.compatible) {
+                                LogW("[codec-universal] rejecting incompatible " +
+                                    std::string("Viewer before SDP: ") +
+                                    selection.reason);
+                                sendFn(json{
+                                    {"type","viewer_error"},
+                                    {"session_id",sessionId},
+                                    {"error","No mutually supported, qualified video codec"}
+                                }.dump());
+                                return;
+                            }
+                            connectionCodec = selection.mode;
+                            LogI("[codec-universal] session=" + sessionId +
+                                " selected=" + connectionCodec +
+                                " qualified=" + (selection.qualified ? "1" : "0") +
+                                " cached_candidates=" +
+                                std::to_string(candidates.size()) +
+                                " reason=" + selection.reason);
+                        }
+                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode, connectionCodec);
                         bool sessionStarted = false;
                         {
                             std::lock_guard<std::mutex> lock(sessionsMu_);
