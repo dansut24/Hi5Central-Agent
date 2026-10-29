@@ -615,7 +615,7 @@ namespace {
     }
 
     bool HandleInputPipe(hi5::InputPipeReader& pipe,
-        DesktopFrameSource& source,
+        DesktopFrameSource* source,
         int& currentDisplay,
         const std::string& sessionId) {
         // Low-latency input: mouse movement is latest-state only. Collapse
@@ -691,9 +691,9 @@ namespace {
                 break;
             case hi5::InputCmdType::SwitchMonitor: {
                 const int requested = cmd.switchMonitor.monitorIndex;
-                if (source.setDisplayIndex(requested)) {
+                if (source && source->setDisplayIndex(requested)) {
                     currentDisplay = requested;
-                    PublishMonitorInfo(pipe, source);
+                    PublishMonitorInfo(pipe, *source);
                     LogInfo("[streamer] switched monitor session=" + sessionId +
                         " display=" + std::to_string(requested));
                 }
@@ -856,7 +856,7 @@ namespace hi5 {
                     ApplyFastMouseTarget(fastTarget, args.sessionId, fastMouseNextLog, fastMouseApplied);
                 }
 
-                hadInput = HandleInputPipe(inputPipe, source, currentDisplay, args.sessionId);
+                hadInput = HandleInputPipe(inputPipe, &source, currentDisplay, args.sessionId);
                 if (hadFastMouse) {
                     // Fast mouse movement is applied directly in the interactive streamer.
                     // Do not treat mouse-only movement as video activity: forcing captures
@@ -1047,6 +1047,56 @@ namespace hi5 {
             CloseHandle(stopEvent);
         }
         LogInfo("[streamer] stopped session=" + args.sessionId);
+        return 0;
+    }
+
+    // The interactive user's capture helper is intentionally medium-integrity,
+    // so Windows UIPI can reject its input to elevated windows. The Agent
+    // service launches this input-only companion in the same interactive
+    // session using its existing privileged default-desktop token.
+    //
+    // No screen capture, stream buffers, network access or WebRTC here.
+    // Only the Agent-owned command ring is consumed. The capture helper has
+    // a SEPARATE ring for display information/monitor switching.
+    int RunInputInjectorMain(int argc, char** argv) {
+        const Args args = ParseArgs(argc, argv);
+        if (args.sessionId.empty() || args.inputPipeName.empty() ||
+            args.stopEventName.empty()) {
+            LogError("[input-injector] incomplete session-bound arguments");
+            return 1;
+        }
+        HANDLE stopEvent = OpenEventA(SYNCHRONIZE, FALSE, args.stopEventName.c_str());
+        if (!stopEvent) {
+            LogError("[input-injector] failed opening stop event err=" +
+                std::to_string(GetLastError()));
+            return 1;
+        }
+        hi5::InputPipeReader commands;
+        if (!commands.Open(args.inputPipeName)) {
+            LogError("[input-injector] failed opening command ring err=" +
+                std::to_string(GetLastError()));
+            CloseHandle(stopEvent);
+            return 1;
+        }
+        LogInfo("[input-injector] privileged input companion ready session=" + args.sessionId);
+        int selectedDisplay = args.display;
+        uint64_t lastFastMouseSeq = 0;
+        std::chrono::steady_clock::time_point nextFastLog{};
+        uint64_t fastMouseApplied = 0;
+        while (WaitForSingleObject(stopEvent, 0) == WAIT_TIMEOUT) {
+            hi5::FastMouseTarget nextMouse{};
+            bool fastMouse = false;
+            while (commands.ReadFastMouseTarget(lastFastMouseSeq, nextMouse)) {
+                fastMouse = true;
+                ApplyFastMouseTarget(nextMouse, args.sessionId, nextFastLog, fastMouseApplied);
+            }
+            const bool received = HandleInputPipe(commands, nullptr, selectedDisplay, args.sessionId);
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                (received || fastMouse) ? 1 : 5));
+        }
+        commands.Close();
+        CloseHandle(stopEvent);
+        LogInfo("[input-injector] stopped session=" + args.sessionId);
         return 0;
     }
 

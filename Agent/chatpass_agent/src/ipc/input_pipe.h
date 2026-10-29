@@ -12,6 +12,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <sddl.h>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -222,19 +223,41 @@ class InputPipeWriter {
 public:
     ~InputPipeWriter() { Close(); }
 
-    bool Create(const std::string& name) {
+    bool Create(const std::string& name, bool localSystemOnly = false) {
         name_ = name;
 
         SECURITY_DESCRIPTOR sd{};
         InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
         SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
-        SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES), &sd, FALSE };
 
+        // The privileged command ring is writable by the Agent service and
+        // its same-identity LocalSystem helper ONLY. Never use the ordinary
+        // null DACL here: unprivileged local processes must not inject input
+        // through a high-integrity companion.
+        PSECURITY_DESCRIPTOR restrictedSd = nullptr;
+        if (localSystemOnly &&
+            !ConvertStringSecurityDescriptorToSecurityDescriptorA(
+                "D:P(A;;GA;;;SY)", SDDL_REVISION_1, &restrictedSd, nullptr))
+            return false;
+        SECURITY_ATTRIBUTES sa{
+            sizeof(SECURITY_ATTRIBUTES),
+            localSystemOnly ? restrictedSd : &sd,
+            FALSE
+        };
         hMap_ = CreateFileMappingA(INVALID_HANDLE_VALUE, &sa,
             PAGE_READWRITE, 0,
             static_cast<DWORD>(kInputShmTotalBytes),
             name.c_str());
+        const DWORD createError = GetLastError();
+        if (restrictedSd) LocalFree(restrictedSd);
         if (!hMap_) return false;
+        if (localSystemOnly && createError == ERROR_ALREADY_EXISTS) {
+            // Reject a pre-created mapping with an attacker-controlled ACL.
+            CloseHandle(hMap_);
+            hMap_ = nullptr;
+            SetLastError(ERROR_ALREADY_EXISTS);
+            return false;
+        }
 
         base_ = MapViewOfFile(hMap_, FILE_MAP_ALL_ACCESS, 0, 0, kInputShmTotalBytes);
         if (!base_) { CloseHandle(hMap_); hMap_ = nullptr; return false; }

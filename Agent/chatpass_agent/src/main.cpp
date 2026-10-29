@@ -32,6 +32,7 @@ using json = nlohmann::json;
 
 namespace hi5 {
     int RunStreamerMain(int argc, char** argv);
+    int RunInputInjectorMain(int argc, char** argv);
     int RunChatOverlayMain(int argc, char** argv);
     int RunNativeBannerMain(int argc, char** argv);
     int RunBackstageHostMain(int argc, char** argv);
@@ -326,6 +327,12 @@ int main(int argc, char** argv) {
             if (next == "streamer") {
                 std::cout << "[main] mode=streamer\n";
                 return hi5::RunStreamerMain(argc, argv);
+            }
+
+            if (next == "input-injector") {
+                // Session-bound privileged input companion. It never captures
+                // video and is launched only by the authenticated Agent service.
+                return hi5::RunInputInjectorMain(argc, argv);
             }
 
             if (next == "chat-overlay") {
