@@ -196,7 +196,7 @@ static Result run(const char* name, const GUID& outSubtype,
             attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
         }
         // Hardware MFTs normally require event-driven input/output.
-        DWORD asyncFlag = FALSE;
+        UINT32 asyncFlag = FALSE;
         if (attrs) attrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag);
         const bool asynchronous = asyncFlag != FALSE;
         AsyncMfEventState asyncEvents;
