@@ -63,6 +63,12 @@ struct Result {
     std::string encoderName;
     std::string deviceManagerStatus;
     std::string asyncEventStatus;
+    std::string outputStreamInfo;
+    std::string firstOutputObservation;
+    UINT32 encoderCandidates = 0;
+    UINT32 candidateNumber = 0;
+    UINT32 outputEventsConsumed = 0;
+    UINT32 emptyOutputSamples = 0;
     std::string note;
 };
 
@@ -168,10 +174,17 @@ static Result run(const char* name, const GUID& outSubtype,
         return r;
     }
     r.discovered = true;
+    r.encoderCandidates = count;
     for (UINT32 i = 0; i < count && !r.produced; ++i) {
         ComPtr<IMFTransform> transform;
         if (!activates[i] || FAILED(activates[i]->ActivateObject(IID_PPV_ARGS(&transform))) || !transform) continue;
         r.activated = true;
+        r.candidateNumber = i + 1;
+        r.firstOutputObservation.clear();
+        r.outputEventsConsumed = 0;
+        r.emptyOutputSamples = 0;
+        r.outputStreamInfo.clear();
+        r.note.clear();
         // Query D3D awareness before supplying a manager. Microsoft explicitly
         // prohibits sending SET_D3D_MANAGER to an MFT without D3D awareness.
         // A registered hardware encoder can still accept system-memory NV12.
@@ -240,6 +253,8 @@ static Result run(const char* name, const GUID& outSubtype,
         r.configured = true;
         MFT_OUTPUT_STREAM_INFO outputInfo{};
         const HRESULT outInfoHr = transform->GetOutputStreamInfo(0, &outputInfo);
+        r.outputStreamInfo = "stream_flags=" + std::to_string(outputInfo.dwFlags) +
+            " cbSize=" + std::to_string(outputInfo.cbSize);
         if (FAILED(outInfoHr)) {
             r.note = "GetOutputStreamInfo failed " + formatHr(outInfoHr);
             continue;
@@ -303,7 +318,7 @@ static Result run(const char* name, const GUID& outSubtype,
                 if (!asyncEvents.waitFor(false, 250, waitStatus)) {
                     // An encoder may buffer frames; keep gathering inputs,
                     // but report the missing event if no frame is produced.
-                    if (!r.produced) r.note = "MFT output event: " + waitStatus;
+                    if (!r.produced && r.note.empty()) r.note = "MFT output event: " + waitStatus;
                     continue;
                 }
             }
@@ -317,27 +332,64 @@ static Result run(const char* name, const GUID& outSubtype,
                     outSample->AddBuffer(outBuffer.Get());
                     packet.pSample=outSample.Get();
                 }
-                DWORD status=0;
-                HRESULT hr=transform->ProcessOutput(0,1,&packet,&status);
-                if (hr==MF_E_TRANSFORM_NEED_MORE_INPUT) break;
-                if (hr==MF_E_TRANSFORM_STREAM_CHANGE) {
-                    transform->GetOutputStreamInfo(0,&outputInfo);
+                DWORD status = 0;
+                const HRESULT hr = transform->ProcessOutput(0,1,&packet,&status);
+                ++r.outputEventsConsumed;
+                // A driver can return an error, a stream-format change, a
+                // zero-length sample, or a caller/encoder-owned sample. Keep
+                // the first observation even if a later input wait times out.
+                const bool samplePresent = packet.pSample != nullptr;
+                if (r.firstOutputObservation.empty()) {
+                    r.firstOutputObservation = "hr=" + formatHr(hr) +
+                        " status=" + std::to_string(status) +
+                        " packet_status=" + std::to_string(packet.dwStatus) +
+                        " sample_present=" + std::to_string(samplePresent ? 1 : 0);
+                }
+                if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+                    if (asynchronous && r.note.empty())
+                        r.note = "async MFT ProcessOutput unexpectedly requested more input";
+                    if (packet.pEvents) packet.pEvents->Release();
+                    break;
+                }
+                if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+                    const HRESULT changed = transform->GetOutputStreamInfo(0, &outputInfo);
+                    if (FAILED(changed) && r.note.empty())
+                        r.note = "stream change output info failed " + formatHr(changed);
+                    if (packet.pEvents) packet.pEvents->Release();
                     continue;
                 }
                 if (FAILED(hr)) {
-                    r.note="MFT ProcessOutput failed hr=" + formatHr(hr);
+                    if (r.note.empty()) r.note="MFT ProcessOutput failed hr=" + formatHr(hr);
+                    if (packet.pEvents) packet.pEvents->Release();
                     break;
                 }
-                ComPtr<IMFSample> got=packet.pSample;
-                if(!got && outSample)got=outSample;
+                // pSample is a borrowed pointer when caller supplies it; an
+                // encoder-supplied output sample transfers one reference.
+                ComPtr<IMFSample> got;
+                if (packet.pSample == outSample.Get()) got = outSample;
+                else if (packet.pSample) got.Attach(packet.pSample);
+                else got = outSample;
                 ComPtr<IMFMediaBuffer> result;
-                DWORD encoded=0;
-                if(got && SUCCEEDED(got->ConvertToContiguousBuffer(&result)) && result)
-                    result->GetCurrentLength(&encoded);
-                if(packet.pEvents) packet.pEvents->Release();
-                if(encoded>0) {
+                DWORD encoded = 0;
+                HRESULT bufferHr = got ? got->ConvertToContiguousBuffer(&result) : E_POINTER;
+                if (SUCCEEDED(bufferHr) && result)
+                    bufferHr = result->GetCurrentLength(&encoded);
+                if (!samplePresent && r.firstOutputObservation.find(" sample_present=0") != std::string::npos) {
+                    // Retain this even if we supplied a buffer: it tells us
+                    // whether the MFT returned an output sample.
+                    r.firstOutputObservation += " caller_supplied=" +
+                        std::to_string(outSample ? 1 : 0);
+                }
+                if (r.firstOutputObservation.find(" encoded_bytes=") == std::string::npos)
+                    r.firstOutputObservation += " buffer_hr=" + formatHr(bufferHr) +
+                        " encoded_bytes=" + std::to_string(encoded);
+                if (packet.pEvents) packet.pEvents->Release();
+                if (encoded > 0) {
                     r.produced=true;
                     ++r.frames;
+                } else {
+                    ++r.emptyOutputSamples;
+                    if (r.note.empty()) r.note = "MFT returned no nonempty encoded sample";
                 }
                 break;
             }
@@ -448,6 +500,11 @@ int main(int argc, char** argv) {
             <<" encoder="<<r.encoderName
             <<" d3d_manager="<<r.deviceManagerStatus
             <<" events="<<r.asyncEventStatus
+            <<" candidate="<<r.candidateNumber<<"/"<<r.encoderCandidates
+            <<" output_stream="<<r.outputStreamInfo
+            <<" output_calls="<<r.outputEventsConsumed
+            <<" empty_output="<<r.emptyOutputSamples
+            <<" first_output="<<r.firstOutputObservation
             <<" note="<<r.note<<"\n";
     };
     std::cout<<"Synthetic Windows MFT encoder qualification (not browser RTP validation) "
