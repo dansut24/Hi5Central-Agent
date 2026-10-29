@@ -65,6 +65,16 @@ public:
 
     bool isExternalFeedMode() const { return m_mode == Mode::ExternalFeed; }
 
+    // SDP-selected codec, not an environment preference or capture default.
+    // The selected codec stays fixed during an established WebRTC session.
+    const char* negotiatedVideoCodecName() const {
+        switch (m_videoCodec) {
+        case VideoCodec::VP9: return "VP9";
+        case VideoCodec::H264: return "H264";
+        default: return "VP8";
+        }
+    }
+
     void setInputEventHandler(InputEventFn fn);
     void setDirectMouseMoveHandler(DirectMouseMoveFn fn);
     void setConnectionClosedHandler(ConnectionClosedFn fn);
