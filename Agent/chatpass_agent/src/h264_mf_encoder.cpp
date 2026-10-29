@@ -460,10 +460,15 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
             mftAttrs->SetUINT32(MF_LOW_LATENCY, TRUE);
         }
         if (experiment) {
-            if (!asyncFlag ||
-                FAILED(m_impl->transform.As(&m_impl->events.generator)) ||
-                !m_impl->events.generator) {
-                if (error) *error = "experimental hardware H264 requires an asynchronous MFT";
+            // Windows hardware MFTs may be synchronous or asynchronous,
+            // depending on Intel/AMD/NVIDIA driver implementations. Only
+            // asynchronous transforms require NeedInput/HaveOutput events;
+            // do not reject a legitimate synchronous GPU encoder.
+            m_impl->asyncHardwareExperiment = asyncFlag != FALSE;
+            if (asyncFlag &&
+                (FAILED(m_impl->transform.As(&m_impl->events.generator)) ||
+                 !m_impl->events.generator)) {
+                if (error) *error = "async hardware H264 has no event generator";
                 return false;
             }
             if (d3d11Aware) {
@@ -492,8 +497,9 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
                     return false;
                 }
             }
-            std::cout << "[h264] experimental async Intel hardware path enabled d3d11_aware="
-                      << d3d11Aware << "\n";
+            std::cout << "[h264] hardware Media Foundation encoder mode="
+                      << (asyncFlag ? "async" : "sync")
+                      << " d3d11_aware=" << d3d11Aware << "\n";
         }
     }
 
