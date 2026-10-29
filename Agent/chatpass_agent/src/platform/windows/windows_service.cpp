@@ -6131,6 +6131,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             void SendStreamDiagnostics(const std::string& sessionId,
                 const std::string& source,
                 const hi5::StreamStats& stats,
+                const char* negotiatedCodec,
                 uint64_t framesForwarded,
                 DesktopMode activeMode,
                 bool backstageMode) {
@@ -6140,7 +6141,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     {"type", "stream_diagnostics"},
                     {"session_id", sessionId},
                     {"source", source},
-                    {"codec", "VP8"},
+                    {"codec", negotiatedCodec},
                     {"transport", "WebRTC"},
                     {"mode", StreamModeName(stats.streamMode)},
                     {"target_fps", stats.targetFps},
@@ -7521,14 +7522,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             if (ctx.sender) {
                                 ctx.sender->setExternalStreamHint(stats.streamMode, stats.targetFps, ctx.backstageMode, stats.secureDesktopActive != 0);
                             }
-                            SendStreamDiagnostics(ctx.sessionId, "normal", stats, framesForwarded, ctx.activeMode, ctx.backstageMode);
+                            SendStreamDiagnostics(ctx.sessionId, "normal", stats, ctx.sender ? ctx.sender->negotiatedVideoCodecName() : "unknown", framesForwarded, ctx.activeMode, ctx.backstageMode);
                         }
                         if (ctx.secureInputPipe.ReadStreamStats(lastSecureStatsSeq, stats)) {
                             lastSecureStatsSeq = stats.seq;
                             if (ctx.sender) {
                                 ctx.sender->setExternalStreamHint(stats.streamMode, stats.targetFps, ctx.backstageMode, stats.secureDesktopActive != 0);
                             }
-                            SendStreamDiagnostics(ctx.sessionId, "secure", stats, framesForwarded, ctx.activeMode, ctx.backstageMode);
+                            SendStreamDiagnostics(ctx.sessionId, "secure", stats, ctx.sender ? ctx.sender->negotiatedVideoCodecName() : "unknown", framesForwarded, ctx.activeMode, ctx.backstageMode);
                         }
                         nextDiagnosticsPoll = now + std::chrono::seconds(1);
                     }
