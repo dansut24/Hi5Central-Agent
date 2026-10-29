@@ -2581,13 +2581,15 @@ LogI(
                         Sleep(45000);
                         const std::filesystem::path path =
                             L"C:\\ProgramData\\Hi5Central\\Agent\\codec-qualification-v1.cache";
+                        std::string probeReason;
                         const bool ok =
                             hi5::universal_codec::probeIdleHardwareH264(
-                                probeBuild, path);
+                                probeBuild, path, &probeReason);
                         LogI(std::string("[codec-universal] idle hardware-only H264 "
                             "synthetic probe ") +
                             (ok ? "completed (decoder unverified)" :
-                                  "skipped or failed safely"));
+                                  "skipped or failed safely") +
+                            " reason=" + probeReason);
                     }).detach();
                 }
 
