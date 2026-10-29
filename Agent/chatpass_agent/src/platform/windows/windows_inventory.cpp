@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -913,6 +914,215 @@ json DisplayInfo(const json& gpu) {
     };
 }
 
+
+json DeepHardwareInventory() {
+    // One constrained Windows inventory pass (no screen, codec, or input code).
+    // A section failure is reported separately so the API can retain the last
+    // known good fields instead of replacing them with misleading empty lists.
+    return RunPowerShellJson(R"PS(
+function SafeDate($value) {
+  if (-not $value) { return $null }
+  try { return ([datetime]$value).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } catch { return $null }
+}
+function EdidText($bytes) {
+  if (-not $bytes) { return '' }
+  return (-join @($bytes | Where-Object { [int]$_ -gt 0 } | ForEach-Object { [char][int]$_ })).Trim()
+}
+$result = [ordered]@{}
+$sections = [ordered]@{}
+try {
+  $result.memory_modules = @(
+    Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop |
+      Select-Object -First 64 | ForEach-Object {
+        [pscustomobject]@{
+          device_locator = $_.DeviceLocator
+          bank_label = $_.BankLabel
+          capacity_bytes = [int64]$_.Capacity
+          manufacturer = $_.Manufacturer
+          part_number = ($_.PartNumber -as [string]).Trim()
+          serial_number = $_.SerialNumber
+          configured_speed_mhz = if ($_.ConfiguredClockSpeed) { [int]$_.ConfiguredClockSpeed } else { $null }
+          speed_mhz = if ($_.Speed) { [int]$_.Speed } else { $null }
+        }
+      }
+  )
+  $board = Get-CimInstance Win32_BaseBoard -ErrorAction Stop | Select-Object -First 1
+  $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop | Select-Object -First 1
+  $result.motherboard = [pscustomobject]@{
+    manufacturer = $board.Manufacturer
+    product = $board.Product
+    version = $board.Version
+    serial_number = $board.SerialNumber
+    bios_manufacturer = $bios.Manufacturer
+    bios_version = $bios.SMBIOSBIOSVersion
+    smbios_version = if ($bios.SMBIOSMajorVersion -ne $null) { "$($bios.SMBIOSMajorVersion).$($bios.SMBIOSMinorVersion)" } else { $null }
+  }
+  $sections.core_hardware = @{ status = 'collected' }
+} catch { $sections.core_hardware = @{ status = 'failed' } }
+try {
+  $disks = @(Get-PhysicalDisk -ErrorAction Stop | Select-Object -First 64)
+  $result.physical_disks = @(
+    $disks | ForEach-Object {
+      $disk = $_
+      $reliability = $null
+      try { $reliability = Get-StorageReliabilityCounter -PhysicalDisk $disk -ErrorAction Stop } catch {}
+      [pscustomobject]@{
+        friendly_name = $disk.FriendlyName
+        device_id = [string]$disk.DeviceId
+        serial_number = $disk.SerialNumber
+        media_type = [string]$disk.MediaType
+        bus_type = [string]$disk.BusType
+        size_bytes = [int64]$disk.Size
+        health_status = [string]$disk.HealthStatus
+        operational_status = [string](@($disk.OperationalStatus) -join ', ')
+        firmware_version = $disk.FirmwareVersion
+        temperature_c = if ($reliability -and $reliability.Temperature -ne $null) { [int]$reliability.Temperature } else { $null }
+        wear_percent = if ($reliability -and $reliability.Wear -ne $null) { [int]$reliability.Wear } else { $null }
+      }
+    }
+  )
+  $sections.storage = @{ status = 'collected' }
+} catch {
+  try {
+    $result.physical_disks = @(
+      Get-CimInstance Win32_DiskDrive -ErrorAction Stop |
+        Select-Object -First 64 | ForEach-Object {
+          [pscustomobject]@{
+            friendly_name = $_.Model
+            device_id = $_.DeviceID
+            serial_number = $_.SerialNumber
+            media_type = $_.MediaType
+            bus_type = $_.InterfaceType
+            size_bytes = [int64]$_.Size
+            health_status = $null
+            operational_status = $_.Status
+            firmware_version = $_.FirmwareRevision
+            temperature_c = $null
+            wear_percent = $null
+          }
+        }
+    )
+    $sections.storage = @{ status = 'collected' }
+  } catch { $sections.storage = @{ status = 'failed' } }
+}
+try {
+  $result.monitors = @(
+    Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop |
+      Select-Object -First 64 | ForEach-Object {
+        [pscustomobject]@{
+          manufacturer = EdidText $_.ManufacturerName
+          model = EdidText $_.UserFriendlyName
+          product_code = EdidText $_.ProductCodeID
+          serial_number = EdidText $_.SerialNumberID
+          manufacture_week = if ($_.WeekOfManufacture -gt 0) { [int]$_.WeekOfManufacture } else { $null }
+          manufacture_year = if ($_.YearOfManufacture -gt 0) { [int]$_.YearOfManufacture } else { $null }
+          active = [bool]$_.Active
+        }
+      }
+  )
+  $sections.monitors = @{ status = 'collected' }
+} catch { $sections.monitors = @{ status = 'failed' } }
+try {
+  $result.drivers = @(
+    Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop |
+      Where-Object { $_.DeviceName -and $_.DriverVersion } |
+      Select-Object -First 400 | ForEach-Object {
+        [pscustomobject]@{
+          device_name = $_.DeviceName
+          device_class = $_.DeviceClass
+          driver_version = $_.DriverVersion
+          driver_date = SafeDate $_.DriverDate
+          driver_provider = $_.DriverProviderName
+          manufacturer = $_.Manufacturer
+          inf_name = $_.InfName
+          signed = if ($_.IsSigned -ne $null) { [bool]$_.IsSigned } else { $null }
+          signer = $_.Signer
+        }
+      }
+  )
+  $sections.drivers = @{ status = 'collected' }
+} catch { $sections.drivers = @{ status = 'failed' } }
+try {
+  $problem = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop)
+  $result.problem_devices = @(
+    $problem | Where-Object {
+      $_.ConfigManagerErrorCode -ne $null -and [int]$_.ConfigManagerErrorCode -ne 0
+    } | Select-Object -First 128 | ForEach-Object {
+      [pscustomobject]@{
+        name = $_.Name
+        manufacturer = $_.Manufacturer
+        pnp_class = $_.PNPClass
+        error_code = [int]$_.ConfigManagerErrorCode
+        status = $_.Status
+        device_id = $_.PNPDeviceID
+      }
+    }
+  )
+  $sections.problem_devices = @{ status = 'collected' }
+} catch { $sections.problem_devices = @{ status = 'failed' } }
+try {
+  $result.printers = @(
+    Get-CimInstance Win32_Printer -ErrorAction Stop |
+      Select-Object -First 64 | ForEach-Object {
+        [pscustomobject]@{
+          name = $_.Name
+          driver_name = $_.DriverName
+          port_name = $_.PortName
+          network = [bool]$_.Network
+          default = [bool]$_.Default
+        }
+      }
+  )
+  $result.usb_devices = @(
+    Get-CimInstance Win32_PnPEntity -Filter "PNPDeviceID LIKE 'USB%'" -ErrorAction Stop |
+      Select-Object -First 128 | ForEach-Object {
+        [pscustomobject]@{
+          name = $_.Name
+          manufacturer = $_.Manufacturer
+          pnp_class = $_.PNPClass
+          status = $_.Status
+          device_id = $_.PNPDeviceID
+        }
+      }
+  )
+  $sections.peripherals = @{ status = 'collected' }
+} catch { $sections.peripherals = @{ status = 'failed' } }
+$result.deep_inventory_sections = $sections
+$result | ConvertTo-Json -Depth 8 -Compress
+)PS", json::object());
+}
+
+json DueDeepHardwareInventory(bool force) {
+    static std::mutex mu;
+    static std::chrono::steady_clock::time_point nextAttemptAt{};
+    std::lock_guard<std::mutex> lock(mu);
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now < nextAttemptAt) {
+        return { {"deep_inventory_included", false} };
+    }
+    // Failed or unsupported WMI providers must not cause a new slow scan
+    // every minute. Explicit technician inventory.scan bypasses this delay.
+    nextAttemptAt = now + std::chrono::minutes(30);
+    auto deep = DeepHardwareInventory();
+    if (!deep.is_object() || !deep.contains("deep_inventory_sections")) {
+        return { {"deep_inventory_included", false} };
+    }
+    bool anySuccess = false;
+    const auto& statuses = deep["deep_inventory_sections"];
+    if (statuses.is_object()) {
+        for (auto it = statuses.begin(); it != statuses.end(); ++it) {
+            if (it.value().is_object() && it.value().value("status", "") == "collected") {
+                anySuccess = true;
+                break;
+            }
+        }
+    }
+    if (!anySuccess) return { {"deep_inventory_included", false} };
+    deep["deep_inventory_included"] = true;
+    deep["deep_inventory_collected_at"] = NowIsoUtc();
+    return deep;
+}
+
 json SessionsInfo() {
     json sessions = json::array();
     int rdpCount = 0;
@@ -1060,7 +1270,7 @@ json HealthInfo(const json& memory, const json& storage, const json& security, c
 
 } // namespace
 
-json BuildInventorySnapshot(const AgentIdentity& identity) {
+json BuildInventorySnapshot(const AgentIdentity& identity, bool forceDeep) {
     const auto collectedAt = NowIsoUtc();
 
     json bitlocker = BitLockerVolumes();
@@ -1084,8 +1294,9 @@ json BuildInventorySnapshot(const AgentIdentity& identity) {
     json agent = AgentInfo(collectedAt);
     json summary = SummaryInfo(os, hardware, memory, storage);
     json health = HealthInfo(memory, storage, security, events, updates);
+    json deep = DueDeepHardwareInventory(forceDeep);
 
-    return {
+    json snapshot = {
         {"type", "inventory_snapshot"},
         {"device_id", identity.deviceId},
         {"collected_at", collectedAt},
@@ -1131,6 +1342,8 @@ json BuildInventorySnapshot(const AgentIdentity& identity) {
             {"notes", "Includes Windows 11 build-name correction, BitLocker, software, updates, event health, GPU, TPM and warranty-ready WMI identity."}
         }}
     };
+    snapshot.update(deep);
+    return snapshot;
 }
 
 } // namespace hi5
