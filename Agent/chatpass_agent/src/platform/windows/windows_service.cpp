@@ -7,6 +7,7 @@
 #include "codec_capabilities.h"
 #include "codec_policy.h"
 #include "codec_universal_connection.h"
+#include "codec_runtime_proof.h"
 #include "codec_windows_qual_identity.h"
 #include "ipc/input_pipe.h"
 #include "ipc/session_launcher.h"
@@ -2567,7 +2568,31 @@ LogI(
                 StartJobLoop(ident);
                 StartAppPortalBroker(ident);
 
-                auto sendFn = [this](const std::string& payload) {
+                auto codecProofs = std::make_shared<hi5::universal_codec::RuntimeProofStore>();
+                auto sendFn = [this, codecProofs](const std::string& payload) {
+                    // Encoder metrics originate in the actual RTP sender,
+                    // unlike an MFT inventory enumeration or a GPU name.
+                    if (ReadConfigInt("HI5_UNIVERSAL_CODEC_LEARN", 0, 0, 1) == 1) {
+                        const auto m = json::parse(payload, nullptr, false);
+                        if (!m.is_discarded() && m.is_object() &&
+                            m.value("type", "") == "stream_encoder_diagnostics") {
+                            hi5::universal_codec::EncoderWindow evidence;
+                            evidence.codec = m.value("codec", "");
+                            std::transform(evidence.codec.begin(), evidence.codec.end(),
+                                evidence.codec.begin(), [](unsigned char c) {
+                                    return static_cast<char>(std::tolower(c));
+                                });
+                            evidence.mode = m.value("codec_runtime_mode",
+                                m.value("encoder_mode", std::string()));
+                            evidence.frames = m.value("encoded_frames", 0u);
+                            evidence.sent = m.value("sent_frames", 0u);
+                            evidence.width = m.value("width", 0);
+                            evidence.height = m.value("height", 0);
+                            evidence.maxEncodeMs = m.value("encode_max_ms", 0.0);
+                            codecProofs->recordEncoder(m.value("session_id", ""),
+                                evidence, static_cast<std::int64_t>(std::time(nullptr)));
+                        }
+                    }
                     if (signaling_) {
                         signaling_->send(payload);
                     }
@@ -2583,7 +2608,7 @@ LogI(
                     }
                     });
 
-                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident, autoSessionCodec](const std::string& text) {
+                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident, autoSessionCodec, codecProofs](const std::string& text) {
                     sessionBridge_.HandleIncomingJson(text);
 
                     const auto msg = json::parse(text, nullptr, false);
@@ -2625,6 +2650,59 @@ LogI(
                     std::string sessionId = msg.value("session_id", msg.value("sessionId", std::string()));
                     if (sessionId.empty()) {
                         sessionId = sessionBridge_.GetActiveSession();
+                    }
+
+                    if (type == "viewer_codec_observation") {
+                        if (ReadConfigInt("HI5_UNIVERSAL_CODEC_LEARN", 0, 0, 1) != 1)
+                            return;
+                        hi5::universal_codec::DecoderReport obs;
+                        obs.codec = msg.value("codec", "");
+                        obs.decoded = msg.value("frames_decoded", 0ull);
+                        obs.keyframes = msg.value("keyframes_decoded", 0ull);
+                        obs.dropped = msg.value("frames_dropped", 0ull);
+                        obs.packets = msg.value("packets_received", 0ull);
+                        obs.width = msg.value("width", 0);
+                        obs.height = msg.value("height", 0);
+                        const bool asyncH264 = ReadConfigInt(
+                            "HI5_H264_ASYNC_HW", 0, 0, 1) == 1;
+                        const auto nowUtc = static_cast<std::int64_t>(std::time(nullptr));
+                        auto proof = codecProofs->confirm(
+                            sessionId, obs, nowUtc, asyncH264);
+                        if (proof.codec.empty()) return;
+                        const auto identity =
+                            hi5::universal_codec::windowsCacheIdentity(
+                                kAgentVersion, nowUtc);
+                        if (identity.operatingSystem.empty() ||
+                            identity.gpuAndDriver.empty()) {
+                            LogW("[codec-universal] driver fingerprint unavailable; "
+                                "refusing to persist qualification");
+                            return;
+                        }
+                        const std::filesystem::path cachePath =
+                            L"C:\\ProgramData\\Hi5Central\\Agent\\codec-qualification-v1.cache";
+                        auto candidates =
+                            hi5::universal_codec::loadQualificationCache(
+                                cachePath, identity, nowUtc);
+                        candidates.erase(std::remove_if(candidates.begin(),
+                            candidates.end(), [&](const auto& c) {
+                                return c.codec == proof.codec &&
+                                    c.backend == proof.backend;
+                            }), candidates.end());
+                        candidates.push_back(proof);
+                        if (hi5::universal_codec::saveQualificationCache(
+                                cachePath, identity, candidates)) {
+                            LogI("[codec-universal] saved actual end-to-end " +
+                                proof.codec + " mode=" + proof.backend +
+                                " frames=" + std::to_string(proof.testedFrames) +
+                                " max_encode_ms=" +
+                                std::to_string(proof.worstEncodeMs) +
+                                " resolution=" + std::to_string(proof.maxWidth) +
+                                "x" + std::to_string(proof.maxHeight));
+                        } else {
+                            LogW("[codec-universal] could not persist proven " +
+                                proof.codec + "; preserving existing policy");
+                        }
+                        return;
                     }
 
                     if (type == "start_webrtc") {
