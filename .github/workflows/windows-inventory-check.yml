@@ -52,8 +52,27 @@ jobs:
             $errors | ForEach-Object { Write-Error $_.Message }
             throw 'PowerShell inventory script has syntax errors'
           }
-          $required = @('memory_modules','motherboard','physical_disks','monitors','drivers','problem_devices','printers','usb_devices','deep_inventory_sections')
+          $required = @(
+            'memory_modules','motherboard','physical_disks','monitors','drivers','problem_devices',
+            'printers','usb_devices','installed_hotfixes','windows_licensing','reboot_state',
+            'startup_items','scheduled_tasks','local_users','local_groups','optional_features',
+            'power_plan','network_profiles','network_configurations','wifi_interfaces',
+            'default_routes','directory_join','machine_certificates','virtualization',
+            'battery_deep','deep_inventory_sections'
+          )
           foreach ($key in $required) {
             if (-not $script.Contains($key)) { throw "Inventory result missing required $key" }
           }
           Write-Host "Deep Windows inventory PowerShell parsed and required payload keys present"
+      - name: Verify explicit and scheduled deep inventory entry points
+        shell: pwsh
+        run: |
+          $collector = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
+          $service = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
+          foreach ($required in @('8 * 60 * 60', 'deep-inventory-last-success.txt', 'deep_inventory_status', 'battery_deep')) {
+            if (-not $collector.Contains($required)) { throw "Collector is missing $required" }
+          }
+          foreach ($required in @('inventory.deep.scan', 'deep_scan_deferred', 'SendInventorySnapshotSafe(ident, false, true)')) {
+            if (-not $service.Contains($required)) { throw "Agent service is missing $required" }
+          }
+          Write-Host 'Eight-hour Agent-local deep scans and manual scan entry point are present'
