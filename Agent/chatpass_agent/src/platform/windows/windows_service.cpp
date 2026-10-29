@@ -5532,10 +5532,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 }
             }
 
-            void SendInventorySnapshotSafe(const AgentIdentity& ident, bool forceDeep = false) {
+            void SendInventorySnapshotSafe(const AgentIdentity& ident, bool forceDeep = false, bool allowScheduledDeep = false) {
                 if (!signaling_) return;
                 try {
-                    auto snapshot = hi5::BuildInventorySnapshot(ident, forceDeep);
+                    auto snapshot = hi5::BuildInventorySnapshot(ident, forceDeep, allowScheduledDeep);
                     signaling_->send(snapshot.dump());
                     LogI("inventory_snapshot sent collected_at=" + snapshot.value("collected_at", std::string()));
                 }
@@ -5562,7 +5562,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             LogI("scheduled full inventory skipped while remote session is active");
                             continue;
                         }
-                        SendInventorySnapshotSafe(ident);
+                        SendInventorySnapshotSafe(ident, false, true);
                     }
                     });
             }
