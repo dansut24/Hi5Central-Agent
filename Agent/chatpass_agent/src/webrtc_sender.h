@@ -3,6 +3,7 @@
 #include "vp8_encoder.h"
 #include "vp9_mf_encoder.h"
 #include "encoding/sustained_encoder_health.h"
+#include "encoding/encoder_latency_window.h"
 #include "h264_mf_encoder.h"
 #include "input_injector.h"
 
@@ -64,6 +65,16 @@ public:
     nlohmann::json buildMonitorInfoMessage() const;
 
     bool isExternalFeedMode() const { return m_mode == Mode::ExternalFeed; }
+
+    // SDP-selected codec, not an environment preference or capture default.
+    // The selected codec stays fixed during an established WebRTC session.
+    const char* negotiatedVideoCodecName() const {
+        switch (m_videoCodec) {
+        case VideoCodec::VP9: return "VP9";
+        case VideoCodec::H264: return "H264";
+        default: return "VP8";
+        }
+    }
 
     void setInputEventHandler(InputEventFn fn);
     void setDirectMouseMoveHandler(DirectMouseMoveFn fn);
@@ -178,6 +189,7 @@ private:
     uint64_t m_externalSentFrames = 0;
     double m_externalEncodeMsTotal = 0.0;
     double m_externalEncodeMsMax = 0.0;
+    EncoderLatencyWindow m_externalEncodeLatency;
     double m_externalSendMsTotal = 0.0;
     double m_externalSendMsMax = 0.0;
     int m_externalKeyframeEvery = 30;
