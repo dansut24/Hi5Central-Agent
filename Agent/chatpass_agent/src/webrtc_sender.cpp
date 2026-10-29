@@ -1,5 +1,6 @@
 ﻿#include "webrtc_sender.h"
 #include "frame_source.h"
+#include "frame_scale_bilinear.h"
 #include "util/log.h"
 
 #include <rtc/rtc.hpp>
@@ -89,7 +90,7 @@ namespace {
     }
 
     static I420Frame scaleI420ToWebRtcBounds(const I420Frame& src, int maxW, int maxH,
-        bool* scaledOut = nullptr) {
+        bool* scaledOut = nullptr, bool filteredScaling = false) {
         if (scaledOut) *scaledOut = false;
         if (src.width <= 0 || src.height <= 0) return src;
 
@@ -110,14 +111,23 @@ namespace {
         dst.width = dstW;
         dst.height = dstH;
 
-        scalePlaneNearest(src.y, src.width, src.height, dst.y, dstW, dstH);
+        if (filteredScaling) {
+            hi5::quality::ScalePlaneBilinear(src.y, src.width, src.height, dst.y, dstW, dstH);
+        } else {
+            scalePlaneNearest(src.y, src.width, src.height, dst.y, dstW, dstH);
+        }
 
         const int srcUw = (src.width + 1) / 2;
         const int srcUh = (src.height + 1) / 2;
         const int dstUw = (dstW + 1) / 2;
         const int dstUh = (dstH + 1) / 2;
-        scalePlaneNearest(src.u, srcUw, srcUh, dst.u, dstUw, dstUh);
-        scalePlaneNearest(src.v, srcUw, srcUh, dst.v, dstUw, dstUh);
+        if (filteredScaling) {
+            hi5::quality::ScalePlaneBilinear(src.u, srcUw, srcUh, dst.u, dstUw, dstUh);
+            hi5::quality::ScalePlaneBilinear(src.v, srcUw, srcUh, dst.v, dstUw, dstUh);
+        } else {
+            scalePlaneNearest(src.u, srcUw, srcUh, dst.u, dstUw, dstUh);
+            scalePlaneNearest(src.v, srcUw, srcUh, dst.v, dstUw, dstUh);
+        }
 
         if (scaledOut) *scaledOut = true;
         return dst;
@@ -142,7 +152,11 @@ namespace {
         const int maxH = sharp
             ? readEnvInt("HI5_H264_SHARP_MAX_HEIGHT", 1080, 2, 1080)
             : readEnvInt("HI5_H264_MAX_HEIGHT", 720, 2, 720);
-        return scaleI420ToWebRtcBounds(src, maxW, maxH, scaledOut);
+        // Opt-in filtered scaler only for sharp-text H.264. The generic
+        // nearest-neighbour scaler remains unchanged for proven codecs.
+        const bool filtered = sharp &&
+            readEnvInt("HI5_H264_SHARP_FILTER", 1, 0, 1) == 1;
+        return scaleI420ToWebRtcBounds(src, maxW, maxH, scaledOut, filtered);
     }
 
     struct Vp8RuntimeProfile {
@@ -2068,6 +2082,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 LogInfo(
                     "[h264] encoder created session=" + m_sessionId +
                     " sharp_text_trial=" + std::string(h264SharpTextTrialEnabled() ? "1" : "0") +
+                    " filtered_scaler=" + std::string(h264SharpTextTrialEnabled() &&
+                        readEnvInt("HI5_H264_SHARP_FILTER", 1, 0, 1) == 1 ? "bilinear" : "nearest") +
                     " name=" + m_h264Encoder->encoderName() +
                     " source=" + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
                     " encoded_size=" + std::to_string(h264Frame.width) + "x" + std::to_string(h264Frame.height) +
