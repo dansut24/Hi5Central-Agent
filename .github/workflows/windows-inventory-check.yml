@@ -102,7 +102,7 @@ jobs:
           }
           Write-Host ('Collector stdout byte count: ' + (Get-Item $output).Length)
           # Match the native Agent JSON decoder: strict UTF-8 and a full JSON parse.
-          $js = 'const fs=require("fs"); const b=fs.readFileSync(process.argv[1]); const s=new TextDecoder("utf-8",{fatal:true}).decode(b); try{const r=JSON.parse(s);console.log("Native-compatible JSON OK; sections="+Object.keys(r.deep_inventory_sections||{}).length+"; bytes="+b.length);}catch(e){const m=e.message.match(/position (\\d+)/);const n=m?Number(m[1]):0;console.error("JSON_ERROR",e.message,"CONTEXT",JSON.stringify(s.slice(Math.max(0,n-130),n+160)));process.exit(1)}'
+          $js = 'const fs=require("fs"); const b=fs.readFileSync(process.argv[1]); const s=new TextDecoder("utf-8",{fatal:true}).decode(b); try{const r=JSON.parse(s);console.log("Native-compatible JSON OK; sections="+Object.keys(r.deep_inventory_sections||{}).length+"; bytes="+b.length);}catch(e){const n=Number(e.message.split("position ")[1]?.split(" ")[0]||0);console.error("JSON_ERROR",e.message,"CONTEXT",JSON.stringify(s.slice(Math.max(0,n-130),n+160)));process.exit(1)}'
           & node -e $js $output
           if ($LASTEXITCODE -ne 0) { throw 'Strict UTF-8 / JSON validation failed' }
           $report = $null
