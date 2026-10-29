@@ -6842,7 +6842,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 }
 
                 ctx->elevatedNormalInputPipeReady =
-                    ctx->elevatedNormalInputPipe.Create(ctx->elevatedNormalInputPipeName);
+                    ctx->elevatedNormalInputPipe.Create(ctx->elevatedNormalInputPipeName, true);
                 if (!ctx->elevatedNormalInputPipeReady) {
                     LogW("create elevated normal input pipe FAILED session=" + sessionId +
                         " err=" + std::to_string(GetLastError()) +
