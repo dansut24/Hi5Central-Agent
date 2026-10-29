@@ -2571,6 +2571,7 @@ LogI(
                     };
 
                 signaling_->onOpen([this, ident]() {
+                    signalingConnected_.store(true);
                     LogI("websocket connected");
                     if (signaling_) {
                         signaling_->send(json{{"type", "hello"}, {"agent_version", kAgentVersion}}.dump());
@@ -2613,7 +2614,7 @@ LogI(
                         LogI("refresh_inventory requested by control server");
                         // Preserve interactive video performance during remote sessions:
                         // deep hardware probes will run on the next idle scheduled pass.
-                        SendInventorySnapshotSafe(ident, !HasActiveSessions());
+                        SendInventorySnapshotSafe(ident);
                         FlushBridgeOutgoing();
                         return;
                     }
@@ -2836,6 +2837,7 @@ LogI(
                     });
 
                 signaling_->onClosed([this]() {
+                    signalingConnected_.store(false);
                     LogW("websocket closed; stopping active remote sessions and streamer helpers");
                     for (;;) {
                         std::string nextId;
@@ -3681,7 +3683,7 @@ if ($failed -gt 0) { exit 1 }
 
                         if (actionType == "refresh_inventory" || actionType == "inventory_refresh") {
                             SendActionProgress(actionId, "running", 40, "Collecting inventory");
-                            SendInventorySnapshotSafe(ident, !HasActiveSessions());
+                            SendInventorySnapshotSafe(ident);
                             SendActionResult(actionId, "completed", 100, "Inventory refresh completed", json{ {"inventory_sent", true} });
                             return;
                         }
@@ -4068,14 +4070,26 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 try {
                     LogI("job claimed id=" + jobId + " type=" + jobType);
 
-                    if (jobType == "inventory.scan" || jobType == "policy.refresh") {
-                        const bool deferDeep = jobType == "inventory.scan" && HasActiveSessions();
-                        SendInventorySnapshotSafe(ident, jobType == "inventory.scan" && !deferDeep);
-                        PostJobResult(ident, jobId, true, json{
-                            {"inventory_sent", true},
-                            {"job_type", jobType},
-                            {"deep_scan_deferred", deferDeep}
-                        });
+                    if (jobType == "inventory.scan" || jobType == "inventory.deep.scan" || jobType == "policy.refresh") {
+                        const bool deepRequested = jobType == "inventory.deep.scan";
+                        if (deepRequested && HasActiveSessions()) {
+                            PostJobResult(ident, jobId, false, json{
+                                {"inventory_sent", false},
+                                {"deep_inventory_status", "deferred"},
+                                {"deep_scan_deferred", true}
+                            }, "Deep inventory was not collected because a remote session is active. Retry when idle.");
+                            return;
+                        }
+                        const json scan = SendInventorySnapshotSafe(ident, deepRequested);
+                        const bool sent = scan.value("inventory_sent", false);
+                        const std::string status = scan.value("deep_inventory_status", std::string());
+                        const bool completed = sent && (!deepRequested || status == "collected" || status == "partial");
+                        const std::string detail = !sent ? "Inventory snapshot could not be sent."
+                            : status == "partial" ? "Deep inventory partially collected: inspect deep_inventory_sections for errors."
+                            : status == "failed" ? "Deep inventory collection failed; inspect section statuses."
+                            : deepRequested && status != "collected" ? "Deep inventory was not collected."
+                            : "";
+                        PostJobResult(ident, jobId, completed, scan, detail);
                         return;
                     }
 
@@ -5536,18 +5550,31 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 }
             }
 
-            void SendInventorySnapshotSafe(const AgentIdentity& ident, bool forceDeep = false, bool allowScheduledDeep = false) {
-                if (!signaling_) return;
+            json SendInventorySnapshotSafe(const AgentIdentity& ident, bool forceDeep = false, bool allowScheduledDeep = false) {
+                // Never build or attempt any inventory when signaling is disconnected.
+                if (!signaling_ || !signalingConnected_.load()) return {{"inventory_sent", false}, {"deep_inventory_status", "offline"}};
                 try {
                     auto snapshot = hi5::BuildInventorySnapshot(ident, forceDeep, allowScheduledDeep);
                     signaling_->send(snapshot.dump());
-                    LogI("inventory_snapshot sent collected_at=" + snapshot.value("collected_at", std::string()));
+                    const std::string status = snapshot.value("deep_inventory_status", std::string("not_requested"));
+                    LogI("inventory_snapshot sent collected_at=" + snapshot.value("collected_at", std::string()) +
+                         " deep_inventory_status=" + status);
+                    return {
+                        {"inventory_sent", true},
+                        {"deep_inventory_included", snapshot.value("deep_inventory_included", false)},
+                        {"deep_inventory_status", status},
+                        {"deep_inventory_collected_at", snapshot.value("deep_inventory_collected_at", std::string())},
+                        {"deep_inventory_sections", snapshot.value("deep_inventory_sections", json::object())},
+                        {"deep_inventory_error", snapshot.value("deep_inventory_error", std::string())}
+                    };
                 }
                 catch (const std::exception& ex) {
                     LogW(std::string("inventory_snapshot failed: ") + ex.what());
+                    return {{"inventory_sent", false}, {"deep_inventory_status", "failed"}};
                 }
                 catch (...) {
                     LogW("inventory_snapshot failed: unknown error");
+                    return {{"inventory_sent", false}, {"deep_inventory_status", "failed"}};
                 }
             }
 
@@ -5562,6 +5589,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             std::this_thread::sleep_for(std::chrono::seconds(1));
                         }
                         if (stop_.load()) break;
+                        // A disconnected device does not attempt inventory or queue work.
+                        // When the socket reconnects, the Agent-local eight-hour checkpoint
+                        // determines whether the next online, idle pass is due.
+                        if (!signalingConnected_.load()) continue;
                         if (HasActiveSessions()) {
                             LogI("scheduled full inventory skipped while remote session is active");
                             continue;
@@ -7599,6 +7630,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             AgentPresenceController presenceController_;
             ChatController chatController_;
             std::unique_ptr<SignalingClient> signaling_;
+            std::atomic<bool> signalingConnected_{ false };
             std::thread inventoryThread_;
 
             std::mutex sessionsMu_;

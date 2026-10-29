@@ -21,7 +21,9 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -240,7 +242,8 @@ std::string EscapeForSingleQuotedPowerShell(const std::string& value) {
     return out;
 }
 
-json RunPowerShellJson(const std::string& script, const json& fallback = json::object()) {
+json RunPowerShellJson(const std::string& script, const json& fallback = json::object(),
+                       bool captureUtf8File = false) {
     wchar_t tempPath[MAX_PATH]{};
     if (!GetTempPathW(MAX_PATH, tempPath)) return fallback;
 
@@ -250,16 +253,32 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
     std::wstring scriptPath = tempFile;
     scriptPath += L".ps1";
     MoveFileW(tempFile, scriptPath.c_str());
+    const std::wstring resultPath = scriptPath + L".json";
 
     {
         std::ofstream f(WideToUtf8(scriptPath), std::ios::binary | std::ios::trunc);
         if (!f) return fallback;
         f << "$ProgressPreference = 'SilentlyContinue'\n";
         f << "$ErrorActionPreference = 'SilentlyContinue'\n";
-        f << script << "\n";
+        if (captureUtf8File) {
+            // Windows PowerShell 5.1 writes redirected native stdout in the
+            // process console code page. Lenovo's real 129 KB inventory is
+            // valid UTF-8 JSON when written directly but fails JSON parsing
+            // after the old _popen/CRT byte conversion. Capture JSON to disk
+            // with an explicit BOM-free UTF-8 encoder instead.
+            f << "$__hi5_inventory_json = & {\n";
+            f << script << "\n}\n";
+            f << "[IO.File]::WriteAllText('"
+              << EscapeForSingleQuotedPowerShell(WideToUtf8(resultPath))
+              << "', [string]($__hi5_inventory_json -join [Environment]::NewLine), "
+                 "(New-Object System.Text.UTF8Encoding($false)))\n";
+        } else {
+            f << script << "\n";
+        }
     }
 
-    std::string cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + WideToUtf8(scriptPath) + "\"";
+    const std::string cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" +
+                            WideToUtf8(scriptPath) + "\"";
     std::string output;
 #if defined(_WIN32)
     FILE* pipe = _popen(cmd.c_str(), "r");
@@ -269,8 +288,10 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
     if (pipe) {
         std::array<char, 4096> buffer{};
         while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe)) {
-            output += buffer.data();
-            if (output.size() > 4 * 1024 * 1024) break;
+            if (!captureUtf8File) {
+                output += buffer.data();
+                if (output.size() > 4 * 1024 * 1024) break;
+            }
         }
 #if defined(_WIN32)
         _pclose(pipe);
@@ -280,14 +301,36 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
     }
     DeleteFileW(scriptPath.c_str());
 
-    const auto first = output.find_first_of("[{\"");
-    if (first != std::string::npos) output = output.substr(first);
-    const auto lastObj = output.find_last_of("]}");
-    if (lastObj != std::string::npos) output = output.substr(0, lastObj + 1);
+    if (captureUtf8File) {
+        std::ifstream input(WideToUtf8(resultPath), std::ios::binary);
+        if (input) {
+            output.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+        }
+        input.close();
+        DeleteFileW(resultPath.c_str());
+        if (output.empty()) {
+            return {{"deep_inventory_transport_error", "utf8_file_empty"}};
+        }
+        if (output.size() > 4 * 1024 * 1024) {
+            return {{"deep_inventory_transport_error", "utf8_file_too_large"},
+                    {"deep_inventory_transport_bytes", output.size()}};
+        }
+    } else {
+        const auto first = output.find_first_of("[{\"");
+        if (first != std::string::npos) output = output.substr(first);
+        const auto lastObj = output.find_last_of("]}");
+        if (lastObj != std::string::npos) output = output.substr(0, lastObj + 1);
+    }
     if (output.empty()) return fallback;
 
     try {
         return json::parse(output);
+    } catch (const json::parse_error&) {
+        if (captureUtf8File) {
+            return {{"deep_inventory_transport_error", "utf8_json_parse_failed"},
+                    {"deep_inventory_transport_bytes", output.size()}};
+        }
+        return fallback;
     } catch (...) {
         return fallback;
     }
@@ -1087,39 +1130,244 @@ try {
   )
   $sections.peripherals = @{ status = 'collected' }
 } catch { $sections.peripherals = @{ status = 'failed' } }
+
+
+try {
+  $full = Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop | Select-Object -First 1
+  $static = Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction Stop | Select-Object -First 1
+  $cycles = Get-CimInstance -Namespace root\wmi -ClassName BatteryCycleCount -ErrorAction SilentlyContinue | Select-Object -First 1
+  $batteryStatus = Get-CimInstance -Namespace root\wmi -ClassName BatteryStatus -ErrorAction SilentlyContinue | Select-Object -First 1
+  $result.battery_deep = [pscustomobject]@{
+    full_charge_capacity_mwh = if ($full -and $full.FullChargedCapacity -ne $null) { [int64]$full.FullChargedCapacity } else { $null }
+    design_capacity_mwh = if ($static -and $static.DesignedCapacity -ne $null) { [int64]$static.DesignedCapacity } else { $null }
+    cycle_count = if ($cycles -and $cycles.CycleCount -ne $null) { [int]$cycles.CycleCount } else { $null }
+    remaining_capacity_mwh = if ($batteryStatus -and $null -ne $batteryStatus.RemainingCapacity) { [int64]$batteryStatus.RemainingCapacity } else { $null }
+    voltage_mv = if ($batteryStatus -and $null -ne $batteryStatus.Voltage) { [int64]$batteryStatus.Voltage } else { $null }
+    rate_mw = if ($batteryStatus -and $batteryStatus.DischargeRate -gt 0) { -[int64]$batteryStatus.DischargeRate } elseif ($batteryStatus -and $batteryStatus.ChargeRate -gt 0) { [int64]$batteryStatus.ChargeRate } else { $null }
+    health_percent = if ($static -and $static.DesignedCapacity -gt 0 -and $full) {
+      [math]::Round(100 * [double]$full.FullChargedCapacity / [double]$static.DesignedCapacity)
+    } else { $null }
+  }
+  $sections.battery = @{ status='collected' }
+} catch { $sections.battery = @{ status='unsupported'; reason=[string]$_.Exception.Message } }
+
+# Extended read-only Windows inventory. Every section reports its own outcome.
+try {
+  $result.installed_hotfixes = @(Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending |
+    Select-Object -First 300 | ForEach-Object {
+      [pscustomobject]@{ hotfix_id=$_.HotFixID; description=$_.Description; installed_on=SafeDate $_.InstalledOn; installed_by=$_.InstalledBy }
+    })
+  $license = Get-CimInstance SoftwareLicensingProduct -Filter 'PartialProductKey IS NOT NULL' -ErrorAction Stop |
+    Where-Object { $_.Name -like '*Windows*' } | Sort-Object LicenseStatus -Descending | Select-Object -First 1
+  $licenseState = if ($license) {
+    switch ([int]$license.LicenseStatus) {
+      1 { 'Licensed' }; 0 { 'Unlicensed' }; 2 { 'OOB grace' }; 3 { 'OOT grace' }
+      4 { 'Non-genuine grace' }; 5 { 'Notification' }; 6 { 'Extended grace' }; default { 'Unknown' }
+    }
+  } else { $null }
+  $result.windows_licensing = [pscustomobject]@{
+    status=$licenseState; name=$license.Name; description=$license.Description; partial_product_key=$license.PartialProductKey
+  }
+  $reasons = @()
+  if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $reasons += 'Component servicing' }
+  if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $reasons += 'Windows Update' }
+  $pendingRename = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+  if ($pendingRename -and $pendingRename.PendingFileRenameOperations) { $reasons += 'Pending file rename' }
+  $result.reboot_state = [pscustomobject]@{ pending=($reasons.Count -gt 0); reasons=@($reasons) }
+  $result.startup_items = @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop |
+    Select-Object -First 200 | ForEach-Object {
+      [pscustomobject]@{ name=$_.Name; command=$_.Command; location=$_.Location; user=$_.User }
+    })
+  $sections.windows_state = @{ status='collected' }
+} catch { $sections.windows_state = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.scheduled_tasks = @(Get-ScheduledTask -ErrorAction Stop | Select-Object -First 500 |
+    ForEach-Object {
+      [pscustomobject]@{ name=[string]$_.TaskName; path=[string]$_.TaskPath; state=[string]$_.State; author=[string]$_.Author; description=$null }
+    })
+  $sections.scheduled_tasks = @{ status='collected' }
+} catch { $sections.scheduled_tasks = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $adminSids = $null
+  try {
+    $adminSids = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { [string]$_.SID })
+  } catch {}
+  $result.local_users = [pscustomobject]@{
+    users = @(Get-LocalUser -ErrorAction Stop | Select-Object -First 256 | ForEach-Object {
+      [pscustomobject]@{
+        name=$_.Name; full_name=$_.FullName; description=$_.Description; enabled=[bool]$_.Enabled; is_admin=if ($null -ne $adminSids) { $adminSids -contains [string]$_.SID } else { $null }
+        last_logon=SafeDate $_.LastLogon; password_last_set=SafeDate $_.PasswordLastSet; sid=[string]$_.SID
+      }
+    })
+  }
+  $sections.local_users = @{ status='collected' }
+} catch { $sections.local_users = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.local_groups = @(Get-LocalGroup -ErrorAction Stop | Select-Object -First 128 | ForEach-Object {
+    $g = $_
+    $members = @()
+    try {
+      $members = @(Get-LocalGroupMember -SID $g.SID -ErrorAction Stop | Select-Object -First 128 |
+        ForEach-Object { [pscustomobject]@{ name=$_.Name; sid=[string]$_.SID; object_class=[string]$_.ObjectClass } })
+    } catch {}
+    [pscustomobject]@{ name=$g.Name; sid=[string]$g.SID; description=$g.Description; members=@($members) }
+  })
+  $sections.local_groups = @{ status='collected' }
+} catch { $sections.local_groups = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.optional_features = @(Get-CimInstance Win32_OptionalFeature -Filter 'InstallState=1' -ErrorAction Stop |
+    Select-Object -First 256 | ForEach-Object { [pscustomobject]@{ name=$_.Name; state='Enabled' } })
+  $plan = Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerPlan -ErrorAction Stop |
+    Where-Object { $_.IsActive } | Select-Object -First 1
+  $result.power_plan = if ($plan) { $plan.ElementName } else { $null }
+  $sections.features_power = @{ status='collected' }
+} catch { $sections.features_power = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.network_profiles = @(Get-NetConnectionProfile -ErrorAction Stop | Select-Object -First 128 |
+    ForEach-Object {
+      [pscustomobject]@{ name=$_.Name; interface_alias=$_.InterfaceAlias; network_category=[string]$_.NetworkCategory
+        ipv4_connectivity=[string]$_.IPv4Connectivity; ipv6_connectivity=[string]$_.IPv6Connectivity }
+    })
+  $result.network_configurations = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' -ErrorAction Stop |
+    Select-Object -First 128 | ForEach-Object {
+      [pscustomobject]@{ description=$_.Description; mac_address=$_.MACAddress
+        ip_addresses=@($_.IPAddress | Where-Object { $_ }); dhcp_enabled=[bool]$_.DHCPEnabled
+        dhcp_server=$_.DHCPServer; dns_servers=@($_.DNSServerSearchOrder | Where-Object { $_ })
+        dns_domain=$_.DNSDomain; gateways=@($_.DefaultIPGateway | Where-Object { $_ }) }
+    })
+  $result.wifi_interfaces = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.ifType -eq 71 } |
+    Select-Object -First 16 | ForEach-Object {
+      [pscustomobject]@{ name=$_.Name; state=[string]$_.Status; ssid=$null; bssid=$null
+        signal=$null; channel=$null; radio_type=$null; authentication=$null; cipher=$null }
+    })
+  # Wi-Fi association details are not guaranteed for a Windows service; leave unknown rather than inventing them.
+  $result.default_routes = @(Get-NetRoute -ErrorAction Stop |
+    Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' -or $_.DestinationPrefix -eq '::/0' } |
+    Select-Object -First 64 | ForEach-Object {
+      [pscustomobject]@{ destination=$_.DestinationPrefix; next_hop=$_.NextHop
+        interface_alias=$_.InterfaceAlias; route_metric=$_.RouteMetric; protocol=[string]$_.Protocol }
+    })
+  $sections.network = @{ status='collected' }
+} catch { $sections.network = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop | Select-Object -First 1
+  $dsreg = @(dsregcmd.exe /status 2>$null)
+  $ds = @{}
+  foreach ($line in $dsreg) {
+    if ($line -match '^\s*(AzureAdJoined|WorkplaceJoined|DeviceId|TenantId|TenantName)\s*:\s*(.*?)\s*$') {
+      $ds[$Matches[1]] = $Matches[2].Trim()
+    }
+  }
+  $result.directory_join = [pscustomobject]@{
+    computer_name=$env:COMPUTERNAME
+    domain_joined=[bool]$cs.PartOfDomain
+    domain=if ($cs.PartOfDomain) { $cs.Domain } else { $null }
+    workgroup=if (-not $cs.PartOfDomain) { $cs.Domain } else { $null }
+    domain_role=[int]$cs.DomainRole
+    azure_ad_joined=if ($ds.AzureAdJoined) { $ds.AzureAdJoined -eq 'YES' } else { $null }
+    workplace_joined=if ($ds.WorkplaceJoined) { $ds.WorkplaceJoined -eq 'YES' } else { $null }
+    entra_device_id=$ds.DeviceId
+    entra_tenant_id=$ds.TenantId
+    entra_tenant_name=$ds.TenantName
+  }
+  $sections.directory_join = @{ status='collected' }
+} catch { $sections.directory_join = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.machine_certificates = @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction Stop |
+    Select-Object -First 256 | ForEach-Object {
+      [pscustomobject]@{
+        subject=$_.Subject; issuer=$_.Issuer; thumbprint=$_.Thumbprint
+        not_before=SafeDate $_.NotBefore; not_after=SafeDate $_.NotAfter
+        has_private_key=[bool]$_.HasPrivateKey
+      }
+    })
+  $sections.certificates = @{ status='collected' }
+} catch { $sections.certificates = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop | Select-Object -First 1
+  $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+  $result.virtualization = [pscustomobject]@{
+    hypervisor_present=[bool]$cs.HypervisorPresent
+    virtualization_firmware_enabled=if ($null -ne $cpu.VirtualizationFirmwareEnabled) { [bool]$cpu.VirtualizationFirmwareEnabled } else { $null }
+    vm_monitor_mode_extensions=if ($null -ne $cpu.VMMonitorModeExtensions) { [bool]$cpu.VMMonitorModeExtensions } else { $null }
+    second_level_address_translation=if ($null -ne $cpu.SecondLevelAddressTranslationExtensions) { [bool]$cpu.SecondLevelAddressTranslationExtensions } else { $null }
+    data_execution_prevention_available=if ($null -ne $cpu.DataExecutionPrevention_Available) { [bool]$cpu.DataExecutionPrevention_Available } else { $null }
+  }
+  $sections.virtualization = @{ status='collected' }
+} catch { $sections.virtualization = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
 $result.deep_inventory_sections = $sections
 $result | ConvertTo-Json -Depth 8 -Compress
-)PS", json::object());
+)PS", json::object(), true);
 }
 
 json DueDeepHardwareInventory(bool force) {
     static std::mutex mu;
-    static std::chrono::steady_clock::time_point nextAttemptAt{};
+    static std::chrono::steady_clock::time_point retryAfter{};
     std::lock_guard<std::mutex> lock(mu);
     const auto now = std::chrono::steady_clock::now();
-    if (!force && now < nextAttemptAt) {
-        return { {"deep_inventory_included", false} };
-    }
-    // Failed or unsupported WMI providers must not cause a new slow scan
-    // every minute. Explicit technician inventory.scan bypasses this delay.
-    nextAttemptAt = now + std::chrono::minutes(30);
-    auto deep = DeepHardwareInventory();
-    if (!deep.is_object() || !deep.contains("deep_inventory_sections")) {
-        return { {"deep_inventory_included", false} };
-    }
-    bool anySuccess = false;
-    const auto& statuses = deep["deep_inventory_sections"];
-    if (statuses.is_object()) {
-        for (auto it = statuses.begin(); it != statuses.end(); ++it) {
-            if (it.value().is_object() && it.value().value("status", "") == "collected") {
-                anySuccess = true;
-                break;
+    if (!force && now < retryAfter) return {{"deep_inventory_included", false}, {"deep_inventory_status", "retry_later"}};
+
+    // A local checkpoint makes the eight-hour cadence survive Agent restarts and
+    // disconnected devices. Nothing is scheduled or attempted by the server while offline.
+    namespace fs = std::filesystem;
+    wchar_t programData[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+    const fs::path root = length > 0 && length < MAX_PATH ? fs::path(programData) : fs::path(L"C:\\ProgramData");
+    const fs::path stamp = root / L"Hi5Central" / L"Agent" / L"deep-inventory-last-success.txt";
+    if (!force) {
+        std::ifstream saved(stamp);
+        std::int64_t previous = 0;
+        if (saved >> previous) {
+            const auto seconds = static_cast<std::int64_t>(std::time(nullptr));
+            if (previous > 0 && seconds >= previous && seconds - previous < 8 * 60 * 60) {
+                return {{"deep_inventory_included", false}, {"deep_inventory_status", "not_due"}};
             }
         }
     }
-    if (!anySuccess) return { {"deep_inventory_included", false} };
+
+    retryAfter = now + std::chrono::minutes(30);
+    json deep = DeepHardwareInventory();
+    if (!deep.is_object() || !deep.contains("deep_inventory_sections") ||
+        !deep["deep_inventory_sections"].is_object()) {
+        return {{"deep_inventory_included", false}, {"deep_inventory_status", "failed"},
+                {"deep_inventory_error", deep.value("deep_inventory_transport_error",
+                  std::string("Windows deep collector did not produce valid section statuses"))},
+                {"deep_inventory_transport_bytes", deep.value("deep_inventory_transport_bytes", std::size_t(0))}};
+    }
+    bool anySuccess = false;
+    bool anyFailure = false;
+    for (auto it = deep["deep_inventory_sections"].begin(); it != deep["deep_inventory_sections"].end(); ++it) {
+        if (!it.value().is_object()) continue;
+        const std::string status = it.value().value("status", "");
+        if (status == "collected") anySuccess = true;
+        else if (status == "failed") anyFailure = true;
+    }
+    if (!anySuccess) {
+        return {{"deep_inventory_included", false}, {"deep_inventory_status", "failed"},
+                {"deep_inventory_sections", deep["deep_inventory_sections"]}};
+    }
     deep["deep_inventory_included"] = true;
+    deep["deep_inventory_status"] = anyFailure ? "partial" : "collected";
     deep["deep_inventory_collected_at"] = NowIsoUtc();
+    // A collected snapshot (including a partial one) counts toward the eight-
+    // hour cadence. Failed optional sections retain their last-known-good data
+    // and retry on the next due pass, not every thirty minutes forever.
+    retryAfter = std::chrono::steady_clock::time_point{};
+    std::error_code error;
+    fs::create_directories(stamp.parent_path(), error);
+    if (!error) {
+        std::ofstream saved(stamp, std::ios::trunc);
+        if (saved) saved << std::time(nullptr);
+    }
     return deep;
 }
 
@@ -1344,6 +1592,10 @@ json BuildInventorySnapshot(const AgentIdentity& identity, bool forceDeep, bool 
         }}
     };
     snapshot.update(deep);
+    if (snapshot.contains("battery_deep") && snapshot["battery_deep"].is_object()) {
+        snapshot["battery"].update(snapshot["battery_deep"]);
+        snapshot.erase("battery_deep");
+    }
     return snapshot;
 }
 

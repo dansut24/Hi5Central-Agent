@@ -42,7 +42,7 @@ jobs:
           $start = $text.IndexOf('json DeepHardwareInventory()')
           if ($start -lt 0) { throw 'Missing deep inventory function' }
           $begin = $text.IndexOf('R"PS(', $start)
-          $finish = $text.IndexOf(')PS", json::object());', $begin)
+          $finish = $text.IndexOf(')PS", json::object(), true);', $begin)
           if ($begin -lt 0 -or $finish -lt $begin) { throw 'Could not find PowerShell script boundaries' }
           $script = $text.Substring($begin + 5, $finish - ($begin + 5))
           $tokens = $null
@@ -52,8 +52,94 @@ jobs:
             $errors | ForEach-Object { Write-Error $_.Message }
             throw 'PowerShell inventory script has syntax errors'
           }
-          $required = @('memory_modules','motherboard','physical_disks','monitors','drivers','problem_devices','printers','usb_devices','deep_inventory_sections')
+          $required = @(
+            'memory_modules','motherboard','physical_disks','monitors','drivers','problem_devices',
+            'printers','usb_devices','installed_hotfixes','windows_licensing','reboot_state',
+            'startup_items','scheduled_tasks','local_users','local_groups','optional_features',
+            'power_plan','network_profiles','network_configurations','wifi_interfaces',
+            'default_routes','directory_join','machine_certificates','virtualization',
+            'battery_deep','deep_inventory_sections'
+          )
           foreach ($key in $required) {
             if (-not $script.Contains($key)) { throw "Inventory result missing required $key" }
           }
           Write-Host "Deep Windows inventory PowerShell parsed and required payload keys present"
+      - name: Verify explicit and scheduled deep inventory entry points
+        shell: pwsh
+        run: |
+          $collector = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
+          $service = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
+          foreach ($required in @('8 * 60 * 60', 'deep-inventory-last-success.txt', 'deep_inventory_status', 'battery_deep')) {
+            if (-not $collector.Contains($required)) { throw "Collector is missing $required" }
+          }
+          foreach ($required in @('inventory.deep.scan', 'deep_scan_deferred', 'SendInventorySnapshotSafe(ident, false, true)')) {
+            if (-not $service.Contains($required)) { throw "Agent service is missing $required" }
+          }
+          Write-Host 'Eight-hour Agent-local deep scans and manual scan entry point are present'
+
+      - name: Execute the real deep inventory script with Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          # The actual Windows interpreter executes the embedded script, not just its parser.
+          $text = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
+          $start = $text.IndexOf('json DeepHardwareInventory()')
+          $begin = $text.IndexOf('R"PS(', $start)
+          $finish = $text.IndexOf(')PS", json::object(), true);', $begin)
+          if ($start -lt 0 -or $begin -lt 0 -or $finish -le $begin) { throw 'Embedded inventory script not found' }
+          $script = '$ProgressPreference = "SilentlyContinue"' + [Environment]::NewLine + '$ErrorActionPreference = "SilentlyContinue"' + [Environment]::NewLine + $text.Substring($begin + 5, $finish - $begin - 5)
+          $path = Join-Path $env:RUNNER_TEMP 'hi5-deep-inventory.ps1'
+          $output = Join-Path $env:RUNNER_TEMP 'hi5-deep-inventory.stdout'
+          $errors = Join-Path $env:RUNNER_TEMP 'hi5-deep-inventory.stderr'
+          Set-Content -Path $path -Value $script -Encoding UTF8
+          $arguments = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $path + '"'))
+          $process = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList $arguments -Wait -PassThru -RedirectStandardOutput $output -RedirectStandardError $errors
+          $stdout = Get-Content $output -Raw -ErrorAction SilentlyContinue
+          $stderr = Get-Content $errors -Raw -ErrorAction SilentlyContinue
+          if ($stderr) { Write-Host ('STDERR: ' + $stderr.Substring(0,[Math]::Min(2500,$stderr.Length))) }
+          if ($process.ExitCode -ne 0) {
+            if ($stdout) { Write-Host ('STDOUT: ' + $stdout.Substring(0,[Math]::Min(2500,$stdout.Length))) }
+            throw "PowerShell collector exited $($process.ExitCode)"
+          }
+          Write-Host ('Collector stdout byte count: ' + (Get-Item $output).Length)
+          # Match the native Agent JSON decoder: strict UTF-8 and a full JSON parse.
+          $js = 'const fs=require("fs"); const b=fs.readFileSync(process.argv[1]); const s=new TextDecoder("utf-8",{fatal:true}).decode(b); try{const r=JSON.parse(s);console.log("Native-compatible JSON OK; sections="+Object.keys(r.deep_inventory_sections||{}).length+"; bytes="+b.length);}catch(e){const n=Number(e.message.split("position ")[1]?.split(" ")[0]||0);console.error("JSON_ERROR",e.message,"CONTEXT",JSON.stringify(s.slice(Math.max(0,n-130),n+160)));process.exit(1)}'
+          & node -e $js $output
+          if ($LASTEXITCODE -ne 0) { throw 'Strict UTF-8 / JSON validation failed' }
+          $report = $null
+          try { $report = $stdout | ConvertFrom-Json -ErrorAction Stop }
+          catch {
+            Write-Host ('PowerShell ConvertFrom-Json error: ' + $_.Exception.Message)
+            if ($stdout) { Write-Host ('STDOUT_START: ' + $stdout.Substring(0,[Math]::Min(2500,$stdout.Length))) }
+            if ($stdout) { Write-Host ('STDOUT_END: ' + $stdout.Substring([Math]::Max(0,$stdout.Length-2500))) }
+            throw 'PowerShell collector did not produce valid JSON'
+          }
+          if (-not $report.deep_inventory_sections) { throw 'PowerShell collector returned no deep inventory section statuses' }
+          $statuses = @($report.deep_inventory_sections.PSObject.Properties)
+          foreach ($s in $statuses) { Write-Host "$($s.Name): $($s.Value.status)" }
+          if (@($statuses | Where-Object { $_.Value.status -eq 'collected' }).Count -eq 0) {
+            throw 'PowerShell collector returned zero successful sections'
+          }
+
+      - name: Verify BOM-free UTF-8 disk handoff on Windows
+        shell: pwsh
+        run: |
+          $text = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
+          $start = $text.IndexOf('json DeepHardwareInventory()')
+          $begin = $text.IndexOf('R"PS(', $start)
+          $finish = $text.IndexOf(')PS", json::object(), true);', $begin)
+          if ($start -lt 0 -or $begin -lt 0 -or $finish -lt $begin) { throw 'Deep UTF-8 inventory script not found' }
+          $script = $text.Substring($begin + 5, $finish - $begin - 5)
+          $path = Join-Path $env:RUNNER_TEMP 'deep-file-handoff.ps1'
+          $out = Join-Path $env:RUNNER_TEMP 'deep-file-handoff.json'
+          $header = '$ProgressPreference = "SilentlyContinue"' + [Environment]::NewLine + '$__hi5_inventory_json = & {' + [Environment]::NewLine
+          $footer = @'
+          }
+          [IO.File]::WriteAllText('OUTPUT_PLACEHOLDER', [string]($__hi5_inventory_json -join [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))
+          '@
+          $wrapped = $header + $script + [Environment]::NewLine + $footer.Replace('OUTPUT_PLACEHOLDER', $out.Replace("'","''"))
+          Set-Content -LiteralPath $path -Value $wrapped -Encoding UTF8
+          $process = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $path + '"')) -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or -not (Test-Path $out)) { throw 'Native-style PowerShell UTF-8 handoff did not write JSON' }
+          $validator = 'const fs=require("fs");const b=fs.readFileSync(process.argv[1]);const s=new TextDecoder("utf-8",{fatal:true}).decode(b);const r=JSON.parse(s);if(Object.keys(r.deep_inventory_sections||{}).length<8)process.exit(2);console.log("UTF8_FILE_HANDOFF_PASS bytes="+b.length+" sections="+Object.keys(r.deep_inventory_sections).length)'
+          & node -e $validator $out
+          if ($LASTEXITCODE -ne 0) { throw 'UTF-8 native handoff JSON failed validation' }
