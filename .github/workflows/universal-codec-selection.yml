@@ -5,6 +5,8 @@ on:
     paths:
       - 'Agent/chatpass_agent/src/codec_universal_selector.h'
       - 'Agent/chatpass_agent/src/codec_universal_connection.h'
+      - 'Agent/chatpass_agent/src/codec_runtime_proof.h'
+      - 'Agent/chatpass_agent/tests/codec_runtime_proof_test.cpp'
       - 'Agent/chatpass_agent/src/codec_windows_qual_identity.h'
       - 'Agent/chatpass_agent/tests/codec_universal_connection_test.cpp'
       - 'Agent/chatpass_agent/tests/universal_codec_selection_test.cpp'
@@ -28,6 +30,10 @@ jobs:
             Agent/chatpass_agent/tests/codec_universal_connection_test.cpp \
             -o /tmp/codec_connection_test
           /tmp/codec_connection_test
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
+            Agent/chatpass_agent/tests/codec_runtime_proof_test.cpp \
+            -o /tmp/codec_runtime_proof_test
+          /tmp/codec_runtime_proof_test
           g++ -std=c++17 -O2 -Wall -Wextra -Werror \
             Agent/chatpass_agent/tests/frame_scale_bilinear_test.cpp \
             -o /tmp/h264_scaler_test
@@ -43,6 +49,6 @@ jobs:
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw "Visual Studio C++ compiler unavailable" }
           $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
-          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/universal_codec_selection_test.cpp /Fe:codec_universal_test.exe && codec_universal_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/codec_universal_connection_test.cpp /Fe:codec_connection_test.exe && codec_connection_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/frame_scale_bilinear_test.cpp /Fe:h264_scaler_test.exe && h264_scaler_test.exe'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/universal_codec_selection_test.cpp /Fe:codec_universal_test.exe && codec_universal_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/codec_universal_connection_test.cpp /Fe:codec_connection_test.exe && codec_connection_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/codec_runtime_proof_test.cpp /Fe:codec_runtime_proof_test.exe && codec_runtime_proof_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/frame_scale_bilinear_test.cpp /Fe:h264_scaler_test.exe && h264_scaler_test.exe'
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "Universal codec selection unit tests failed" }
