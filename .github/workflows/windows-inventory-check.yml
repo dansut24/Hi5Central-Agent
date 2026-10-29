@@ -119,3 +119,27 @@ jobs:
           if (@($statuses | Where-Object { $_.Value.status -eq 'collected' }).Count -eq 0) {
             throw 'PowerShell collector returned zero successful sections'
           }
+
+      - name: Verify BOM-free UTF-8 disk handoff on Windows
+        shell: pwsh
+        run: |
+          $text = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
+          $start = $text.IndexOf('json DeepHardwareInventory()')
+          $begin = $text.IndexOf('R"PS(', $start)
+          $finish = $text.IndexOf(')PS", json::object(), true);', $begin)
+          if ($start -lt 0 -or $begin -lt 0 -or $finish -lt $begin) { throw 'Deep UTF-8 inventory script not found' }
+          $script = $text.Substring($begin + 5, $finish - $begin - 5)
+          $path = Join-Path $env:RUNNER_TEMP 'deep-file-handoff.ps1'
+          $out = Join-Path $env:RUNNER_TEMP 'deep-file-handoff.json'
+          $header = '$ProgressPreference = "SilentlyContinue"' + [Environment]::NewLine + '$__hi5_inventory_json = & {' + [Environment]::NewLine
+          $footer = @'
+          }
+          [IO.File]::WriteAllText('OUTPUT_PLACEHOLDER', [string]($__hi5_inventory_json -join [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))
+          '@
+          $wrapped = $header + $script + [Environment]::NewLine + $footer.Replace('OUTPUT_PLACEHOLDER', $out.Replace("'","''"))
+          Set-Content -LiteralPath $path -Value $wrapped -Encoding UTF8
+          $process = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $path + '"')) -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or -not (Test-Path $out)) { throw 'Native-style PowerShell UTF-8 handoff did not write JSON' }
+          $validator = 'const fs=require("fs");const b=fs.readFileSync(process.argv[1]);const s=new TextDecoder("utf-8",{fatal:true}).decode(b);const r=JSON.parse(s);if(Object.keys(r.deep_inventory_sections||{}).length<8)process.exit(2);console.log("UTF8_FILE_HANDOFF_PASS bytes="+b.length+" sections="+Object.keys(r.deep_inventory_sections).length)'
+          & node -e $validator $out
+          if ($LASTEXITCODE -ne 0) { throw 'UTF-8 native handoff JSON failed validation' }
