@@ -100,9 +100,15 @@ jobs:
             if ($stdout) { Write-Host ('STDOUT: ' + $stdout.Substring(0,[Math]::Min(2500,$stdout.Length))) }
             throw "PowerShell collector exited $($process.ExitCode)"
           }
+          Write-Host ('Collector stdout byte count: ' + (Get-Item $output).Length)
+          # Match the native Agent JSON decoder: strict UTF-8 and a full JSON parse.
+          $js = 'const fs=require("fs"); const b=fs.readFileSync(process.argv[1]); const s=new TextDecoder("utf-8",{fatal:true}).decode(b); const r=JSON.parse(s); console.log("Native-compatible JSON OK; sections="+Object.keys(r.deep_inventory_sections||{}).length+"; bytes="+b.length);'
+          & node -e $js $output
+          if ($LASTEXITCODE -ne 0) { throw 'Strict UTF-8 / JSON validation failed' }
           $report = $null
           try { $report = $stdout | ConvertFrom-Json -ErrorAction Stop }
           catch {
+            Write-Host ('PowerShell ConvertFrom-Json error: ' + $_.Exception.Message)
             if ($stdout) { Write-Host ('STDOUT_START: ' + $stdout.Substring(0,[Math]::Min(2500,$stdout.Length))) }
             if ($stdout) { Write-Host ('STDOUT_END: ' + $stdout.Substring([Math]::Max(0,$stdout.Length-2500))) }
             throw 'PowerShell collector did not produce valid JSON'
