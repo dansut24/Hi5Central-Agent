@@ -1898,6 +1898,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 }
                 m_externalEncodeMsTotal += encodeMs;
                 m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
+                m_externalEncodeLatency.record(encodeMs);
                 ++m_externalEncodedFrames;
 
                 if (!encoded.data.empty()) {
@@ -1958,6 +1959,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                         " sent=" + std::to_string(m_externalSentFrames) +
                         " encode_avg_ms=" + std::to_string(m_externalEncodeMsTotal / encodedCount) +
                         " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+                        " encode_p95_ms=" + std::to_string(m_externalEncodeLatency.percentile95()) +
                         " rtp_enqueue_avg_ms=" + std::to_string(m_externalSendMsTotal / sentCount) +
                         " rtp_enqueue_max_ms=" + std::to_string(m_externalSendMsMax) +
                         " target_fps=" + std::to_string(m_externalConfiguredFps) +
@@ -1974,6 +1976,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                             {"sent_frames", m_externalSentFrames},
                             {"encode_avg_ms", m_externalEncodeMsTotal / encodedCount},
                             {"encode_max_ms", m_externalEncodeMsMax},
+                            {"encode_p95_ms", m_externalEncodeLatency.percentile95()},
                             {"send_avg_ms", m_externalSendMsTotal / sentCount},
                             {"send_max_ms", m_externalSendMsMax},
                             {"target_fps", m_externalConfiguredFps},
@@ -1990,6 +1993,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     m_externalSentFrames = 0;
                     m_externalEncodeMsTotal = 0.0;
                     m_externalEncodeMsMax = 0.0;
+                    m_externalEncodeLatency.clear();
                     m_externalSendMsTotal = 0.0;
                     m_externalSendMsMax = 0.0;
                     m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
@@ -2125,6 +2129,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
                 m_externalEncodeMsTotal += encodeMs;
                 m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
+                m_externalEncodeLatency.record(encodeMs);
                 ++m_externalEncodedFrames;
 
                 if (!encoded.data.empty()) {
@@ -2150,6 +2155,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                         " sent=" + std::to_string(m_externalSentFrames) +
                         " encode_avg_ms=" + std::to_string(m_externalEncodeMsTotal / encodedCount) +
                         " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+                        " encode_p95_ms=" + std::to_string(m_externalEncodeLatency.percentile95()) +
                         " rtp_enqueue_avg_ms=" + std::to_string(m_externalSendMsTotal / sentCount) +
                         " rtp_enqueue_max_ms=" + std::to_string(m_externalSendMsMax) +
                         " target_fps=" + std::to_string(m_externalConfiguredFps) +
@@ -2167,6 +2173,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                             {"sent_frames", m_externalSentFrames},
                             {"encode_avg_ms", m_externalEncodeMsTotal / encodedCount},
                             {"encode_max_ms", m_externalEncodeMsMax},
+                            {"encode_p95_ms", m_externalEncodeLatency.percentile95()},
                             {"send_avg_ms", m_externalSendMsTotal / sentCount},
                             {"send_max_ms", m_externalSendMsMax},
                             {"target_fps", m_externalConfiguredFps},
@@ -2183,6 +2190,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     m_externalSentFrames = 0;
                     m_externalEncodeMsTotal = 0.0;
                     m_externalEncodeMsMax = 0.0;
+                    m_externalEncodeLatency.clear();
                     m_externalSendMsTotal = 0.0;
                     m_externalSendMsMax = 0.0;
                     m_externalNextStatsLog = now + std::chrono::seconds(5);
@@ -2215,6 +2223,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
         m_externalEncodeMsTotal += encodeMs;
         m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
+                m_externalEncodeLatency.record(encodeMs);
         ++m_externalEncodedFrames;
 
         if (!encoded.data.empty()) {
@@ -2246,6 +2255,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 " sent=" + std::to_string(m_externalSentFrames) +
                 " encode_avg_ms=" + std::to_string(encodeAvgMs) +
                 " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+                        " encode_p95_ms=" + std::to_string(m_externalEncodeLatency.percentile95()) +
                 " rtp_enqueue_avg_ms=" + std::to_string(sendAvgMs) +
                 " rtp_enqueue_max_ms=" + std::to_string(m_externalSendMsMax) +
                 " target_fps=" + std::to_string(m_externalConfiguredFps) +
@@ -2269,6 +2279,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     {"sent_frames", m_externalSentFrames},
                     {"encode_avg_ms", encodeAvgMs},
                     {"encode_max_ms", m_externalEncodeMsMax},
+                            {"encode_p95_ms", m_externalEncodeLatency.percentile95()},
                     {"send_avg_ms", sendAvgMs},
                     {"send_max_ms", m_externalSendMsMax},
                     {"bitrate_kbps", m_externalConfiguredBitrateKbps},
@@ -2287,6 +2298,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             m_externalSentFrames = 0;
             m_externalEncodeMsTotal = 0.0;
             m_externalEncodeMsMax = 0.0;
+                    m_externalEncodeLatency.clear();
             m_externalSendMsTotal = 0.0;
             m_externalSendMsMax = 0.0;
             m_externalNextStatsLog = now + std::chrono::seconds(5);
