@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <string>
 #include <vector>
 
@@ -156,6 +159,78 @@ inline bool cacheValid(const CacheIdentity& saved, const CacheIdentity& current,
         saved.gpuAndDriver == current.gpuAndDriver &&
         !saved.encoderConfigVersion.empty() &&
         saved.encoderConfigVersion == current.encoderConfigVersion;
+}
+
+// Only bounded, non-identifying performance observations are persisted.
+// Never cache screen pixels, account names, network addresses or SDP offers.
+// The cache is advisory: if missing, stale or corrupt, fall back safely.
+inline bool saveQualificationCache(const std::filesystem::path& path,
+                                   const CacheIdentity& identity,
+                                   const std::vector<Candidate>& candidates) {
+    if (identity.qualifiedAtUnixSeconds <= 0 || candidates.size() > 32) return false;
+    const auto temp = std::filesystem::path(path.string() + ".new");
+    try {
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream file(temp, std::ios::trunc | std::ios::binary);
+        if (!file) return false;
+        file << "H5C-CODEC-QUALIFICATION-1\n"
+             << std::quoted(identity.agentBuild) << " "
+             << std::quoted(identity.operatingSystem) << " "
+             << std::quoted(identity.gpuAndDriver) << " "
+             << std::quoted(identity.encoderConfigVersion) << " "
+             << identity.qualifiedAtUnixSeconds << "\n"
+             << candidates.size() << "\n" << std::setprecision(17);
+        for (const auto& c : candidates) {
+            file << std::quoted(c.codec) << " " << std::quoted(c.backend) << " "
+                 << c.hardware << " " << c.emittedFrames << " "
+                 << c.decodedFrames << " " << c.keyframeRecovery << " "
+                 << c.packetizationVerified << " " << c.testedFrames << " "
+                 << c.maxWidth << " " << c.maxHeight << " "
+                 << c.p95EncodeMs << " " << c.worstEncodeMs << "\n";
+        }
+        file.flush();
+        if (!file.good()) return false;
+        file.close();
+        // Failure to replace must never interfere with the Agent session.
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        std::filesystem::rename(temp, path, ec);
+        return !ec;
+    } catch (...) { return false; }
+}
+inline std::vector<Candidate> loadQualificationCache(
+    const std::filesystem::path& path, const CacheIdentity& current,
+    int64_t nowUnixSeconds) {
+    std::vector<Candidate> candidates;
+    try {
+        if (!std::filesystem::exists(path) ||
+            std::filesystem::file_size(path) > 16384) return candidates;
+        std::ifstream file(path, std::ios::binary);
+        std::string magic;
+        if (!std::getline(file, magic) || magic != "H5C-CODEC-QUALIFICATION-1")
+            return {};
+        CacheIdentity id;
+        if (!(file >> std::quoted(id.agentBuild) >> std::quoted(id.operatingSystem)
+                   >> std::quoted(id.gpuAndDriver) >> std::quoted(id.encoderConfigVersion)
+                   >> id.qualifiedAtUnixSeconds) ||
+            !cacheValid(id, current, nowUnixSeconds)) return {};
+        size_t count = 0;
+        if (!(file >> count) || count > 32) return {};
+        for (size_t i=0;i<count;++i) {
+            Candidate c;
+            if (!(file >> std::quoted(c.codec) >> std::quoted(c.backend)
+                       >> c.hardware >> c.emittedFrames >> c.decodedFrames
+                       >> c.keyframeRecovery >> c.packetizationVerified
+                       >> c.testedFrames >> c.maxWidth >> c.maxHeight
+                       >> c.p95EncodeMs >> c.worstEncodeMs))
+                return {};
+            if (c.testedFrames < 0 || c.maxWidth < 0 || c.maxHeight < 0 ||
+                !std::isfinite(c.p95EncodeMs) || !std::isfinite(c.worstEncodeMs))
+                return {};
+            candidates.push_back(std::move(c));
+        }
+    } catch (...) { return {}; }
+    return candidates;
 }
 
 } // namespace universal_codec
