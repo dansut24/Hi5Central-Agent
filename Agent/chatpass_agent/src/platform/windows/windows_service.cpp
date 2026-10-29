@@ -2636,7 +2636,7 @@ LogI(
                         // step. Start the consent/connected banner AFTER that cleanup:
                         // otherwise it is immediately closed, leaving no visible notice.
                         std::string connectionCodec = autoSessionCodec;
-                        if (codecDecision.requestedMode == "auto" &&
+                        if (ReadConfigString("HI5_CODEC", "auto") == "auto" &&
                             ReadConfigInt("HI5_UNIVERSAL_CODEC_AUTO", 0, 0, 1) == 1 &&
                             msg.value("viewer_caps_v1", false) &&
                             msg.contains("viewer_codecs") &&
