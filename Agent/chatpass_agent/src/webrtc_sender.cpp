@@ -1939,6 +1939,19 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                         LogWarn("[codec-auto] sustained VP9 overload session=" + m_sessionId +
                             " next_auto_session=vp8");
                         if (m_encoderOverloadFn) m_encoderOverloadFn();
+                        if (nativeRequested) {
+                            // An SDP codec change would disrupt this live track.
+                            // A VP9 resolution change is allowed: the next frame
+                            // reinitializes the same negotiated codec at 1080p,
+                            // sends a fresh keyframe and releases the overloaded
+                            // 2560x1600 Media Foundation encoder.
+                            m_vp9NativeFailed = true;
+                            m_vp9Encoder.reset();
+                            m_forceKeyframe = true;
+                            LogWarn("[quality] sustained native VP9 overload; " 
+                                "reducing resolution to 1080p without SDP renegotiation session=" +
+                                m_sessionId);
+                        }
                     }
                     LogInfo("[encoder-health] codec=VP9 session=" + m_sessionId +
                         " encoded=" + std::to_string(m_externalEncodedFrames) +
