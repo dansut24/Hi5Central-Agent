@@ -23,6 +23,7 @@
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -241,7 +242,8 @@ std::string EscapeForSingleQuotedPowerShell(const std::string& value) {
     return out;
 }
 
-json RunPowerShellJson(const std::string& script, const json& fallback = json::object()) {
+json RunPowerShellJson(const std::string& script, const json& fallback = json::object(),
+                       bool captureUtf8File = false) {
     wchar_t tempPath[MAX_PATH]{};
     if (!GetTempPathW(MAX_PATH, tempPath)) return fallback;
 
@@ -251,16 +253,32 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
     std::wstring scriptPath = tempFile;
     scriptPath += L".ps1";
     MoveFileW(tempFile, scriptPath.c_str());
+    const std::wstring resultPath = scriptPath + L".json";
 
     {
         std::ofstream f(WideToUtf8(scriptPath), std::ios::binary | std::ios::trunc);
         if (!f) return fallback;
         f << "$ProgressPreference = 'SilentlyContinue'\n";
         f << "$ErrorActionPreference = 'SilentlyContinue'\n";
-        f << script << "\n";
+        if (captureUtf8File) {
+            // Windows PowerShell 5.1 writes redirected native stdout in the
+            // process console code page. Lenovo's real 129 KB inventory is
+            // valid UTF-8 JSON when written directly but fails JSON parsing
+            // after the old _popen/CRT byte conversion. Capture JSON to disk
+            // with an explicit BOM-free UTF-8 encoder instead.
+            f << "$__hi5_inventory_json = & {\n";
+            f << script << "\n}\n";
+            f << "[IO.File]::WriteAllText('"
+              << EscapeForSingleQuotedPowerShell(WideToUtf8(resultPath))
+              << "', [string]($__hi5_inventory_json -join [Environment]::NewLine), "
+                 "(New-Object System.Text.UTF8Encoding($false)))\n";
+        } else {
+            f << script << "\n";
+        }
     }
 
-    std::string cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + WideToUtf8(scriptPath) + "\"";
+    const std::string cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" +
+                            WideToUtf8(scriptPath) + "\"";
     std::string output;
 #if defined(_WIN32)
     FILE* pipe = _popen(cmd.c_str(), "r");
@@ -270,8 +288,10 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
     if (pipe) {
         std::array<char, 4096> buffer{};
         while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe)) {
-            output += buffer.data();
-            if (output.size() > 4 * 1024 * 1024) break;
+            if (!captureUtf8File) {
+                output += buffer.data();
+                if (output.size() > 4 * 1024 * 1024) break;
+            }
         }
 #if defined(_WIN32)
         _pclose(pipe);
@@ -281,14 +301,36 @@ json RunPowerShellJson(const std::string& script, const json& fallback = json::o
     }
     DeleteFileW(scriptPath.c_str());
 
-    const auto first = output.find_first_of("[{\"");
-    if (first != std::string::npos) output = output.substr(first);
-    const auto lastObj = output.find_last_of("]}");
-    if (lastObj != std::string::npos) output = output.substr(0, lastObj + 1);
+    if (captureUtf8File) {
+        std::ifstream input(WideToUtf8(resultPath), std::ios::binary);
+        if (input) {
+            output.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+        }
+        input.close();
+        DeleteFileW(resultPath.c_str());
+        if (output.empty()) {
+            return {{"deep_inventory_transport_error", "utf8_file_empty"}};
+        }
+        if (output.size() > 4 * 1024 * 1024) {
+            return {{"deep_inventory_transport_error", "utf8_file_too_large"},
+                    {"deep_inventory_transport_bytes", output.size()}};
+        }
+    } else {
+        const auto first = output.find_first_of("[{\"");
+        if (first != std::string::npos) output = output.substr(first);
+        const auto lastObj = output.find_last_of("]}");
+        if (lastObj != std::string::npos) output = output.substr(0, lastObj + 1);
+    }
     if (output.empty()) return fallback;
 
     try {
         return json::parse(output);
+    } catch (const json::parse_error&) {
+        if (captureUtf8File) {
+            return {{"deep_inventory_transport_error", "utf8_json_parse_failed"},
+                    {"deep_inventory_transport_bytes", output.size()}};
+        }
+        return fallback;
     } catch (...) {
         return fallback;
     }
@@ -1264,7 +1306,7 @@ try {
 
 $result.deep_inventory_sections = $sections
 $result | ConvertTo-Json -Depth 8 -Compress
-)PS", json::object());
+)PS", json::object(), true);
 }
 
 json DueDeepHardwareInventory(bool force) {
@@ -1297,7 +1339,9 @@ json DueDeepHardwareInventory(bool force) {
     if (!deep.is_object() || !deep.contains("deep_inventory_sections") ||
         !deep["deep_inventory_sections"].is_object()) {
         return {{"deep_inventory_included", false}, {"deep_inventory_status", "failed"},
-                {"deep_inventory_error", "Windows deep collector did not produce valid section statuses"}};
+                {"deep_inventory_error", deep.value("deep_inventory_transport_error",
+                  std::string("Windows deep collector did not produce valid section statuses"))},
+                {"deep_inventory_transport_bytes", deep.value("deep_inventory_transport_bytes", std::size_t(0))}};
     }
     bool anySuccess = false;
     bool anyFailure = false;
