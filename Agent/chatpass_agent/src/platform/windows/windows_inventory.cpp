@@ -1089,6 +1089,22 @@ try {
   $sections.peripherals = @{ status = 'collected' }
 } catch { $sections.peripherals = @{ status = 'failed' } }
 
+
+try {
+  $full = Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop | Select-Object -First 1
+  $static = Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction Stop | Select-Object -First 1
+  $cycles = Get-CimInstance -Namespace root\wmi -ClassName BatteryCycleCount -ErrorAction SilentlyContinue | Select-Object -First 1
+  $result.battery_deep = [pscustomobject]@{
+    full_charge_capacity_mwh = if ($full -and $full.FullChargedCapacity -ne $null) { [int64]$full.FullChargedCapacity } else { $null }
+    design_capacity_mwh = if ($static -and $static.DesignedCapacity -ne $null) { [int64]$static.DesignedCapacity } else { $null }
+    cycle_count = if ($cycles -and $cycles.CycleCount -ne $null) { [int]$cycles.CycleCount } else { $null }
+    health_percent = if ($static -and $static.DesignedCapacity -gt 0 -and $full) {
+      [math]::Round(100 * [double]$full.FullChargedCapacity / [double]$static.DesignedCapacity)
+    } else { $null }
+  }
+  $sections.battery = @{ status='collected' }
+} catch { $sections.battery = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
 # Extended read-only Windows inventory. Every section reports its own outcome.
 try {
   $result.installed_hotfixes = @(Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending |
@@ -1204,7 +1220,7 @@ json DueDeepHardwareInventory(bool force) {
     static std::chrono::steady_clock::time_point retryAfter{};
     std::lock_guard<std::mutex> lock(mu);
     const auto now = std::chrono::steady_clock::now();
-    if (now < retryAfter) return {{"deep_inventory_included", false}, {"deep_inventory_status", "retry_later"}};
+    if (!force && now < retryAfter) return {{"deep_inventory_included", false}, {"deep_inventory_status", "retry_later"}};
 
     // A local checkpoint makes the eight-hour cadence survive Agent restarts and
     // disconnected devices. Nothing is scheduled or attempted by the server while offline.
@@ -1479,6 +1495,10 @@ json BuildInventorySnapshot(const AgentIdentity& identity, bool forceDeep, bool 
         }}
     };
     snapshot.update(deep);
+    if (snapshot.contains("battery_deep") && snapshot["battery_deep"].is_object()) {
+        snapshot["battery"].update(snapshot["battery_deep"]);
+        snapshot.erase("battery_deep");
+    }
     return snapshot;
 }
 
