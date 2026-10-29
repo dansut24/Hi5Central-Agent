@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <d3d11.h>
 #include "h264_mf_encoder.h"
 #include "av1_mf_encoder.h"
 #include "h265_mf_encoder.h"
@@ -15,6 +16,7 @@
 #include <mferror.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
@@ -27,6 +29,7 @@
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "d3d11.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -58,10 +61,42 @@ struct Result {
     double worstMs = 0;
     double p95Ms = 0;
     std::string encoderName;
+    std::string deviceManagerStatus;
     std::string note;
 };
 
-static Result run(const char* name, const GUID& outSubtype) {
+static std::string formatHr(HRESULT hr) {
+    char buf[20]{};
+    std::snprintf(buf, sizeof(buf), "0x%08lX", static_cast<unsigned long>(hr));
+    return buf;
+}
+struct HardwareMfContext {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> deviceContext;
+    ComPtr<IMFDXGIDeviceManager> manager;
+    HRESULT deviceHr = E_FAIL;
+    HRESULT managerHr = E_FAIL;
+    HardwareMfContext() {
+        D3D_FEATURE_LEVEL feature{};
+        deviceHr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
+                                    nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                                    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, nullptr,
+                                    0, D3D11_SDK_VERSION, &device, &feature,
+                                    &deviceContext);
+        if (FAILED(deviceHr)) {
+            deviceHr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
+                                        nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                        nullptr, 0, D3D11_SDK_VERSION, &device,
+                                        &feature, &deviceContext);
+        }
+        if (FAILED(deviceHr)) return;
+        UINT resetToken = 0;
+        managerHr = MFCreateDXGIDeviceManager(&resetToken, &manager);
+        if (SUCCEEDED(managerHr)) managerHr = manager->ResetDevice(device.Get(), resetToken);
+    }
+};
+static Result run(const char* name, const GUID& outSubtype,
+                  HardwareMfContext* hardware) {
     Result r{};
     r.name = name;
     const int width=config.width, height=config.height, fps=config.fps;
@@ -87,6 +122,14 @@ static Result run(const char* name, const GUID& outSubtype) {
         ComPtr<IMFTransform> transform;
         if (!activates[i] || FAILED(activates[i]->ActivateObject(IID_PPV_ARGS(&transform))) || !transform) continue;
         r.activated = true;
+        if (hardware && SUCCEEDED(hardware->managerHr) && hardware->manager) {
+            const auto hr = transform->ProcessMessage(
+                MFT_MESSAGE_SET_D3D_MANAGER,
+                reinterpret_cast<ULONG_PTR>(hardware->manager.Get()));
+            r.deviceManagerStatus = formatHr(hr);
+        } else if (hardware) {
+            r.deviceManagerStatus = "hardware D3D11/MF device manager unavailable";
+        }
         WCHAR* friendly = nullptr;
         UINT32 friendlyLen = 0;
         if (SUCCEEDED(activates[i]->GetAllocatedString(
@@ -153,8 +196,13 @@ static Result run(const char* name, const GUID& outSubtype) {
             const LONGLONG duration = 10000000LL / fps;
             sample->SetSampleTime(LONGLONG(frame) * duration);
             sample->SetSampleDuration(duration);
-            if (FAILED(transform->ProcessInput(0,sample.Get(),0))) {
-                r.note = "MFT ProcessInput failed";
+            DWORD inputFlags=0;
+            const HRESULT ready = transform->GetInputStatus(0,&inputFlags);
+            const HRESULT inputHr = transform->ProcessInput(0,sample.Get(),0);
+            if (FAILED(inputHr)) {
+                r.note = "MFT ProcessInput failed hr=" + formatHr(inputHr) +
+                         " input_status=" + formatHr(ready) +
+                         " flags=" + std::to_string(inputFlags);
                 break;
             }
             for (int poll=0;poll<2;++poll) {
@@ -281,21 +329,26 @@ int main(int argc, char** argv) {
         std::cerr<<"Media Foundation unavailable\n";
         return 1;
     }
+    HardwareMfContext hardware;
     const auto print=[](const Result& r) {
         std::cout<<r.name<<": detected="<<r.discovered
             <<" active="<<r.activated<<" configured="<<r.configured
             <<" frames="<<r.frames<<" attempts="<<r.attempts<<" avg_ms="<<std::fixed<<std::setprecision(1)
             <<r.avgMs<<" p95_ms="<<r.p95Ms<<" max_ms="<<r.worstMs
-            <<" encoder="<<r.encoderName<<" note="<<r.note<<"\n";
+            <<" encoder="<<r.encoderName
+            <<" d3d_manager="<<r.deviceManagerStatus
+            <<" note="<<r.note<<"\n";
     };
     std::cout<<"Synthetic Windows MFT encoder qualification (not browser RTP validation) "
         <<config.width<<"x"<<config.height<<" @"<<config.fps<<"fps frames="<<config.frames
         <<" hardware_only="<<config.hardwareOnly<<"\n";
     std::cout<<"VP8: existing libvpx production encoder; not benchmarked by this MFT-only test\n";
-    print(run("H264",subtype('H','2','6','4')));
-    print(run("H265/HEVC",subtype('H','E','V','C')));
-    print(run("VP9",subtype('V','P','9','0')));
-    print(run("AV1",subtype('A','V','0','1')));
+    std::cout<<"D3D11 hardware device="<<formatHr(hardware.deviceHr)
+             <<" MF device manager="<<formatHr(hardware.managerHr)<<"\n";
+    print(run("H264",subtype('H','2','6','4'),&hardware));
+    print(run("H265/HEVC",subtype('H','E','V','C'),&hardware));
+    print(run("VP9",subtype('V','P','9','0'),&hardware));
+    print(run("AV1",subtype('A','V','0','1'),&hardware));
     if (!config.hardwareOnly) {
         // These encoder wrappers may fall back to software; never count
         // their output as evidence of GPU encoding in hardware-only mode.
