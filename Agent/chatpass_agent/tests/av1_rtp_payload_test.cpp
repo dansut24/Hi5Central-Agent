@@ -18,7 +18,7 @@ int main() {
     std::vector<uint8_t> large{0x32,0x20};
     large.insert(large.end(),32,0xAB);
     assert(BuildAv1RtpPayloads(large,12,out,&why));
-    assert(out.packets.size()==3+1); // OBU 1-byte header + 32 data / 11 bytes
+    assert(out.packets.size()==3); // OBU 1-byte header + 32 data / 11 bytes
     assert(out.packets.front()[0]==0x50);
     assert(out.packets.back()[0]==0x90);
     for(const auto& p:out.packets)assert(p.size()<=12);
