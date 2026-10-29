@@ -364,7 +364,7 @@ void H264MfEncoder::shutdown() {
     m_open = false;
 }
 
-bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error) {
+bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error, bool strictHardwareOnly) {
     shutdown();
 
     if (width <= 0 || height <= 0) {
@@ -398,7 +398,7 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
     // Never change the stable VP8 / existing H264 selection path by default.
     // A deliberate HI5_CODEC=h264_hw + HI5_H264_ASYNC_HW=1 test opts into
     // hardware-only enumeration: no silent software MFT masquerading as GPU.
-    const bool experiment = preferHardware && EnvEnabled("HI5_H264_ASYNC_HW");
+    const bool experiment = preferHardware && (strictHardwareOnly || EnvEnabled("HI5_H264_ASYNC_HW"));
     m_impl->asyncHardwareExperiment = experiment;
     UINT32 flags = experiment
         ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
