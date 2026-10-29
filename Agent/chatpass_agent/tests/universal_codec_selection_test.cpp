@@ -1,5 +1,7 @@
 #include "../src/codec_universal_selector.h"
 #include <cassert>
+#include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -55,6 +57,15 @@ int main() {
     same=a;same.agentBuild="1.0.171";
     assert(!cacheValid(a,same,1020));
     assert(!cacheValid(a,a,1000 + 8*86400));
+    const auto cache = std::filesystem::temp_directory_path() /
+        "hi5central-universal-codec-qualification-test.cache";
+    std::filesystem::remove(cache);
+    assert(saveQualificationCache(cache,a,{h264Intel,vp8}));
+    auto loaded=loadQualificationCache(cache,a,1100);
+    assert(loaded.size()==2 && loaded[0].codec=="h264" && loaded[1].codec=="vp8");
+    assert(loadQualificationCache(cache,a,1000+8*86400).empty());
+    assert(loadQualificationCache(cache,same,1100).empty()); // new Agent build
+    std::filesystem::remove(cache);
     std::cout<<"UNIVERSAL_CODEC_SELECTOR_TESTS_PASSED vendor_neutral=1 "
                 "viewer_compatible=1 fail_safe=1 cache_invalidation=1\n";
     return 0;
