@@ -46,6 +46,9 @@ public:
     DisplayInfo currentDisplayInfo() const;
     int currentDisplayIndex() const;
     bool setDisplayIndex(int index);
+    // Only normal desktop helpers are allowed to retry DXGI after fallback.
+    // Secure desktop stays on its proven GDI path.
+    void setDxgiRecoveryEnabled(bool enabled);
 
     std::vector<uint8_t> capturePreviewJpeg(int index, int maxWidth, int maxHeight, int quality = 70) const;
 

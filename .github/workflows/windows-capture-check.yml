@@ -3,7 +3,7 @@ name: Windows Capture Source Check
 on:
   pull_request:
     paths:
-      - 'Agent/chatpass_agent/src/frame_source.cpp'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_screen.cpp'
       - 'Agent/chatpass_agent/src/frame_source.h'
       - 'Agent/chatpass_agent/src/ipc/input_pipe.h'
       - 'Agent/chatpass_agent/tests/stream_stats_ipc_test.cpp'
@@ -32,11 +32,11 @@ jobs:
           if (-not $vs) { throw "Windows C++ compiler unavailable" }
           $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          $command = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I C:\vcpkg\installed\x64-windows-static\include /I Agent/chatpass_agent/src /c Agent/chatpass_agent/src/frame_source.cpp /Fodist\frame_source.obj'
+          $command = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I C:\vcpkg\installed\x64-windows-static\include /I Agent/chatpass_agent/src /c Agent/chatpass_agent/src/platform/windows/windows_screen.cpp /Fodist\windows_screen.obj'
           cmd.exe /d /s /c $command
           if ($LASTEXITCODE -ne 0) { throw "DXGI/GDI capture compile failed" }
-          if (-not (Test-Path dist/frame_source.obj)) { throw "Capture object missing" }
-          Write-Host "Capture translation unit compiled successfully"
+          if (-not (Test-Path dist/windows_screen.obj)) { throw "Capture object missing" }
+          Write-Host "Shipping Windows screen capture translation unit compiled successfully"
 
       - name: Windows helper IPC timing roundtrip
         shell: pwsh
