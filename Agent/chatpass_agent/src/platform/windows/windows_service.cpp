@@ -2611,7 +2611,7 @@ LogI(
 
                 if (type == "refresh_inventory" || type == "inventory_refresh") {
                         LogI("refresh_inventory requested by control server");
-                        SendInventorySnapshotSafe(ident);
+                        SendInventorySnapshotSafe(ident, true);
                         FlushBridgeOutgoing();
                         return;
                     }
@@ -3679,7 +3679,7 @@ if ($failed -gt 0) { exit 1 }
 
                         if (actionType == "refresh_inventory" || actionType == "inventory_refresh") {
                             SendActionProgress(actionId, "running", 40, "Collecting inventory");
-                            SendInventorySnapshotSafe(ident);
+                            SendInventorySnapshotSafe(ident, true);
                             SendActionResult(actionId, "completed", 100, "Inventory refresh completed", json{ {"inventory_sent", true} });
                             return;
                         }
@@ -4067,7 +4067,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     LogI("job claimed id=" + jobId + " type=" + jobType);
 
                     if (jobType == "inventory.scan" || jobType == "policy.refresh") {
-                        SendInventorySnapshotSafe(ident);
+                        SendInventorySnapshotSafe(ident, jobType == "inventory.scan");
                         PostJobResult(ident, jobId, true, json{
                             {"inventory_sent", true},
                             {"job_type", jobType}
@@ -5535,7 +5535,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             void SendInventorySnapshotSafe(const AgentIdentity& ident, bool forceDeep = false) {
                 if (!signaling_) return;
                 try {
-                    auto snapshot = hi5::BuildInventorySnapshot(ident);
+                    auto snapshot = hi5::BuildInventorySnapshot(ident, forceDeep);
                     signaling_->send(snapshot.dump());
                     LogI("inventory_snapshot sent collected_at=" + snapshot.value("collected_at", std::string()));
                 }
