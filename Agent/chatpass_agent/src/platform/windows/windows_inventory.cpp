@@ -1094,10 +1094,14 @@ try {
   $full = Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop | Select-Object -First 1
   $static = Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction Stop | Select-Object -First 1
   $cycles = Get-CimInstance -Namespace root\wmi -ClassName BatteryCycleCount -ErrorAction SilentlyContinue | Select-Object -First 1
+  $batteryStatus = Get-CimInstance -Namespace root\wmi -ClassName BatteryStatus -ErrorAction SilentlyContinue | Select-Object -First 1
   $result.battery_deep = [pscustomobject]@{
     full_charge_capacity_mwh = if ($full -and $full.FullChargedCapacity -ne $null) { [int64]$full.FullChargedCapacity } else { $null }
     design_capacity_mwh = if ($static -and $static.DesignedCapacity -ne $null) { [int64]$static.DesignedCapacity } else { $null }
     cycle_count = if ($cycles -and $cycles.CycleCount -ne $null) { [int]$cycles.CycleCount } else { $null }
+    remaining_capacity_mwh = if ($batteryStatus -and $null -ne $batteryStatus.RemainingCapacity) { [int64]$batteryStatus.RemainingCapacity } else { $null }
+    voltage_mv = if ($batteryStatus -and $null -ne $batteryStatus.Voltage) { [int64]$batteryStatus.Voltage } else { $null }
+    rate_mw = if ($batteryStatus -and $batteryStatus.DischargeRate -gt 0) { -[int64]$batteryStatus.DischargeRate } elseif ($batteryStatus -and $batteryStatus.ChargeRate -gt 0) { [int64]$batteryStatus.ChargeRate } else { $null }
     health_percent = if ($static -and $static.DesignedCapacity -gt 0 -and $full) {
       [math]::Round(100 * [double]$full.FullChargedCapacity / [double]$static.DesignedCapacity)
     } else { $null }
@@ -1144,10 +1148,14 @@ try {
 } catch { $sections.scheduled_tasks = @{ status='failed'; reason=[string]$_.Exception.Message } }
 
 try {
+  $adminSids = $null
+  try {
+    $adminSids = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { [string]$_.SID })
+  } catch {}
   $result.local_users = [pscustomobject]@{
     users = @(Get-LocalUser -ErrorAction Stop | Select-Object -First 256 | ForEach-Object {
       [pscustomobject]@{
-        name=$_.Name; full_name=$_.FullName; description=$_.Description; enabled=[bool]$_.Enabled
+        name=$_.Name; full_name=$_.FullName; description=$_.Description; enabled=[bool]$_.Enabled; is_admin=if ($null -ne $adminSids) { $adminSids -contains [string]$_.SID } else { $null }
         last_logon=SafeDate $_.LastLogon; password_last_set=SafeDate $_.PasswordLastSet; sid=[string]$_.SID
       }
     })
