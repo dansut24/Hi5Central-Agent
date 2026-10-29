@@ -3,6 +3,7 @@
 #include "vp8_encoder.h"
 #include "vp9_mf_encoder.h"
 #include "encoding/sustained_encoder_health.h"
+#include "encoding/encoder_latency_window.h"
 #include "h264_mf_encoder.h"
 #include "input_injector.h"
 
@@ -188,6 +189,7 @@ private:
     uint64_t m_externalSentFrames = 0;
     double m_externalEncodeMsTotal = 0.0;
     double m_externalEncodeMsMax = 0.0;
+    EncoderLatencyWindow m_externalEncodeLatency;
     double m_externalSendMsTotal = 0.0;
     double m_externalSendMsMax = 0.0;
     int m_externalKeyframeEvery = 30;
