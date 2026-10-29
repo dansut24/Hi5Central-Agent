@@ -27,8 +27,13 @@ jobs:
             Agent/chatpass_agent/tests/av1_software_encoder_test.cpp \
             Agent/chatpass_agent/src/encoding/av1_software_encoder_experimental.cpp \
             -laom -o dist/av1_software_encoder_test
-      - name: Encode synthetic screen updates with AV1 and validate RTP payloads
-        run: timeout 80s dist/av1_software_encoder_test | tee dist/av1-software-qualification.txt
+      - name: Qualify 360p, 720p and 1080p AV1 encode, RTP reassembly, and decoder restart
+        run: |
+          set -o pipefail
+          timeout 90s dist/av1_software_encoder_test | tee dist/av1-360p.txt
+          timeout 120s dist/av1_software_encoder_test --720p | tee dist/av1-720p.txt
+          timeout 160s dist/av1_software_encoder_test --1080p | tee dist/av1-1080p.txt
+          cat dist/av1-360p.txt dist/av1-720p.txt dist/av1-1080p.txt > dist/av1-software-qualification.txt
       - uses: actions/upload-artifact@v4
         with:
           name: libaom-av1-qualification-report
