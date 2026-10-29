@@ -1142,7 +1142,7 @@ try {
 try {
   $result.scheduled_tasks = @(Get-ScheduledTask -ErrorAction Stop | Select-Object -First 500 |
     ForEach-Object {
-      [pscustomobject]@{ name=$_.TaskName; path=$_.TaskPath; state=[string]$_.State; author=$_.Author; description=$_.Description }
+      [pscustomobject]@{ name=[string]$_.TaskName; path=[string]$_.TaskPath; state=[string]$_.State; author=[string]$_.Author; description=[string]$_.Description }
     })
   $sections.scheduled_tasks = @{ status='collected' }
 } catch { $sections.scheduled_tasks = @{ status='failed'; reason=[string]$_.Exception.Message } }
