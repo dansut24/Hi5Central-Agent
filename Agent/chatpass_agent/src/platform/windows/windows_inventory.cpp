@@ -1149,7 +1149,7 @@ try {
     } else { $null }
   }
   $sections.battery = @{ status='collected' }
-} catch { $sections.battery = @{ status='failed'; reason=[string]$_.Exception.Message } }
+} catch { $sections.battery = @{ status='unsupported'; reason=[string]$_.Exception.Message } }
 
 # Extended read-only Windows inventory. Every section reports its own outcome.
 try {
@@ -1358,14 +1358,15 @@ json DueDeepHardwareInventory(bool force) {
     deep["deep_inventory_included"] = true;
     deep["deep_inventory_status"] = anyFailure ? "partial" : "collected";
     deep["deep_inventory_collected_at"] = NowIsoUtc();
-    if (!anyFailure) {
-        retryAfter = std::chrono::steady_clock::time_point{};
-        std::error_code error;
-        fs::create_directories(stamp.parent_path(), error);
-        if (!error) {
-            std::ofstream saved(stamp, std::ios::trunc);
-            if (saved) saved << std::time(nullptr);
-        }
+    // A collected snapshot (including a partial one) counts toward the eight-
+    // hour cadence. Failed optional sections retain their last-known-good data
+    // and retry on the next due pass, not every thirty minutes forever.
+    retryAfter = std::chrono::steady_clock::time_point{};
+    std::error_code error;
+    fs::create_directories(stamp.parent_path(), error);
+    if (!error) {
+        std::ofstream saved(stamp, std::ios::trunc);
+        if (saved) saved << std::time(nullptr);
     }
     return deep;
 }
