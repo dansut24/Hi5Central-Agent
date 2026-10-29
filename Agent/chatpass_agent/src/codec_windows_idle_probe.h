@@ -9,6 +9,8 @@
 #include <objbase.h>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
+#include <cwchar>
 #include <filesystem>
 #include <string>
 #include <vector>
