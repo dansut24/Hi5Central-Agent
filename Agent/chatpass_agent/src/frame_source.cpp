@@ -698,7 +698,7 @@ struct DesktopFrameSource::Impl {
         // A bounded retry, never a busy retry loop: persistent unsupported
         // display drivers keep their functioning GDI stream.
         nextDxgiRetryAt = now + std::chrono::seconds(
-            dxgiRetryFailures >= 3 ? 60 : 15);
+            dxgiRetryFailures >= 2 ? 180 : (dxgiRetryFailures == 1 ? 60 : 20));
         ++dxgiRetryFailures;
         if (targets.empty()) return;
 
