@@ -1,6 +1,7 @@
 #include "../src/encoding/av1_software_encoder_experimental.h"
 #include "../src/encoding/av1_rtp_payload_experimental.h"
 #include <cassert>
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <vector>
