@@ -2233,11 +2233,14 @@ namespace hi5 {
 
             InputPipeWriter normalInputPipe;
             InputPipeWriter secureInputPipe;
+            InputPipeWriter elevatedNormalInputPipe;
+            bool elevatedNormalInputPipeReady = false;
 
             std::string normalShmemName;
             std::string secureShmemName;
             std::string normalInputPipeName;
             std::string secureInputPipeName;
+            std::string elevatedNormalInputPipeName;
             std::string normalStopEventName;
             std::string secureStopEventName;
             std::string chatPipeName;
@@ -2246,6 +2249,7 @@ namespace hi5 {
             HANDLE secureStopEvent = nullptr;
 
             HANDLE normalStreamerProcess = nullptr;
+            HANDLE elevatedNormalInputProcess = nullptr;
             // Single-session, opt-in DXGI access test. A failed interactive
             // helper reverts to the unchanged elevated normal helper.
             bool normalInteractiveTrial = false;
@@ -5742,10 +5746,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             }
 
             InputPipeWriter& ActiveInputPipe(SessionContext& ctx) {
-
-                return (ctx.activeMode == DesktopMode::Secure)
-                    ? ctx.secureInputPipe
-                    : ctx.normalInputPipe;
+                if (ctx.activeMode == DesktopMode::Secure)
+                    return ctx.secureInputPipe;
+                if (ctx.normalInteractiveTrial && ctx.elevatedNormalInputProcess)
+                    return ctx.elevatedNormalInputPipe;
+                return ctx.normalInputPipe;
             }
 
             bool SendChatOpen(InputPipeWriter& pipe) {
@@ -6526,6 +6531,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             enabled == 1;
                     }();
                 const bool tryInteractive = userCaptureRequested &&
+                    ctx.elevatedNormalInputPipeReady &&
                     !ctx.normalInteractiveFallbackUsed && !ctx.backstageMode;
                 if (tryInteractive) {
                     LogI("[capture-test] launching normal streamer as interactive user session=" +
@@ -6538,6 +6544,31 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     } else {
                         ctx.normalInteractiveFallbackUsed = true;
                         LogW("[capture-test] interactive launch failed; falling back to elevated normal helper session=" +
+                            ctx.sessionId);
+                    }
+                }
+                if (ctx.normalInteractiveTrial && ctx.normalStreamerProcess) {
+                    // UIAccess/UIPI blocks medium-integrity input to elevated
+                    // windows. Retain the user-token frame source, but consume
+                    // all remote input through a privileged companion.
+                    const std::string injectorArgs =
+                        "--mode input-injector"
+                        " --session " + ctx.sessionId +
+                        " --input-pipe " + ctx.elevatedNormalInputPipeName +
+                        " --stop-event " + ctx.normalStopEventName +
+                        " --display " + std::to_string(ctx.displayIndex);
+                    ctx.elevatedNormalInputProcess = LaunchInElevatedDefaultSession(
+                        std::string(exePath), injectorArgs);
+                    if (!ctx.elevatedNormalInputProcess ||
+                        WaitForSingleObject(ctx.elevatedNormalInputProcess, 100) == WAIT_OBJECT_0) {
+                        LogW("[capture-test] elevated input helper unavailable, "
+                            "restoring normal system capture session=" + ctx.sessionId);
+                        ctx.normalInteractiveFallbackUsed = true;
+                        StopNormalStreamer(ctx);
+                        ctx.normalInteractiveTrial = false;
+                        ResetEvent(ctx.normalStopEvent);
+                    } else {
+                        LogI("[capture-test] fast user capture with privileged input ready session=" +
                             ctx.sessionId);
                     }
                 }
@@ -6773,6 +6804,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 ctx->normalShmemName = "Global\\Hi5Stream_" + prefix;
                 ctx->secureShmemName = "Global\\Hi5Stream_UAC_" + prefix;
                 ctx->normalInputPipeName = "Global\\Hi5Input_" + prefix;
+                ctx->elevatedNormalInputPipeName = "Global\\Hi5PrivInput_" + prefix;
                 ctx->secureInputPipeName = "Global\\Hi5Input_UAC_" + prefix;
                 ctx->normalStopEventName = "Global\\Hi5Stop_" + prefix;
                 ctx->secureStopEventName = "Global\\Hi5Stop_UAC_" + prefix;
@@ -6798,6 +6830,14 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 if (!ctx->normalInputPipe.Create(ctx->normalInputPipeName)) {
                     LogW("create normal input pipe FAILED session=" + sessionId +
                         " err=" + std::to_string(GetLastError()));
+                }
+
+                ctx->elevatedNormalInputPipeReady =
+                    ctx->elevatedNormalInputPipe.Create(ctx->elevatedNormalInputPipeName);
+                if (!ctx->elevatedNormalInputPipeReady) {
+                    LogW("create elevated normal input pipe FAILED session=" + sessionId +
+                        " err=" + std::to_string(GetLastError()) +
+                        " action=use_system_capture");
                 }
 
                 if (!ctx->secureInputPipe.Create(ctx->secureInputPipeName)) {
