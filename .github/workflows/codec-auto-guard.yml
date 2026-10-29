@@ -1,0 +1,38 @@
+name: Codec Auto Fallback Guard
+
+on:
+  pull_request:
+    paths:
+      - 'Agent/chatpass_agent/src/encoding/auto_codec_cooldown.h'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp'
+      - 'Agent/chatpass_agent/tests/auto_codec_cooldown_test.cpp'
+      - '.github/workflows/codec-auto-guard.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  codec-auto:
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test future-session cooldown and measured encoder budget
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC build tools unavailable' }
+          $devcmd = Join-Path $vs 'Common7\\Tools\\VsDevCmd.bat'
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 Agent/chatpass_agent/tests/auto_codec_cooldown_test.cpp /Fe:dist\\auto_codec_cooldown_test.exe && dist\\auto_codec_cooldown_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw 'Codec auto fallback tests failed' }
+      - name: Verify stable RTP session and persistence integration
+        shell: pwsh
+        run: |
+          $text = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
+          foreach ($token in @('Vp9AutoCooldownActive', 'Vp9CompetitiveForAuto', 'RememberVp9AutoOverload', 'prior-session-sustained-vp9-overload')) {
+            if (-not $text.Contains($token)) { throw "Codec integration missing: $token" }
+          }
