@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -1087,6 +1088,439 @@ try {
   )
   $sections.peripherals = @{ status = 'collected' }
 } catch { $sections.peripherals = @{ status = 'failed' } }
+
+# Extended read-only Windows inventory. Every section reports its own outcome.
+try {
+  $result.installed_hotfixes = @(Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending |
+    Select-Object -First 300 | ForEach-Object {
+      [pscustomobject]@{ hotfix_id=$_.HotFixID; description=$_.Description; installed_on=SafeDate $_.InstalledOn; installed_by=$_.InstalledBy }
+    })
+  $license = Get-CimInstance SoftwareLicensingProduct -Filter 'PartialProductKey IS NOT NULL' -ErrorAction Stop |
+    Where-Object { $_.Name -like '*Windows*' } | Sort-Object LicenseStatus -Descending | Select-Object -First 1
+  $licenseState = if ($license) {
+    switch ([int]$license.LicenseStatus) {
+      1 { 'Licensed' }; 0 { 'Unlicensed' }; 2 { 'OOB grace' }; 3 { 'OOT grace' }
+      4 { 'Non-genuine grace' }; 5 { 'Notification' }; 6 { 'Extended grace' }; default { 'Unknown' }
+    }
+  } else { $null }
+  $result.windows_licensing = [pscustomobject]@{
+    status=$licenseState; name=$license.Name; description=$license.Description; partial_product_key=$license.PartialProductKey
+  }
+  $reasons = @()
+  if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $reasons += 'Component servicing' }
+  if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $reasons += 'Windows Update' }
+  $pendingRename = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+  if ($pendingRename -and $pendingRename.PendingFileRenameOperations) { $reasons += 'Pending file rename' }
+  $result.reboot_state = [pscustomobject]@{ pending=($reasons.Count -gt 0); reasons=@($reasons) }
+  $result.startup_items = @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop |
+    Select-Object -First 200 | ForEach-Object {
+      [pscustomobject]@{ name=$_.Name; command=$_.Command; location=$_.Location; user=$_.User }
+    })
+  $sections.windows_state = @{ status='collected' }
+} catch { $sections.windows_state = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.scheduled_tasks = @(Get-ScheduledTask -ErrorAction Stop | Select-Object -First 500 |
+    ForEach-Object {
+      [pscustomobject]@{ name=$_.TaskName; path=$_.TaskPath; state=[string]$_.State; author=$_.Author; description=$_.Description }
+    })
+  $sections.scheduled_tasks = @{ status='collected' }
+} catch { $sections.scheduled_tasks = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.local_users = [pscustomobject]@{
+    users = @(Get-LocalUser -ErrorAction Stop | Select-Object -First 256 | ForEach-Object {
+      [pscustomobject]@{
+        name=$_.Name; full_name=$_.FullName; description=$_.Description; enabled=[bool]$_.Enabled
+        last_logon=SafeDate $_.LastLogon; password_last_set=SafeDate $_.PasswordLastSet; sid=[string]$_.SID
+      }
+    })
+  }
+  $sections.local_users = @{ status='collected' }
+} catch { $sections.local_users = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.local_groups = @(Get-LocalGroup -ErrorAction Stop | Select-Object -First 128 | ForEach-Object {
+    $g = $_
+    $members = @()
+    try {
+      $members = @(Get-LocalGroupMember -SID $g.SID -ErrorAction Stop | Select-Object -First 128 |
+        ForEach-Object { [pscustomobject]@{ name=$_.Name; sid=[string]$_.SID; object_class=[string]$_.ObjectClass } })
+    } catch {}
+    [pscustomobject]@{ name=$g.Name; sid=[string]$g.SID; description=$g.Description; members=@($members) }
+  })
+  $sections.local_groups = @{ status='collected' }
+} catch { $sections.local_groups = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.optional_features = @(Get-CimInstance Win32_OptionalFeature -Filter 'InstallState=1' -ErrorAction Stop |
+    Select-Object -First 256 | ForEach-Object { [pscustomobject]@{ name=$_.Name; state='Enabled' } })
+  $plan = Get-CimInstance -Namespace root\cimv2\power -Class Win32_PowerPlan -ErrorAction Stop |
+    Where-Object { $_.IsActive } | Select-Object -First 1
+  $result.power_plan = if ($plan) { $plan.ElementName } else { $null }
+  $sections.features_power = @{ status='collected' }
+} catch { $sections.features_power = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.network_profiles = @(Get-NetConnectionProfile -ErrorAction Stop | Select-Object -First 128 |
+    ForEach-Object {
+      [pscustomobject]@{ name=$_.Name; interface_alias=$_.InterfaceAlias; network_category=[string]$_.NetworkCategory
+        ipv4_connectivity=[string]$_.IPv4Connectivity; ipv6_connectivity=[string]$_.IPv6Connectivity }
+    })
+  $result.network_configurations = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' -ErrorAction Stop |
+    Select-Object -First 128 | ForEach-Object {
+      [pscustomobject]@{ description=$_.Description; mac_address=$_.MACAddress
+        ip_addresses=@($_.IPAddress | Where-Object { $_ }); dhcp_enabled=[bool]$_.DHCPEnabled
+        dhcp_server=$_.DHCPServer; dns_servers=@($_.DNSServerSearchOrder | Where-Object { $_ })
+        dns_domain=$_.DNSDomain; gateways=@($_.DefaultIPGateway | Where-Object { $_ }) }
+    })
+  $result.wifi_interfaces = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.ifType -eq 71 } |
+    Select-Object -First 16 | ForEach-Object {
+      [pscustomobject]@{ name=$_.Name; state=[string]$_.Status; ssid=$null; bssid=$null
+        signal=$null; channel=$null; radio_type=$null; authentication=$null; cipher=$null }
+    })
+  # Wi-Fi association details are not guaranteed for a Windows service; leave unknown rather than inventing them.
+  $result.default_routes = @(Get-NetRoute -ErrorAction Stop |
+    Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' -or $_.DestinationPrefix -eq '::/0' } |
+    Select-Object -First 64 | ForEach-Object {
+      [pscustomobject]@{ destination=$_.DestinationPrefix; next_hop=$_.NextHop
+        interface_alias=$_.InterfaceAlias; route_metric=$_.RouteMetric; protocol=[string]$_.Protocol }
+    })
+  $sections.network = @{ status='collected' }
+} catch { $sections.network = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop | Select-Object -First 1
+  $dsreg = @(dsregcmd.exe /status 2>$null)
+  $ds = @{}
+  foreach ($line in $dsreg) {
+    if ($line -match '^\s*(AzureAdJoined|WorkplaceJoined|DeviceId|TenantId|TenantName)\s*:\s*(.*?)\s*
+$result | ConvertTo-Json -Depth 8 -Compress
+)PS", json::object());
+}
+
+json DueDeepHardwareInventory(bool force) {
+    static std::mutex mu;
+    static std::chrono::steady_clock::time_point retryAfter{};
+    std::lock_guard<std::mutex> lock(mu);
+    const auto now = std::chrono::steady_clock::now();
+    if (now < retryAfter) return {{"deep_inventory_included", false}, {"deep_inventory_status", "retry_later"}};
+
+    // A local checkpoint makes the eight-hour cadence survive Agent restarts and
+    // disconnected devices. Nothing is scheduled or attempted by the server while offline.
+    namespace fs = std::filesystem;
+    wchar_t programData[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+    const fs::path root = length > 0 && length < MAX_PATH ? fs::path(programData) : fs::path(L"C:\\ProgramData");
+    const fs::path stamp = root / L"Hi5Central" / L"Agent" / L"deep-inventory-last-success.txt";
+    if (!force) {
+        std::ifstream saved(stamp);
+        std::int64_t previous = 0;
+        if (saved >> previous) {
+            const auto seconds = static_cast<std::int64_t>(std::time(nullptr));
+            if (previous > 0 && seconds >= previous && seconds - previous < 8 * 60 * 60) {
+                return {{"deep_inventory_included", false}, {"deep_inventory_status", "not_due"}};
+            }
+        }
+    }
+
+    retryAfter = now + std::chrono::minutes(30);
+    json deep = DeepHardwareInventory();
+    if (!deep.is_object() || !deep.contains("deep_inventory_sections") ||
+        !deep["deep_inventory_sections"].is_object()) {
+        return {{"deep_inventory_included", false}, {"deep_inventory_status", "failed"},
+                {"deep_inventory_error", "Windows deep collector did not produce valid section statuses"}};
+    }
+    bool anySuccess = false;
+    bool anyFailure = false;
+    for (auto it = deep["deep_inventory_sections"].begin(); it != deep["deep_inventory_sections"].end(); ++it) {
+        if (!it.value().is_object()) continue;
+        const std::string status = it.value().value("status", "");
+        if (status == "collected") anySuccess = true;
+        else if (status == "failed") anyFailure = true;
+    }
+    if (!anySuccess) {
+        return {{"deep_inventory_included", false}, {"deep_inventory_status", "failed"},
+                {"deep_inventory_sections", deep["deep_inventory_sections"]}};
+    }
+    deep["deep_inventory_included"] = true;
+    deep["deep_inventory_status"] = anyFailure ? "partial" : "collected";
+    deep["deep_inventory_collected_at"] = NowIsoUtc();
+    if (!anyFailure) {
+        retryAfter = std::chrono::steady_clock::time_point{};
+        std::error_code error;
+        fs::create_directories(stamp.parent_path(), error);
+        if (!error) {
+            std::ofstream saved(stamp, std::ios::trunc);
+            if (saved) saved << std::time(nullptr);
+        }
+    }
+    return deep;
+}
+
+json SessionsInfo() {
+    json sessions = json::array();
+    int rdpCount = 0;
+    WTS_SESSION_INFOA* sessionInfo = nullptr;
+    DWORD count = 0;
+    if (WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessionInfo, &count)) {
+        for (DWORD i = 0; i < count; ++i) {
+            LPSTR user = nullptr;
+            DWORD userLen = 0;
+            std::string userName;
+            if (WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, sessionInfo[i].SessionId, WTSUserName, &user, &userLen) && user) {
+                userName = user;
+                WTSFreeMemory(user);
+            }
+            if (sessionInfo[i].SessionId != WTSGetActiveConsoleSessionId() && !userName.empty()) ++rdpCount;
+            sessions.push_back({
+                {"id", sessionInfo[i].SessionId},
+                {"station", sessionInfo[i].pWinStationName ? sessionInfo[i].pWinStationName : ""},
+                {"state", static_cast<int>(sessionInfo[i].State)},
+                {"user", userName}
+            });
+        }
+        WTSFreeMemory(sessionInfo);
+    }
+    const std::string current = LoggedInUser();
+    return {
+        {"current_user", current},
+        {"console_user", current},
+        {"active_console_user", current},
+        {"last_logged_in_user", LastLoggedOnUser()},
+        {"rdp_sessions", rdpCount},
+        {"locked", json(nullptr)},
+        {"idle_time", json(nullptr)},
+        {"sessions", sessions}
+    };
+}
+
+json ServicesSummary() {
+    DWORD bytesNeeded = 0;
+    DWORD servicesReturned = 0;
+    DWORD resume = 0;
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+    if (!scm) return json::object();
+    EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, nullptr, 0, &bytesNeeded, &servicesReturned, &resume, nullptr);
+    std::vector<BYTE> buffer(bytesNeeded ? bytesNeeded : 64 * 1024);
+    resume = 0;
+    BOOL ok = EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesNeeded, &servicesReturned, &resume, nullptr);
+    CloseServiceHandle(scm);
+    if (!ok) return json::object();
+
+    auto* rows = reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
+    int running = 0;
+    int stoppedCritical = 0;
+    json stopped = json::array();
+    const std::vector<std::wstring> critical = { L"WinDefend", L"MpsSvc", L"wuauserv", L"EventLog", L"Dhcp", L"Dnscache", L"LanmanWorkstation" };
+    for (DWORD i = 0; i < servicesReturned; ++i) {
+        const bool isRunning = rows[i].ServiceStatusProcess.dwCurrentState == SERVICE_RUNNING;
+        if (isRunning) ++running;
+        std::wstring svcName = rows[i].lpServiceName ? rows[i].lpServiceName : L"";
+        if (!isRunning && std::find(critical.begin(), critical.end(), svcName) != critical.end()) {
+            ++stoppedCritical;
+            stopped.push_back(WideToUtf8(svcName));
+        }
+    }
+    return {
+        {"running_services", running},
+        {"stopped_critical_services", stoppedCritical},
+        {"stopped_critical_service_names", stopped},
+        {"win_defend_running", ServiceRunning(L"WinDefend")},
+        {"firewall_service_running", ServiceRunning(L"MpsSvc")},
+        {"windows_update_service", ServiceState(L"wuauserv")}
+    };
+}
+
+json AgentInfo(const std::string& collectedAt) {
+    std::string state = ServiceState(L"Hi5CentralAgent");
+    if (state == "Not installed") state = ServiceState(L"Hi5CentralAgent");
+    return {
+        {"version", kAgentVersion},
+        {"service", state},
+        {"service_status", state},
+        {"install_path", GetModulePath()},
+        {"transport", "websocket"},
+        {"websocket", "Connected"},
+        {"websocket_status", "Connected"},
+        {"last_heartbeat", collectedAt},
+        {"inventory_sync", collectedAt}
+    };
+}
+
+json SummaryInfo(const json& os, const json& hardware, const json& memory, const json& storage) {
+    json primaryDrive = storage.is_array() && !storage.empty() ? storage[0] : json::object();
+    const auto uptimeSeconds = static_cast<std::uint64_t>(GetTickCount64() / 1000ULL);
+    return {
+        {"hostname", ComputerName()},
+        {"domain", DomainOrWorkgroup()},
+        {"domain_workgroup", DomainOrWorkgroup()},
+        {"logged_in_user", LoggedInUser()},
+        {"os_name", os.value("name", "Windows")},
+        {"operating_system", os.value("name", "Windows")},
+        {"os_version", os.value("version", "")},
+        {"os_build", os.value("build", "")},
+        {"architecture", os.value("architecture", "")},
+        {"manufacturer", hardware.value("manufacturer", "")},
+        {"model", hardware.value("model", "")},
+        {"serial_number", hardware.value("serial_number", "")},
+        {"asset_tag", hardware.value("asset_tag", "")},
+        {"device_uuid", hardware.value("device_uuid", "")},
+        {"total_memory_bytes", memory.value("total_bytes", 0ULL)},
+        {"primary_drive", primaryDrive.value("drive", "")},
+        {"primary_drive_used_percent", primaryDrive.value("used_percent", 0.0)},
+        {"uptime_seconds", uptimeSeconds},
+        {"uptime", DurationText(uptimeSeconds)},
+        {"last_boot", os.value("last_boot", "")},
+        {"install_date", os.value("install_date", "")}
+    };
+}
+
+json HealthInfo(const json& memory, const json& storage, const json& security, const json& events, const json& updates) {
+    const double memPct = memory.value("used_percent", 0.0);
+    double diskPct = 0.0;
+    if (storage.is_array() && !storage.empty()) diskPct = storage[0].value("used_percent", 0.0);
+
+    json warnings = json::array();
+    if (memPct >= 90.0) warnings.push_back("High memory usage");
+    if (diskPct >= 90.0) warnings.push_back("Low disk space");
+    if (security.value("defender_enabled", true) == false) warnings.push_back("Microsoft Defender is not running");
+    if (security.value("firewall_enabled", true) == false) warnings.push_back("Windows Firewall service is not running");
+    if (events.value("unexpected_shutdowns", 0) > 0) warnings.push_back("Unexpected shutdowns detected");
+    if (events.value("recent_crashes", 0) > 0) warnings.push_back("Recent application crashes detected");
+    if (updates.value("pending_count", 0) > 0) warnings.push_back("Windows updates pending");
+
+    return {
+        {"memory_warning", memPct >= 90.0},
+        {"disk_warning", diskPct >= 90.0},
+        {"security_warning", security.value("defender_enabled", true) == false || security.value("firewall_enabled", true) == false},
+        {"update_failures", events.value("update_failures", json(nullptr))},
+        {"recent_crashes", events.value("recent_crashes", json(nullptr))},
+        {"unexpected_shutdowns", events.value("unexpected_shutdowns", json(nullptr))},
+        {"service_failures", events.value("service_failures", json(nullptr))},
+        {"warnings", warnings},
+        {"overall", warnings.empty() ? "good" : "warning"}
+    };
+}
+
+} // namespace
+
+json BuildInventorySnapshot(const AgentIdentity& identity, bool forceDeep, bool allowScheduledDeep) {
+    const auto collectedAt = NowIsoUtc();
+
+    json bitlocker = BitLockerVolumes();
+    json tpm = TpmInfo();
+    json localAdmins = LocalAdmins();
+    json os = OsInfo();
+    json hardware = HardwareInfo();
+    json cpu = CpuInfo();
+    json memory = MemoryInfo();
+    json storage = StorageInfo(bitlocker);
+    json security = SecurityInfo(bitlocker, tpm, localAdmins);
+    json network = NetworkInfo();
+    json battery = BatteryInfo();
+    json gpu = GpuInfo();
+    json displays = DisplayInfo(gpu);
+    json sessions = SessionsInfo();
+    json software = InstalledSoftwareInventory();
+    json updates = WindowsUpdates();
+    json events = EventHealth();
+    json services = ServicesSummary();
+    json agent = AgentInfo(collectedAt);
+    json summary = SummaryInfo(os, hardware, memory, storage);
+    json health = HealthInfo(memory, storage, security, events, updates);
+    json deep = (forceDeep || allowScheduledDeep) ? DueDeepHardwareInventory(forceDeep)
+                                                    : json{{"deep_inventory_included", false}};
+
+    json snapshot = {
+        {"type", "inventory_snapshot"},
+        {"device_id", identity.deviceId},
+        {"collected_at", collectedAt},
+        {"summary", summary},
+        {"hardware", hardware},
+        {"warranty_identity", {
+            {"manufacturer", hardware.value("manufacturer", "")},
+            {"model", hardware.value("model", "")},
+            {"serial_number", hardware.value("serial_number", "")},
+            {"asset_tag", hardware.value("asset_tag", "")},
+            {"device_uuid", hardware.value("device_uuid", "")},
+            {"bios_vendor", hardware.value("bios_vendor", "")},
+            {"bios_version", hardware.value("bios_version", "")},
+            {"bios_date", hardware.value("bios_date", "")}
+        }},
+        {"os", os},
+        {"cpu", cpu},
+        {"memory", memory},
+        {"storage", storage},
+        {"security", security},
+        {"network", network},
+        {"sessions", sessions},
+        {"displays", displays},
+        {"gpu", gpu},
+        {"battery", battery},
+        {"agent", agent},
+        {"health", health},
+        {"software", software},
+        {"software_summary", {
+            {"status", software.value("status", "collected")},
+            {"count", software.value("count", 0)},
+            {"installed_apps", software.value("installed_apps", 0)},
+            {"recently_installed", software.value("recently_installed_count", 0)},
+            {"items", software.value("items", json::array())}
+        }},
+        {"services_summary", services},
+        {"windows_updates", updates},
+        {"updates", updates},
+        {"events_summary", events},
+        {"event_health", events},
+        {"raw", {
+            {"collector", "inventory_pass_2"},
+            {"notes", "Includes Windows 11 build-name correction, BitLocker, software, updates, event health, GPU, TPM and warranty-ready WMI identity."}
+        }}
+    };
+    snapshot.update(deep);
+    return snapshot;
+}
+
+} // namespace hi5
+) {
+      $ds[$Matches[1]] = $Matches[2].Trim()
+    }
+  }
+  $result.directory_join = [pscustomobject]@{
+    computer_name=$env:COMPUTERNAME; domain_joined=[bool]$cs.PartOfDomain
+    domain=if ($cs.PartOfDomain) { $cs.Domain } else { $null }
+    workgroup=if (-not $cs.PartOfDomain) { $cs.Domain } else { $null }
+    domain_role=[int]$cs.DomainRole
+    azure_ad_joined=if ($ds.AzureAdJoined) { $ds.AzureAdJoined -eq 'YES' } else { $null }
+    workplace_joined=if ($ds.WorkplaceJoined) { $ds.WorkplaceJoined -eq 'YES' } else { $null }
+    entra_device_id=$ds.DeviceId; entra_tenant_id=$ds.TenantId; entra_tenant_name=$ds.TenantName
+  }
+  $sections.directory_join = @{ status='collected' }
+} catch { $sections.directory_join = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.machine_certificates = @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction Stop |
+    Select-Object -First 256 | ForEach-Object {
+      [pscustomobject]@{ subject=$_.Subject; issuer=$_.Issuer; thumbprint=$_.Thumbprint
+        not_before=SafeDate $_.NotBefore; not_after=SafeDate $_.NotAfter; has_private_key=[bool]$_.HasPrivateKey }
+    })
+  $sections.certificates = @{ status='collected' }
+} catch { $sections.certificates = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop | Select-Object -First 1
+  $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+  $result.virtualization = [pscustomobject]@{
+    hypervisor_present=[bool]$cs.HypervisorPresent
+    virtualization_firmware_enabled=if ($null -ne $cpu.VirtualizationFirmwareEnabled) { [bool]$cpu.VirtualizationFirmwareEnabled } else { $null }
+    vm_monitor_mode_extensions=if ($null -ne $cpu.VMMonitorModeExtensions) { [bool]$cpu.VMMonitorModeExtensions } else { $null }
+    second_level_address_translation=if ($null -ne $cpu.SecondLevelAddressTranslationExtensions) { [bool]$cpu.SecondLevelAddressTranslationExtensions } else { $null }
+    data_execution_prevention_available=if ($null -ne $cpu.DataExecutionPrevention_Available) { [bool]$cpu.DataExecutionPrevention_Available } else { $null }
+  }
+  $sections.virtualization = @{ status='collected' }
+} catch { $sections.virtualization = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
 $result.deep_inventory_sections = $sections
 $result | ConvertTo-Json -Depth 8 -Compress
 )PS", json::object());
