@@ -42,7 +42,7 @@ jobs:
           $start = $text.IndexOf('json DeepHardwareInventory()')
           if ($start -lt 0) { throw 'Missing deep inventory function' }
           $begin = $text.IndexOf('R"PS(', $start)
-          $finish = $text.IndexOf(')PS", json::object());', $begin)
+          $finish = $text.IndexOf(')PS", json::object(), true);', $begin)
           if ($begin -lt 0 -or $finish -lt $begin) { throw 'Could not find PowerShell script boundaries' }
           $script = $text.Substring($begin + 5, $finish - ($begin + 5))
           $tokens = $null
@@ -84,7 +84,7 @@ jobs:
           $text = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
           $start = $text.IndexOf('json DeepHardwareInventory()')
           $begin = $text.IndexOf('R"PS(', $start)
-          $finish = $text.IndexOf(')PS", json::object());', $begin)
+          $finish = $text.IndexOf(')PS", json::object(), true);', $begin)
           if ($start -lt 0 -or $begin -lt 0 -or $finish -le $begin) { throw 'Embedded inventory script not found' }
           $script = '$ProgressPreference = "SilentlyContinue"' + [Environment]::NewLine + '$ErrorActionPreference = "SilentlyContinue"' + [Environment]::NewLine + $text.Substring($begin + 5, $finish - $begin - 5)
           $path = Join-Path $env:RUNNER_TEMP 'hi5-deep-inventory.ps1'
