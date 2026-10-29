@@ -1,4 +1,5 @@
 #include "frame_source.h"
+#include <libyuv/convert.h>
 #include "util/log.h"
 #include "windows_wgc_capture.h"
 
@@ -144,57 +145,27 @@ namespace {
     }
 
     static void bgraToI420(const uint8_t* src, int srcStride, int width, int height, I420Frame& out) {
+        if (!src || width <= 0 || height <= 0 || srcStride < width * 4)
+            throw std::runtime_error("Invalid BGRA frame for I420 conversion");
+
         out.width = width;
         out.height = height;
-        out.y.resize(static_cast<size_t>(width) * height);
-        out.u.resize(static_cast<size_t>((width + 1) / 2) * ((height + 1) / 2));
-        out.v.resize(static_cast<size_t>((width + 1) / 2) * ((height + 1) / 2));
-
-        for (int y = 0; y < height; ++y) {
-            const uint8_t* row = src + y * srcStride;
-            for (int x = 0; x < width; ++x) {
-                const uint8_t b = row[x * 4 + 0];
-                const uint8_t g = row[x * 4 + 1];
-                const uint8_t r = row[x * 4 + 2];
-
-                const int Y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                out.y[static_cast<size_t>(y) * width + x] = clampByte(Y);
-            }
-        }
-
         const int uvWidth = (width + 1) / 2;
         const int uvHeight = (height + 1) / 2;
+        out.y.resize(static_cast<size_t>(width) * height);
+        out.u.resize(static_cast<size_t>(uvWidth) * uvHeight);
+        out.v.resize(static_cast<size_t>(uvWidth) * uvHeight);
 
-        for (int by = 0; by < uvHeight; ++by) {
-            for (int bx = 0; bx < uvWidth; ++bx) {
-                int sumU = 0;
-                int sumV = 0;
-                int count = 0;
-
-                for (int dy = 0; dy < 2; ++dy) {
-                    for (int dx = 0; dx < 2; ++dx) {
-                        const int x = bx * 2 + dx;
-                        const int y = by * 2 + dy;
-                        if (x >= width || y >= height) continue;
-
-                        const uint8_t* px = src + y * srcStride + x * 4;
-                        const uint8_t b = px[0];
-                        const uint8_t g = px[1];
-                        const uint8_t r = px[2];
-
-                        const int U = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                        const int V = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-
-                        sumU += U;
-                        sumV += V;
-                        ++count;
-                    }
-                }
-
-                out.u[static_cast<size_t>(by) * uvWidth + bx] = clampByte(sumU / std::max(1, count));
-                out.v[static_cast<size_t>(by) * uvWidth + bx] = clampByte(sumV / std::max(1, count));
-            }
-        }
+        // Native DXGI and 32-bit GDI produce BGRA memory bytes; libyuv's
+        // ARGBToI420 uses this ordering on little-endian Windows.
+        // This is the ACTUAL Windows capture implementation compiled by CMake.
+        // The previous scalar Y/UV loops processed every pixel on every frame.
+        if (libyuv::ARGBToI420(src, srcStride,
+                out.y.data(), width,
+                out.u.data(), uvWidth,
+                out.v.data(), uvWidth,
+                width, height) != 0)
+            throw std::runtime_error("libyuv ARGBToI420 failed");
     }
 
     static void compositeCursorBgra(int originX, int originY, int width, int height,
@@ -481,6 +452,8 @@ struct DesktopFrameSource::Impl {
     int requestedIndex = 0;
     std::string currentName;
     std::chrono::steady_clock::time_point lastDxgiRetry{};
+    std::chrono::steady_clock::time_point nextDisplayProbeAt{};
+    bool allowDxgiRecovery = false; // normal desktop only, never secure/UAC
     std::unique_ptr<WgcMonitorCapture> wgc;
     bool wgcAttempted = false;
     bool wgcReceivedFrame = false;
@@ -579,13 +552,13 @@ struct DesktopFrameSource::Impl {
 
     // Called only while the DesktopFrameSource mutex is held.
     void retryDxgiIfDueLocked() {
-        if (requestedIndex < 0 || currentIndex != -1) return;
+        if (!allowDxgiRecovery || requestedIndex < 0 || currentIndex != -1) return;
         const auto now = std::chrono::steady_clock::now();
         if (lastDxgiRetry.time_since_epoch().count() != 0 &&
             now - lastDxgiRetry < std::chrono::seconds(30)) return;
         lastDxgiRetry = now;
 
-        refreshDisplaysLocked();
+        refreshDisplaysLocked(true);
         const auto target = std::find_if(targets.begin(), targets.end(),
             [this](const OutputTarget& entry) { return entry.info.index == requestedIndex; });
         if (target == targets.end()) {
@@ -620,18 +593,25 @@ struct DesktopFrameSource::Impl {
         height = 0;
     }
 
-    void refreshDisplaysLocked() {
+    void refreshDisplaysLocked(bool force = false) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now < nextDisplayProbeAt) return;
+        nextDisplayProbeAt = now + std::chrono::seconds(1);
         const int previousIndex = currentIndex;
         const std::string previousName = currentName;
 
-        targets = enumerateTargets();
-
-        if (targets.empty()) {
+        auto discovered = enumerateTargets();
+        if (discovered.empty()) {
+            // Preserve an ACTIVE duplication on transient empty enumeration.
+            // Formerly this reset DXGI and permanently fell back to GDI.
+            if (duplication && !targets.empty()) return;
+            targets.clear();
             currentIndex = -1;
             currentName.clear();
             resetD3DLocked();
             return;
         }
+        targets = std::move(discovered);
 
         if (previousIndex == -1) {
             currentIndex = -1;
@@ -747,8 +727,12 @@ struct DesktopFrameSource::Impl {
         }
     }
 
+    void setDxgiRecoveryEnabledLocked(bool enabled) {
+        allowDxgiRecovery = enabled;
+    }
+
     bool setDisplayIndexLocked(int index) {
-        refreshDisplaysLocked();
+        refreshDisplaysLocked(true);
 
         // Switching monitors discards the old monitor's WGC capture item.
         wgc.reset();
@@ -1123,6 +1107,11 @@ int DesktopFrameSource::currentDisplayIndex() const {
 bool DesktopFrameSource::setDisplayIndex(int index) {
     std::lock_guard<std::mutex> lock(m_impl->mu);
     return m_impl->setDisplayIndexLocked(index);
+}
+
+void DesktopFrameSource::setDxgiRecoveryEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    m_impl->setDxgiRecoveryEnabledLocked(enabled);
 }
 
 std::vector<uint8_t> DesktopFrameSource::capturePreviewJpeg(int index, int maxWidth, int maxHeight, int quality) const {
