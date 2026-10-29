@@ -123,11 +123,20 @@ namespace {
         return dst;
     }
 
+    static bool h264SharpTextTrialEnabled() {
+        // Opt-in only: generic H.264 WebRTC continues to advertise Level 3.1.
+        // The higher resolution must be signalled with a matching SDP level.
+        return readEnvInt("HI5_H264_SHARP_TEXT", 0, 0, 1) == 1;
+    }
+
     static I420Frame scaleI420ForH264WebRtc(const I420Frame& src, bool* scaledOut = nullptr) {
-        // Browser H.264 Constrained Baseline level 3.1 requires 720p.
-        return scaleI420ToWebRtcBounds(src,
-            readEnvInt("HI5_H264_MAX_WIDTH", 1280, 0, 7680),
-            readEnvInt("HI5_H264_MAX_HEIGHT", 720, 0, 4320), scaledOut);
+        const bool sharp = h264SharpTextTrialEnabled();
+        // Constrained Baseline L3.1 = 720p; the opt-in L4.0 trial allows
+        // up to 1080p/30, preserving full-size desktop text when possible.
+        // Never allow a caller override to exceed the negotiated H264 level.
+        const int maxW = readEnvInt("HI5_H264_MAX_WIDTH", sharp ? 1920 : 1280, 2, sharp ? 1920 : 1280);
+        const int maxH = readEnvInt("HI5_H264_MAX_HEIGHT", sharp ? 1080 : 720, 2, sharp ? 1080 : 720);
+        return scaleI420ToWebRtcBounds(src, maxW, maxH, scaledOut);
     }
 
     struct Vp8RuntimeProfile {
@@ -724,15 +733,18 @@ static void replaceAllInPlace(std::string& s, const std::string& from, const std
     }
 }
 
-static std::string normalizeOutgoingH264SdpForDesktop(std::string sdp, int bitrateKbps) {
-    // Keep the SDP at Constrained Baseline level 3.1 (42e01f) and cap the
-    // encoded H.264 resolution to 720p in the sender. Chromium/WebView was
-    // answering with 42e01f even when the offer advertised a higher level, so
-    // sending oversized desktop frames produced a connected black video track.
-    replaceAllInPlace(sdp, "profile-level-id=42e034", "profile-level-id=42e01f");
-    replaceAllInPlace(sdp, "profile-level-id=420034", "profile-level-id=42e01f");
-    replaceAllInPlace(sdp, "profile-level-id=42C034", "profile-level-id=42e01f");
-    replaceAllInPlace(sdp, "profile-level-id=42c034", "profile-level-id=42e01f");
+static std::string normalizeOutgoingH264SdpForDesktop(std::string sdp, int bitrateKbps, bool sharp1080p) {
+    // L3.1 is the known-good 720p baseline. The explicit higher-clarity
+    // experiment uses Constrained Baseline L4.0 (42e028). Never send 1080p
+    // under a falsely advertised L3.1 profile-level-id.
+    const std::string profile = sharp1080p ? "profile-level-id=42e028" : "profile-level-id=42e01f";
+    for (const char* source : {
+            "profile-level-id=42e034", "profile-level-id=420034",
+            "profile-level-id=42C034", "profile-level-id=42c034",
+            "profile-level-id=42e01f", "profile-level-id=42001f",
+            "profile-level-id=42e028", "profile-level-id=420028" }) {
+        replaceAllInPlace(sdp, source, profile);
+    }
 
     // If a previous pass accidentally produced an enormous AS value, normalise
     // it to the configured kbps. b=AS is in kbps in SDP.
@@ -767,9 +779,10 @@ void WebRtcSender::signalLocalOfferIfReady() {
     std::string sdp = std::string(desc.value());
 
     if (m_videoCodec == VideoCodec::H264) {
-        sdp = normalizeOutgoingH264SdpForDesktop(sdp, m_bitrateKbps);
+        const bool sharp = h264SharpTextTrialEnabled();
+        sdp = normalizeOutgoingH264SdpForDesktop(sdp, m_bitrateKbps, sharp);
         std::cout << "[codec] outgoing H.264 SDP normalized session=" << m_sessionId
-            << " profile_level_id=42e01f"
+            << " profile_level_id=" << (sharp ? "42e028" : "42e01f")
             << " bitrate_kbps=" << m_bitrateKbps << "\n";
     }
 
@@ -2029,6 +2042,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 m_h264Encoder = std::move(enc);
                 LogInfo(
                     "[h264] encoder created session=" + m_sessionId +
+                    " sharp_text_trial=" + std::string(h264SharpTextTrialEnabled() ? "1" : "0") +
                     " name=" + m_h264Encoder->encoderName() +
                     " source=" + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
                     " encoded_size=" + std::to_string(h264Frame.width) + "x" + std::to_string(h264Frame.height) +
