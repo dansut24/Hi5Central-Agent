@@ -2611,7 +2611,9 @@ LogI(
 
                 if (type == "refresh_inventory" || type == "inventory_refresh") {
                         LogI("refresh_inventory requested by control server");
-                        SendInventorySnapshotSafe(ident, true);
+                        // Preserve interactive video performance during remote sessions:
+                        // deep hardware probes will run on the next idle scheduled pass.
+                        SendInventorySnapshotSafe(ident, !HasActiveSessions());
                         FlushBridgeOutgoing();
                         return;
                     }
@@ -3679,7 +3681,7 @@ if ($failed -gt 0) { exit 1 }
 
                         if (actionType == "refresh_inventory" || actionType == "inventory_refresh") {
                             SendActionProgress(actionId, "running", 40, "Collecting inventory");
-                            SendInventorySnapshotSafe(ident, true);
+                            SendInventorySnapshotSafe(ident, !HasActiveSessions());
                             SendActionResult(actionId, "completed", 100, "Inventory refresh completed", json{ {"inventory_sent", true} });
                             return;
                         }
@@ -4067,10 +4069,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     LogI("job claimed id=" + jobId + " type=" + jobType);
 
                     if (jobType == "inventory.scan" || jobType == "policy.refresh") {
-                        SendInventorySnapshotSafe(ident, jobType == "inventory.scan");
+                        const bool deferDeep = jobType == "inventory.scan" && HasActiveSessions();
+                        SendInventorySnapshotSafe(ident, jobType == "inventory.scan" && !deferDeep);
                         PostJobResult(ident, jobId, true, json{
                             {"inventory_sent", true},
-                            {"job_type", jobType}
+                            {"job_type", jobType},
+                            {"deep_scan_deferred", deferDeep}
                         });
                         return;
                     }
