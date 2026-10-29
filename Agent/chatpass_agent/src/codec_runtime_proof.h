@@ -36,6 +36,12 @@ class RuntimeProofStore {
         unsigned int sent = 0;
         double maxEncodeMs = 0;
         std::int64_t lastReportUnix = 0;
+        // A startup IDR is not evidence that the decoder can recover later.
+        // Require a SECOND decoded keyframe after a later observation.
+        std::uint64_t initialDecoded = 0;
+        std::uint64_t initialKeyframes = 0;
+        std::uint64_t initialPackets = 0;
+        std::int64_t firstViewerObservationUnix = 0;
     };
     std::mutex mutex_;
     std::unordered_map<std::string, Evidence> sessions_;
@@ -69,7 +75,7 @@ public:
         std::lock_guard<std::mutex> guard(mutex_);
         const auto found=sessions_.find(session);
         if(found==sessions_.end())return proof;
-        const Evidence& e=found->second;
+        Evidence& e=found->second;
         const EncoderWindow& m=e.last;
         if(now<e.lastReportUnix || now-e.lastReportUnix>30 ||
            decoder.codec!=m.codec || e.encoded<20 || e.sent<20 ||
@@ -78,12 +84,29 @@ public:
            decoder.dropped>decoder.decoded/5 ||
            decoder.width!=m.width || decoder.height!=m.height ||
            e.maxEncodeMs<=0)return proof;
-        const bool hardware=(m.mode=="h264_hw" && asyncH264) ||
-            m.mode=="vp9_hw";
+        // VP9's current "prefer hardware" MFT path may select a software
+        // transform. Until it exposes actual hardware-only MFT identity,
+        // NEVER label a VP9 result as GPU accelerated.
+        if(m.mode=="vp9_hw")return proof;
+        const bool hardware=(m.mode=="h264_hw" && asyncH264);
         if(m.codec=="h264" && m.mode=="h264_hw" && !asyncH264)return proof;
         if((m.codec=="h264" && m.mode!="h264_hw" && m.mode!="h264_sw") ||
            (m.codec=="vp9" && m.mode!="vp9_hw" && m.mode!="vp9_sw") ||
            (m.codec=="vp8" && m.mode!="vp8"))return proof;
+        // The first keyframe generally arrives on initial connection;
+        // this alone is NOT keyframe recovery. Wait for a later keyframe
+        // and meaningful decoding progress before trusting this device.
+        if(e.firstViewerObservationUnix == 0) {
+            e.initialDecoded=decoder.decoded;
+            e.initialKeyframes=decoder.keyframes;
+            e.initialPackets=decoder.packets;
+            e.firstViewerObservationUnix=now;
+            return proof;
+        }
+        if(now-e.firstViewerObservationUnix < 3 ||
+           decoder.keyframes <= e.initialKeyframes ||
+           decoder.decoded < e.initialDecoded + 20 ||
+           decoder.packets <= e.initialPackets) return proof;
         proof.codec=m.codec;
         proof.backend=m.mode;
         proof.hardware=hardware;
