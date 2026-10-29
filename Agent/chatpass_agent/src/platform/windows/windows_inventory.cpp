@@ -1210,7 +1210,51 @@ try {
   $dsreg = @(dsregcmd.exe /status 2>$null)
   $ds = @{}
   foreach ($line in $dsreg) {
-    if ($line -match '^\s*(AzureAdJoined|WorkplaceJoined|DeviceId|TenantId|TenantName)\s*:\s*(.*?)\s*
+    if ($line -match '^\s*(AzureAdJoined|WorkplaceJoined|DeviceId|TenantId|TenantName)\s*:\s*(.*?)\s*$') {
+      $ds[$Matches[1]] = $Matches[2].Trim()
+    }
+  }
+  $result.directory_join = [pscustomobject]@{
+    computer_name=$env:COMPUTERNAME
+    domain_joined=[bool]$cs.PartOfDomain
+    domain=if ($cs.PartOfDomain) { $cs.Domain } else { $null }
+    workgroup=if (-not $cs.PartOfDomain) { $cs.Domain } else { $null }
+    domain_role=[int]$cs.DomainRole
+    azure_ad_joined=if ($ds.AzureAdJoined) { $ds.AzureAdJoined -eq 'YES' } else { $null }
+    workplace_joined=if ($ds.WorkplaceJoined) { $ds.WorkplaceJoined -eq 'YES' } else { $null }
+    entra_device_id=$ds.DeviceId
+    entra_tenant_id=$ds.TenantId
+    entra_tenant_name=$ds.TenantName
+  }
+  $sections.directory_join = @{ status='collected' }
+} catch { $sections.directory_join = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $result.machine_certificates = @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction Stop |
+    Select-Object -First 256 | ForEach-Object {
+      [pscustomobject]@{
+        subject=$_.Subject; issuer=$_.Issuer; thumbprint=$_.Thumbprint
+        not_before=SafeDate $_.NotBefore; not_after=SafeDate $_.NotAfter
+        has_private_key=[bool]$_.HasPrivateKey
+      }
+    })
+  $sections.certificates = @{ status='collected' }
+} catch { $sections.certificates = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+try {
+  $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop | Select-Object -First 1
+  $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+  $result.virtualization = [pscustomobject]@{
+    hypervisor_present=[bool]$cs.HypervisorPresent
+    virtualization_firmware_enabled=if ($null -ne $cpu.VirtualizationFirmwareEnabled) { [bool]$cpu.VirtualizationFirmwareEnabled } else { $null }
+    vm_monitor_mode_extensions=if ($null -ne $cpu.VMMonitorModeExtensions) { [bool]$cpu.VMMonitorModeExtensions } else { $null }
+    second_level_address_translation=if ($null -ne $cpu.SecondLevelAddressTranslationExtensions) { [bool]$cpu.SecondLevelAddressTranslationExtensions } else { $null }
+    data_execution_prevention_available=if ($null -ne $cpu.DataExecutionPrevention_Available) { [bool]$cpu.DataExecutionPrevention_Available } else { $null }
+  }
+  $sections.virtualization = @{ status='collected' }
+} catch { $sections.virtualization = @{ status='failed'; reason=[string]$_.Exception.Message } }
+
+$result.deep_inventory_sections = $sections
 $result | ConvertTo-Json -Depth 8 -Compress
 )PS", json::object());
 }
@@ -1499,305 +1543,6 @@ json BuildInventorySnapshot(const AgentIdentity& identity, bool forceDeep, bool 
         snapshot["battery"].update(snapshot["battery_deep"]);
         snapshot.erase("battery_deep");
     }
-    return snapshot;
-}
-
-} // namespace hi5
-) {
-      $ds[$Matches[1]] = $Matches[2].Trim()
-    }
-  }
-  $result.directory_join = [pscustomobject]@{
-    computer_name=$env:COMPUTERNAME; domain_joined=[bool]$cs.PartOfDomain
-    domain=if ($cs.PartOfDomain) { $cs.Domain } else { $null }
-    workgroup=if (-not $cs.PartOfDomain) { $cs.Domain } else { $null }
-    domain_role=[int]$cs.DomainRole
-    azure_ad_joined=if ($ds.AzureAdJoined) { $ds.AzureAdJoined -eq 'YES' } else { $null }
-    workplace_joined=if ($ds.WorkplaceJoined) { $ds.WorkplaceJoined -eq 'YES' } else { $null }
-    entra_device_id=$ds.DeviceId; entra_tenant_id=$ds.TenantId; entra_tenant_name=$ds.TenantName
-  }
-  $sections.directory_join = @{ status='collected' }
-} catch { $sections.directory_join = @{ status='failed'; reason=[string]$_.Exception.Message } }
-
-try {
-  $result.machine_certificates = @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction Stop |
-    Select-Object -First 256 | ForEach-Object {
-      [pscustomobject]@{ subject=$_.Subject; issuer=$_.Issuer; thumbprint=$_.Thumbprint
-        not_before=SafeDate $_.NotBefore; not_after=SafeDate $_.NotAfter; has_private_key=[bool]$_.HasPrivateKey }
-    })
-  $sections.certificates = @{ status='collected' }
-} catch { $sections.certificates = @{ status='failed'; reason=[string]$_.Exception.Message } }
-
-try {
-  $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop | Select-Object -First 1
-  $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
-  $result.virtualization = [pscustomobject]@{
-    hypervisor_present=[bool]$cs.HypervisorPresent
-    virtualization_firmware_enabled=if ($null -ne $cpu.VirtualizationFirmwareEnabled) { [bool]$cpu.VirtualizationFirmwareEnabled } else { $null }
-    vm_monitor_mode_extensions=if ($null -ne $cpu.VMMonitorModeExtensions) { [bool]$cpu.VMMonitorModeExtensions } else { $null }
-    second_level_address_translation=if ($null -ne $cpu.SecondLevelAddressTranslationExtensions) { [bool]$cpu.SecondLevelAddressTranslationExtensions } else { $null }
-    data_execution_prevention_available=if ($null -ne $cpu.DataExecutionPrevention_Available) { [bool]$cpu.DataExecutionPrevention_Available } else { $null }
-  }
-  $sections.virtualization = @{ status='collected' }
-} catch { $sections.virtualization = @{ status='failed'; reason=[string]$_.Exception.Message } }
-
-$result.deep_inventory_sections = $sections
-$result | ConvertTo-Json -Depth 8 -Compress
-)PS", json::object());
-}
-
-json DueDeepHardwareInventory(bool force) {
-    static std::mutex mu;
-    static std::chrono::steady_clock::time_point nextAttemptAt{};
-    std::lock_guard<std::mutex> lock(mu);
-    const auto now = std::chrono::steady_clock::now();
-    if (!force && now < nextAttemptAt) {
-        return { {"deep_inventory_included", false} };
-    }
-    // Failed or unsupported WMI providers must not cause a new slow scan
-    // every minute. Explicit technician inventory.scan bypasses this delay.
-    nextAttemptAt = now + std::chrono::minutes(30);
-    auto deep = DeepHardwareInventory();
-    if (!deep.is_object() || !deep.contains("deep_inventory_sections")) {
-        return { {"deep_inventory_included", false} };
-    }
-    bool anySuccess = false;
-    const auto& statuses = deep["deep_inventory_sections"];
-    if (statuses.is_object()) {
-        for (auto it = statuses.begin(); it != statuses.end(); ++it) {
-            if (it.value().is_object() && it.value().value("status", "") == "collected") {
-                anySuccess = true;
-                break;
-            }
-        }
-    }
-    if (!anySuccess) return { {"deep_inventory_included", false} };
-    deep["deep_inventory_included"] = true;
-    deep["deep_inventory_collected_at"] = NowIsoUtc();
-    return deep;
-}
-
-json SessionsInfo() {
-    json sessions = json::array();
-    int rdpCount = 0;
-    WTS_SESSION_INFOA* sessionInfo = nullptr;
-    DWORD count = 0;
-    if (WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessionInfo, &count)) {
-        for (DWORD i = 0; i < count; ++i) {
-            LPSTR user = nullptr;
-            DWORD userLen = 0;
-            std::string userName;
-            if (WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, sessionInfo[i].SessionId, WTSUserName, &user, &userLen) && user) {
-                userName = user;
-                WTSFreeMemory(user);
-            }
-            if (sessionInfo[i].SessionId != WTSGetActiveConsoleSessionId() && !userName.empty()) ++rdpCount;
-            sessions.push_back({
-                {"id", sessionInfo[i].SessionId},
-                {"station", sessionInfo[i].pWinStationName ? sessionInfo[i].pWinStationName : ""},
-                {"state", static_cast<int>(sessionInfo[i].State)},
-                {"user", userName}
-            });
-        }
-        WTSFreeMemory(sessionInfo);
-    }
-    const std::string current = LoggedInUser();
-    return {
-        {"current_user", current},
-        {"console_user", current},
-        {"active_console_user", current},
-        {"last_logged_in_user", LastLoggedOnUser()},
-        {"rdp_sessions", rdpCount},
-        {"locked", json(nullptr)},
-        {"idle_time", json(nullptr)},
-        {"sessions", sessions}
-    };
-}
-
-json ServicesSummary() {
-    DWORD bytesNeeded = 0;
-    DWORD servicesReturned = 0;
-    DWORD resume = 0;
-    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
-    if (!scm) return json::object();
-    EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, nullptr, 0, &bytesNeeded, &servicesReturned, &resume, nullptr);
-    std::vector<BYTE> buffer(bytesNeeded ? bytesNeeded : 64 * 1024);
-    resume = 0;
-    BOOL ok = EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesNeeded, &servicesReturned, &resume, nullptr);
-    CloseServiceHandle(scm);
-    if (!ok) return json::object();
-
-    auto* rows = reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
-    int running = 0;
-    int stoppedCritical = 0;
-    json stopped = json::array();
-    const std::vector<std::wstring> critical = { L"WinDefend", L"MpsSvc", L"wuauserv", L"EventLog", L"Dhcp", L"Dnscache", L"LanmanWorkstation" };
-    for (DWORD i = 0; i < servicesReturned; ++i) {
-        const bool isRunning = rows[i].ServiceStatusProcess.dwCurrentState == SERVICE_RUNNING;
-        if (isRunning) ++running;
-        std::wstring svcName = rows[i].lpServiceName ? rows[i].lpServiceName : L"";
-        if (!isRunning && std::find(critical.begin(), critical.end(), svcName) != critical.end()) {
-            ++stoppedCritical;
-            stopped.push_back(WideToUtf8(svcName));
-        }
-    }
-    return {
-        {"running_services", running},
-        {"stopped_critical_services", stoppedCritical},
-        {"stopped_critical_service_names", stopped},
-        {"win_defend_running", ServiceRunning(L"WinDefend")},
-        {"firewall_service_running", ServiceRunning(L"MpsSvc")},
-        {"windows_update_service", ServiceState(L"wuauserv")}
-    };
-}
-
-json AgentInfo(const std::string& collectedAt) {
-    std::string state = ServiceState(L"Hi5CentralAgent");
-    if (state == "Not installed") state = ServiceState(L"Hi5CentralAgent");
-    return {
-        {"version", kAgentVersion},
-        {"service", state},
-        {"service_status", state},
-        {"install_path", GetModulePath()},
-        {"transport", "websocket"},
-        {"websocket", "Connected"},
-        {"websocket_status", "Connected"},
-        {"last_heartbeat", collectedAt},
-        {"inventory_sync", collectedAt}
-    };
-}
-
-json SummaryInfo(const json& os, const json& hardware, const json& memory, const json& storage) {
-    json primaryDrive = storage.is_array() && !storage.empty() ? storage[0] : json::object();
-    const auto uptimeSeconds = static_cast<std::uint64_t>(GetTickCount64() / 1000ULL);
-    return {
-        {"hostname", ComputerName()},
-        {"domain", DomainOrWorkgroup()},
-        {"domain_workgroup", DomainOrWorkgroup()},
-        {"logged_in_user", LoggedInUser()},
-        {"os_name", os.value("name", "Windows")},
-        {"operating_system", os.value("name", "Windows")},
-        {"os_version", os.value("version", "")},
-        {"os_build", os.value("build", "")},
-        {"architecture", os.value("architecture", "")},
-        {"manufacturer", hardware.value("manufacturer", "")},
-        {"model", hardware.value("model", "")},
-        {"serial_number", hardware.value("serial_number", "")},
-        {"asset_tag", hardware.value("asset_tag", "")},
-        {"device_uuid", hardware.value("device_uuid", "")},
-        {"total_memory_bytes", memory.value("total_bytes", 0ULL)},
-        {"primary_drive", primaryDrive.value("drive", "")},
-        {"primary_drive_used_percent", primaryDrive.value("used_percent", 0.0)},
-        {"uptime_seconds", uptimeSeconds},
-        {"uptime", DurationText(uptimeSeconds)},
-        {"last_boot", os.value("last_boot", "")},
-        {"install_date", os.value("install_date", "")}
-    };
-}
-
-json HealthInfo(const json& memory, const json& storage, const json& security, const json& events, const json& updates) {
-    const double memPct = memory.value("used_percent", 0.0);
-    double diskPct = 0.0;
-    if (storage.is_array() && !storage.empty()) diskPct = storage[0].value("used_percent", 0.0);
-
-    json warnings = json::array();
-    if (memPct >= 90.0) warnings.push_back("High memory usage");
-    if (diskPct >= 90.0) warnings.push_back("Low disk space");
-    if (security.value("defender_enabled", true) == false) warnings.push_back("Microsoft Defender is not running");
-    if (security.value("firewall_enabled", true) == false) warnings.push_back("Windows Firewall service is not running");
-    if (events.value("unexpected_shutdowns", 0) > 0) warnings.push_back("Unexpected shutdowns detected");
-    if (events.value("recent_crashes", 0) > 0) warnings.push_back("Recent application crashes detected");
-    if (updates.value("pending_count", 0) > 0) warnings.push_back("Windows updates pending");
-
-    return {
-        {"memory_warning", memPct >= 90.0},
-        {"disk_warning", diskPct >= 90.0},
-        {"security_warning", security.value("defender_enabled", true) == false || security.value("firewall_enabled", true) == false},
-        {"update_failures", events.value("update_failures", json(nullptr))},
-        {"recent_crashes", events.value("recent_crashes", json(nullptr))},
-        {"unexpected_shutdowns", events.value("unexpected_shutdowns", json(nullptr))},
-        {"service_failures", events.value("service_failures", json(nullptr))},
-        {"warnings", warnings},
-        {"overall", warnings.empty() ? "good" : "warning"}
-    };
-}
-
-} // namespace
-
-json BuildInventorySnapshot(const AgentIdentity& identity, bool forceDeep, bool allowScheduledDeep) {
-    const auto collectedAt = NowIsoUtc();
-
-    json bitlocker = BitLockerVolumes();
-    json tpm = TpmInfo();
-    json localAdmins = LocalAdmins();
-    json os = OsInfo();
-    json hardware = HardwareInfo();
-    json cpu = CpuInfo();
-    json memory = MemoryInfo();
-    json storage = StorageInfo(bitlocker);
-    json security = SecurityInfo(bitlocker, tpm, localAdmins);
-    json network = NetworkInfo();
-    json battery = BatteryInfo();
-    json gpu = GpuInfo();
-    json displays = DisplayInfo(gpu);
-    json sessions = SessionsInfo();
-    json software = InstalledSoftwareInventory();
-    json updates = WindowsUpdates();
-    json events = EventHealth();
-    json services = ServicesSummary();
-    json agent = AgentInfo(collectedAt);
-    json summary = SummaryInfo(os, hardware, memory, storage);
-    json health = HealthInfo(memory, storage, security, events, updates);
-    json deep = (forceDeep || allowScheduledDeep) ? DueDeepHardwareInventory(forceDeep)
-                                                    : json{{"deep_inventory_included", false}};
-
-    json snapshot = {
-        {"type", "inventory_snapshot"},
-        {"device_id", identity.deviceId},
-        {"collected_at", collectedAt},
-        {"summary", summary},
-        {"hardware", hardware},
-        {"warranty_identity", {
-            {"manufacturer", hardware.value("manufacturer", "")},
-            {"model", hardware.value("model", "")},
-            {"serial_number", hardware.value("serial_number", "")},
-            {"asset_tag", hardware.value("asset_tag", "")},
-            {"device_uuid", hardware.value("device_uuid", "")},
-            {"bios_vendor", hardware.value("bios_vendor", "")},
-            {"bios_version", hardware.value("bios_version", "")},
-            {"bios_date", hardware.value("bios_date", "")}
-        }},
-        {"os", os},
-        {"cpu", cpu},
-        {"memory", memory},
-        {"storage", storage},
-        {"security", security},
-        {"network", network},
-        {"sessions", sessions},
-        {"displays", displays},
-        {"gpu", gpu},
-        {"battery", battery},
-        {"agent", agent},
-        {"health", health},
-        {"software", software},
-        {"software_summary", {
-            {"status", software.value("status", "collected")},
-            {"count", software.value("count", 0)},
-            {"installed_apps", software.value("installed_apps", 0)},
-            {"recently_installed", software.value("recently_installed_count", 0)},
-            {"items", software.value("items", json::array())}
-        }},
-        {"services_summary", services},
-        {"windows_updates", updates},
-        {"updates", updates},
-        {"events_summary", events},
-        {"event_health", events},
-        {"raw", {
-            {"collector", "inventory_pass_2"},
-            {"notes", "Includes Windows 11 build-name correction, BitLocker, software, updates, event health, GPU, TPM and warranty-ready WMI identity."}
-        }}
-    };
-    snapshot.update(deep);
     return snapshot;
 }
 
