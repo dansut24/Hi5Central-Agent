@@ -61,6 +61,16 @@ namespace {
     }
 
 
+    // Exact p95 of bounded, actually measured encoder frame times.
+    // A rare slow frame is recorded in max, but not mislabeled as p95.
+    static double encodeP95Ms(const std::vector<double>& samples) {
+        if (samples.empty()) return 0.0;
+        auto ordered = samples;
+        std::sort(ordered.begin(), ordered.end());
+        const size_t index = (ordered.size() * 95 + 99) / 100 - 1;
+        return ordered[std::min(index, ordered.size() - 1)];
+    }
+
     static int makeEvenAtLeast2(int v) {
         v = std::max(2, v);
         if (v & 1) --v;
@@ -1949,6 +1959,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     }
                 }
                 m_externalEncodeMsTotal += encodeMs;
+        // Rolling 512-frame history survives five-second diagnostics
+                    // windows. At 2 idle fps, ten samples would make the
+                    // nearest-rank p95 equal to the single worst spike.
+                    if (m_externalEncodeMsSamples.size() >= 512)
+                        m_externalEncodeMsSamples.erase(m_externalEncodeMsSamples.begin());
+                    m_externalEncodeMsSamples.push_back(encodeMs);
                 m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
                 ++m_externalEncodedFrames;
 
@@ -2014,6 +2030,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                             {"sent_frames", m_externalSentFrames},
                             {"encode_avg_ms", m_externalEncodeMsTotal / encodedCount},
                             {"encode_max_ms", m_externalEncodeMsMax},
+                            {"encode_p95_ms", encodeP95Ms(m_externalEncodeMsSamples)},
                             {"send_avg_ms", m_externalSendMsTotal / sentCount},
                             {"send_max_ms", m_externalSendMsMax},
                             {"target_fps", m_externalConfiguredFps},
@@ -2030,6 +2047,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     m_externalSentFrames = 0;
                     m_externalEncodeMsTotal = 0.0;
                     m_externalEncodeMsMax = 0.0;
+                    // Retain recent encoder latency history across stats windows.
                     m_externalSendMsTotal = 0.0;
                     m_externalSendMsMax = 0.0;
                     m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
@@ -2167,6 +2185,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
                 const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
                 m_externalEncodeMsTotal += encodeMs;
+        // Rolling 512-frame history survives five-second diagnostics
+                    // windows. At 2 idle fps, ten samples would make the
+                    // nearest-rank p95 equal to the single worst spike.
+                    if (m_externalEncodeMsSamples.size() >= 512)
+                        m_externalEncodeMsSamples.erase(m_externalEncodeMsSamples.begin());
+                    m_externalEncodeMsSamples.push_back(encodeMs);
                 m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
                 ++m_externalEncodedFrames;
 
@@ -2211,6 +2235,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                             {"sent_frames", m_externalSentFrames},
                             {"encode_avg_ms", m_externalEncodeMsTotal / encodedCount},
                             {"encode_max_ms", m_externalEncodeMsMax},
+                            {"encode_p95_ms", encodeP95Ms(m_externalEncodeMsSamples)},
                             {"send_avg_ms", m_externalSendMsTotal / sentCount},
                             {"send_max_ms", m_externalSendMsMax},
                             {"target_fps", m_externalConfiguredFps},
@@ -2227,6 +2252,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     m_externalSentFrames = 0;
                     m_externalEncodeMsTotal = 0.0;
                     m_externalEncodeMsMax = 0.0;
+                    // Retain recent encoder latency history across stats windows.
                     m_externalSendMsTotal = 0.0;
                     m_externalSendMsMax = 0.0;
                     m_externalNextStatsLog = now + std::chrono::seconds(5);
@@ -2258,6 +2284,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
         const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
         m_externalEncodeMsTotal += encodeMs;
+        // Rolling 512-frame history survives five-second diagnostics
+        // windows. At 2 idle fps, ten samples would make the
+        // nearest-rank p95 equal to the single worst spike.
+        if (m_externalEncodeMsSamples.size() >= 512)
+            m_externalEncodeMsSamples.erase(m_externalEncodeMsSamples.begin());
+        m_externalEncodeMsSamples.push_back(encodeMs);
         m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
         ++m_externalEncodedFrames;
 
@@ -2314,6 +2346,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     {"sent_frames", m_externalSentFrames},
                     {"encode_avg_ms", encodeAvgMs},
                     {"encode_max_ms", m_externalEncodeMsMax},
+                    {"encode_p95_ms", encodeP95Ms(m_externalEncodeMsSamples)},
                     {"send_avg_ms", sendAvgMs},
                     {"send_max_ms", m_externalSendMsMax},
                     {"bitrate_kbps", m_externalConfiguredBitrateKbps},
@@ -2332,6 +2365,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             m_externalSentFrames = 0;
             m_externalEncodeMsTotal = 0.0;
             m_externalEncodeMsMax = 0.0;
+            // Retain recent encoder latency history across stats windows.
             m_externalSendMsTotal = 0.0;
             m_externalSendMsMax = 0.0;
             m_externalNextStatsLog = now + std::chrono::seconds(5);

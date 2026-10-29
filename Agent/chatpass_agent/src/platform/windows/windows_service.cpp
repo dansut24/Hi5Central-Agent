@@ -2614,6 +2614,7 @@ LogI(
                             evidence.width = m.value("width", 0);
                             evidence.height = m.value("height", 0);
                             evidence.maxEncodeMs = m.value("encode_max_ms", 0.0);
+                            evidence.p95EncodeMs = m.value("encode_p95_ms", 0.0);
                             codecProofs->recordEncoder(m.value("session_id", ""),
                                 evidence, static_cast<std::int64_t>(std::time(nullptr)));
                         }
@@ -2691,9 +2692,16 @@ LogI(
                         const bool asyncH264 = ReadConfigInt(
                             "HI5_H264_ASYNC_HW", 0, 0, 1) == 1;
                         const auto nowUtc = static_cast<std::int64_t>(std::time(nullptr));
+                        std::string proofReason;
                         auto proof = codecProofs->confirm(
-                            sessionId, obs, nowUtc, asyncH264);
-                        if (proof.codec.empty()) return;
+                            sessionId, obs, nowUtc, asyncH264, &proofReason);
+                        if (proof.codec.empty()) {
+                            // At most one line per Viewer sample (normally 6s).
+                            // No account, device or session identifiers.
+                            LogI("[codec-universal] viewer evidence rejected codec=" +
+                                obs.codec + " reason=" + proofReason);
+                            return;
+                        }
                         const auto identity =
                             hi5::universal_codec::windowsCacheIdentity(
                                 kAgentVersion, nowUtc);
