@@ -69,6 +69,9 @@ struct Result {
     UINT32 candidateNumber = 0;
     UINT32 outputEventsConsumed = 0;
     UINT32 emptyOutputSamples = 0;
+    UINT32 streamChanges = 0;
+    UINT32 completedRenegotiations = 0;
+    std::string renegotiationStatus;
     std::string note;
 };
 
@@ -183,6 +186,9 @@ static Result run(const char* name, const GUID& outSubtype,
         r.firstOutputObservation.clear();
         r.outputEventsConsumed = 0;
         r.emptyOutputSamples = 0;
+        r.streamChanges = 0;
+        r.completedRenegotiations = 0;
+        r.renegotiationStatus.clear();
         r.outputStreamInfo.clear();
         r.note.clear();
         // Query D3D awareness before supplying a manager. Microsoft explicitly
@@ -322,7 +328,10 @@ static Result run(const char* name, const GUID& outSubtype,
                     continue;
                 }
             }
-            for (int poll=0;poll<2;++poll) {
+            // A single encoded sample can require a bounded output type
+            // reconfiguration before any bytes are emitted. Do not feed a
+            // second input while the first output format is invalid.
+            for (int poll=0;poll<6;++poll) {
                 ComPtr<IMFSample> outSample;
                 ComPtr<IMFMediaBuffer> outBuffer;
                 MFT_OUTPUT_DATA_BUFFER packet{};
@@ -351,11 +360,73 @@ static Result run(const char* name, const GUID& outSubtype,
                     if (packet.pEvents) packet.pEvents->Release();
                     break;
                 }
-                if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-                    const HRESULT changed = transform->GetOutputStreamInfo(0, &outputInfo);
-                    if (FAILED(changed) && r.note.empty())
-                        r.note = "stream change output info failed " + formatHr(changed);
+                if (hr == MF_E_TRANSFORM_STREAM_CHANGE ||
+                    packet.dwStatus == MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE) {
                     if (packet.pEvents) packet.pEvents->Release();
+                    if (packet.pSample && packet.pSample != outSample.Get())
+                        packet.pSample->Release();
+                    ++r.streamChanges;
+                    if (r.streamChanges > 3) {
+                        r.note = "excessive output format changes (max 3)";
+                        break;
+                    }
+                    // The physical Lenovo's Quick Sync H.264 MFT returns
+                    // 0xC00D6D61 with packet status 0x100. Refreshing
+                    // GetOutputStreamInfo alone does NOT reset its format.
+                    // Microsoft prescribes selecting an offered media type
+                    // and calling SetOutputType before requesting output.
+                    HRESULT selectedHr = MF_E_INVALIDMEDIATYPE;
+                    HRESULT lastListHr = S_OK;
+                    UINT32 offeredCount = 0;
+                    bool selected = false;
+                    for (DWORD typeIndex = 0; typeIndex < 16; ++typeIndex) {
+                        ComPtr<IMFMediaType> offered;
+                        lastListHr = transform->GetOutputAvailableType(
+                            0, typeIndex, &offered);
+                        if (lastListHr == MF_E_NO_MORE_TYPES) break;
+                        if (FAILED(lastListHr) || !offered) break;
+                        ++offeredCount;
+                        GUID offeredSubtype{};
+                        if (FAILED(offered->GetGUID(MF_MT_SUBTYPE, &offeredSubtype)) ||
+                            !IsEqualGUID(offeredSubtype, outSubtype)) continue;
+                        selectedHr = transform->SetOutputType(0, offered.Get(), 0);
+                        if (SUCCEEDED(selectedHr)) {
+                            selected = true;
+                            break;
+                        }
+                    }
+                    // Some encoders do not enumerate complete output types.
+                    // Permit one bounded reapply of the originally accepted
+                    // encoder type, but never switch codecs or stream shape.
+                    if (!selected) {
+                        const HRESULT retry = transform->SetOutputType(
+                            0, output.Get(), 0);
+                        selectedHr = retry;
+                        selected = SUCCEEDED(retry);
+                    }
+                    r.renegotiationStatus =
+                        "offered=" + std::to_string(offeredCount) +
+                        " list_hr=" + formatHr(lastListHr) +
+                        " set_hr=" + formatHr(selectedHr);
+                    if (!selected) {
+                        r.note = "H264 output type renegotiation failed: " +
+                            r.renegotiationStatus;
+                        break;
+                    }
+                    ++r.completedRenegotiations;
+                    outputInfo = {};
+                    const HRESULT infoHr = transform->GetOutputStreamInfo(
+                        0, &outputInfo);
+                    if (FAILED(infoHr)) {
+                        r.note = "renegotiated GetOutputStreamInfo failed " +
+                            formatHr(infoHr);
+                        break;
+                    }
+                    r.outputStreamInfo = "stream_flags=" +
+                        std::to_string(outputInfo.dwFlags) +
+                        " cbSize=" + std::to_string(outputInfo.cbSize);
+                    // Retry ProcessOutput for this same input frame before
+                    // waiting for another NeedInput event.
                     continue;
                 }
                 if (FAILED(hr)) {
@@ -504,6 +575,9 @@ int main(int argc, char** argv) {
             <<" output_stream="<<r.outputStreamInfo
             <<" output_calls="<<r.outputEventsConsumed
             <<" empty_output="<<r.emptyOutputSamples
+            <<" stream_changes="<<r.streamChanges
+            <<" renegotiated="<<r.completedRenegotiations
+            <<" renegotiation="<<r.renegotiationStatus
             <<" first_output="<<r.firstOutputObservation
             <<" note="<<r.note<<"\n";
     };
