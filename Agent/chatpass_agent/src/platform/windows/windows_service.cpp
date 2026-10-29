@@ -4083,7 +4083,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         const json scan = SendInventorySnapshotSafe(ident, deepRequested);
                         const bool sent = scan.value("inventory_sent", false);
                         const std::string status = scan.value("deep_inventory_status", std::string());
-                        const bool completed = sent && (!deepRequested || status == "collected");
+                        const bool completed = sent && (!deepRequested || status == "collected" || status == "partial");
                         const std::string detail = !sent ? "Inventory snapshot could not be sent."
                             : status == "partial" ? "Deep inventory partially collected: inspect deep_inventory_sections for errors."
                             : status == "failed" ? "Deep inventory collection failed; inspect section statuses."
@@ -5564,7 +5564,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         {"deep_inventory_included", snapshot.value("deep_inventory_included", false)},
                         {"deep_inventory_status", status},
                         {"deep_inventory_collected_at", snapshot.value("deep_inventory_collected_at", std::string())},
-                        {"deep_inventory_sections", snapshot.value("deep_inventory_sections", json::object())}
+                        {"deep_inventory_sections", snapshot.value("deep_inventory_sections", json::object())},
+                        {"deep_inventory_error", snapshot.value("deep_inventory_error", std::string())}
                     };
                 }
                 catch (const std::exception& ex) {
