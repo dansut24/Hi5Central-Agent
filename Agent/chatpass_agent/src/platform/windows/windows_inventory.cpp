@@ -939,7 +939,7 @@ try {
           bank_label = $_.BankLabel
           capacity_bytes = [int64]$_.Capacity
           manufacturer = $_.Manufacturer
-          part_number = ($_.PartNumber -as [string]).Trim()
+          part_number = ([string]$_.PartNumber).Trim()
           serial_number = $_.SerialNumber
           configured_speed_mhz = if ($_.ConfiguredClockSpeed) { [int]$_.ConfiguredClockSpeed } else { $null }
           speed_mhz = if ($_.Speed) { [int]$_.Speed } else { $null }
@@ -1270,7 +1270,7 @@ json HealthInfo(const json& memory, const json& storage, const json& security, c
 
 } // namespace
 
-json BuildInventorySnapshot(const AgentIdentity& identity, bool forceDeep) {
+json BuildInventorySnapshot(const AgentIdentity& identity, bool forceDeep, bool allowScheduledDeep) {
     const auto collectedAt = NowIsoUtc();
 
     json bitlocker = BitLockerVolumes();
@@ -1294,7 +1294,8 @@ json BuildInventorySnapshot(const AgentIdentity& identity, bool forceDeep) {
     json agent = AgentInfo(collectedAt);
     json summary = SummaryInfo(os, hardware, memory, storage);
     json health = HealthInfo(memory, storage, security, events, updates);
-    json deep = DueDeepHardwareInventory(forceDeep);
+    json deep = (forceDeep || allowScheduledDeep) ? DueDeepHardwareInventory(forceDeep)
+                                                    : json{{"deep_inventory_included", false}};
 
     json snapshot = {
         {"type", "inventory_snapshot"},
