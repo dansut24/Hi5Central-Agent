@@ -486,12 +486,7 @@ struct DesktopFrameSource::Impl {
     // Refresh at most once per second, but allow explicit monitor switches.
     std::chrono::steady_clock::time_point nextDisplayProbeAt{};
     int currentIndex = 0;
-    int requestedIndex = 0; // -1 explicitly means All Monitors, not DXGI fallback
     std::string currentName;
-    bool gdiFallback = false;
-    bool allowDxgiRecovery = false; // normal helper only, never UAC helper
-    std::chrono::steady_clock::time_point nextDxgiRetryAt{};
-    unsigned int dxgiRetryFailures = 0;
 
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -521,9 +516,6 @@ struct DesktopFrameSource::Impl {
 
     void useGdiFallbackLocked() {
         resetD3DLocked();
-        gdiFallback = requestedIndex >= 0;
-        if (gdiFallback && nextDxgiRetryAt.time_since_epoch().count() == 0)
-            nextDxgiRetryAt = std::chrono::steady_clock::now() + std::chrono::seconds(8);
         currentIndex = -1;
         currentName.clear();
         const auto desktop = buildAllMonitorsInfo();
@@ -556,16 +548,14 @@ struct DesktopFrameSource::Impl {
         const UINT oldAdapter = previousTarget ? previousTarget->adapterIndex : 0;
         const UINT oldOutput = previousTarget ? previousTarget->outputIndex : 0;
 
-        auto discovered = enumerateTargets();
-        if (discovered.empty()) {
-            // A transient empty DXGI enumeration must NOT discard a live
-            // duplication. Losing it once previously stranded us in GDI.
-            if (duplication && !targets.empty()) return;
-            targets.clear();
-            if (requestedIndex >= 0) useGdiFallbackLocked();
+        targets = enumerateTargets();
+
+        if (targets.empty()) {
+            currentIndex = -1;
+            currentName.clear();
+            resetD3DLocked();
             return;
         }
-        targets = std::move(discovered);
 
         if (previousIndex == -1) {
             currentIndex = -1;
@@ -686,50 +676,12 @@ struct DesktopFrameSource::Impl {
         if (FAILED(device->CreateTexture2D(&desc, nullptr, &staging))) {
             throw std::runtime_error("CreateTexture2D(staging) failed");
         }
-        gdiFallback = false;
-        dxgiRetryFailures = 0;
-        nextDxgiRetryAt = {};
-    }
-
-    void tryRestoreDxgiLocked() {
-        if (!allowDxgiRecovery || !gdiFallback || requestedIndex == -1) return;
-        const auto now = std::chrono::steady_clock::now();
-        if (now < nextDxgiRetryAt) return;
-        // A bounded retry, never a busy retry loop: persistent unsupported
-        // display drivers keep their functioning GDI stream.
-        nextDxgiRetryAt = now + std::chrono::seconds(
-            dxgiRetryFailures >= 2 ? 180 : (dxgiRetryFailures == 1 ? 60 : 20));
-        ++dxgiRetryFailures;
-        if (targets.empty()) return;
-
-        auto selected = std::find_if(targets.begin(), targets.end(),
-            [&](const OutputTarget& t) { return t.info.index == requestedIndex; });
-        if (selected == targets.end()) {
-            selected = std::find_if(targets.begin(), targets.end(),
-                [](const OutputTarget& t) { return t.info.primary; });
-        }
-        if (selected == targets.end()) selected = targets.begin();
-
-        currentIndex = selected->info.index;
-        currentName = selected->info.name;
-        try {
-            initForCurrentLocked();
-            // Prior GDI frame remains usable if DXGI initially times out.
-        } catch (const std::exception&) {
-            useGdiFallbackLocked();
-        }
-    }
-
-    void setDxgiRecoveryEnabledLocked(bool enabled) {
-        allowDxgiRecovery = enabled;
     }
 
     bool setDisplayIndexLocked(int index) {
         refreshDisplaysLocked(true);
 
         if (index == -1) {
-            requestedIndex = -1;
-            gdiFallback = false;
             currentIndex = -1;
             currentName.clear();
             initForCurrentLocked();
@@ -743,7 +695,6 @@ struct DesktopFrameSource::Impl {
             return false;
         }
 
-        requestedIndex = it->info.index;
         currentIndex = it->info.index;
         currentName = it->info.name;
         try {
@@ -826,8 +777,7 @@ struct DesktopFrameSource::Impl {
         refreshDisplaysLocked();
 
         if (currentIndex == -1) {
-            tryRestoreDxgiLocked();
-            if (currentIndex == -1) return captureAllMonitorsGdiLocked();
+            return captureAllMonitorsGdiLocked();
         }
 
         if (!duplication || !findCurrentTargetLocked()) {
@@ -971,11 +921,6 @@ int DesktopFrameSource::currentDisplayIndex() const {
 bool DesktopFrameSource::setDisplayIndex(int index) {
     std::lock_guard<std::mutex> lock(m_impl->mu);
     return m_impl->setDisplayIndexLocked(index);
-}
-
-void DesktopFrameSource::setDxgiRecoveryEnabled(bool enabled) {
-    std::lock_guard<std::mutex> lock(m_impl->mu);
-    m_impl->setDxgiRecoveryEnabledLocked(enabled);
 }
 
 std::vector<uint8_t> DesktopFrameSource::capturePreviewJpeg(int index, int maxWidth, int maxHeight, int quality) const {
