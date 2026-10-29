@@ -6770,6 +6770,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx.normalStreamerProcess = nullptr;
                 }
 
+                if (ctx.elevatedNormalInputProcess) {
+                    const DWORD rc = WaitForSingleObject(ctx.elevatedNormalInputProcess, 1200);
+                    if (rc == WAIT_TIMEOUT) {
+                        TerminateProcess(ctx.elevatedNormalInputProcess, 0);
+                        WaitForSingleObject(ctx.elevatedNormalInputProcess, 500);
+                    }
+                    CloseHandle(ctx.elevatedNormalInputProcess);
+                    ctx.elevatedNormalInputProcess = nullptr;
+                }
                 ctx.lastNormalFrameAt = {};
             }
 
@@ -6851,6 +6860,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         " err=" + std::to_string(GetLastError()));
                     ctx->secureInputPipe.Close();
                     ctx->normalInputPipe.Close();
+                ctx->elevatedNormalInputPipe.Close();
                     ctx->secureShmem.Close();
                     ctx->normalShmem.Close();
                     return;
@@ -6864,6 +6874,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->normalStopEvent = nullptr;
                     ctx->secureInputPipe.Close();
                     ctx->normalInputPipe.Close();
+                ctx->elevatedNormalInputPipe.Close();
                     ctx->secureShmem.Close();
                     ctx->normalShmem.Close();
                     return;
@@ -6968,6 +6979,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->normalStopEvent = nullptr;
                     ctx->secureInputPipe.Close();
                     ctx->normalInputPipe.Close();
+                ctx->elevatedNormalInputPipe.Close();
                     ctx->secureShmem.Close();
                     ctx->normalShmem.Close();
                     return;
@@ -7075,6 +7087,16 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 ctx.lastNormalLaunchAttempt = now - std::chrono::seconds(3);
                             }
                         }
+                    }
+
+                    if (ctx.normalInteractiveTrial && ctx.elevatedNormalInputProcess &&
+                        WaitForSingleObject(ctx.elevatedNormalInputProcess, 0) == WAIT_OBJECT_0) {
+                        LogW("[capture-test] privileged input helper exited, "
+                            "restoring system capture and input session=" + ctx.sessionId);
+                        ctx.normalInteractiveFallbackUsed = true;
+                        StopNormalStreamer(ctx);
+                        ctx.normalInteractiveTrial = false;
+                        ctx.lastNormalLaunchAttempt = now - std::chrono::seconds(3);
                     }
 
                     if (ctx.normalStreamerProcess) {
@@ -7551,6 +7573,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 ctx->secureInputPipe.Close();
                 ctx->normalInputPipe.Close();
+                ctx->elevatedNormalInputPipe.Close();
                 ctx->secureShmem.Close();
                 ctx->normalShmem.Close();
 
