@@ -1,0 +1,59 @@
+name: Windows Deep Inventory Source Check
+
+on:
+  pull_request:
+    paths:
+      - 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp'
+      - 'Agent/chatpass_agent/src/inventory/inventory_snapshot.h'
+      - '.github/workflows/windows-inventory-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-inventory:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install inventory JSON compile dependency
+        shell: pwsh
+        run: |
+          & C:\vcpkg\vcpkg.exe install nlohmann-json:x64-windows-static
+          if ($LASTEXITCODE -ne 0) { throw 'Windows inventory JSON dependency unavailable' }
+      - name: Compile actual shipping Windows inventory collector
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path (Get-Item 'Env:ProgramFiles(x86)').Value 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'VS C++ build tools unavailable' }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I C:\vcpkg\installed\x64-windows-static\include /I Agent/chatpass_agent/src /c Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp /Fodist\windows_inventory.obj'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw 'Actual Windows inventory source compile failed' }
+          if (-not (Test-Path dist/windows_inventory.obj)) { throw 'Inventory object missing' }
+      - name: Parse embedded PowerShell inventory script
+        shell: pwsh
+        run: |
+          $text = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
+          $start = $text.IndexOf('json DeepHardwareInventory()')
+          if ($start -lt 0) { throw 'Missing deep inventory function' }
+          $begin = $text.IndexOf('R"PS(', $start)
+          $finish = $text.IndexOf(')PS", json::object());', $begin)
+          if ($begin -lt 0 -or $finish -lt $begin) { throw 'Could not find PowerShell script boundaries' }
+          $script = $text.Substring($begin + 5, $finish - ($begin + 5))
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseInput($script, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            throw 'PowerShell inventory script has syntax errors'
+          }
+          $required = @('memory_modules','motherboard','physical_disks','monitors','drivers','problem_devices','printers','usb_devices','deep_inventory_sections')
+          foreach ($key in $required) {
+            if (-not $script.Contains($key)) { throw "Inventory result missing required $key" }
+          }
+          Write-Host "Deep Windows inventory PowerShell parsed and required payload keys present"
