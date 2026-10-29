@@ -76,3 +76,40 @@ jobs:
             if (-not $service.Contains($required)) { throw "Agent service is missing $required" }
           }
           Write-Host 'Eight-hour Agent-local deep scans and manual scan entry point are present'
+
+      - name: Execute the real deep inventory script with Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          # The actual Windows interpreter executes the embedded script, not just its parser.
+          $text = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_inventory.cpp' -Raw
+          $start = $text.IndexOf('json DeepHardwareInventory()')
+          $begin = $text.IndexOf('R"PS(', $start)
+          $finish = $text.IndexOf(')PS", json::object());', $begin)
+          if ($start -lt 0 -or $begin -lt 0 -or $finish -le $begin) { throw 'Embedded inventory script not found' }
+          $script = '$ProgressPreference = "SilentlyContinue"' + [Environment]::NewLine + '$ErrorActionPreference = "SilentlyContinue"' + [Environment]::NewLine + $text.Substring($begin + 5, $finish - $begin - 5)
+          $path = Join-Path $env:RUNNER_TEMP 'hi5-deep-inventory.ps1'
+          $output = Join-Path $env:RUNNER_TEMP 'hi5-deep-inventory.stdout'
+          $errors = Join-Path $env:RUNNER_TEMP 'hi5-deep-inventory.stderr'
+          Set-Content -Path $path -Value $script -Encoding UTF8
+          $arguments = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $path + '"'))
+          $process = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList $arguments -Wait -PassThru -RedirectStandardOutput $output -RedirectStandardError $errors
+          $stdout = Get-Content $output -Raw -ErrorAction SilentlyContinue
+          $stderr = Get-Content $errors -Raw -ErrorAction SilentlyContinue
+          if ($stderr) { Write-Host ('STDERR: ' + $stderr.Substring(0,[Math]::Min(2500,$stderr.Length))) }
+          if ($process.ExitCode -ne 0) {
+            if ($stdout) { Write-Host ('STDOUT: ' + $stdout.Substring(0,[Math]::Min(2500,$stdout.Length))) }
+            throw "PowerShell collector exited $($process.ExitCode)"
+          }
+          $report = $null
+          try { $report = $stdout | ConvertFrom-Json -ErrorAction Stop }
+          catch {
+            if ($stdout) { Write-Host ('STDOUT_START: ' + $stdout.Substring(0,[Math]::Min(2500,$stdout.Length))) }
+            if ($stdout) { Write-Host ('STDOUT_END: ' + $stdout.Substring([Math]::Max(0,$stdout.Length-2500))) }
+            throw 'PowerShell collector did not produce valid JSON'
+          }
+          if (-not $report.deep_inventory_sections) { throw 'PowerShell collector returned no deep inventory section statuses' }
+          $statuses = @($report.deep_inventory_sections.PSObject.Properties)
+          foreach ($s in $statuses) { Write-Host "$($s.Name): $($s.Value.status)" }
+          if (@($statuses | Where-Object { $_.Value.status -eq 'collected' }).Count -eq 0) {
+            throw 'PowerShell collector returned zero successful sections'
+          }
