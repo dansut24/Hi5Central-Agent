@@ -9,6 +9,7 @@
 #include "codec_universal_connection.h"
 #include "codec_runtime_proof.h"
 #include "codec_windows_qual_identity.h"
+#include "codec_windows_idle_probe.h"
 #include "ipc/input_pipe.h"
 #include "ipc/session_launcher.h"
 #include "ipc/shmem_ring.h"
@@ -2567,6 +2568,28 @@ LogI(
                 StartTelemetryLoop(ident);
                 StartJobLoop(ident);
                 StartAppPortalBroker(ident);
+
+                if (ReadConfigInt("HI5_UNIVERSAL_CODEC_LEARN", 0, 0, 1) == 1) {
+                    // Never run synthetic GPU tests on an incoming remote
+                    // connection. Probe once at startup, after an idle grace
+                    // period, with no screen capture and below-normal priority.
+                    // A partially successful encoder probe cannot trigger auto
+                    // hardware selection: browser decode is still required.
+                    const std::string probeBuild = kAgentVersion;
+                    std::thread([probeBuild]() {
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        Sleep(45000);
+                        const std::filesystem::path path =
+                            L"C:\\ProgramData\\Hi5Central\\Agent\\codec-qualification-v1.cache";
+                        const bool ok =
+                            hi5::universal_codec::probeIdleHardwareH264(
+                                probeBuild, path);
+                        LogI(std::string("[codec-universal] idle hardware-only H264 "
+                            "synthetic probe ") +
+                            (ok ? "completed (decoder unverified)" :
+                                  "skipped or failed safely"));
+                    }).detach();
+                }
 
                 auto codecProofs = std::make_shared<hi5::universal_codec::RuntimeProofStore>();
                 auto sendFn = [this, codecProofs](const std::string& payload) {
