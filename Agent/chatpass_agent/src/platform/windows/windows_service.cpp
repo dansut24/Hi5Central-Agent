@@ -5532,7 +5532,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 }
             }
 
-            void SendInventorySnapshotSafe(const AgentIdentity& ident) {
+            void SendInventorySnapshotSafe(const AgentIdentity& ident, bool forceDeep = false) {
                 if (!signaling_) return;
                 try {
                     auto snapshot = hi5::BuildInventorySnapshot(ident);
