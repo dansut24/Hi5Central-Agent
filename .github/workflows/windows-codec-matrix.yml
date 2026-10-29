@@ -5,6 +5,9 @@ on:
   pull_request:
     paths:
       - 'Agent/chatpass_agent/tests/windows_codec_matrix.cpp'
+      - 'Agent/chatpass_agent/tests/av1_rtp_payload_test.cpp'
+      - 'Agent/chatpass_agent/src/encoding/av1_rtp_payload_experimental.h'
+      - 'Agent/chatpass_agent/src/av1_mf_encoder.cpp'
       - 'Agent/chatpass_agent/src/h265_mf_encoder.cpp'
       - 'Agent/chatpass_agent/src/h265_mf_encoder.h'
       - '.github/workflows/windows-codec-matrix.yml'
@@ -12,6 +15,9 @@ on:
     branches: [main]
     paths:
       - 'Agent/chatpass_agent/tests/windows_codec_matrix.cpp'
+      - 'Agent/chatpass_agent/tests/av1_rtp_payload_test.cpp'
+      - 'Agent/chatpass_agent/src/encoding/av1_rtp_payload_experimental.h'
+      - 'Agent/chatpass_agent/src/av1_mf_encoder.cpp'
       - 'Agent/chatpass_agent/src/h265_mf_encoder.cpp'
       - 'Agent/chatpass_agent/src/h265_mf_encoder.h'
       - '.github/workflows/windows-codec-matrix.yml'
@@ -36,6 +42,15 @@ jobs:
           $command = 'call "' + $vcvars + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /MT /DNOMINMAX /I Agent/chatpass_agent/src Agent/chatpass_agent/tests/windows_codec_matrix.cpp Agent/chatpass_agent/src/h264_mf_encoder.cpp Agent/chatpass_agent/src/av1_mf_encoder.cpp Agent/chatpass_agent/src/h265_mf_encoder.cpp /link mfplat.lib mf.lib mfuuid.lib ole32.lib /OUT:dist\windows_codec_matrix.exe'
           cmd.exe /d /s /c $command
           if ($LASTEXITCODE -ne 0) { throw "codec matrix compile failed" }
+      - name: Validate AV1 RFC 9364 packetizer with MSVC
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vcvars = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $cmd = 'call "' + $vcvars + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 Agent/chatpass_agent/tests/av1_rtp_payload_test.cpp /Fe:dist\av1_rtp_payload_test.exe && dist\av1_rtp_payload_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "experimental AV1 packetization test failed" }
       - name: Probe H264 HEVC VP9 AV1 synthetic encoding
         shell: pwsh
         run: |
@@ -43,6 +58,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "640x360 codec matrix exited with error" }
           & dist/windows_codec_matrix.exe --1080p | Tee-Object -FilePath dist/windows-codec-matrix-1080p.txt
           if ($LASTEXITCODE -ne 0) { throw "1080p codec matrix exited with error" }
+          & dist/windows_codec_matrix.exe --hardware-only | Tee-Object -FilePath dist/windows-codec-hardware-only.txt
+          if ($LASTEXITCODE -ne 0) { throw "hardware-only codec matrix failed" }
+          & dist/windows_codec_matrix.exe --hardware-only --1080p | Tee-Object -FilePath dist/windows-codec-hardware-1080p.txt
+          if ($LASTEXITCODE -ne 0) { throw "1080p hardware-only codec matrix failed" }
+          $hardwareReport = (Get-Content dist/windows-codec-hardware-only.txt -Raw) + (Get-Content dist/windows-codec-hardware-1080p.txt -Raw)
+          if (-not $hardwareReport.Contains('hardware_only=1')) { throw "Hardware-only MFT filter not enabled" }
           $report = (Get-Content dist/windows-codec-matrix.txt -Raw) + (Get-Content dist/windows-codec-matrix-1080p.txt -Raw)
           foreach ($codec in @('H264:', 'H265/HEVC:', 'VP9:', 'AV1:', 'VP8:')) {
             if (-not $report.Contains($codec)) { throw "Codec missing from report: $codec" }
@@ -53,6 +74,9 @@ jobs:
           path: |
             dist/windows-codec-matrix.txt
             dist/windows-codec-matrix-1080p.txt
+            dist/windows-codec-hardware-only.txt
+            dist/windows-codec-hardware-1080p.txt
+            dist/av1_rtp_payload_test.exe
             dist/windows_codec_matrix.exe
           retention-days: 14
           if-no-files-found: error
