@@ -104,6 +104,9 @@ struct AsyncMfEventState {
     ComPtr<IMFMediaEventGenerator> generator;
     unsigned int needInput = 0;
     unsigned int haveOutput = 0;
+    unsigned int needInputEvents = 0;
+    unsigned int haveOutputEvents = 0;
+    unsigned int otherEvents = 0;
     bool waitFor(bool input, DWORD timeoutMs, std::string& diagnostic) {
         if (!generator) { diagnostic = "asynchronous MFT has no event generator"; return false; }
         const auto deadline = std::chrono::steady_clock::now() +
@@ -118,14 +121,14 @@ struct AsyncMfEventState {
                 if (FAILED(event->GetType(&type))) {
                     diagnostic = "async MFT GetType failed"; return false;
                 }
-                if (type == METransformNeedInput) ++needInput;
-                else if (type == METransformHaveOutput) ++haveOutput;
+                if (type == METransformNeedInput) { ++needInput; ++needInputEvents; }
+                else if (type == METransformHaveOutput) { ++haveOutput; ++haveOutputEvents; }
                 else if (type == MEError) {
                     HRESULT status = S_OK;
                     event->GetStatus(&status);
                     diagnostic = "async MFT reported MEError " + formatHr(status);
                     return false;
-                }
+                } else ++otherEvents;
                 continue;
             }
             if (hr != MF_E_NO_EVENTS_AVAILABLE) {
@@ -169,14 +172,9 @@ static Result run(const char* name, const GUID& outSubtype,
         ComPtr<IMFTransform> transform;
         if (!activates[i] || FAILED(activates[i]->ActivateObject(IID_PPV_ARGS(&transform))) || !transform) continue;
         r.activated = true;
-        if (hardware && SUCCEEDED(hardware->managerHr) && hardware->manager) {
-            const auto hr = transform->ProcessMessage(
-                MFT_MESSAGE_SET_D3D_MANAGER,
-                reinterpret_cast<ULONG_PTR>(hardware->manager.Get()));
-            r.deviceManagerStatus = formatHr(hr);
-        } else if (hardware) {
-            r.deviceManagerStatus = "hardware D3D11/MF device manager unavailable";
-        }
+        // Query D3D awareness before supplying a manager. Microsoft explicitly
+        // prohibits sending SET_D3D_MANAGER to an MFT without D3D awareness.
+        // A registered hardware encoder can still accept system-memory NV12.
         WCHAR* friendly = nullptr;
         UINT32 friendlyLen = 0;
         if (SUCCEEDED(activates[i]->GetAllocatedString(
@@ -191,13 +189,27 @@ static Result run(const char* name, const GUID& outSubtype,
             CoTaskMemFree(friendly);
         }
         ComPtr<IMFAttributes> attrs;
+        UINT32 asyncFlag = FALSE, d3d11Aware = FALSE, d3d9Aware = FALSE;
         if (SUCCEEDED(transform->GetAttributes(&attrs)) && attrs) {
-            attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            attrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag);
+            attrs->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware);
+            attrs->GetUINT32(MF_SA_D3D_AWARE, &d3d9Aware);
+            if (asyncFlag) attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
             attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
         }
+        if (d3d11Aware && hardware && SUCCEEDED(hardware->managerHr) && hardware->manager) {
+            const HRESULT hr = transform->ProcessMessage(
+                MFT_MESSAGE_SET_D3D_MANAGER,
+                reinterpret_cast<ULONG_PTR>(hardware->manager.Get()));
+            r.deviceManagerStatus = "d3d11_aware=1 attach=" + formatHr(hr);
+        } else if (d3d11Aware) {
+            r.deviceManagerStatus = "d3d11_aware=1 manager_unavailable";
+        } else {
+            r.deviceManagerStatus = d3d9Aware
+                ? "d3d11_aware=0 d3d9_aware=1 manager_skipped"
+                : "d3d11_aware=0 manager_skipped";
+        }
         // Hardware MFTs normally require event-driven input/output.
-        UINT32 asyncFlag = FALSE;
-        if (attrs) attrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag);
         const bool asynchronous = asyncFlag != FALSE;
         AsyncMfEventState asyncEvents;
         if (asynchronous) {
@@ -227,9 +239,19 @@ static Result run(const char* name, const GUID& outSubtype,
         }
         r.configured = true;
         MFT_OUTPUT_STREAM_INFO outputInfo{};
-        transform->GetOutputStreamInfo(0, &outputInfo);
-        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,0);
-        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM,0);
+        const HRESULT outInfoHr = transform->GetOutputStreamInfo(0, &outputInfo);
+        if (FAILED(outInfoHr)) {
+            r.note = "GetOutputStreamInfo failed " + formatHr(outInfoHr);
+            continue;
+        }
+        const HRESULT beginHr = transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,0);
+        const HRESULT startHr = transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM,0);
+        if (FAILED(beginHr) || FAILED(startHr)) {
+            r.note = "stream start failed begin=" + formatHr(beginHr) +
+                     " start=" + formatHr(startHr);
+            transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING,0);
+            continue;
+        }
         const size_t imageSize = size_t(width) * size_t(height) * 3 / 2;
         const auto wholeStart = std::chrono::steady_clock::now();
         double totalMs = 0, worst = 0;
@@ -303,7 +325,7 @@ static Result run(const char* name, const GUID& outSubtype,
                     continue;
                 }
                 if (FAILED(hr)) {
-                    r.note="MFT ProcessOutput failed";
+                    r.note="MFT ProcessOutput failed hr=" + formatHr(hr);
                     break;
                 }
                 ComPtr<IMFSample> got=packet.pSample;
@@ -335,6 +357,14 @@ static Result run(const char* name, const GUID& outSubtype,
             std::sort(encodeSamples.begin(), encodeSamples.end());
             const size_t rank = (encodeSamples.size()*95 + 99)/100 - 1;
             r.p95Ms = encodeSamples[rank];
+        }
+        if (asynchronous) {
+            r.asyncEventStatus += " need_input_events=" +
+                std::to_string(asyncEvents.needInputEvents) +
+                " have_output_events=" + std::to_string(asyncEvents.haveOutputEvents) +
+                " other_events=" + std::to_string(asyncEvents.otherEvents) +
+                " pending_input=" + std::to_string(asyncEvents.needInput) +
+                " pending_output=" + std::to_string(asyncEvents.haveOutput);
         }
         transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING,0);
     }
