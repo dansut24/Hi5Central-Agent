@@ -21,6 +21,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <numeric>
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mf.lib")
@@ -31,7 +32,7 @@ using Microsoft::WRL::ComPtr;
 
 // Default smoke runs quickly on a Windows CI runner. --1080p uses the
 // endpoint's actual Full HD workload and 40 frames, still synthetic.
-struct BenchmarkConfig { int width=640; int height=360; int fps=20; int frames=16; };
+struct BenchmarkConfig { int width=640; int height=360; int fps=20; int frames=16; bool hardwareOnly=false; };
 static BenchmarkConfig config;
 
 static GUID subtype(char a, char b, char c, char d) {
@@ -55,6 +56,8 @@ struct Result {
     int attempts = 0;
     double avgMs = 0;
     double worstMs = 0;
+    double p95Ms = 0;
+    std::string encoderName;
     std::string note;
 };
 
@@ -66,8 +69,12 @@ static Result run(const char* name, const GUID& outSubtype) {
     MFT_REGISTER_TYPE_INFO outInfo{MFMediaType_Video, outSubtype};
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
-    const UINT32 flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_LOCALMFT |
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
+    // Hardware-only mode must not enumerate generic software MFTs and
+    // must not silently fall back to CPU encoding.
+    const UINT32 flags = config.hardwareOnly
+        ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
+        : (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_LOCALMFT |
+           MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER);
     const HRESULT found = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags,
         &inInfo, &outInfo, &activates, &count);
     if (FAILED(found) || count == 0 || !activates) {
@@ -80,6 +87,19 @@ static Result run(const char* name, const GUID& outSubtype) {
         ComPtr<IMFTransform> transform;
         if (!activates[i] || FAILED(activates[i]->ActivateObject(IID_PPV_ARGS(&transform))) || !transform) continue;
         r.activated = true;
+        WCHAR* friendly = nullptr;
+        UINT32 friendlyLen = 0;
+        if (SUCCEEDED(activates[i]->GetAllocatedString(
+                MFT_FRIENDLY_NAME_Attribute, &friendly, &friendlyLen)) && friendly) {
+            const int bytes = WideCharToMultiByte(CP_UTF8, 0, friendly, -1, nullptr, 0, nullptr, nullptr);
+            if (bytes > 1) {
+                std::string name(static_cast<size_t>(bytes), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, friendly, -1, name.data(), bytes, nullptr, nullptr);
+                name.resize(static_cast<size_t>(bytes - 1));
+                r.encoderName = name;
+            }
+            CoTaskMemFree(friendly);
+        }
         ComPtr<IMFAttributes> attrs;
         if (SUCCEEDED(transform->GetAttributes(&attrs)) && attrs) {
             attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
@@ -108,6 +128,7 @@ static Result run(const char* name, const GUID& outSubtype) {
         const size_t imageSize = size_t(width) * size_t(height) * 3 / 2;
         const auto wholeStart = std::chrono::steady_clock::now();
         double totalMs = 0, worst = 0;
+        std::vector<double> encodeSamples;
         for (int frame = 0; frame < config.frames; ++frame) {
             const auto tick = std::chrono::steady_clock::now();
             ComPtr<IMFSample> sample;
@@ -172,6 +193,7 @@ static Result run(const char* name, const GUID& outSubtype) {
             }
             const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
             totalMs+=ms;
+            encodeSamples.push_back(ms);
             ++r.attempts;
             worst=std::max(worst,ms);
             if(std::chrono::steady_clock::now()-wholeStart>std::chrono::seconds(4)) {
@@ -181,6 +203,11 @@ static Result run(const char* name, const GUID& outSubtype) {
         }
         r.avgMs=totalMs/std::max(1,r.attempts);
         r.worstMs=worst;
+        if (!encodeSamples.empty()) {
+            std::sort(encodeSamples.begin(), encodeSamples.end());
+            const size_t rank = (encodeSamples.size()*95 + 99)/100 - 1;
+            r.p95Ms = encodeSamples[rank];
+        }
         transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING,0);
     }
     for(UINT32 i=0;i<count;++i)if(activates[i])activates[i]->Release();
@@ -236,11 +263,18 @@ static void exerciseAgentEncoder(const char* codec) {
 }
 
 int main(int argc, char** argv) {
-    if (argc==2 && std::string(argv[1])=="--1080p") {
-        config={1920,1080,20,40};
-    } else if(argc>1) {
-        std::cerr << "Usage: windows_codec_matrix.exe [--1080p]\\n";
-        return 2;
+    // Strict hardware qualification is a separate, opt-in workload.
+    // It never captures the real desktop and does not enable SDP/RTP.
+    for (int i=1;i<argc;++i) {
+        const std::string arg(argv[i]);
+        if (arg=="--1080p") {
+            config.width=1920; config.height=1080; config.frames=40;
+        } else if (arg=="--hardware-only") {
+            config.hardwareOnly=true;
+        } else {
+            std::cerr << "Usage: windows_codec_matrix.exe [--1080p] [--hardware-only]\n";
+            return 2;
+        }
     }
     const HRESULT init=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(FAILED(MFStartup(MF_VERSION,MFSTARTUP_LITE))) {
@@ -251,18 +285,24 @@ int main(int argc, char** argv) {
         std::cout<<r.name<<": detected="<<r.discovered
             <<" active="<<r.activated<<" configured="<<r.configured
             <<" frames="<<r.frames<<" attempts="<<r.attempts<<" avg_ms="<<std::fixed<<std::setprecision(1)
-            <<r.avgMs<<" max_ms="<<r.worstMs<<" note="<<r.note<<"\n";
+            <<r.avgMs<<" p95_ms="<<r.p95Ms<<" max_ms="<<r.worstMs
+            <<" encoder="<<r.encoderName<<" note="<<r.note<<"\n";
     };
     std::cout<<"Synthetic Windows MFT encoder qualification (not browser RTP validation) "
-        <<config.width<<"x"<<config.height<<" @"<<config.fps<<"fps frames="<<config.frames<<"\n";
+        <<config.width<<"x"<<config.height<<" @"<<config.fps<<"fps frames="<<config.frames
+        <<" hardware_only="<<config.hardwareOnly<<"\n";
     std::cout<<"VP8: existing libvpx production encoder; not benchmarked by this MFT-only test\n";
     print(run("H264",subtype('H','2','6','4')));
     print(run("H265/HEVC",subtype('H','E','V','C')));
     print(run("VP9",subtype('V','P','9','0')));
     print(run("AV1",subtype('A','V','0','1')));
-    exerciseAgentEncoder<H264MfEncoder,H264EncodedFrame>("H264");
-    exerciseAgentEncoder<Av1MfEncoder,Av1EncodedFrame>("AV1");
-    exerciseAgentEncoder<H265MfEncoder,H265EncodedFrame>("H265/HEVC");
+    if (!config.hardwareOnly) {
+        // These encoder wrappers may fall back to software; never count
+        // their output as evidence of GPU encoding in hardware-only mode.
+        exerciseAgentEncoder<H264MfEncoder,H264EncodedFrame>("H264");
+        exerciseAgentEncoder<Av1MfEncoder,Av1EncodedFrame>("AV1");
+        exerciseAgentEncoder<H265MfEncoder,H265EncodedFrame>("H265/HEVC");
+    }
     MFShutdown();
     if(SUCCEEDED(init)) CoUninitialize();
     return 0; // Hardware absence is a capability result, not CI failure.
