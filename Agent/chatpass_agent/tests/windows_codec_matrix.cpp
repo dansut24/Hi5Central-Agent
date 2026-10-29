@@ -65,6 +65,7 @@ struct Result {
     std::string asyncEventStatus;
     std::string outputStreamInfo;
     std::string firstOutputObservation;
+    std::string postChangeOutputObservation;
     UINT32 encoderCandidates = 0;
     UINT32 candidateNumber = 0;
     UINT32 outputEventsConsumed = 0;
@@ -184,6 +185,7 @@ static Result run(const char* name, const GUID& outSubtype,
         r.activated = true;
         r.candidateNumber = i + 1;
         r.firstOutputObservation.clear();
+        r.postChangeOutputObservation.clear();
         r.outputEventsConsumed = 0;
         r.emptyOutputSamples = 0;
         r.streamChanges = 0;
@@ -319,19 +321,28 @@ static Result run(const char* name, const GUID& outSubtype,
                          " flags=" + std::to_string(inputFlags);
                 break;
             }
-            if (asynchronous) {
-                std::string waitStatus;
-                if (!asyncEvents.waitFor(false, 250, waitStatus)) {
-                    // An encoder may buffer frames; keep gathering inputs,
-                    // but report the missing event if no frame is produced.
-                    if (!r.produced && r.note.empty()) r.note = "MFT output event: " + waitStatus;
-                    continue;
-                }
-            }
-            // A single encoded sample can require a bounded output type
-            // reconfiguration before any bytes are emitted. Do not feed a
-            // second input while the first output format is invalid.
+            // Asynchronous MFTs permit *one* ProcessOutput per
+            // METransformHaveOutput. In particular, after a format-change
+            // response and SetOutputType, the next output event must be
+            // consumed before retrying. Previously we called ProcessOutput
+            // a second time without waiting for its event, which could
+            // return E_UNEXPECTED while leaving HaveOutput pending.
+            bool stopEncoder = false;
+            bool outputRenegotiatedThisFrame = false;
             for (int poll=0;poll<6;++poll) {
+                if (asynchronous) {
+                    std::string waitStatus;
+                    if (!asyncEvents.waitFor(false, 1000, waitStatus)) {
+                        if (outputRenegotiatedThisFrame) {
+                            r.note = "no new METransformHaveOutput after successful "
+                                     "SetOutputType: " + waitStatus;
+                            stopEncoder = true;
+                        } else if (!r.produced && r.note.empty()) {
+                            r.note = "MFT output event: " + waitStatus;
+                        }
+                        break;
+                    }
+                }
                 ComPtr<IMFSample> outSample;
                 ComPtr<IMFMediaBuffer> outBuffer;
                 MFT_OUTPUT_DATA_BUFFER packet{};
@@ -348,15 +359,20 @@ static Result run(const char* name, const GUID& outSubtype,
                 // zero-length sample, or a caller/encoder-owned sample. Keep
                 // the first observation even if a later input wait times out.
                 const bool samplePresent = packet.pSample != nullptr;
-                if (r.firstOutputObservation.empty()) {
-                    r.firstOutputObservation = "hr=" + formatHr(hr) +
-                        " status=" + std::to_string(status) +
-                        " packet_status=" + std::to_string(packet.dwStatus) +
-                        " sample_present=" + std::to_string(samplePresent ? 1 : 0);
-                }
+                const std::string observed = "hr=" + formatHr(hr) +
+                    " status=" + std::to_string(status) +
+                    " packet_status=" + std::to_string(packet.dwStatus) +
+                    " sample_present=" + std::to_string(samplePresent ? 1 : 0);
+                if (r.firstOutputObservation.empty())
+                    r.firstOutputObservation = observed;
+                if (r.completedRenegotiations > 0 &&
+                    r.postChangeOutputObservation.empty())
+                    r.postChangeOutputObservation = observed;
                 if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-                    if (asynchronous && r.note.empty())
+                    if (asynchronous) {
                         r.note = "async MFT ProcessOutput unexpectedly requested more input";
+                        stopEncoder = true;
+                    }
                     if (packet.pEvents) packet.pEvents->Release();
                     break;
                 }
@@ -368,6 +384,7 @@ static Result run(const char* name, const GUID& outSubtype,
                     ++r.streamChanges;
                     if (r.streamChanges > 3) {
                         r.note = "excessive output format changes (max 3)";
+                        stopEncoder = true;
                         break;
                     }
                     // The physical Lenovo's Quick Sync H.264 MFT returns
@@ -411,6 +428,7 @@ static Result run(const char* name, const GUID& outSubtype,
                     if (!selected) {
                         r.note = "H264 output type renegotiation failed: " +
                             r.renegotiationStatus;
+                        stopEncoder = true;
                         break;
                     }
                     ++r.completedRenegotiations;
@@ -420,18 +438,23 @@ static Result run(const char* name, const GUID& outSubtype,
                     if (FAILED(infoHr)) {
                         r.note = "renegotiated GetOutputStreamInfo failed " +
                             formatHr(infoHr);
+                        stopEncoder = true;
                         break;
                     }
                     r.outputStreamInfo = "stream_flags=" +
                         std::to_string(outputInfo.dwFlags) +
                         " cbSize=" + std::to_string(outputInfo.cbSize);
-                    // Retry ProcessOutput for this same input frame before
-                    // waiting for another NeedInput event.
+                    // The MFT may emit another HaveOutput event for the
+                    // original input after applying the output type.
+                    // The next iteration consumes that event *before* calling
+                    // ProcessOutput, never submitting new input prematurely.
+                    outputRenegotiatedThisFrame = true;
                     continue;
                 }
                 if (FAILED(hr)) {
                     if (r.note.empty()) r.note="MFT ProcessOutput failed hr=" + formatHr(hr);
                     if (packet.pEvents) packet.pEvents->Release();
+                    stopEncoder = true;
                     break;
                 }
                 // pSample is a borrowed pointer when caller supplies it; an
@@ -451,8 +474,10 @@ static Result run(const char* name, const GUID& outSubtype,
                     r.firstOutputObservation += " caller_supplied=" +
                         std::to_string(outSample ? 1 : 0);
                 }
-                if (r.firstOutputObservation.find(" encoded_bytes=") == std::string::npos)
-                    r.firstOutputObservation += " buffer_hr=" + formatHr(bufferHr) +
+                auto& outputObservation = r.completedRenegotiations > 0
+                    ? r.postChangeOutputObservation : r.firstOutputObservation;
+                if (outputObservation.find(" encoded_bytes=") == std::string::npos)
+                    outputObservation += " buffer_hr=" + formatHr(bufferHr) +
                         " encoded_bytes=" + std::to_string(encoded);
                 if (packet.pEvents) packet.pEvents->Release();
                 if (encoded > 0) {
@@ -464,6 +489,7 @@ static Result run(const char* name, const GUID& outSubtype,
                 }
                 break;
             }
+            if (stopEncoder) break;
             const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
             totalMs+=ms;
             encodeSamples.push_back(ms);
@@ -579,6 +605,7 @@ int main(int argc, char** argv) {
             <<" renegotiated="<<r.completedRenegotiations
             <<" renegotiation="<<r.renegotiationStatus
             <<" first_output="<<r.firstOutputObservation
+            <<" post_change_output="<<r.postChangeOutputObservation
             <<" note="<<r.note<<"\n";
     };
     std::cout<<"Synthetic Windows MFT encoder qualification (not browser RTP validation) "
