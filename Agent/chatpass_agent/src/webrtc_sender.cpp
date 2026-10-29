@@ -131,11 +131,17 @@ namespace {
 
     static I420Frame scaleI420ForH264WebRtc(const I420Frame& src, bool* scaledOut = nullptr) {
         const bool sharp = h264SharpTextTrialEnabled();
-        // Constrained Baseline L3.1 = 720p; the opt-in L4.0 trial allows
-        // up to 1080p/30, preserving full-size desktop text when possible.
-        // Never allow a caller override to exceed the negotiated H264 level.
-        const int maxW = readEnvInt("HI5_H264_MAX_WIDTH", sharp ? 1920 : 1280, 2, sharp ? 1920 : 1280);
-        const int maxH = readEnvInt("HI5_H264_MAX_HEIGHT", sharp ? 1080 : 720, 2, sharp ? 1080 : 720);
+        // Constrained Baseline L3.1 = 720p; opt-in L4.0 = up to 1080p.
+        // Older deployments may have MACHINE-SCOPE HI5_H264_MAX_* = 1280/720
+        // from historical L3.1 testing. Do not let that stale global setting
+        // silently defeat an explicit service-scoped sharp-text trial.
+        // Sharp mode has its OWN independent bounds, clamped to L4.0.
+        const int maxW = sharp
+            ? readEnvInt("HI5_H264_SHARP_MAX_WIDTH", 1920, 2, 1920)
+            : readEnvInt("HI5_H264_MAX_WIDTH", 1280, 2, 1280);
+        const int maxH = sharp
+            ? readEnvInt("HI5_H264_SHARP_MAX_HEIGHT", 1080, 2, 1080)
+            : readEnvInt("HI5_H264_MAX_HEIGHT", 720, 2, 720);
         return scaleI420ToWebRtcBounds(src, maxW, maxH, scaledOut);
     }
 
@@ -1630,6 +1636,25 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             readEnvInt("HI5_VP9_DESKTOP_FPS", 20, 1, 60)));
         profile.bitrateKbps = std::max(250, std::min(m_bitrateKbps,
             readEnvInt("HI5_VP9_DESKTOP_KBPS", 6000, 500, 20000)));
+    }
+
+    // H.264 must NOT inherit the VP8 idle profile (2fps / 1200kbps).
+    // H.264 Media Foundation currently sets bitrate at encoder creation and
+    // does not retune it on every wake/motion transition. Its first frame is
+    // normally an idle frame, which previously locked the entire session to
+    // a 1200kbps encode even with "Prioritise clarity" / 8000kbps selected.
+    // Keep a stable real-time encoder configuration; capture cadence still
+    // saves resources whenever the desktop is truly idle.
+    if (m_videoCodec == VideoCodec::H264 && !m_externalHintBackstage.load()) {
+        profile.name = "h264-desktop-clarity";
+        profile.fps = std::max(1, std::min(m_fps,
+            readEnvInt("HI5_H264_DESKTOP_FPS", 20, 1, 60)));
+        profile.bitrateKbps = std::max(250, std::min(m_bitrateKbps,
+            readEnvInt("HI5_H264_DESKTOP_KBPS", 8000, 250, 20000)));
+        const int requestedFps = m_viewerTargetFps.load();
+        const int requestedKbps = m_viewerTargetBitrateKbps.load();
+        if (requestedFps > 0) profile.fps = std::min(profile.fps, requestedFps);
+        if (requestedKbps > 0) profile.bitrateKbps = std::min(profile.bitrateKbps, requestedKbps);
     }
 
     // The feedback-driven Viewer caps both VP8 and VP9. Previously these
