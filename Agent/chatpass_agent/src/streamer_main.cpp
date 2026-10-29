@@ -740,6 +740,7 @@ namespace hi5 {
         std::signal(SIGTERM, SignalHandler);
 
         const Args args = ParseArgs(argc, argv);
+        const bool isSecureHelper = IsSecureHelperArgs(args);
         if (args.sessionId.empty() || args.shmemName.empty()) {
             LogError("[streamer] missing required args");
             return 1;
@@ -784,6 +785,7 @@ namespace hi5 {
 
         DesktopFrameSource source;
         source.setDisplayIndex(args.display);
+        source.setDxgiRecoveryEnabled(!isSecureHelper);
         LogInfo("[streamer] capture source ready session=" + args.sessionId +
             " selected_display=" + std::to_string(source.currentDisplayIndex()) +
             " gdi_fallback=" + std::string(source.currentDisplayIndex() == -1 ? "1" : "0"));
@@ -793,7 +795,6 @@ namespace hi5 {
 
         int currentDisplay = args.display;
         bool lastSecureState = false;
-        const bool isSecureHelper = IsSecureHelperArgs(args);
         bool secureDesktopEnding = false;
         std::chrono::steady_clock::time_point secureDesktopEndedAt{};
         int consecutiveResetFailures = 0;
@@ -959,6 +960,7 @@ namespace hi5 {
                 try {
                     DesktopFrameSource resetSource;
                     resetSource.setDisplayIndex(currentDisplay);
+                    resetSource.setDxgiRecoveryEnabled(!isSecureHelper);
                     source = std::move(resetSource);
                     consecutiveResetFailures = 0;
                     if (inputPipeOk) {
