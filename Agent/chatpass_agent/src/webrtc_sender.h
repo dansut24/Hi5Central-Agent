@@ -178,6 +178,8 @@ private:
     uint64_t m_externalSentFrames = 0;
     double m_externalEncodeMsTotal = 0.0;
     double m_externalEncodeMsMax = 0.0;
+    // Bounded per-frame encoder timings for a real five-second p95.
+    std::vector<double> m_externalEncodeMsSamples;
     double m_externalSendMsTotal = 0.0;
     double m_externalSendMsMax = 0.0;
     int m_externalKeyframeEvery = 30;
