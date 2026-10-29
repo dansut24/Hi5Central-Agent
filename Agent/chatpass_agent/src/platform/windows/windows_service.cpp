@@ -6,6 +6,7 @@
 #include "webrtc_sender.h"
 #include "codec_capabilities.h"
 #include "codec_policy.h"
+#include "encoding/auto_codec_cooldown.h"
 #include "ipc/input_pipe.h"
 #include "ipc/session_launcher.h"
 #include "ipc/shmem_ring.h"
@@ -38,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -66,6 +68,35 @@ namespace hi5 {
         static void LogI(const std::string& s) { LogInfo("[service] " + s); }
         static void LogW(const std::string& s) { LogWarn("[service] " + s); }
         static void LogE(const std::string& s) { LogError("[service] " + s); }
+
+        // A sustained overload observed during a real remote session is a
+        // stronger signal than eight synthetic benchmark frames. Persist this
+        // small, content-free marker so an Agent restart does not immediately
+        // choose the codec that just failed. Explicit VP9 remains available.
+        static std::filesystem::path Vp9AutoOverloadStampPath() {
+            return std::filesystem::path(L"C:\\ProgramData\\Hi5Central\\Agent") /
+                L"vp9-auto-last-overload.txt";
+        }
+
+        static std::int64_t ReadVp9AutoOverloadEpoch() {
+            std::ifstream saved(Vp9AutoOverloadStampPath());
+            std::int64_t stamp = 0;
+            if (!(saved >> stamp)) return 0;
+            return stamp;
+        }
+
+        static bool RememberVp9AutoOverload() {
+            const auto stamp = Vp9AutoOverloadStampPath();
+            std::error_code error;
+            std::filesystem::create_directories(stamp.parent_path(), error);
+            if (error) return false;
+            std::ofstream out(stamp, std::ios::trunc);
+            if (!out) return false;
+            out << static_cast<std::int64_t>(std::time(nullptr)) << '\n';
+            out.flush();
+            return static_cast<bool>(out);
+        }
+
 
         static std::wstring Utf8ToWide(const std::string& value) {
             if (value.empty()) return std::wstring();
@@ -2352,6 +2383,12 @@ hi5::CodecSelectionResult codecProbe =
 // session; a different codec needs a new negotiated session.
 std::string autoSessionCodec = "vp8";
 std::string autoSessionReason = "VP8 safe default";
+const int vp9AutoCooldownHours = ReadConfigInt("HI5_VP9_AUTO_COOLDOWN_HOURS", 24, 1, 168);
+const std::int64_t lastVp9OverloadEpoch = ReadVp9AutoOverloadEpoch();
+const bool vp9AutoCooldownActive = Vp9AutoCooldownActive(
+    lastVp9OverloadEpoch,
+    static_cast<std::int64_t>(std::time(nullptr)),
+    vp9AutoCooldownHours);
 if (codecDecision.requestedMode == "auto") {
     bool vp9Available = false;
     for (const auto& capability : codecProbe.capabilities) {
@@ -2362,7 +2399,12 @@ if (codecDecision.requestedMode == "auto") {
         }
     }
     const unsigned int cpuThreads = std::thread::hardware_concurrency();
-    if (!vp9Available) {
+    if (vp9AutoCooldownActive) {
+        autoSessionReason = "VP8 safe fallback; recent real-session VP9 encoder overload (persistent cooldown)";
+        LogW("[codec-auto] VP9 suppressed for future Auto sessions; hours=" +
+            std::to_string(vp9AutoCooldownHours) +
+            " last_overload_epoch=" + std::to_string(lastVp9OverloadEpoch));
+    } else if (!vp9Available) {
         autoSessionReason = "VP9 encoder unavailable";
     } else if (cpuThreads != 0 && cpuThreads < 4) {
         autoSessionReason = "fewer than four logical CPUs; protecting endpoint performance";
@@ -2487,11 +2529,12 @@ if (codecDecision.requestedMode == "auto") {
             // Give VP9 a modest quality/compression benefit allowance, but
             // NEVER choose it merely because an encoder exists or because
             // it can run as much as 3x slower than VP8.
-            constexpr double vp9AbsoluteCeilingMs = 22.0;
-            const double vp9RelativeCeilingMs = std::max(7.5, vp8Ms * 1.6);
-            const bool vp9Competitive = !vp9Failed && vp8Count >= 4 &&
-                vp9Count >= 4 && vp9Ms <= vp9AbsoluteCeilingMs &&
-                vp9Ms <= vp9RelativeCeilingMs && vp9MaxMs <= 40.0;
+            const double vp9RelativeCeilingMs = std::max(7.5, vp8Ms * 1.35);
+            const bool vp9Competitive = Vp9CompetitiveForAuto({
+                vp8Ms, vp9Ms, vp9MaxMs,
+                static_cast<unsigned int>(vp8Count),
+                static_cast<unsigned int>(vp9Count), vp9Failed
+            });
             autoSessionCodec = vp9Competitive ? "vp9_sw" : "vp8";
             autoSessionReason = vp9Competitive ?
                 "VP9 measured within real-time and relative CPU budgets at 1080p" :
@@ -6978,8 +7021,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     autoSessionCodec == "vp9_sw") {
                     ctx->sender->setEncoderOverloadHandler([this, sid = sessionId]() {
                         if (!autoVp9Overloaded_.exchange(true)) {
+                            const bool persisted = RememberVp9AutoOverload();
                             LogW("[codec-auto] future sessions will select VP8 after " +
-                                sid + " demonstrated sustained VP9 overload");
+                                sid + " demonstrated sustained VP9 overload; persisted=" +
+                                std::string(persisted ? "true" : "false"));
                         }
                     });
                 }
