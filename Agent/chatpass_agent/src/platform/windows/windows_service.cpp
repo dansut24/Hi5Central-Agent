@@ -2571,6 +2571,7 @@ LogI(
                     };
 
                 signaling_->onOpen([this, ident]() {
+                    signalingConnected_.store(true);
                     LogI("websocket connected");
                     if (signaling_) {
                         signaling_->send(json{{"type", "hello"}, {"agent_version", kAgentVersion}}.dump());
@@ -2836,6 +2837,7 @@ LogI(
                     });
 
                 signaling_->onClosed([this]() {
+                    signalingConnected_.store(false);
                     LogW("websocket closed; stopping active remote sessions and streamer helpers");
                     for (;;) {
                         std::string nextId;
@@ -5549,7 +5551,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             }
 
             json SendInventorySnapshotSafe(const AgentIdentity& ident, bool forceDeep = false, bool allowScheduledDeep = false) {
-                if (!signaling_) return {{"inventory_sent", false}, {"deep_inventory_status", "offline"}};
+                // Never build or attempt any inventory when signaling is disconnected.
+                if (!signaling_ || !signalingConnected_.load()) return {{"inventory_sent", false}, {"deep_inventory_status", "offline"}};
                 try {
                     auto snapshot = hi5::BuildInventorySnapshot(ident, forceDeep, allowScheduledDeep);
                     signaling_->send(snapshot.dump());
@@ -5585,6 +5588,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             std::this_thread::sleep_for(std::chrono::seconds(1));
                         }
                         if (stop_.load()) break;
+                        // A disconnected device does not attempt inventory or queue work.
+                        // When the socket reconnects, the Agent-local eight-hour checkpoint
+                        // determines whether the next online, idle pass is due.
+                        if (!signalingConnected_.load()) continue;
                         if (HasActiveSessions()) {
                             LogI("scheduled full inventory skipped while remote session is active");
                             continue;
@@ -7622,6 +7629,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             AgentPresenceController presenceController_;
             ChatController chatController_;
             std::unique_ptr<SignalingClient> signaling_;
+            std::atomic<bool> signalingConnected_{ false };
             std::thread inventoryThread_;
 
             std::mutex sessionsMu_;
