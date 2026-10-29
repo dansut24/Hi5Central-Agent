@@ -18,7 +18,11 @@ int main() {
     f.v.assign(640*360/4,128);
     unsigned int encoded=0, packetized=0, keyframes=0;
     double worstMs=0.0;
-    for (int i=0;i<10;++i) {
+    double startupMs=0.0;
+    std::vector<double> steadyMs;
+    constexpr int warmupFrames = 8;
+    constexpr int totalFrames = 40;
+    for (int i=0;i<totalFrames;++i) {
         // Nontrivial changing blocks approximate window movement without
         // reading the real desktop, credentials or UI.
         for(int row=0;row<f.height;++row) {
@@ -33,6 +37,8 @@ int main() {
         const double elapsed=std::chrono::duration<double,std::milli>(
             std::chrono::steady_clock::now()-before).count();
         worstMs=std::max(elapsed,worstMs);
+        if (i==0) startupMs=elapsed;
+        if (i>=warmupFrames) steadyMs.push_back(elapsed);
         for(const auto& p:packets) {
             ++encoded;
             if(p.keyframe) ++keyframes;
@@ -51,8 +57,17 @@ int main() {
     assert(keyframes>0);
     assert(packetized>0);
     encoder.shutdown();
+    assert(steadyMs.size()==totalFrames-warmupFrames);
+    std::sort(steadyMs.begin(),steadyMs.end());
+    const double p95Ms=steadyMs[(steadyMs.size()*95+99)/100-1];
+    const double steadyWorstMs=steadyMs.back();
+    const bool realTime20Fps = p95Ms <= 35.0 && steadyWorstMs <= 50.0;
     std::cout<<"LIBAOM_REALTIME_SCREEN_AV1_PASS "
              <<"encoded_frames="<<encoded
              <<" rtp_payloads="<<packetized
-             <<" worst_encode_ms="<<worstMs<<"\n";
+             <<" first_frame_ms="<<startupMs
+             <<" p95_steady_ms="<<p95Ms
+             <<" worst_steady_ms="<<steadyWorstMs
+             <<" worst_including_startup_ms="<<worstMs
+             <<" realtime_20fps_qualified="<<(realTime20Fps?"yes":"no")<<"\n";
 }
