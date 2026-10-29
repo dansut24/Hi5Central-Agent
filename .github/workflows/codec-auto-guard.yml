@@ -4,6 +4,10 @@ on:
   pull_request:
     paths:
       - 'Agent/chatpass_agent/src/encoding/auto_codec_cooldown.h'
+      - 'Agent/chatpass_agent/src/encoding/encoder_latency_window.h'
+      - 'Agent/chatpass_agent/src/webrtc_sender.cpp'
+      - 'Agent/chatpass_agent/src/webrtc_sender.h'
+      - 'Agent/chatpass_agent/tests/encoder_latency_window_test.cpp'
       - 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp'
       - 'Agent/chatpass_agent/tests/auto_codec_cooldown_test.cpp'
       - '.github/workflows/codec-auto-guard.yml'
@@ -29,6 +33,9 @@ jobs:
           $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 Agent/chatpass_agent/tests/auto_codec_cooldown_test.cpp /Fe:dist\auto_codec_cooldown_test.exe && dist\auto_codec_cooldown_test.exe'
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw 'Codec auto fallback tests failed' }
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 Agent/chatpass_agent/tests/encoder_latency_window_test.cpp /Fe:dist\\encoder_latency_window_test.exe && dist\\encoder_latency_window_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw 'Encoder p95 latency tests failed' }
           $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 Agent/chatpass_agent/tests/sustained_encoder_health_test.cpp /Fe:dist\sustained_encoder_health_test.exe && dist\sustained_encoder_health_test.exe'
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw 'Live encoder overload policy tests failed' }
@@ -40,6 +47,11 @@ jobs:
             if (-not $text.Contains($token)) { throw "Codec integration missing: $token" }
           }
           $sender = Get-Content 'Agent/chatpass_agent/src/webrtc_sender.cpp' -Raw
+          $capture = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
+          if (-not $capture.Contains('ctx.sender->negotiatedVideoCodecName()')) { throw 'Capture diagnostics must report negotiated codec' }
+          foreach ($token in @('m_externalEncodeLatency.record(encodeMs)', 'encode_p95_ms', 'm_externalEncodeLatency.clear()')) {
+            if (-not $sender.Contains($token)) { throw "Encoder latency telemetry missing: $token" }
+          }
           foreach ($token in @('m_vp9Health.observeWindow(', 'if (nativeRequested)', 'm_vp9NativeFailed = true;', 'm_forceKeyframe = true;', 'without SDP renegotiation')) {
             if (-not $sender.Contains($token)) { throw "Native VP9 recovery missing: $token" }
           }
