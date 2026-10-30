@@ -15,21 +15,21 @@ jobs:
       - name: Retrieve qualified Windows standalone libaom executable
         uses: actions/download-artifact@v4
         with:
-          run-id: 41017289582
-          artifact-ids: 12959389038
+          run-id: 41053464136
+          artifact-ids: 12975886710
           github-token: ${{ github.token }}
           path: artifact
       - name: Check exact artifact hash; publish only executable
         shell: bash
         run: |
           set -euo pipefail
-          cp artifact/windows-av1-lenovo-portable-qualifier/av1_lenovo_qualifier.exe AV1LenovoSoftwareQualifier.exe
-          echo 'a7a3268d1c8e271dda061c5bd8e95af456f0a89ff46f73053cf806977069959f  AV1LenovoSoftwareQualifier.exe' | sha256sum -c -
-          file AV1LenovoSoftwareQualifier.exe
+          cp artifact/windows-av1-lenovo-portable-qualifier/av1_lenovo_qualifier.exe AV1LenovoSoftwareQualifier-720p60.exe
+          echo '2444f3c02bbcc36e396d091c08b4e376f1b90ad1d804d737d00ef9e123a6b8a4  AV1LenovoSoftwareQualifier-720p60.exe' | sha256sum -c -
+          file AV1LenovoSoftwareQualifier-720p60.exe
       - name: Add to existing pre-release (no new production version)
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view agent-1.0.196-test --repo "${{ github.repository }}" --json isPrerelease
-          gh release upload agent-1.0.196-test AV1LenovoSoftwareQualifier.exe --repo "${{ github.repository }}" --clobber
+          gh release view agent-1.0.213-test --repo "${{ github.repository }}" --json isPrerelease
+          gh release upload agent-1.0.213-test AV1LenovoSoftwareQualifier-720p60.exe --repo "${{ github.repository }}" --clobber
