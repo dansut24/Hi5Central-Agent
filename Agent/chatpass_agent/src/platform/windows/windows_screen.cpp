@@ -1040,6 +1040,7 @@ struct DesktopFrameSource::Impl {
 
     FrameCaptureResult captureGdiDisplayLocked(const DisplayInfo& display) {
         FrameCaptureResult result;
+        result.backend = DesktopCaptureBackend::Gdi;
         if (display.width <= 0 || display.height <= 0) {
             result.frame = lastFrame;
             result.hasFrame = !lastFrame.y.empty();
@@ -1113,7 +1114,11 @@ struct DesktopFrameSource::Impl {
             std::vector<uint8_t> bgra;
             int w = 0, h = 0, pitch = 0;
             std::string error;
+            const auto wgcReadStarted = std::chrono::steady_clock::now();
             if (wgc->TryReadBgra(bgra, w, h, pitch, error)) {
+                // Includes WGC frame acquisition, GPU staging map and CPU readback.
+                const double readbackMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - wgcReadStarted).count();
                 // Compare suspected empty compositor output against GDI.
                 // Truly dark desktops remain valid; nonempty GDI means WGC
                 // returned an unusable frame, so stop WGC for this session.
@@ -1171,12 +1176,18 @@ struct DesktopFrameSource::Impl {
                     compositeCursorBgra(target->info.x, target->info.y,
                                         w, h, bgra, pitch);
                 }
+                const auto convertStarted = std::chrono::steady_clock::now();
                 bgraToI420(bgra.data(), pitch, w, h, frame);
+                const double convertMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - convertStarted).count();
                 lastFrame = frame;
                 FrameCaptureResult result;
                 result.frame = std::move(frame);
                 result.hasFrame = true;
                 result.changed = true;
+                result.backend = DesktopCaptureBackend::Wgc;
+                result.wgcReadbackMs = readbackMs;
+                result.wgcConversionMs = convertMs;
                 result.changedIsNative = true; // WGC compositor delivered a new frame
                 result.frameId = ++frameId;
                 if (!wgcReceivedFrame) {
@@ -1197,9 +1208,12 @@ struct DesktopFrameSource::Impl {
                 wgc.reset();
                 lastDxgiRetry = std::chrono::steady_clock::now();
             } else if (wgcReceivedFrame && !lastFrame.y.empty()) {
+                // TryGetNextFrame returned no compositor update. The streamer
+                // will not publish an unchanged frame. Avoid copying the
+                // cached multi-megabyte I420 image on every empty WGC poll;
+                // it remains in lastFrame for recovery and other APIs.
                 FrameCaptureResult result;
-                result.frame = lastFrame;
-                result.hasFrame = true;
+                result.backend = DesktopCaptureBackend::Wgc;
                 result.changed = false;
                 result.frameId = frameId;
                 return result;
@@ -1243,6 +1257,7 @@ struct DesktopFrameSource::Impl {
             }
 
             FrameCaptureResult result;
+            result.backend = DesktopCaptureBackend::Dxgi;
             result.frame = lastFrame;
             result.hasFrame = true;
             result.changed = false;
@@ -1264,6 +1279,7 @@ struct DesktopFrameSource::Impl {
             }
 
             FrameCaptureResult result;
+            result.backend = DesktopCaptureBackend::Dxgi;
             result.frame = lastFrame;
             result.hasFrame = true;
             result.changed = false;
@@ -1312,6 +1328,7 @@ struct DesktopFrameSource::Impl {
         result.hasFrame = true;
         result.changed = true;
         result.changedIsNative = true; // DXGI reported a new acquired frame
+        result.backend = DesktopCaptureBackend::Dxgi;
         result.cursorOnly = cursorOnly;
         result.frameId = ++frameId;
         return result;
