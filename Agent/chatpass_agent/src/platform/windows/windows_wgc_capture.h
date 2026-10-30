@@ -20,6 +20,17 @@ struct WgcFrameArrivalDiagnostics {
     int64_t sourceTimestamp100ns = 0;
     int64_t sourceTimestampGap100ns = 0;
 };
+// Per-session OS capture update interval. Untouched by default.
+// Nonzero WgcMinUpdateIntervalUs registry setting opts in one test device.
+struct WgcUpdateIntervalStatus {
+    bool propertySupported = false;
+    bool requested = false;
+    bool applied = false;
+    uint32_t requestedUs = 0;
+    int64_t default100ns = -1;
+    int64_t active100ns = -1;
+    int32_t errorHresult = 0;
+};
 struct WgcReadbackTimings {
     double gpuCopyMapMs = 0.0; // GPU CopyResource and blocking CPU Map
     double cpuBufferCopyMs = 0.0; // mapped BGRA to reusable CPU buffer
@@ -41,6 +52,7 @@ public:
                      WgcFrameArrivalDiagnostics* frameDiagnostics = nullptr);
     void Stop();
     bool IsRunning() const;
+    WgcUpdateIntervalStatus GetUpdateIntervalStatus() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
