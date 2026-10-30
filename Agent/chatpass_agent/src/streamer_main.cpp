@@ -1,4 +1,5 @@
 #include "frame_source.h"
+#include "capture_frame_rate_policy.h"
 #include "ipc/shmem_ring.h"
 #include "ipc/input_pipe.h"
 #include "util/log.h"
@@ -916,17 +917,23 @@ namespace hi5 {
                     captureTotalMs += captureMs;
                     captureWorstMs = std::max(captureWorstMs, captureMs);
                     ++measuredCaptures;
-                    const bool recentInput = (now - lastInputAt) <= activeHold;
-                    const bool recentMotion = (now - lastChangedFrameAt) <= std::chrono::milliseconds(ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
-                    const int targetFps = recentInput ? motionFps : (recentMotion ? activeFps : idleFps);
-                    lastTargetFps = targetFps;
-                    lastStreamMode = recentInput ? 2 : (recentMotion ? 1 : 0);
-                    const auto frameInterval = std::chrono::milliseconds(1000 / std::max(1, targetFps));
-                    nextCaptureAt = now + frameInterval;
+                    const bool changedThisCapture = captured.hasFrame && captured.changed;
+                    if (changedThisCapture) lastChangedFrameAt = now;
+                    const auto motionHold = std::chrono::milliseconds(
+                        ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
+                    const auto rate = hi5::SelectCaptureFrameRate(
+                        now, lastInputAt, lastChangedFrameAt, changedThisCapture,
+                        requestedMaxFps, activeFps, motionFps, idleFps,
+                        activeHold, motionHold);
+                    lastTargetFps = rate.targetFps;
+                    lastStreamMode = rate.mode;
+                    // Use the rate of the *newly observed* frame, not the
+                    // previous idle mode's 500ms interval. 500ms idle polls
+                    // otherwise outlive the 300ms motion hold indefinitely.
+                    nextCaptureAt = now + std::chrono::milliseconds(1000 / std::max(1, rate.targetFps));
 
-                    if (captured.hasFrame && captured.changed) {
+                    if (changedThisCapture) {
                         ++changedFrames;
-                        lastChangedFrameAt = now;
                         const uint64_t tsNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
                         const auto writeStart = std::chrono::steady_clock::now();
                         const bool writeOk = shmem.WriteRawI420Frame(captured.frame, tsNs);
