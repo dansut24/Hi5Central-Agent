@@ -914,6 +914,7 @@ struct DesktopFrameSource::Impl {
                 result.frame = std::move(frame);
                 result.hasFrame = true;
                 result.changed = true;
+                result.changedIsNative = true; // WGC compositor delivered a new frame
                 result.frameId = ++frameId;
                 if (!wgcReceivedFrame) {
                     wgcReceivedFrame = true;
@@ -1047,6 +1048,7 @@ struct DesktopFrameSource::Impl {
         result.frame = out;
         result.hasFrame = true;
         result.changed = true;
+        result.changedIsNative = true; // DXGI reported a new acquired frame
         result.cursorOnly = cursorOnly;
         result.frameId = ++frameId;
         return result;

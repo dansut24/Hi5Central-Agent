@@ -16,6 +16,10 @@ struct FrameCaptureResult {
     I420Frame frame;
     bool hasFrame = false;
     bool changed = false;
+    // True only when the capture provider itself reported a new desktop
+    // frame (DXGI dirty frame or WGC compositor event). GDI BitBlt has no
+    // change signal, so its successful copies need sparse pixel comparison.
+    bool changedIsNative = false;
     bool cursorOnly = false;
     uint64_t frameId = 0;
 };

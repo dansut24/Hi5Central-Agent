@@ -1,6 +1,7 @@
 #include "frame_source.h"
 #include "capture_frame_rate_policy.h"
 #include "capture_motion_samples.h"
+#include "capture_publish_policy.h"
 #include "ipc/shmem_ring.h"
 #include "ipc/input_pipe.h"
 #include "util/log.h"
@@ -919,14 +920,11 @@ namespace hi5 {
                     captureTotalMs += captureMs;
                     captureWorstMs = std::max(captureWorstMs, captureMs);
                     ++measuredCaptures;
-                    // DXGI has genuine dirty-frame detection. GDI fallback
-                    // always marks captures dirty, so sample sparse luma to
-                    // avoid holding an otherwise idle desktop at motion FPS.
+                    // DXGI and WGC already report new frames. Only GDI
+                    // BitBlt copies need sparse luma suppression: filtering
+                    // genuine compositor updates discards real small motion.
                     const bool changedThisCapture =
-                        captured.hasFrame && captured.changed &&
-                        !captured.cursorOnly &&
-                        sampledDesktopMotion.observe(captured.frame.y,
-                            captured.frame.width, captured.frame.height);
+                        hi5::ShouldPublishDesktopFrame(captured, sampledDesktopMotion);
                     if (changedThisCapture) lastChangedFrameAt = now;
                     const auto motionHold = std::chrono::milliseconds(
                         ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
