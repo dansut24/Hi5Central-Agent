@@ -485,12 +485,31 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         // override can request higher speeds within m_fps.
                         const auto automatic = hi5::universal_codec::selectAutomaticFps(
                             m_codecMode, {}, 0, std::max(1, m_fps), 120);
-                        const int fps = fpsMode == "auto"
-                            ? std::min(requestedFps, automatic.targetFps)
-                            : requestedFps;
+                        // Automatic stays evidence-based. Manual is an explicit
+                        // viewer-requested experiment; it never asserts actual
+                        // delivered FPS, and cannot exceed this sender's ceiling.
+                        const bool manual = fpsMode == "manual" &&
+                            hi5::universal_codec::manualFpsAllowed(requestedFps);
+                        const int fps = manual
+                            ? std::min(requestedFps, m_fps)
+                            : std::min(requestedFps > 0 ? requestedFps : 20,
+                                       automatic.targetFps);
                         const int prevW = m_viewerMaxWidth.exchange(w);
                         const int prevH = m_viewerMaxHeight.exchange(h);
                         const int prevFps = m_viewerTargetFps.exchange(fps);
+                        const int prevManual = m_viewerManualFps.exchange(
+                            manual ? fps : 0);
+                        // The authenticated Viewer control also updates actual
+                        // capture-helper pacing. Otherwise a 60 FPS request
+                        // changes only the encoder while GDI stays capped at 20.
+                        if (m_mode == Mode::ExternalFeed && m_inputEventFn &&
+                            (prevManual != (manual ? fps : 0))) {
+                            m_inputEventFn(json{
+                                {"kind", "viewer_frame_rate"},
+                                {"target_fps", manual ? fps : 0}
+                            });
+                        }
+
                         m_viewerTargetBitrateKbps = kbps;
                         if (prevW != w || prevH != h) m_forceKeyframe = true;
                         // Authoritative reply on the already-authenticated
@@ -505,13 +524,15 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                                 {"accepted_fps", std::min(fps > 0 ? fps : m_fps, m_fps)},
                                 {"qualified_max_fps", std::min(automatic.targetFps, m_fps)},
                                 {"agent_max_fps", m_fps},
-                                {"fps_qualified", automatic.qualified}
+                                {"fps_qualified", !manual && automatic.qualified},
+                                {"manual_override", manual},
+                                {"target_is_not_measured_fps", true}
                             };
                             sendControlMessageText(ack.dump());
                         } catch (...) {
                             // A diagnostic reply must never interrupt the media.
                         }
-                        if (prevW != w || prevH != h || prevFps != fps) {
+                        if (prevW != w || prevH != h || prevFps != fps || prevManual != (manual ? fps : 0)) {
                             LogInfo("[fps-policy] mode=" + fpsMode +
                                 " requested=" + std::to_string(requestedFps) +
                                 " accepted=" + std::to_string(fps) +
@@ -1714,8 +1735,10 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         profile.bitrateKbps = std::max(250, std::min(m_bitrateKbps,
             readEnvInt("HI5_H264_DESKTOP_KBPS", 8000, 250, 20000)));
         const int requestedFps = m_viewerTargetFps.load();
+        const int manualFps = m_viewerManualFps.load();
         const int requestedKbps = m_viewerTargetBitrateKbps.load();
-        if (requestedFps > 0) profile.fps = std::min(profile.fps, requestedFps);
+        if (manualFps > 0) profile.fps = std::min(m_fps, manualFps);
+        else if (requestedFps > 0) profile.fps = std::min(profile.fps, requestedFps);
         if (requestedKbps > 0) profile.bitrateKbps = std::min(profile.bitrateKbps, requestedKbps);
     }
 
@@ -2133,7 +2156,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         const bool profileChangedH264 = profile.fps != m_externalConfiguredFps ||
             profile.bitrateKbps != m_externalConfiguredBitrateKbps;
 
-        if (!m_h264Encoder || sizeChangedH264) {
+        // Media Foundation's nominal frame rate is set at encoder
+        // creation. Reinitialise on an explicit rate change so asking for
+        // 30/45/60 does not keep the old 20 FPS encoder configuration.
+        // This is one swap per user change, not a new encoder per frame.
+        if (!m_h264Encoder || sizeChangedH264 ||
+            profile.fps != m_externalConfiguredFps) {
             m_externalEncoderWidth = h264Frame.width;
             m_externalEncoderHeight = h264Frame.height;
             m_externalConfiguredFps = profile.fps;

@@ -38,4 +38,14 @@ inline CaptureFrameRateDecision SelectCaptureFrameRate(
     if (changing) return {active, 1};
     return {idle, 0};
 }
+// Explicit FPS selection is a target for an active changing desktop, not
+// a forced rate on a static screen and not a guarantee of delivered frames.
+inline CaptureFrameRateDecision ApplyManualCaptureFps(
+    CaptureFrameRateDecision decision, int manualFps, int maxFps) {
+    if (decision.mode != 0 &&
+        (manualFps == 15 || manualFps == 30 ||
+         manualFps == 45 || manualFps == 60))
+        decision.targetFps = std::min(manualFps, std::max(1, maxFps));
+    return decision;
+}
 } // namespace hi5

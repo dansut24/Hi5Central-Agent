@@ -1,5 +1,6 @@
 #include "frame_source.h"
 #include "capture_frame_rate_policy.h"
+#include "codec_auto_fps.h"
 #include "capture_motion_samples.h"
 #include "capture_publish_policy.h"
 #include "ipc/shmem_ring.h"
@@ -620,7 +621,8 @@ namespace {
     bool HandleInputPipe(hi5::InputPipeReader& pipe,
         DesktopFrameSource* source,
         int& currentDisplay,
-        const std::string& sessionId) {
+        const std::string& sessionId,
+        int* manualCaptureFps = nullptr) {
         // Low-latency input: mouse movement is latest-state only. Collapse
         // runs of MouseMove commands so clicks/keys are not delayed behind a
         // backlog of stale pointer locations.
@@ -640,7 +642,8 @@ namespace {
         bool hadInput = false;
         while (drained < kMaxDrainPerTick && pipe.Read(cmd)) {
             ++drained;
-            hadInput = true;
+            if (cmd.type != hi5::InputCmdType::SetCaptureFps)
+                hadInput = true;
             if (cmd.type == hi5::InputCmdType::MouseMove) {
                 pendingMove = cmd;
                 havePendingMove = true;
@@ -650,6 +653,18 @@ namespace {
             flushMove();
 
             switch (cmd.type) {
+            case hi5::InputCmdType::SetCaptureFps:
+                // A control message, not a mouse/key event. Preserve idle
+                // motion filtering and allow manual selection during session.
+                if (manualCaptureFps &&
+                    (cmd.captureFps.targetFps == 0 ||
+                     hi5::universal_codec::manualFpsAllowed(cmd.captureFps.targetFps))) {
+                    *manualCaptureFps = cmd.captureFps.targetFps;
+                    LogInfo("[fps-policy] capture-manual=" +
+                        std::to_string(*manualCaptureFps) +
+                        " session=" + sessionId);
+                }
+                break;
             case hi5::InputCmdType::MouseButton:
                 SendMouseButton(cmd.mouseButton.button, cmd.mouseButton.down != 0);
                 break;
@@ -832,6 +847,7 @@ namespace hi5 {
         double captureWorstMs = 0.0;
         double ipcWriteTotalMs = 0.0;
         double ipcWriteWorstMs = 0.0;
+        int manualCaptureFps = 0;
         int lastTargetFps = idleFps;
         int lastStreamMode = 0;
         hi5::SampledDesktopMotion sampledDesktopMotion;
@@ -860,7 +876,7 @@ namespace hi5 {
                     ApplyFastMouseTarget(fastTarget, args.sessionId, fastMouseNextLog, fastMouseApplied);
                 }
 
-                hadInput = HandleInputPipe(inputPipe, &source, currentDisplay, args.sessionId);
+                hadInput = HandleInputPipe(inputPipe, &source, currentDisplay, args.sessionId, &manualCaptureFps);
                 if (hadFastMouse) {
                     // Fast mouse movement is applied directly in the interactive streamer.
                     // Do not treat mouse-only movement as video activity: forcing captures
@@ -932,12 +948,14 @@ namespace hi5 {
                         now, lastInputAt, lastChangedFrameAt, changedThisCapture,
                         requestedMaxFps, activeFps, motionFps, idleFps,
                         activeHold, motionHold);
-                    lastTargetFps = rate.targetFps;
-                    lastStreamMode = rate.mode;
+                    const auto chosenRate = hi5::ApplyManualCaptureFps(
+                        rate, manualCaptureFps, requestedMaxFps);
+                    lastTargetFps = chosenRate.targetFps;
+                    lastStreamMode = chosenRate.mode;
                     // Use the rate of the *newly observed* frame, not the
                     // previous idle mode's 500ms interval. 500ms idle polls
                     // otherwise outlive the 300ms motion hold indefinitely.
-                    nextCaptureAt = now + std::chrono::milliseconds(1000 / std::max(1, rate.targetFps));
+                    nextCaptureAt = now + std::chrono::milliseconds(1000 / std::max(1, chosenRate.targetFps));
 
                     if (changedThisCapture) {
                         ++changedFrames;

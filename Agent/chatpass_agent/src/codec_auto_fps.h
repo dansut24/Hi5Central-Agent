@@ -9,6 +9,12 @@
 #include <vector>
 
 namespace hi5::universal_codec {
+inline bool manualFpsAllowed(int fps) {
+    // An explicit user override is a requested ceiling, not a claim that
+    // capture/encoder/network/browser can sustain that many decoded frames.
+    return fps == 15 || fps == 30 || fps == 45 || fps == 60;
+}
+
 struct FpsQualification {
     std::string codec;
     int testedFps = 0;

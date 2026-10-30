@@ -37,6 +37,7 @@ enum class InputCmdType : uint8_t {
     ChatOpen,        // show remote chat window
     ChatClose,       // hide remote chat window
     ChatMessage,     // display incoming chat text
+    SetCaptureFps,   // 0=Automatic, 15/30/45/60=manual capture ceiling
 };
 
 enum class ShortcutAction : uint16_t {
@@ -103,6 +104,10 @@ struct InputCmd {
         struct {
             int32_t monitorIndex;   // target monitor index
         } switchMonitor;
+
+        struct {
+            int32_t targetFps;      // manual 15/30/45/60, 0=Automatic
+        } captureFps;
 
         struct {
             uint32_t length;

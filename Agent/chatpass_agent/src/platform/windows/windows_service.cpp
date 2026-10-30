@@ -2332,7 +2332,7 @@ class Worker {
 
 const int fps = ReadConfigInt(
     "HI5_STREAM_FPS",
-    codecDecision.fps,
+    60, // available manual ceiling; Automatic still requests <=20
     5,
     60
 );
@@ -6037,6 +6037,25 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 const std::string kind = msg.value("kind", "");
                 const std::string type = msg.value("type", "");
 
+                if (kind == "viewer_frame_rate") {
+                    const int fps = msg.value("target_fps", -1);
+                    if (fps != 0 && fps != 15 && fps != 30 && fps != 45 && fps != 60) {
+                        LogW("[fps-policy] rejected invalid capture rate");
+                        return;
+                    }
+                    InputCmd cmd{};
+                    cmd.type = InputCmdType::SetCaptureFps;
+                    cmd.captureFps.targetFps = fps;
+                    // Notify both desktop helpers: the inactive desktop
+                    // applies its next rate when it becomes active. Do not
+                    // send this to pointer/input injection logic.
+                    const bool normal = ctx.normalInputPipe.Write(cmd);
+                    const bool secure = ctx.secureInputPipe.Write(cmd);
+                    LogI("[fps-policy] capture manual=" + std::to_string(fps) +
+                        " normal_queued=" + (normal ? "1" : "0") +
+                        " secure_queued=" + (secure ? "1" : "0"));
+                    return;
+                }
                 if (kind == "request_keyframe") {
                     ctx.recoveryKeyframeRequested.store(true);
                     LogI("[video-recovery] frame requested session=" + ctx.sessionId);
