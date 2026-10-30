@@ -9,7 +9,7 @@
 #include <windows.h>
 #include <roapi.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <wrl/client.h>
@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -84,6 +85,81 @@ BOOL CALLBACK VisitMon(HMONITOR h,HDC,LPRECT rect,LPARAM param) {
     }
     return TRUE;
 }
+class AnimatedWindow {
+public:
+    std::atomic<uint64_t> paints{0},ticks{0};
+    std::atomic<bool> ready{false};
+    std::atomic<HWND> hwnd{nullptr};
+    std::thread worker;
+    static LRESULT CALLBACK WindowProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+        auto* self=reinterpret_cast<AnimatedWindow*>(GetWindowLongPtrW(h,GWLP_USERDATA));
+        if(msg==WM_NCCREATE) {
+            self=reinterpret_cast<AnimatedWindow*>(
+                reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+            SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));
+            return TRUE;
+        }
+        if(msg==WM_TIMER && self) {
+            self->ticks.fetch_add(1,std::memory_order_relaxed);
+            InvalidateRect(h,nullptr,FALSE);
+            return 0;
+        }
+        if(msg==WM_PAINT) {
+            PAINTSTRUCT ps{};HDC dc=BeginPaint(h,&ps);
+            if(self && dc) {
+                // Change a visibly large region each 16ms; this is a REAL local
+                // window redraw, not synthetic WGC frame duplication.
+                const auto index=self->paints.fetch_add(1,std::memory_order_relaxed);
+                RECT rect{};GetClientRect(h,&rect);
+                HBRUSH bg=CreateSolidBrush((index&1)?RGB(14,62,172):RGB(172,52,14));
+                FillRect(dc,&rect,bg);DeleteObject(bg);
+                RECT bar{LONG((index*31)%390),48,LONG((index*31)%390)+90,172};
+                HBRUSH fg=CreateSolidBrush(RGB(255,230,96));
+                FillRect(dc,&bar,fg);DeleteObject(fg);
+                GdiFlush();
+            }
+            EndPaint(h,&ps);
+            return 0;
+        }
+        if(msg==WM_CLOSE) {DestroyWindow(h);return 0;}
+        if(msg==WM_DESTROY) {KillTimer(h,1);PostQuitMessage(0);return 0;}
+        return DefWindowProcW(h,msg,w,l);
+    }
+    bool Start() {
+        if(worker.joinable())return false;
+        worker=std::thread([this]{
+            const wchar_t* cls=L"H5CWgcFrameCadenceTest20261030";
+            WNDCLASSW wc{};wc.lpfnWndProc=WindowProc;
+            wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=cls;
+            RegisterClassW(&wc);
+            // Small, non-topmost, non-activating visible diagnostic window.
+            HWND h=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+                cls,L"Hi5Central WGC 60Hz local animation diagnostic",
+                WS_POPUP|WS_VISIBLE,85,90,480,210,nullptr,nullptr,
+                GetModuleHandleW(nullptr),this);
+            hwnd.store(h,std::memory_order_release);
+            ready.store(true,std::memory_order_release);
+            if(!h)return;
+            ShowWindow(h,SW_SHOWNOACTIVATE);
+            if(!SetTimer(h,1,16,nullptr)) {DestroyWindow(h);return;}
+            MSG msg{};
+            while(GetMessageW(&msg,nullptr,0,0)>0) {
+                TranslateMessage(&msg);DispatchMessageW(&msg);
+            }
+            hwnd.store(nullptr,std::memory_order_release);
+        });
+        for(int i=0;i<50&&!ready.load(std::memory_order_acquire);++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        return hwnd.load(std::memory_order_acquire)!=nullptr;
+    }
+    void Stop() {
+        const HWND h=hwnd.load(std::memory_order_acquire);
+        if(h)PostMessageW(h,WM_CLOSE,0,0);
+        if(worker.joinable())worker.join();
+    }
+    ~AnimatedWindow(){Stop();}
+};
+
 std::string DxgiCheck(HMONITOR target) {
     ComPtr<IDXGIFactory1> factory;
     HRESULT hr=CreateDXGIFactory1(IID_PPV_ARGS(&factory));
@@ -108,8 +184,24 @@ std::string DxgiCheck(HMONITOR target) {
             if(FAILED(hr)) return "DXGI_D3D_DEVICE="+Hex(hr);
             ComPtr<IDXGIOutputDuplication> duplication;
             hr=output1->DuplicateOutput(device.Get(),&duplication);
+            const HRESULT legacy=hr;
+            duplication.Reset();
+            ComPtr<IDXGIOutput5> output5;
+            const HRESULT check5=output.As(&output5);
+            HRESULT result1=check5;
+            if(SUCCEEDED(check5)) {
+                DXGI_FORMAT formats[1]={DXGI_FORMAT_B8G8R8A8_UNORM};
+                result1=output5->DuplicateOutput1(device.Get(),0,1,formats,&duplication);
+            }
+            ComPtr<IDXGIAdapter1> infoAdapter=adapter;
+            DXGI_ADAPTER_DESC1 desc{};
+            infoAdapter->GetDesc1(&desc);
             return "DXGI_ADAPTER="+std::to_string(a)+" OUTPUT="+std::to_string(o)+
-                   " DUPLICATEOUTPUT="+Hex(hr);
+                " VENDOR_ID="+std::to_string(desc.VendorId)+
+                " DEVICE_ID="+std::to_string(desc.DeviceId)+
+                " DUPLICATEOUTPUT="+Hex(legacy)+
+                " OUTPUT5_QI="+Hex(check5)+
+                " DUPLICATEOUTPUT1="+Hex(result1);
         }
     }
     return "DXGI_NO_MATCHING_MONITOR";
@@ -141,8 +233,12 @@ int RunProbe(std::ostream& out) {
     Monitor monitor;
     EnumDisplayMonitors(nullptr,nullptr,VisitMon,reinterpret_cast<LPARAM>(&monitor));
     if(!monitor.handle) {out<<"NO_PRIMARY_MONITOR\n";return 12;}
-    out << "DISPLAY="<<(monitor.rect.right-monitor.rect.left)<<"x"
-        <<(monitor.rect.bottom-monitor.rect.top)<<"\n";
+    out << "DISPLAY_PHYSICAL="<<(monitor.rect.right-monitor.rect.left)<<"x"
+        <<(monitor.rect.bottom-monitor.rect.top)
+        << " SYSTEM_DPI="<<GetDpiForSystem()
+        << " DPI_CONTEXT_PER_MONITOR_V2="<<
+           (AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(),
+               DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?1:0)<<"\n";
     out << DxgiCheck(monitor.handle)<<"\n"; // Duplication is released before WGC.
     const HRESULT init=RoInitialize(RO_INIT_MULTITHREADED);
     if(FAILED(init) && init!=RPC_E_CHANGED_MODE) {
@@ -170,7 +266,9 @@ int RunProbe(std::ostream& out) {
             winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2,item.Size());
         auto session=pool.CreateCaptureSession(item);
-        out<<"WGC_MIN_INTERVAL_100NS="<<session.MinUpdateInterval().count()<<"\n";
+        out<<"WGC_ITEM_SIZE="<<item.Size().Width<<"x"<<item.Size().Height
+           <<" WGC_MIN_INTERVAL_100NS="<<session.MinUpdateInterval().count()<<"\n";
+        AnimatedWindow animation;
         auto samples=std::make_shared<Samples>();
         auto token=pool.FrameArrived([samples](
             WGC::Direct3D11CaptureFramePool const& sender,
@@ -202,11 +300,18 @@ int RunProbe(std::ostream& out) {
             } catch (...) {samples->exceptions.fetch_add(1,std::memory_order_relaxed);}
         });
         session.StartCapture();
-        out << "WGC_STARTED probe_seconds=12 privacy_border=default\n";
-        uint64_t prev=0;
-        for(int i=1;i<=4;++i) {
+        out << "WGC_STARTED probe_seconds=15 baseline_first_3sec then_60Hz_GDI_local_animation_12sec privacy_border=default\n";
+        uint64_t prev=0,priorPaints=0,priorTicks=0;
+        for(int i=1;i<=5;++i) {
+            if(i==2) {
+                bool started=animation.Start();
+                out<<"LOCAL_ANIMATION_STARTED="<<(started?1:0)<<"\n";
+                if(!started) {out<<"LOCAL_ANIMATION_UNAVAILABLE\n";break;}
+            }
             std::this_thread::sleep_for(std::chrono::seconds(3));
             auto n=samples->consumed.load(std::memory_order_relaxed);
+            const uint64_t nowPaints=animation.paints.load(std::memory_order_relaxed);
+            const uint64_t nowTicks=animation.ticks.load(std::memory_order_relaxed);
             double arrivalMeanMs=samples->gapCount.load()?
                 (double(samples->gapTotalNs.load())/double(samples->gapCount.load()))/1e6:0.;
             double sourceMeanMs=samples->sourceGapCount.load()?
@@ -217,9 +322,13 @@ int RunProbe(std::ostream& out) {
                 <<" arrival_gap_ms="<<arrivalMeanMs
                 <<" source_gap_ms="<<sourceMeanMs
                 <<" max_arrival_gap_ms="<<samples->gapMaxNs.load()/1e6
-                <<" errors="<<samples->exceptions.load()<<"\n";
-            prev=n;out.flush();
+                <<" errors="<<samples->exceptions.load()
+                <<" animation_paints="<<(nowPaints-priorPaints)
+                <<" animation_paint_fps="<<(nowPaints-priorPaints)/3.0
+                <<" timer_ticks="<<(nowTicks-priorTicks)<<"\n";
+            prev=n;priorPaints=nowPaints;priorTicks=nowTicks;out.flush();
         }
+        animation.Stop();
         session.Close();
         pool.FrameArrived(token);
         pool.Close();
@@ -281,7 +390,7 @@ int Spawn(bool useSystem) {
     if(env)DestroyEnvironmentBlock(env);
     CloseHandle(token);
     if(!launched){std::cout<<"SPAWN_FAIL="<<err<<"\n";return 27;}
-    DWORD wait=WaitForSingleObject(pi.hProcess,21000);
+    DWORD wait=WaitForSingleObject(pi.hProcess,35000);
     DWORD exitCode=0;GetExitCodeProcess(pi.hProcess,&exitCode);
     CloseHandle(pi.hThread);CloseHandle(pi.hProcess);
     std::cout<<"CHILD="<<(useSystem?"SYSTEM":"USER")
@@ -292,6 +401,11 @@ int Spawn(bool useSystem) {
     return wait==WAIT_OBJECT_0?int(exitCode):29;
 }
 int wmain(int argc,wchar_t** argv) {
+    // This occurs BEFORE monitor enumeration, WGC creation, and Win32 windows.
+    const BOOL dpi=SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if(!dpi && GetLastError()!=ERROR_ACCESS_DENIED) {
+        std::cout<<"DPI_AWARENESS_SET_ERROR="<<GetLastError()<<"\n";
+    }
     if(argc!=2) {
         std::cout<<"USAGE: Hi5WgcProbe.exe --launch|--run-user|--run-system\n";return 2;
     }
