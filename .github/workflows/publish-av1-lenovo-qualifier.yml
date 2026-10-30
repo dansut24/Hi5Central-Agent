@@ -1,0 +1,35 @@
+name: Publish checksum-verified Lenovo AV1 offline qualifier
+on:
+  push:
+    branches:
+      - feature/av1-hardware-qualification-20261029
+    paths:
+      - .github/workflows/publish-av1-lenovo-qualifier.yml
+permissions:
+  contents: write
+  actions: read
+jobs:
+  release-qualifier:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Retrieve qualified Windows standalone libaom executable
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 41017289582
+          artifact-ids: 12959389038
+          github-token: ${{ github.token }}
+          path: artifact
+      - name: Check exact artifact hash; publish only executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp artifact/windows-av1-lenovo-portable-qualifier/av1_lenovo_qualifier.exe AV1LenovoSoftwareQualifier.exe
+          echo 'a7a3268d1c8e271dda061c5bd8e95af456f0a89ff46f73053cf806977069959f  AV1LenovoSoftwareQualifier.exe' | sha256sum -c -
+          file AV1LenovoSoftwareQualifier.exe
+      - name: Add to existing pre-release (no new production version)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view agent-1.0.196-test --repo "${{ github.repository }}" --json isPrerelease
+          gh release upload agent-1.0.196-test AV1LenovoSoftwareQualifier.exe --repo "${{ github.repository }}" --clobber
