@@ -1,0 +1,59 @@
+name: Diagnose Agent 1.0.225 WGC crash RVA with exact PDB
+on:
+  push:
+    branches:
+      - diagnostics/wgc-agent225-rva-20261030
+    paths:
+      - .github/workflows/diagnose-agent225-wgc-symbol.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  symbolize:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Download exact 1.0.225 Agent and symbols from original green run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 41087176620
+          artifact-ids: 12993197271
+          github-token: ${{ github.token }}
+          path: symbols
+      - name: Validate PDB origin and symbolicate new WGC crash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $exe=(Get-ChildItem symbols -Recurse -File -Filter Hi5CentralAgent.exe | Select-Object -First 1).FullName
+          $pdb=(Get-ChildItem symbols -Recurse -File -Filter Hi5CentralAgent.pdb | Select-Object -First 1).FullName
+          $manifest=(Get-ChildItem symbols -Recurse -File -Filter build-manifest.json | Select-Object -First 1).FullName
+          if(-not $exe -or -not $pdb -or -not $manifest){throw 'Missing exact Agent/PDB/manifest'}
+          $info=Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          if($info.agent_version -ne '1.0.225' -or $info.commit -ne '814d4305848d14eba80a844a8a3c75606613c855' -or $info.run_id -ne '41087176620'){throw 'PDB source mismatch'}
+          if((Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant() -ne $info.exe_sha256){throw 'Executable checksum mismatch'}
+          if((Get-FileHash -Algorithm SHA256 -LiteralPath $pdb).Hash.ToLowerInvariant() -ne $info.pdb_sha256){throw 'PDB checksum mismatch'}
+          Write-Host 'AGENT225_SOURCE_AND_PDB_SHA256_VERIFIED'
+          $candidates=@(
+            'C:\Program Files\LLVM\bin\llvm-symbolizer.exe',
+            'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin\llvm-symbolizer.exe',
+            'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin\llvm-symbolizer.exe',
+            'C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin\llvm-symbolizer.exe',
+            'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin\llvm-symbolizer.exe'
+          )
+          $symbolizer=$candidates | Where-Object {Test-Path -LiteralPath $_} | Select-Object -First 1
+          if(-not $symbolizer){
+            $cmd=Get-Command llvm-symbolizer.exe -ErrorAction SilentlyContinue
+            if($cmd){$symbolizer=$cmd.Source}
+          }
+          if(-not $symbolizer){
+            $where=Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Filter 'llvm-symbolizer.exe' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if($where){$symbolizer=$where.FullName}
+          }
+          if(-not $symbolizer){throw 'LLVM symbolizer missing; cannot infer crash function reliably'}
+          Write-Host "SYMBOLIZER=$symbolizer"
+          foreach($address in @('0x319473','0x31c8e7','0x31c8eb','0x31c8ef','0x31c8f3','0x31c900')){
+            Write-Host "=== AGENT225_SYMBOL_RVA=$address ==="
+            & $symbolizer --obj="$exe" --inlines --pretty-print $address
+            if($LASTEXITCODE -ne 0){throw "Symbolizer failed on $address"}
+          }
