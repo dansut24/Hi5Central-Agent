@@ -296,6 +296,98 @@ namespace {
         std::memcpy(bgraOut.data(), scratch.bits, bgraOut.size());
         const auto stageCopy = GdiClock::now();
 
+        // Diagnostic only. An administrator may opt into a small, bounded
+        // A/B probe with HKLM\SOFTWARE\Hi5Central\Agent\GdiBitBltProbe=1.
+        // The stream ALWAYS uses the original CAPTUREBLT image. No user
+        // desktop or secure/UAC capture semantics change in this build.
+        // Benchmark plain SRCCOPY into a separate cached surface, never
+        // replacing the pixels already copied into the live frame.
+        struct BltProbe {
+            GdiCaptureSurface surface;
+            unsigned long captures = 0;
+            unsigned int samples = 0;
+        };
+        static thread_local BltProbe bltProbe{};
+        if (bltProbe.samples < 12 && (++bltProbe.captures % 60) == 0) {
+            DWORD enabled = 0;
+            DWORD bytes = sizeof(enabled);
+            const bool enabledByAdmin =
+                RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Hi5Central\\Agent",
+                    "GdiBitBltProbe", RRF_RT_REG_DWORD, nullptr,
+                    &enabled, &bytes) == ERROR_SUCCESS && enabled == 1;
+            if (enabledByAdmin) {
+                wchar_t desktopName[64]{};
+                DWORD nameBytes = 0;
+                const HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+                const bool onDefaultDesktop =
+                    desktop && GetUserObjectInformationW(desktop, UOI_NAME,
+                        desktopName, sizeof(desktopName), &nameBytes) &&
+                    _wcsicmp(desktopName, L"Default") == 0;
+                // Never benchmark the Winlogon/secure desktop.
+                if (onDefaultDesktop) {
+                    HDC probeSource = GetDC(nullptr);
+                    if (probeSource) {
+                        if (bltProbe.surface.prepare(probeSource, dstW, dstH)) {
+                            const auto probeStart = GdiClock::now();
+                            BOOL probeOk = FALSE;
+                            if (srcW == dstW && srcH == dstH) {
+                                probeOk = BitBlt(bltProbe.surface.memDc,
+                                    0, 0, dstW, dstH, probeSource, x, y, SRCCOPY);
+                            } else {
+                                SetStretchBltMode(bltProbe.surface.memDc, HALFTONE);
+                                probeOk = StretchBlt(bltProbe.surface.memDc,
+                                    0, 0, dstW, dstH, probeSource, x, y,
+                                    srcW, srcH, SRCCOPY);
+                            }
+                            GdiFlush();
+                            const auto probeEnd = GdiClock::now();
+                            if (probeOk) {
+                                // Sparse pixel difference is a diagnostic,
+                                // not proof of visual equivalence: the desktop
+                                // may change between the two captures.
+                                int differing = 0;
+                                int sampled = 0;
+                                const size_t stepX = std::max(1, dstW / 96);
+                                const size_t stepY = std::max(1, dstH / 54);
+                                for (int yy = 0; yy < dstH; yy += static_cast<int>(stepY)) {
+                                    for (int xx = 0; xx < dstW; xx += static_cast<int>(stepX)) {
+                                        const size_t pixel = (static_cast<size_t>(yy) *
+                                            static_cast<size_t>(dstW) +
+                                            static_cast<size_t>(xx)) * 4;
+                                        const uint8_t* baseline = bgraOut.data() + pixel;
+                                        const uint8_t* candidate = bltProbe.surface.bits + pixel;
+                                        ++sampled;
+                                        if (std::abs(int(baseline[0]) - int(candidate[0])) > 12 ||
+                                            std::abs(int(baseline[1]) - int(candidate[1])) > 12 ||
+                                            std::abs(int(baseline[2]) - int(candidate[2])) > 12) {
+                                            ++differing;
+                                        }
+                                    }
+                                }
+                                LogInfo("[capture] gdi-blt-probe mode=nonvisible " +
+                                    std::string("default_desktop=1") +
+                                    " display=" + std::to_string(dstW) + "x" +
+                                    std::to_string(dstH) +
+                                    " baseline_capblt_ms=" +
+                                    std::to_string(std::chrono::duration<double, std::milli>(
+                                        stageBlt - stagePrepared).count()) +
+                                    " candidate_srcopy_ms=" +
+                                    std::to_string(std::chrono::duration<double, std::milli>(
+                                        probeEnd - probeStart).count()) +
+                                    " pixels_different=" + std::to_string(differing) +
+                                    " pixels_sampled=" + std::to_string(sampled));
+                                ++bltProbe.samples;
+                            } else {
+                                LogWarn("[capture] gdi-blt-probe plain SRCCOPY failed; "
+                                    "live CAPTUREBLT unaffected");
+                            }
+                        }
+                        ReleaseDC(nullptr, probeSource);
+                    }
+                }
+            }
+        }
+
         struct GdiTiming {
             uint64_t count = 0;
             double acquireMs = 0, blitMs = 0, cursorMs = 0;
@@ -814,6 +906,45 @@ struct DesktopFrameSource::Impl {
         }
 
         if (const HRESULT hr = output1->DuplicateOutput(device.Get(), &duplication); FAILED(hr)) {
+            if (hr == E_ACCESSDENIED) {
+                // Read-only context: distinguishes wrong desktop/session from
+                // a GPU/driver refusal. No SetThreadDesktop, privilege change
+                // or secure desktop switch is attempted here.
+                wchar_t threadDesktop[96]{};
+                wchar_t inputDesktop[96]{};
+                DWORD ignored = 0;
+                DWORD inputError = 0;
+                const HDESK thread = GetThreadDesktop(GetCurrentThreadId());
+                if (!thread || !GetUserObjectInformationW(thread, UOI_NAME,
+                        threadDesktop, sizeof(threadDesktop), &ignored)) {
+                    wcscpy_s(threadDesktop, L"unavailable");
+                }
+                const HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+                if (input) {
+                    ignored = 0;
+                    if (!GetUserObjectInformationW(input, UOI_NAME,
+                            inputDesktop, sizeof(inputDesktop), &ignored)) {
+                        wcscpy_s(inputDesktop, L"unavailable");
+                    }
+                    CloseDesktop(input);
+                } else {
+                    inputError = GetLastError();
+                    wcscpy_s(inputDesktop, L"unavailable");
+                }
+                DWORD processSession = 0;
+                ProcessIdToSessionId(GetCurrentProcessId(), &processSession);
+                DXGI_OUTPUT_DESC outputDesc{};
+                const HRESULT descResult = output->GetDesc(&outputDesc);
+                LogWarn("[capture] dxgi-access-context" +
+                    std::string(" process_session=") + std::to_string(processSession) +
+                    " console_session=" + std::to_string(WTSGetActiveConsoleSessionId()) +
+                    " thread_desktop=" + wideToUtf8(threadDesktop) +
+                    " input_desktop=" + wideToUtf8(inputDesktop) +
+                    " input_error=" + std::to_string(inputError) +
+                    " adapter_index=" + std::to_string(target->adapterIndex) +
+                    " output_index=" + std::to_string(target->outputIndex) +
+                    " output_desc_ok=" + std::to_string(SUCCEEDED(descResult) ? 1 : 0));
+            }
             throw DxgiError("DuplicateOutput", hr);
         }
 
