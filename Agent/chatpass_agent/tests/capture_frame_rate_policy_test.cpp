@@ -23,6 +23,11 @@ int main() {
     assert(mouse.targetFps == 30 && mouse.mode == 2);
     assert(decide(origin+500ms,old,origin,true,15).targetFps == 15);
     assert(decide(origin+500ms,old,origin,true,60).targetFps == 20);
+    assert(hi5::SelectManualSessionCeilingFps(60) == 60);
+    assert(hi5::SelectManualSessionCeilingFps(55) == 45);
+    assert(hi5::SelectManualSessionCeilingFps(40) == 30);
+    assert(hi5::SelectManualSessionCeilingFps(20) == 15);
+    assert(hi5::SelectManualSessionCeilingFps(15) == 15);
     // Explicit viewer rates must reach the capture helper (not just SDP),
     // while Automatic and static desktop retain low-CPU behaviour.
     for (int requested : {15, 30, 45, 60}) {
