@@ -58,3 +58,61 @@ jobs:
             & $symbolizer --obj="$exe" --inlines --pretty-print $address
             if($LASTEXITCODE -ne 0){throw "Symbolizer failed on $address"}
           }
+
+      - name: Resolve crash offset through matching PDB using native DbgHelp
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $exe=(Get-ChildItem symbols -Recurse -File -Filter Hi5CentralAgent.exe | Select-Object -First 1).FullName
+          $src=Join-Path (Get-Location).Path 'crash-symbol-resolver.cpp'
+          $out=Join-Path (Get-Location).Path 'crash-symbol-resolver.exe'
+          $code=@'
+          #define NOMINMAX
+          #include <windows.h>
+          #include <dbghelp.h>
+          #include <cstdio>
+          #include <cstdlib>
+          #pragma comment(lib, "dbghelp.lib")
+          int main(int argc,char** argv) {
+            if(argc<2) return 3;
+            HANDLE p=GetCurrentProcess();
+            SymSetOptions(SYMOPT_UNDNAME|SYMOPT_DEFERRED_LOADS|SYMOPT_LOAD_LINES);
+            if(!SymInitialize(p, nullptr, FALSE)){printf("sym-init-fail=%lu\n",GetLastError());return 4;}
+            DWORD64 base=SymLoadModuleEx(p,nullptr,argv[1],nullptr,0x100000000ULL,0,nullptr,0);
+            if(!base){printf("sym-load-fail=%lu\n",GetLastError());return 5;}
+            IMAGEHLP_MODULE64 mod{};mod.SizeOfStruct=sizeof(mod);
+            if(SymGetModuleInfo64(p,base,&mod)) {
+              printf("SYM_MODULE_TYPE=%u PDB=%s EXE=%s\n",mod.SymType,mod.LoadedPdbName,mod.ImageName);
+            }
+            const unsigned offsets[]={0x31c8e0,0x31c8e7,0x31c8eb,0x31c8ef,0x31c8f3,0x31c900};
+            for(unsigned addr:offsets){
+              char storage[sizeof(SYMBOL_INFO)+MAX_SYM_NAME+8]{};
+              auto sym=reinterpret_cast<PSYMBOL_INFO>(storage);
+              sym->SizeOfStruct=sizeof(SYMBOL_INFO);
+              sym->MaxNameLen=MAX_SYM_NAME;
+              DWORD64 displacement=0;
+              auto ok=SymFromAddr(p,base+addr,&displacement,sym);
+              printf("ADDR=0x%X SYMBOL=%s DISP=%llu ERR=%lu",addr,ok?sym->Name:"<not-found>",
+                static_cast<unsigned long long>(displacement),ok?0:GetLastError());
+              IMAGEHLP_LINE64 line{};line.SizeOfStruct=sizeof(line);
+              DWORD ld=0;
+              if(SymGetLineFromAddr64(p,base+addr,&ld,&line)){
+                printf(" FILE=%s LINE=%lu LINE_DISP=%lu",line.FileName,line.LineNumber,ld);
+              } else printf(" NO_LINE=%lu",GetLastError());
+              puts("");
+            }
+            SymCleanup(p);
+            return 0;
+          }
+          '@
+          [IO.File]::WriteAllText($src,$code,[Text.Encoding]::ASCII)
+          $vswhere="${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs=& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if(-not $vs){throw 'No VS C++ compiler'}
+          $cmdPath=Join-Path (Get-Location).Path 'build-crash-symbol-resolver.cmd'
+          $cmdText="@echo off`r`ncall `"$(Join-Path $vs 'Common7\Tools\VsDevCmd.bat')`" -arch=x64 -host_arch=x64`r`ncl.exe /nologo /EHsc /W3 /MD /Fe:`"$out`" `"$src`" /link dbghelp.lib`r`n"
+          [IO.File]::WriteAllText($cmdPath,$cmdText,[Text.Encoding]::ASCII)
+          & cmd.exe /d /c $cmdPath
+          if($LASTEXITCODE -ne 0){throw "Unable to compile resolver: $LASTEXITCODE"}
+          & $out $exe
+          if($LASTEXITCODE -ne 0){throw "DbgHelp symbol resolver failed: $LASTEXITCODE"}
