@@ -1117,8 +1117,9 @@ struct DesktopFrameSource::Impl {
             auto& bgra = wgcBgraBuffer;
             int w = 0, h = 0, pitch = 0;
             std::string error;
+            WgcReadbackTimings readbackStages{};
             const auto wgcReadStarted = std::chrono::steady_clock::now();
-            if (wgc->TryReadBgra(bgra, w, h, pitch, error)) {
+            if (wgc->TryReadBgra(bgra, w, h, pitch, error, &readbackStages)) {
                 // Includes WGC frame acquisition, GPU staging map and CPU readback.
                 const double readbackMs = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - wgcReadStarted).count();
@@ -1193,6 +1194,8 @@ struct DesktopFrameSource::Impl {
                 result.changed = true;
                 result.backend = DesktopCaptureBackend::Wgc;
                 result.wgcReadbackMs = readbackMs;
+                result.wgcGpuCopyMapMs = readbackStages.gpuCopyMapMs;
+                result.wgcCpuBufferCopyMs = readbackStages.cpuBufferCopyMs;
                 result.wgcConversionMs = convertMs;
                 result.changedIsNative = true; // WGC compositor delivered a new frame
                 result.frameId = ++frameId;
