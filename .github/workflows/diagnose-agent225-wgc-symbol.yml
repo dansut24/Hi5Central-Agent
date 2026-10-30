@@ -121,3 +121,21 @@ jobs:
           if($LASTEXITCODE -ne 0){throw "Unable to compile resolver: $LASTEXITCODE"}
           & $out $exe
           if($LASTEXITCODE -ne 0){throw "DbgHelp symbol resolver failed: $LASTEXITCODE"}
+
+      - name: Inspect PE CodeView debug directory and the PDB GUID
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $exe=(Get-ChildItem symbols -Recurse -File -Filter Hi5CentralAgent.exe | Select-Object -First 1).FullName
+          $pdb=(Get-ChildItem symbols -Recurse -File -Filter Hi5CentralAgent.pdb | Select-Object -First 1).FullName
+          $readobj='C:\Program Files\LLVM\bin\llvm-readobj.exe'
+          $pdbutil='C:\Program Files\LLVM\bin\llvm-pdbutil.exe'
+          Write-Host ('EXE_SIZE='+((Get-Item $exe).Length)+' PDB_SIZE='+((Get-Item $pdb).Length))
+          Write-Host 'PE_HEADERS_AND_CODEVIEW'
+          & $readobj --file-headers --coff-debug-directory "$exe"
+          Write-Host 'PDB_SUMMARY'
+          & $pdbutil dump -summary "$pdb"
+          $vswhere="\${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs=& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          Write-Host ('DIA_SDK_INCLUDE_EXISTS='+(Test-Path (Join-Path $vs 'DIA SDK\include\dia2.h')))
+          Write-Host ('DIA_SDK_LIB_EXISTS='+(Test-Path (Join-Path $vs 'DIA SDK\lib\amd64\diaguids.lib')))
