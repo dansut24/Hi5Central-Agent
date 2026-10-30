@@ -488,7 +488,7 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         // Automatic stays evidence-based. Manual is an explicit
                         // viewer-requested experiment; it never asserts actual
                         // delivered FPS, and cannot exceed this sender's ceiling.
-                        const bool manual = fpsMode == "manual" &&
+                        const bool manual = (fpsMode == "manual" || fpsMode == "development_override") &&
                             hi5::universal_codec::manualFpsAllowed(requestedFps);
                         const int fps = manual
                             ? std::min(requestedFps, m_fps)
