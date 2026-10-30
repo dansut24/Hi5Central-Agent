@@ -1,0 +1,84 @@
+name: Standalone WGC Frame Arrival and DXGI Probe
+on:
+  push:
+    branches: [diag/standalone-wgc-20261030]
+    paths:
+      - Agent/chatpass_agent/tests/wgc_standalone_probe.cpp
+      - .github/workflows/standalone-wgc-probe.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+  packages: write
+jobs:
+  build-windows-standalone-probe:
+    runs-on: windows-2025
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile isolated x64 WinRT capture diagnostic
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC unavailable' }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          New-Item -ItemType dist -Force | Out-Null
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++20 /EHsc /MT /O2 /W3 /DNOMINMAX /DWIN32_LEAN_AND_MEAN Agent/chatpass_agent/tests/wgc_standalone_probe.cpp /Fe:dist\Hi5WgcProbe.exe /link d3d11.lib dxgi.lib windowsapp.lib runtimeobject.lib wtsapi32.lib userenv.lib advapi32.lib'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw 'Independent WGC probe compile or link failed' }
+          if (!(Test-Path dist/Hi5WgcProbe.exe)) { throw 'Standalone executable missing' }
+          $sha = (Get-FileHash dist/Hi5WgcProbe.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha  Hi5WgcProbe.exe" | Set-Content -Path dist/Hi5WgcProbe.exe.sha256 -Encoding ascii
+          Write-Host "STANDALONE_WGC_PROBE_BUILT sha256=$sha size=$((Get-Item dist/Hi5WgcProbe.exe).Length)"
+      - name: Upload standalone diagnostic executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-WGC-Standalone-Probe
+          path: |
+            dist/Hi5WgcProbe.exe
+            dist/Hi5WgcProbe.exe.sha256
+          if-no-files-found: error
+  publish-test-transport:
+    needs: build-windows-standalone-probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download Windows-built standalone probe
+        uses: actions/download-artifact@v4
+        with:
+          name: Hi5Central-WGC-Standalone-Probe
+          path: probe
+      - name: Verify standalone output and prepare transport image
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd probe && sha256sum -c Hi5WgcProbe.exe.sha256)
+          file probe/Hi5WgcProbe.exe
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('probe/Hi5WgcProbe.exe')
+          assert p.read_bytes()[:2]==b'MZ'
+          assert p.stat().st_size>30000
+          print('STANDALONE_PROBE_SHA256',__import__('hashlib').sha256(p.read_bytes()).hexdigest())
+          PY
+          cat >probe/Dockerfile <<'DOCKER'
+          FROM scratch
+          LABEL org.opencontainers.image.title="Hi5Central read-only standalone WGC/DXGI probe"
+          LABEL hi5central.scope="Lenovo diagnostic only, no Agent deployment"
+          COPY Hi5WgcProbe.exe /diagnostic/Hi5WgcProbe.exe
+          COPY Hi5WgcProbe.exe.sha256 /diagnostic/Hi5WgcProbe.exe.sha256
+          CMD ["/diagnostic/Hi5WgcProbe.exe"]
+          DOCKER
+      - name: Authenticate to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish immutable diagnostic-only transport
+        uses: docker/build-push-action@v6
+        with:
+          context: probe
+          push: true
+          tags: ghcr.io/dansut24/hi5central-wgc-standalone-probe:${{ github.sha }}
