@@ -25,7 +25,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import hashlib,struct,zipfile
-          data=Path('artifact/Hi5CentralAgentTemplate.exe').read_bytes()
+          data=Path('artifact/Hi5Central-Windows-Tenant-Template/Hi5CentralAgentTemplate.exe').read_bytes()
           u16=lambda i:struct.unpack_from('<H',data,i)[0]
           u32=lambda i:struct.unpack_from('<I',data,i)[0]
           pe=u32(0x3c)
