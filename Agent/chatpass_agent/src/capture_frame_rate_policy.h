@@ -48,6 +48,25 @@ inline CaptureFrameRateDecision ApplyManualCaptureFps(
         decision.targetFps = std::min(manualFps, std::max(1, maxFps));
     return decision;
 }
+// WGC exposes compositor frame availability independently of screen motion.
+// An explicit Viewer FPS selection is a polling ceiling even when the
+// compositor has temporarily reported no new frame. Otherwise a 2-FPS idle
+// downshift can delay the *next* fresh WGC frame by up to 500 ms.
+// This path is NORMAL desktop WGC only: do not force GDI, DXGI, secure/UAC,
+// Automatic sessions, or a static desktop to encode duplicate video frames.
+inline CaptureFrameRateDecision ApplyWgcManualPollingFloor(
+    CaptureFrameRateDecision decision,
+    int manualFps,
+    int maxFps,
+    bool wgcActive,
+    bool secureDesktop) {
+    if (wgcActive && !secureDesktop &&
+        (manualFps == 15 || manualFps == 30 ||
+         manualFps == 45 || manualFps == 60)) {
+        decision.targetFps = std::min(manualFps, std::max(1, maxFps));
+    }
+    return decision;
+}
 // Explicit session ceiling. Older endpoint installers wrote
 // HI5_STREAM_FPS=20 into machine environment; that legacy Automatic default
 // cannot constrain newer manual Viewer selections. Round an administrator's
