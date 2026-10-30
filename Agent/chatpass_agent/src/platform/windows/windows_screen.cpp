@@ -971,6 +971,22 @@ struct DesktopFrameSource::Impl {
     }
 
     bool setDisplayIndexLocked(int index) {
+        // The normal capture helper is constructed before RunStreamerMain
+        // explicitly selects args.display. If DXGI duplication fails, that
+        // constructor already starts the opt-in WGC trial on requestedIndex.
+        // Selecting the *same* output moments later must not close a running
+        // capture session and synchronously reactivate its WinRT factory.
+        // Physical Lenovo Agent 1.0.225: that duplicate activation crashed
+        // (0xC0000005 RVA 0x31C8EF, windows_wgc_capture.cpp:207), while
+        // its first WGC trial had started successfully 30 ms earlier.
+        // Switching to a different display still recreates WGC below.
+        if (index >= 0 && index == requestedIndex &&
+            wgc && wgc->IsRunning()) {
+            LogInfo("[capture] retain running WGC trial for unchanged display=" +
+                std::to_string(index) + " action=skip_duplicate_winrt_activation");
+            return true;
+        }
+
         refreshDisplaysLocked(true);
 
         // Switching monitors discards the old monitor's WGC capture item.
