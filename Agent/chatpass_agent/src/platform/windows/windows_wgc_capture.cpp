@@ -254,8 +254,10 @@ struct WgcMonitorCapture::Impl {
     }
 
     bool TryReadBgra(std::vector<uint8_t>& bgra, int& width, int& height,
-                     int& stride, std::string& failure) {
+                     int& stride, std::string& failure,
+                     WgcReadbackTimings* timings) {
         failure.clear();
+        if (timings) *timings = {};
         if (!session || !pool || !device) return false;
         try {
             auto frame = pool.TryGetNextFrame();
@@ -291,10 +293,13 @@ struct WgcMonitorCapture::Impl {
                 stagingWidth = static_cast<int>(desc.Width);
                 stagingHeight = static_cast<int>(desc.Height);
             }
+            const auto gpuCopyStarted = std::chrono::steady_clock::now();
             context->CopyResource(staging.Get(), texture.Get());
             D3D11_MAPPED_SUBRESOURCE mapped{};
             winrt::check_hresult(context->Map(
                 staging.Get(), 0, D3D11_MAP_READ, 0, &mapped));
+            const double gpuCopyMapMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - gpuCopyStarted).count();
             // Validate GPU readback stride before copying or allocating.
             // A corrupt or unexpectedly large RowPitch must never overwrite
             // the frame buffer or bring down the remote-session helper.
@@ -307,9 +312,17 @@ struct WgcMonitorCapture::Impl {
                 throw std::runtime_error("WGC mapped texture invalid stride or size");
             }
             stride = static_cast<int>(mapped.RowPitch);
+            const auto cpuCopyStarted = std::chrono::steady_clock::now();
+            // Caller owns a persistent BGRA buffer; resize reuses capacity
+            // on every same-resolution frame instead of reallocating ~16MB.
             bgra.resize(byteCount);
-            std::memcpy(bgra.data(), mapped.pData, bgra.size());
+            std::memcpy(bgra.data(), mapped.pData, byteCount);
             context->Unmap(staging.Get(), 0);
+            if (timings) {
+                timings->gpuCopyMapMs = gpuCopyMapMs;
+                timings->cpuBufferCopyMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cpuCopyStarted).count();
+            }
             return true;
         } catch (const winrt::hresult_error& ex) {
             failure = FormatError("WGC frame read", ex.code());
@@ -327,8 +340,8 @@ bool WgcMonitorCapture::Start(int x, int y, int w, int h, std::string& failure) 
 }
 bool WgcMonitorCapture::TryReadBgra(
     std::vector<uint8_t>& bgra, int& width, int& height, int& stride,
-    std::string& failure) {
-    return impl_->TryReadBgra(bgra, width, height, stride, failure);
+    std::string& failure, WgcReadbackTimings* timings) {
+    return impl_->TryReadBgra(bgra, width, height, stride, failure, timings);
 }
 void WgcMonitorCapture::Stop() { if (impl_) impl_->Stop(); }
 bool WgcMonitorCapture::IsRunning() const {
