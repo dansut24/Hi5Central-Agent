@@ -6,6 +6,7 @@
 #include "webrtc_sender.h"
 #include "codec_capabilities.h"
 #include "codec_policy.h"
+#include "capture_frame_rate_policy.h"
 #include "codec_universal_connection.h"
 #include "codec_runtime_proof.h"
 #include "codec_windows_qual_identity.h"
