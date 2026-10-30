@@ -1,7 +1,7 @@
 name: Standalone WGC Frame Arrival and DXGI Probe
 on:
   push:
-    branches: [diag/standalone-wgc-20261030]
+    branches: [diag/wgc-four-tests-20261030]
     paths:
       - Agent/chatpass_agent/tests/wgc_standalone_probe.cpp
       - .github/workflows/standalone-wgc-probe.yml
