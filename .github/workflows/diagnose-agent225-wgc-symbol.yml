@@ -30,7 +30,7 @@ jobs:
           $manifest=(Get-ChildItem symbols -Recurse -File -Filter build-manifest.json | Select-Object -First 1).FullName
           if(-not $exe -or -not $pdb -or -not $manifest){throw 'Missing exact Agent/PDB/manifest'}
           $info=Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-          if($info.agent_version -ne '1.0.225' -or $info.commit -ne '814d4305848d14eba80a844a8a3c75606613c855' -or $info.run_id -ne '41087176620'){throw 'PDB source mismatch'}
+          if($info.agent_version -ne '1.0.225' -or $info.commit -ne '814d4305848d14eba80a844a8a3c75606613c855' -or [string]$info.run_id -ne '41087176620'){throw 'PDB source mismatch'}
           if((Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant() -ne $info.exe_sha256){throw 'Executable checksum mismatch'}
           if((Get-FileHash -Algorithm SHA256 -LiteralPath $pdb).Hash.ToLowerInvariant() -ne $info.pdb_sha256){throw 'PDB checksum mismatch'}
           Write-Host 'AGENT225_SOURCE_AND_PDB_SHA256_VERIFIED'
