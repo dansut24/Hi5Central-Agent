@@ -99,11 +99,6 @@ public:
             SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));
             return TRUE;
         }
-        if(msg==WM_TIMER && self) {
-            self->ticks.fetch_add(1,std::memory_order_relaxed);
-            InvalidateRect(h,nullptr,FALSE);
-            return 0;
-        }
         if(msg==WM_PAINT) {
             PAINTSTRUCT ps{};HDC dc=BeginPaint(h,&ps);
             if(self && dc) {
@@ -122,7 +117,7 @@ public:
             return 0;
         }
         if(msg==WM_CLOSE) {DestroyWindow(h);return 0;}
-        if(msg==WM_DESTROY) {KillTimer(h,1);PostQuitMessage(0);return 0;}
+        if(msg==WM_DESTROY) {PostQuitMessage(0);return 0;}
         return DefWindowProcW(h,msg,w,l);
     }
     bool Start() {
@@ -141,11 +136,33 @@ public:
             ready.store(true,std::memory_order_release);
             if(!h)return;
             ShowWindow(h,SW_SHOWNOACTIVATE);
-            if(!SetTimer(h,1,16,nullptr)) {DestroyWindow(h);return;}
+            // WM_TIMER on this Lenovo delivered only ~34 paints/s despite
+            // a 16ms request. Use a high-resolution waitable timer instead,
+            // identical to the already-tested host capture pacer approach.
+            HANDLE timer=CreateWaitableTimerExW(nullptr,nullptr,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
+            if(!timer) timer=CreateWaitableTimerExW(nullptr,nullptr,0,TIMER_ALL_ACCESS);
             MSG msg{};
-            while(GetMessageW(&msg,nullptr,0,0)>0) {
-                TranslateMessage(&msg);DispatchMessageW(&msg);
+            bool running=true;
+            while(running) {
+                while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) {
+                    if(msg.message==WM_QUIT) {running=false;break;}
+                    TranslateMessage(&msg);DispatchMessageW(&msg);
+                }
+                if(!running)break;
+                LARGE_INTEGER due{};due.QuadPart=-166667; // 16.6667 ms
+                if(timer && SetWaitableTimer(timer,&due,0,nullptr,nullptr,FALSE)) {
+                    WaitForSingleObject(timer,1000);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                }
+                if(!IsWindow(h))break;
+                ticks.fetch_add(1,std::memory_order_relaxed);
+                InvalidateRect(h,nullptr,FALSE);
+                UpdateWindow(h);
             }
+            if(timer)CloseHandle(timer);
+            if(IsWindow(h))DestroyWindow(h);
             hwnd.store(nullptr,std::memory_order_release);
         });
         for(int i=0;i<50&&!ready.load(std::memory_order_acquire);++i)
