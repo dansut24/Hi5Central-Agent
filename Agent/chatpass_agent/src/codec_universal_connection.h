@@ -11,6 +11,16 @@ struct ConnectionSelection {
     bool compatible = true;
     std::string reason;
 };
+// Sharp-text H.264 uses a Level 4 stream. A receiver that does not
+// explicitly advertise L4 must not be offered that profile. Keep VP8/VP9
+// intact; the policy then selects a compatible fallback before SDP.
+inline bool enforceSharpH264ViewerLevel(Viewer& viewer, bool sharpText) {
+    if (!sharpText || viewer.h264Level4 || !supports(viewer, "h264"))
+        return false;
+    viewer.receiveCodecs.erase(std::remove(viewer.receiveCodecs.begin(),
+        viewer.receiveCodecs.end(), "h264"), viewer.receiveCodecs.end());
+    return true;
+}
 inline ConnectionSelection chooseForConnection(
     bool optIn, const std::string& operatorMode,
     const std::string& legacyAutoMode,

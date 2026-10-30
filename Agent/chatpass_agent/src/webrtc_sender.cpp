@@ -2353,7 +2353,11 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     {"target_fps", m_externalConfiguredFps},
                     {"cpu_used", m_externalConfiguredCpuUsed},
                     {"max_quantizer", m_externalConfiguredMaxQuantizer},
-                    {"keyframe_every_frames", m_externalKeyframeEvery}
+                    {"keyframe_every_frames", m_externalKeyframeEvery},
+                    // The actual VP8 encoder dimensions are needed to pair
+                    // Agent frame evidence with the Viewer decode report.
+                    {"width", m_externalEncoderWidth},
+                    {"height", m_externalEncoderHeight}
                 };
                 m_signalSend(diag.dump());
                 sendControlMessage(diag);

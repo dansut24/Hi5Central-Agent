@@ -28,6 +28,26 @@ int main() {
  Viewer noCommon;noCommon.receiveCodecs={"h264"};
  auto blocked=chooseForConnection(true,"auto","vp8",noCommon,{},link,true);
  assert(!blocked.compatible && blocked.mode.empty());
+ // Real Lenovo 1.0.195 proof, and receiver-L4 compatibility.
+ auto real=intel;
+ real.backend="h264_hw";real.testedFrames=33;
+ real.maxWidth=1728;real.maxHeight=1080;
+ real.p95EncodeMs=23.9889;real.worstEncodeMs=42.3373;
+ assert(chooseForConnection(true,"auto","vp8",viewer,{real},link,true).mode=="h264_hw");
+ Viewer limited=viewer;limited.h264Level4=false;
+ assert(enforceSharpH264ViewerLevel(limited,true));
+ assert(!supports(limited,"h264"));
+ assert(chooseForConnection(true,"auto","vp8",limited,{real},link,true).mode=="vp8");
+ Viewer full=viewer;
+ assert(!enforceSharpH264ViewerLevel(full,true));
+ assert(supports(full,"h264"));
+ Viewer nonSharp=viewer;nonSharp.h264Level4=false;
+ assert(!enforceSharpH264ViewerLevel(nonSharp,false));
+ assert(supports(nonSharp,"h264"));
+ Viewer noH264Again=viewer;
+ noH264Again.receiveCodecs={"vp8","vp9"};
+ assert(!enforceSharpH264ViewerLevel(noH264Again,true));
+ assert(chooseForConnection(true,"auto","vp8",noH264Again,{real},link,true).mode=="vp8");
  auto av1=intel;av1.codec="av1";
  assert(chooseForConnection(true,"auto","vp8",viewer,{av1},link,true).mode=="vp8");
  Viewer missing;
