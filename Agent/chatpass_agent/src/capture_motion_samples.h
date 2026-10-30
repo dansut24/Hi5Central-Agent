@@ -1,7 +1,9 @@
 #pragma once
-// Cheap low-frequency luminance change detection for GDI fallback.
-// GDI reports every successful BitBlt as changed even for a static screen;
-// do not let that hold the expensive native-resolution capture at motion FPS.
+// Sparse luminance change detection for GDI fallback. The old 48x27 grid
+// missed narrow text/scroll movement and forwarded just 1-2 FPS despite
+// 5-9 successful captures. A 96x54 grid is still only 5,184 luma samples
+// per native-resolution capture, but is sensitive to normal UI motion.
+// Suppress single-sample cursor flickers and unchanged desktops.
 #include <array>
 #include <algorithm>
 #include <cstddef>
@@ -10,8 +12,8 @@
 
 namespace hi5 {
 class SampledDesktopMotion {
-    static constexpr int kCols = 48;
-    static constexpr int kRows = 27;
+    static constexpr int kCols = 96;
+    static constexpr int kRows = 54;
     std::array<uint8_t, kCols*kRows> last_{};
     int lastWidth_ = 0;
     int lastHeight_ = 0;
@@ -36,7 +38,7 @@ public:
             }
         }
         const bool changed = !valid_ || width != lastWidth_ ||
-            height != lastHeight_ || differences >= 3;
+            height != lastHeight_ || differences >= 2;
         last_=current;
         lastWidth_=width;
         lastHeight_=height;
