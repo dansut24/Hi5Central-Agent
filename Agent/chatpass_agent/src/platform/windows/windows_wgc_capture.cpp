@@ -16,7 +16,10 @@
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <memory>
 #include <cstring>
 #include <cwchar>
 #include <sstream>
@@ -139,6 +142,30 @@ BOOL CALLBACK FindMonitor(HMONITOR monitor, HDC, LPRECT bounds, LPARAM param) {
 }
 
 struct WgcMonitorCapture::Impl {
+    struct ArrivalState {
+        std::atomic<uint64_t> events{0};
+        std::atomic<int64_t> lastEventNs{0};
+        std::atomic<uint64_t> gaps{0};
+        std::atomic<uint64_t> totalGapNs{0};
+        std::atomic<uint64_t> maxGapNs{0};
+    };
+    std::shared_ptr<ArrivalState> arrivalState;
+    winrt::event_token frameArrivedToken{};
+    bool subscribedToFrameArrived = false;
+    uint64_t consumedFrames = 0;
+    uint64_t eventsAtPreviousFrame = 0;
+    int64_t previousSourceTimestamp100ns = 0;
+    WgcFrameArrivalDiagnostics Snapshot() const {
+        WgcFrameArrivalDiagnostics out{};
+        if (arrivalState) {
+            out.eventsTotal = arrivalState->events.load(std::memory_order_relaxed);
+            out.arrivalGapCount = arrivalState->gaps.load(std::memory_order_relaxed);
+            out.arrivalGapTotalNs = arrivalState->totalGapNs.load(std::memory_order_relaxed);
+            out.arrivalGapMaxNs = arrivalState->maxGapNs.load(std::memory_order_relaxed);
+        }
+        out.framesConsumedTotal = consumedFrames;
+        return out;
+    }
     bool apartmentInitialized = false;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -152,7 +179,18 @@ struct WgcMonitorCapture::Impl {
     void Stop() {
         // Close capture objects before releasing D3D and the WinRT apartment.
         if (session) { session.Close(); session = nullptr; }
-        if (pool) { pool.Close(); pool = nullptr; }
+        if (pool) {
+            if (subscribedToFrameArrived) {
+                pool.FrameArrived(frameArrivedToken);
+                subscribedToFrameArrived = false;
+            }
+            pool.Close();
+            pool = nullptr;
+        }
+        arrivalState.reset();
+        consumedFrames = 0;
+        eventsAtPreviousFrame = 0;
+        previousSourceTimestamp100ns = 0;
         item = nullptr;
         staging.Reset();
         context.Reset();
@@ -237,6 +275,29 @@ struct WgcMonitorCapture::Impl {
                 winrtDevice,
                 winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 2, size);
+            // Subscribe after pool construction, before StartCapture.
+            // The callback must NEVER drain frames or synchronise with
+            // GPU work; it only counts arrivals and their timing.
+            arrivalState = std::make_shared<ArrivalState>();
+            frameArrivedToken = pool.FrameArrived(
+                [state = arrivalState](
+                    WGC::Direct3D11CaptureFramePool const&,
+                    winrt::Windows::Foundation::IInspectable const&) noexcept {
+                    const auto now = std::chrono::steady_clock::now();
+                    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now.time_since_epoch()).count();
+                    const int64_t prev = state->lastEventNs.exchange(ns, std::memory_order_relaxed);
+                    if (prev > 0 && ns > prev) {
+                        const uint64_t gap = static_cast<uint64_t>(ns - prev);
+                        state->totalGapNs.fetch_add(gap, std::memory_order_relaxed);
+                        state->gaps.fetch_add(1, std::memory_order_relaxed);
+                        uint64_t oldMax = state->maxGapNs.load(std::memory_order_relaxed);
+                        while (gap > oldMax && !state->maxGapNs.compare_exchange_weak(
+                            oldMax, gap, std::memory_order_relaxed)) {}
+                    }
+                    state->events.fetch_add(1, std::memory_order_release);
+                });
+            subscribedToFrameArrived = true;
             stage = "CreateCaptureSession";
             session = pool.CreateCaptureSession(item);
             // Do not request borderless capture; the operating system's
@@ -255,13 +316,16 @@ struct WgcMonitorCapture::Impl {
 
     bool TryReadBgra(std::vector<uint8_t>& bgra, int& width, int& height,
                      int& stride, std::string& failure,
-                     WgcReadbackTimings* timings) {
+                     WgcReadbackTimings* timings,
+                     WgcFrameArrivalDiagnostics* frameDiagnostics) {
         failure.clear();
         if (timings) *timings = {};
+        if (frameDiagnostics) *frameDiagnostics = Snapshot();
         if (!session || !pool || !device) return false;
         try {
             auto frame = pool.TryGetNextFrame();
             if (!frame) return false;
+            const int64_t frameTimestamp = frame.SystemRelativeTime().count();
             const auto size = frame.ContentSize();
             if (size.Width <= 0 || size.Height <= 0) {
                 throw std::runtime_error("WGC frame has invalid dimensions");
@@ -323,6 +387,22 @@ struct WgcMonitorCapture::Impl {
                 timings->cpuBufferCopyMs = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - cpuCopyStarted).count();
             }
+            ++consumedFrames;
+            if (frameDiagnostics) {
+                *frameDiagnostics = Snapshot();
+                frameDiagnostics->sourceTimestamp100ns = frameTimestamp;
+                frameDiagnostics->sourceTimestampGap100ns =
+                    (previousSourceTimestamp100ns > 0 && frameTimestamp > previousSourceTimestamp100ns)
+                        ? frameTimestamp - previousSourceTimestamp100ns : 0;
+                frameDiagnostics->eventsSincePreviousFrame =
+                    (frameDiagnostics->eventsTotal >= eventsAtPreviousFrame)
+                    ? frameDiagnostics->eventsTotal - eventsAtPreviousFrame : 0;
+            }
+            // Keep frame timestamps from the compositor rather than local
+            // consumption time; latter can hide frame-pool coalescing.
+            if (arrivalState) eventsAtPreviousFrame =
+                arrivalState->events.load(std::memory_order_relaxed);
+            previousSourceTimestamp100ns = frameTimestamp;
             return true;
         } catch (const winrt::hresult_error& ex) {
             failure = FormatError("WGC frame read", ex.code());
@@ -340,8 +420,9 @@ bool WgcMonitorCapture::Start(int x, int y, int w, int h, std::string& failure) 
 }
 bool WgcMonitorCapture::TryReadBgra(
     std::vector<uint8_t>& bgra, int& width, int& height, int& stride,
-    std::string& failure, WgcReadbackTimings* timings) {
-    return impl_->TryReadBgra(bgra, width, height, stride, failure, timings);
+    std::string& failure, WgcReadbackTimings* timings,
+    WgcFrameArrivalDiagnostics* frameDiagnostics) {
+    return impl_->TryReadBgra(bgra, width, height, stride, failure, timings, frameDiagnostics);
 }
 void WgcMonitorCapture::Stop() { if (impl_) impl_->Stop(); }
 bool WgcMonitorCapture::IsRunning() const {
