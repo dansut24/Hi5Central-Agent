@@ -1,0 +1,69 @@
+name: Trace WGC access violation in Agent 1.0.205
+on:
+  push:
+    branches:
+      - diag/wgc-crash205-20261030
+    paths:
+      - .github/workflows/diag-wgc-crash205.yml
+permissions:
+  contents: read
+  actions: read
+jobs:
+  symbolize:
+    runs-on: windows-2025
+    steps:
+      - name: Download exact Agent205 executable and PDB
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 41030372590
+          artifact-ids: 12966631621
+          github-token: ${{ github.token }}
+          path: artifacts
+      - name: Print symbol and line at repeated AV offset 0x319473
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem artifacts -Recurse -Filter Hi5CentralAgent.exe | Select-Object -First 1).FullName
+          $pdb = (Get-ChildItem artifacts -Recurse -Filter Hi5CentralAgent.pdb | Select-Object -First 1).FullName
+          if (!$exe -or !$pdb) { throw 'Pinned binary or PDB missing' }
+          if ((Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'bafdc68a97d99fd83aa282a9874bfa1c0adf964710e3b5b62eb25e03fa312bd9') {throw 'Binary checksum mismatch'}
+          Copy-Item $exe -Destination Hi5CentralAgent.exe
+          Copy-Item $pdb -Destination Hi5CentralAgent.pdb
+          @'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+          #include <dbghelp.h>
+          #include <cstdio>
+          #include <cstring>
+          #include <vector>
+          #pragma comment(lib, "dbghelp.lib")
+          int main() {
+            HANDLE proc=GetCurrentProcess();
+            SymSetOptions(SYMOPT_LOAD_LINES|SYMOPT_UNDNAME|SYMOPT_DEFERRED_LOADS);
+            if(!SymInitialize(proc,".",FALSE)) { printf("SymInitialize failed=%lu\n",GetLastError());return 1; }
+            DWORD64 base=SymLoadModuleExA(proc,nullptr,"Hi5CentralAgent.exe",nullptr,0x140000000,0,nullptr,0);
+            if(!base) {printf("SymLoadModuleEx failed=%lu\n",GetLastError());return 2;}
+            std::vector<char> bytes(sizeof(SYMBOL_INFO)+MAX_SYM_NAME);
+            auto* info=reinterpret_cast<SYMBOL_INFO*>(bytes.data());
+            std::memset(info,0,bytes.size());
+            info->SizeOfStruct=sizeof(SYMBOL_INFO);info->MaxNameLen=MAX_SYM_NAME;
+            DWORD64 disp=0;
+            if(!SymFromAddr(proc,base+0x319473ULL,&disp,info)) {printf("SymFromAddr failed=%lu\n",GetLastError());return 3;}
+            printf("WGC205_SYMBOL=%s FUNCTION_RVA=0x%llx DISP=0x%llx\n",info->Name,
+              static_cast<unsigned long long>(info->Address-base),
+              static_cast<unsigned long long>(disp));
+            IMAGEHLP_LINE64 line{};line.SizeOfStruct=sizeof(line);
+            DWORD lineDisp=0;
+            if(SymGetLineFromAddr64(proc,base+0x319473ULL,&lineDisp,&line))
+              printf("WGC205_SOURCE=%s:%lu LINE_DISP=%lu\n",line.FileName,line.LineNumber,lineDisp);
+            else printf("WGC205_LINE_UNAVAILABLE=%lu\n",GetLastError());
+            SymCleanup(proc);
+            return 0;
+          }
+          '@ | Set-Content crash_sym205.cpp -Encoding utf8
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -property installationPath
+          if (!$vs) {throw 'Visual Studio missing'}
+          $dev=Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $cmd='call "'+$dev+'" -arch=x64 -host_arch=x64 && cl /nologo /EHsc /std:c++17 crash_sym205.cpp /Fe:crash_sym205.exe /link dbghelp.lib && crash_sym205.exe'
+          cmd /c $cmd
+          if ($LASTEXITCODE -ne 0) {throw 'Symbol lookup failed'}
