@@ -2330,12 +2330,12 @@ class Worker {
                 constexpr int height = 0;
                 const auto codecDecision = hi5::SelectCodecPolicy();
 
-const int fps = ReadConfigInt(
-    "HI5_STREAM_FPS",
-    60, // available manual ceiling; Automatic still requests <=20
-    5,
-    60
-);
+// HI5_STREAM_FPS is a legacy default from early 20-FPS releases and
+// must NOT restrict an explicit 15/30/45/60 viewer override. Automatic
+// remains separately qualified at 20 FPS until live capture/browser proof.
+// Keep the maximum session budget independent of legacy machine settings.
+const int fps = hi5::SelectManualSessionCeilingFps(ReadConfigInt(
+    "HI5_STREAM_MANUAL_CEILING_FPS", 60, 15, 60));
 
 const int bitrateKbps = ReadConfigInt(
     "HI5_STREAM_BITRATE_KBPS",
