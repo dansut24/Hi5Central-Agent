@@ -29,6 +29,8 @@ struct FrameCaptureResult {
     DesktopCaptureBackend backend = DesktopCaptureBackend::Unknown;
     // Per-new-WGC-frame timings; zero for empty polls and other backends.
     double wgcReadbackMs = 0.0;
+    double wgcGpuCopyMapMs = 0.0;
+    double wgcCpuBufferCopyMs = 0.0;
     double wgcConversionMs = 0.0;
     I420Frame frame;
     bool hasFrame = false;
