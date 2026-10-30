@@ -1,5 +1,6 @@
 #include "frame_source.h"
 #include "capture_frame_rate_policy.h"
+#include "capture_motion_samples.h"
 #include "ipc/shmem_ring.h"
 #include "ipc/input_pipe.h"
 #include "util/log.h"
@@ -832,6 +833,7 @@ namespace hi5 {
         double ipcWriteWorstMs = 0.0;
         int lastTargetFps = idleFps;
         int lastStreamMode = 0;
+        hi5::SampledDesktopMotion sampledDesktopMotion;
 
         LogInfo("[streamer] low-cpu mode session=" + args.sessionId +
             " requested_fps=" + std::to_string(requestedMaxFps) +
@@ -917,7 +919,14 @@ namespace hi5 {
                     captureTotalMs += captureMs;
                     captureWorstMs = std::max(captureWorstMs, captureMs);
                     ++measuredCaptures;
-                    const bool changedThisCapture = captured.hasFrame && captured.changed;
+                    // DXGI has genuine dirty-frame detection. GDI fallback
+                    // always marks captures dirty, so sample sparse luma to
+                    // avoid holding an otherwise idle desktop at motion FPS.
+                    const bool changedThisCapture =
+                        captured.hasFrame && captured.changed &&
+                        !captured.cursorOnly &&
+                        sampledDesktopMotion.observe(captured.frame.y,
+                            captured.frame.width, captured.frame.height);
                     if (changedThisCapture) lastChangedFrameAt = now;
                     const auto motionHold = std::chrono::milliseconds(
                         ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));

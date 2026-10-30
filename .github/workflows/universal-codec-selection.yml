@@ -3,6 +3,8 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - 'Agent/chatpass_agent/src/capture_motion_samples.h'
+      - 'Agent/chatpass_agent/tests/capture_motion_samples_test.cpp'
       - 'Agent/chatpass_agent/src/capture_frame_rate_policy.h'
       - 'Agent/chatpass_agent/src/streamer_main.cpp'
       - 'Agent/chatpass_agent/tests/capture_frame_rate_policy_test.cpp'
@@ -31,6 +33,8 @@ jobs:
           /tmp/codec_universal_test
           g++ -std=c++17 -O2 -Wall -Wextra -Werror Agent/chatpass_agent/tests/capture_frame_rate_policy_test.cpp -o /tmp/capture_frame_rate_policy_test
           /tmp/capture_frame_rate_policy_test
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror Agent/chatpass_agent/tests/capture_motion_samples_test.cpp -o /tmp/capture_motion_samples_test
+          /tmp/capture_motion_samples_test
           g++ -std=c++17 -O2 -Wall -Wextra -Werror \
             Agent/chatpass_agent/tests/codec_universal_connection_test.cpp \
             -o /tmp/codec_connection_test
@@ -54,6 +58,6 @@ jobs:
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw "Visual Studio C++ compiler unavailable" }
           $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
-          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/universal_codec_selection_test.cpp /Fe:codec_universal_test.exe && codec_universal_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/capture_frame_rate_policy_test.cpp /Fe:capture_frame_rate_policy_test.exe && capture_frame_rate_policy_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/codec_universal_connection_test.cpp /Fe:codec_connection_test.exe && codec_connection_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/codec_runtime_proof_test.cpp /Fe:codec_runtime_proof_test.exe && codec_runtime_proof_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/frame_scale_bilinear_test.cpp /Fe:h264_scaler_test.exe && h264_scaler_test.exe'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/universal_codec_selection_test.cpp /Fe:codec_universal_test.exe && codec_universal_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/capture_frame_rate_policy_test.cpp /Fe:capture_frame_rate_policy_test.exe && capture_frame_rate_policy_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/capture_motion_samples_test.cpp /Fe:capture_motion_samples_test.exe && capture_motion_samples_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/codec_universal_connection_test.cpp /Fe:codec_connection_test.exe && codec_connection_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/codec_runtime_proof_test.cpp /Fe:codec_runtime_proof_test.exe && codec_runtime_proof_test.exe && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/frame_scale_bilinear_test.cpp /Fe:h264_scaler_test.exe && h264_scaler_test.exe'
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "Universal codec selection unit tests failed" }
