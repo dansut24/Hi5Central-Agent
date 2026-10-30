@@ -11,6 +11,7 @@
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Graphics.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.h>
@@ -175,6 +176,46 @@ struct WgcMonitorCapture::Impl {
     WGC::GraphicsCaptureItem item{nullptr};
     WGC::Direct3D11CaptureFramePool pool{nullptr};
     WGC::GraphicsCaptureSession session{nullptr};
+    WgcUpdateIntervalStatus updateIntervalStatus{};
+    void ApplyOptInUpdateInterval() noexcept {
+        // This feature is already restricted to WGC on the normal desktop.
+        // The registry value is intentionally absent on customer devices.
+        // No minimum-interval change occurs unless a named pilot sets it.
+        DWORD requested = 0;
+        DWORD length = sizeof(requested);
+        const LSTATUS found = RegGetValueA(HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Hi5Central\\Agent", "WgcMinUpdateIntervalUs",
+            RRF_RT_REG_DWORD, nullptr, &requested, &length);
+        if (found == ERROR_SUCCESS && requested >= 1000 && requested <= 20000) {
+            updateIntervalStatus.requested = true;
+            updateIntervalStatus.requestedUs = requested;
+        }
+        try {
+            updateIntervalStatus.propertySupported =
+                winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
+                    L"Windows.Graphics.Capture.GraphicsCaptureSession",
+                    L"MinUpdateInterval");
+            if (!updateIntervalStatus.propertySupported) return;
+            updateIntervalStatus.default100ns = session.MinUpdateInterval().count();
+            if (updateIntervalStatus.requested) {
+                // Convert microseconds to WinRT TimeSpan (100ns ticks).
+                // A minimum interval is not a request to synthesize frames:
+                // source changes still control FrameArrived notifications.
+                session.MinUpdateInterval(
+                    winrt::Windows::Foundation::TimeSpan{
+                        static_cast<int64_t>(requested) * 10});
+                updateIntervalStatus.applied = true;
+            }
+            updateIntervalStatus.active100ns = session.MinUpdateInterval().count();
+        } catch (const winrt::hresult_error& ex) {
+            updateIntervalStatus.errorHresult = static_cast<int32_t>(ex.code());
+            // Any failure keeps the existing healthy capture session.
+            updateIntervalStatus.applied = false;
+        } catch (...) {
+            updateIntervalStatus.errorHresult = static_cast<int32_t>(E_FAIL);
+            updateIntervalStatus.applied = false;
+        }
+    }
 
     void Stop() {
         // Close capture objects before releasing D3D and the WinRT apartment.
@@ -188,6 +229,7 @@ struct WgcMonitorCapture::Impl {
             pool = nullptr;
         }
         arrivalState.reset();
+        updateIntervalStatus = {};
         consumedFrames = 0;
         eventsAtPreviousFrame = 0;
         previousSourceTimestamp100ns = 0;
@@ -300,6 +342,9 @@ struct WgcMonitorCapture::Impl {
             subscribedToFrameArrived = true;
             stage = "CreateCaptureSession";
             session = pool.CreateCaptureSession(item);
+            // Best-effort, opt-in OS-side interval only. Failure must not
+            // break WGC startup or change GDI/DXGI/UAC recovery.
+            ApplyOptInUpdateInterval();
             // Do not request borderless capture; the operating system's
             // privacy/consent indicator must remain visible.
             stage = "GraphicsCaptureSession.StartCapture";
@@ -427,4 +472,7 @@ bool WgcMonitorCapture::TryReadBgra(
 void WgcMonitorCapture::Stop() { if (impl_) impl_->Stop(); }
 bool WgcMonitorCapture::IsRunning() const {
     return impl_ && static_cast<bool>(impl_->session);
+}
+WgcUpdateIntervalStatus WgcMonitorCapture::GetUpdateIntervalStatus() const {
+    return impl_ ? impl_->updateIntervalStatus : WgcUpdateIntervalStatus{};
 }
