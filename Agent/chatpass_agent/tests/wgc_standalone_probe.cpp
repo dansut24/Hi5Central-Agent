@@ -238,9 +238,9 @@ int RunProbe(std::ostream& out) {
 int Spawn(bool useSystem) {
     const DWORD active=WTSGetActiveConsoleSessionId();
     if(active==0xffffffff) {std::cout<<"NO_ACTIVE_CONSOLE\n";return 21;}
-    if(!Enable(SE_TCB_NAME)) std::cout<<"WARN_NO_TCB_PRIVILEGE\n";
-    Enable(SE_ASSIGNPRIMARYTOKEN_NAME);
-    Enable(SE_INCREASE_QUOTA_NAME);
+    if(!Enable(L"SeTcbPrivilege")) std::cout<<"WARN_NO_TCB_PRIVILEGE\n";
+    Enable(L"SeAssignPrimaryTokenPrivilege");
+    Enable(L"SeIncreaseQuotaPrivilege");
     HANDLE token=nullptr;
     if(useSystem) {
         HANDLE original=nullptr;
