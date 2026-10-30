@@ -1154,8 +1154,13 @@ namespace hi5 {
 
             const auto sleepUntil = std::min(nextCaptureAt, currentTime + std::chrono::milliseconds(25));
             if (sleepUntil > currentTime) {
+                // The scoped 1ms fallback must be limited to an explicit
+                // 15/30/45/60 FPS WGC selection. Automatic, secure desktop,
+                // DXGI and GDI keep the existing system timer behaviour.
                 if (lastCaptureBackend == DesktopCaptureBackend::Wgc &&
-                    !isSecureHelper && !lastSecureState) {
+                    !isSecureHelper && !lastSecureState &&
+                    (manualCaptureFps == 15 || manualCaptureFps == 30 ||
+                     manualCaptureFps == 45 || manualCaptureFps == 60)) {
                     if (wgcPacer.WaitUntil(sleepUntil)) {
                         ++wgcHighResWaits;
                     } else {
@@ -1164,15 +1169,23 @@ namespace hi5 {
                     if (!wgcTimerStatusLogged) {
                         wgcTimerStatusLogged = true;
                         if (wgcPacer.Available()) {
-                            LogInfo("[streamer] WGC high-resolution waitable timer enabled session=" + args.sessionId);
+                            LogInfo("[streamer] WGC high-resolution capture pacing enabled session=" +
+                                args.sessionId + " mode=" + wgcPacer.Mode() +
+                                " waitable_error=" + std::to_string(wgcPacer.CreateError()) +
+                                " timer_period_error=" + std::to_string(wgcPacer.PeriodError()));
                         } else {
-                            LogWarn("[streamer] WGC high-resolution timer unavailable error=" +
+                            LogWarn("[streamer] WGC high-resolution pacing unavailable session=" +
+                                args.sessionId + " waitable_error=" +
                                 std::to_string(wgcPacer.CreateError()) +
-                                " action=legacy_sleep_fallback session=" + args.sessionId);
+                                " timer_period_error=" + std::to_string(wgcPacer.PeriodError()) +
+                                " action=legacy_sleep");
                         }
                     }
                 } else {
-                    // Preserve existing GDI/DXGI and secure/UAC timings.
+                    // Release scoped timer-resolution requests immediately
+                    // when switching back to Automatic or GDI/UAC.
+                    wgcPacer.Release();
+                    wgcTimerStatusLogged = false;
                     std::this_thread::sleep_until(sleepUntil);
                 }
             }
