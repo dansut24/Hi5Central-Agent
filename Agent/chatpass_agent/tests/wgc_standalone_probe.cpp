@@ -277,7 +277,7 @@ int RunProbe(std::ostream& out) {
        <<" DEFAULT_DESKTOP_READ_ENUM="<<(verify?1:0)
        <<" ACCESS_ERROR="<<verifyError
        <<" TOKEN_INTEGRITY_RID="<<tokenLevel
-       <<" REMOTE_SESSION_FLAG="<<GetSystemMetrics(SM_REMOTESESSION)<<"\\n";
+       <<" REMOTE_SESSION_FLAG="<<GetSystemMetrics(SM_REMOTESESSION)<<"\n";
     Monitor monitor;
     EnumDisplayMonitors(nullptr,nullptr,VisitMon,reinterpret_cast<LPARAM>(&monitor));
     if(!monitor.handle) {out<<"NO_PRIMARY_MONITOR\n";return 12;}
