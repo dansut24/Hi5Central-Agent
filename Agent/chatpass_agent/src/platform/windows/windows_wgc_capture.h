@@ -6,6 +6,11 @@
 #include <vector>
 #include <cstdint>
 
+// Valid only when TryReadBgra returned a compositor frame successfully.
+struct WgcReadbackTimings {
+    double gpuCopyMapMs = 0.0; // GPU CopyResource and blocking CPU Map
+    double cpuBufferCopyMs = 0.0; // mapped BGRA to reusable CPU buffer
+};
 class WgcMonitorCapture final {
 public:
     WgcMonitorCapture();
@@ -18,7 +23,8 @@ public:
     // Returns false without failure when the compositor has not produced a
     // new frame; caller can reuse its last good frame or use GDI initially.
     bool TryReadBgra(std::vector<uint8_t>& bgra, int& width, int& height,
-                     int& stride, std::string& failure);
+                     int& stride, std::string& failure,
+                     WgcReadbackTimings* timings = nullptr);
     void Stop();
     bool IsRunning() const;
 private:
