@@ -3,6 +3,7 @@
 #include "codec_auto_fps.h"
 #include "capture_motion_samples.h"
 #include "capture_publish_policy.h"
+#include "wgc_high_resolution_pacer_win.h"
 #include "ipc/shmem_ring.h"
 #include "ipc/input_pipe.h"
 #include "util/log.h"
@@ -844,6 +845,12 @@ namespace hi5 {
         // The actual capture provider may be WGC even if legacy displayIndex
         // remains -1 because DXGI DuplicateOutput was access-denied.
         DesktopCaptureBackend lastCaptureBackend = DesktopCaptureBackend::Unknown;
+        // A local high-resolution waitable timer is enabled only when a
+        // live WGC poll is the active normal-desktop capture provider.
+        hi5::WgcHighResolutionPacer wgcPacer;
+        bool wgcTimerStatusLogged = false;
+        uint64_t wgcHighResWaits = 0;
+        uint64_t wgcFallbackWaits = 0;
         uint64_t wgcNew = 0;
         uint64_t wgcEmpty = 0;
         uint64_t dxgiNew = 0;
@@ -995,7 +1002,11 @@ namespace hi5 {
                     // Use the rate of the *newly observed* frame, not the
                     // previous idle mode's 500ms interval. 500ms idle polls
                     // otherwise outlive the 300ms motion hold indefinitely.
-                    nextCaptureAt = now + std::chrono::milliseconds(1000 / std::max(1, chosenRate.targetFps));
+                    // Preserve fractional frame periods (60 FPS = 16.667ms).
+                    // Integer millisecond truncation accumulated scheduling
+                    // phase error before the new high-resolution WGC wait.
+                    nextCaptureAt = now + std::chrono::nanoseconds(
+                        1000000000ll / std::max(1, chosenRate.targetFps));
 
                     if (changedThisCapture) {
                         ++changedFrames;
@@ -1065,7 +1076,9 @@ namespace hi5 {
                         wgcConversionTotalMs / std::max<uint64_t>(1, wgcNew)) +
                     " poll_gap_avg_ms=" + std::to_string(
                         pollGapTotalMs / std::max<uint64_t>(1, pollGapCount)) +
-                    " target_poll_fps=" + std::to_string(lastTargetFps));
+                    " target_poll_fps=" + std::to_string(lastTargetFps) +
+                    " wgc_high_res_waits=" + std::to_string(wgcHighResWaits) +
+                    " wgc_fallback_waits=" + std::to_string(wgcFallbackWaits));
                 LogInfo("[streamer] low-cpu stats session=" + args.sessionId +
                     " attempts=" + std::to_string(captureAttempts) +
                     " changed=" + std::to_string(changedFrames) +
@@ -1111,6 +1124,8 @@ namespace hi5 {
                 wgcConversionTotalMs = 0.0;
                 pollGapTotalMs = 0.0;
                 pollGapCount = 0;
+                wgcHighResWaits = 0;
+                wgcFallbackWaits = 0;
                 // Keep previousCaptureAt across windows to measure gaps.
                 changedFrames = 0;
                 cursorOnlyFrames = 0;
@@ -1129,7 +1144,27 @@ namespace hi5 {
 
             const auto sleepUntil = std::min(nextCaptureAt, currentTime + std::chrono::milliseconds(25));
             if (sleepUntil > currentTime) {
-                std::this_thread::sleep_until(sleepUntil);
+                if (lastCaptureBackend == DesktopCaptureBackend::Wgc &&
+                    !isSecureHelper && !lastSecureState) {
+                    if (wgcPacer.WaitUntil(sleepUntil)) {
+                        ++wgcHighResWaits;
+                    } else {
+                        ++wgcFallbackWaits;
+                    }
+                    if (!wgcTimerStatusLogged) {
+                        wgcTimerStatusLogged = true;
+                        if (wgcPacer.Available()) {
+                            LogInfo("[streamer] WGC high-resolution waitable timer enabled session=" + args.sessionId);
+                        } else {
+                            LogWarn("[streamer] WGC high-resolution timer unavailable error=" +
+                                std::to_string(wgcPacer.CreateError()) +
+                                " action=legacy_sleep_fallback session=" + args.sessionId);
+                        }
+                    }
+                } else {
+                    // Preserve existing GDI/DXGI and secure/UAC timings.
+                    std::this_thread::sleep_until(sleepUntil);
+                }
             }
         }
 
