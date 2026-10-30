@@ -1,0 +1,94 @@
+name: Package verified Lenovo Agent 1.0.259 via GHCR
+on:
+  push:
+    branches: [feature/av1-hardware-qualification-20261029]
+    paths:
+      - .github/workflows/package-agent259-vps.yml
+permissions:
+  contents: read
+  actions: read
+  packages: write
+jobs:
+  publish-test-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify immutable source run and download Windows artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/${{ github.repository }}/actions/runs/41118227313 --jq '[.head_sha,.conclusion,.run_number] | join(" ")' > source-run.txt
+          grep -Fx '7a888404923a5a9f284ba67d6ad6a3197dcb4774 success 234' source-run.txt
+      - name: Download exact green Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 41118227313
+          artifact-ids: 13007428826
+          github-token: ${{ github.token }}
+          path: artifact
+      - name: Extract original Inno installer and publish checksum
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct,hashlib
+          data=Path('artifact/Hi5Central-Windows-Tenant-Template/Hi5CentralAgentTemplate.exe').read_bytes()
+          u16=lambda i:struct.unpack_from('<H',data,i)[0]
+          u32=lambda i:struct.unpack_from('<I',data,i)[0]
+          pe=u32(0x3c)
+          assert data[pe:pe+4]==b'PE\x00\x00'
+          opt=pe+24
+          res_rva=u32(opt+(96 if u16(opt)==0x10b else 112)+16)
+          sections=[]
+          for j in range(u16(pe+6)):
+              k=opt+u16(pe+20)+j*40
+              sections.append((u32(k+12),max(u32(k+8),u32(k+16)),u32(k+20)))
+          def offs(rva):
+              for va,size,raw in sections:
+                  if va<=rva<va+size:return raw+rva-va
+              raise ValueError('resource RVA outside PE')
+          base=offs(res_rva)
+          def entries(rel):
+              k=base+rel
+              return [(u32(k+16+8*i),u32(k+20+8*i)) for i in range(u16(k+12)+u16(k+14))]
+          typ=next(b for a,b in entries(0) if a==10)
+          name=next(b for a,b in entries(typ&0x7fffffff) if a==101)
+          leaf=entries(name&0x7fffffff)[0][1]
+          rva,size=u32(base+leaf),u32(base+leaf+4)
+          payload=data[offs(rva):offs(rva)+size]
+          assert len(payload)>4000000 and payload[:2]==b'MZ'
+          out=Path('Hi5CentralAgentSetup-1.0.259.exe')
+          out.write_bytes(payload)
+          digest=hashlib.sha256(payload).hexdigest()
+          Path('Hi5CentralAgentSetup-1.0.259.exe.sha256').write_text(digest+'  '+out.name+'\n')
+          print('LENOVO_259_SHA256',digest,'SIZE',len(payload),'SOURCE_SHA','7a888404923a5a9f284ba67d6ad6a3197dcb4774')
+          PY
+      - name: Verify packaged installer matches measured source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '3f913f44ba2de1112b2e093c529cdcf758a668c4f027d5e1721eb538deeecc09  Hi5CentralAgentSetup-1.0.259.exe' | sha256sum -c -
+          test "$(stat -c %s Hi5CentralAgentSetup-1.0.259.exe)" = '6021568'
+          mkdir -p stage
+          cp Hi5CentralAgentSetup-1.0.259.exe Hi5CentralAgentSetup-1.0.259.exe.sha256 stage/
+          cat >stage/Dockerfile <<'DOCKER'
+          FROM scratch
+          LABEL org.opencontainers.image.title="Hi5Central Agent Lenovo-only installer transport"
+          LABEL org.opencontainers.image.revision="7a888404923a5a9f284ba67d6ad6a3197dcb4774"
+          LABEL hi5central.release_scope="single-device-lenovo-test-no-fleet"
+          COPY Hi5CentralAgentSetup-1.0.259.exe /artifact/Hi5CentralAgentSetup-1.0.259.exe
+          COPY Hi5CentralAgentSetup-1.0.259.exe.sha256 /artifact/Hi5CentralAgentSetup-1.0.259.exe.sha256
+          CMD ["/artifact/Hi5CentralAgentSetup-1.0.259.exe"]
+          DOCKER
+      - name: Authenticate to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish immutable installer transport image
+        uses: docker/build-push-action@v6
+        with:
+          context: stage
+          push: true
+          tags: ghcr.io/dansut24/hi5central-agent-lenovo-installer:1.0.259-7a888404
