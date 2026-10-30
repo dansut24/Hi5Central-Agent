@@ -2,6 +2,7 @@
 #include <libyuv/convert.h>
 #include "util/log.h"
 #include "windows_wgc_capture.h"
+#include "wgc_adaptive_i420.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -31,6 +32,17 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+    // Set HI5_WGC_ADAPTIVE_I420=0 to fall back instantly to the proven
+    // single-call libyuv path. WGC is already normal-desktop opt-in only.
+    static bool Hi5WgcAdaptiveI420Enabled() {
+        static const bool enabled = []() {
+            char value[8]{};
+            const DWORD n = GetEnvironmentVariableA(
+                "HI5_WGC_ADAPTIVE_I420", value, static_cast<DWORD>(sizeof(value)));
+            return !(n == 1 && value[0] == '0');
+        }();
+        return enabled;
+    }
     static bool Hi5CompositeCursorEnabled() {
         static const bool enabled = []() {
             char buf[16]{};
@@ -668,6 +680,8 @@ struct DesktopFrameSource::Impl {
     // Reuse the ~16MB GPU-readback buffer across WGC compositor updates.
     // Streamer owns this source on one thread; no per-frame allocations.
     std::vector<uint8_t> wgcBgraBuffer;
+    hi5::WgcAdaptiveI420Converter wgcI420Converter;
+    bool wgcI420ChoiceLogged = false;
     uint64_t gdiProfileSamples = 0;
     double gdiCopyMs = 0;
     double gdiConvertMs = 0;
@@ -1118,8 +1132,19 @@ struct DesktopFrameSource::Impl {
             int w = 0, h = 0, pitch = 0;
             std::string error;
             WgcReadbackTimings readbackStages{};
+            WgcFrameArrivalDiagnostics arrivals{};
+            auto addArrivalStats = [&arrivals](FrameCaptureResult& r) {
+                r.wgcArrivalEventsTotal = arrivals.eventsTotal;
+                r.wgcArrivalGapCount = arrivals.arrivalGapCount;
+                r.wgcArrivalGapTotalNs = arrivals.arrivalGapTotalNs;
+                r.wgcArrivalGapMaxNs = arrivals.arrivalGapMaxNs;
+                r.wgcFramesConsumedTotal = arrivals.framesConsumedTotal;
+                r.wgcArrivalsSincePreviousFrame = arrivals.eventsSincePreviousFrame;
+                r.wgcSourceTimestamp100ns = arrivals.sourceTimestamp100ns;
+                r.wgcSourceTimestampGap100ns = arrivals.sourceTimestampGap100ns;
+            };
             const auto wgcReadStarted = std::chrono::steady_clock::now();
-            if (wgc->TryReadBgra(bgra, w, h, pitch, error, &readbackStages)) {
+            if (wgc->TryReadBgra(bgra, w, h, pitch, error, &readbackStages, &arrivals)) {
                 // Includes WGC frame acquisition, GPU staging map and CPU readback.
                 const double readbackMs = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - wgcReadStarted).count();
@@ -1181,9 +1206,21 @@ struct DesktopFrameSource::Impl {
                                         w, h, bgra, pitch);
                 }
                 const auto convertStarted = std::chrono::steady_clock::now();
-                bgraToI420(bgra.data(), pitch, w, h, frame);
+                if (!wgcI420Converter.Convert(
+                    bgra.data(), pitch, w, h, frame, Hi5WgcAdaptiveI420Enabled())) {
+                    throw std::runtime_error("WGC libyuv ARGBToI420 conversion failed");
+                }
                 const double convertMs = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - convertStarted).count();
+                if (wgcI420Converter.Qualified() && !wgcI420ChoiceLogged) {
+                    wgcI420ChoiceLogged = true;
+                    LogInfo("[capture] WGC I420 adaptive decision=" +
+                        std::string(wgcI420Converter.UsingParallel() ? "two_strip" : "serial") +
+                        " serial_trial_avg_ms=" +
+                        std::to_string(wgcI420Converter.SerialTrialAvgMs()) +
+                        " parallel_trial_avg_ms=" +
+                        std::to_string(wgcI420Converter.ParallelTrialAvgMs()));
+                }
                 // Do not clone a new 6MB I420 frame into lastFrame on
                 // every successful WGC update. WGC itself signals changed
                 // frames; no unchanged video is written. Retaining an old
@@ -1197,6 +1234,12 @@ struct DesktopFrameSource::Impl {
                 result.wgcGpuCopyMapMs = readbackStages.gpuCopyMapMs;
                 result.wgcCpuBufferCopyMs = readbackStages.cpuBufferCopyMs;
                 result.wgcConversionMs = convertMs;
+                result.wgcConversionParallel = wgcI420Converter.ParallelLast();
+                result.wgcConverterQualified = wgcI420Converter.Qualified();
+                result.wgcConverterPrefersParallel = wgcI420Converter.UsingParallel();
+                result.wgcConversionSerialTrialAvgMs = wgcI420Converter.SerialTrialAvgMs();
+                result.wgcConversionParallelTrialAvgMs = wgcI420Converter.ParallelTrialAvgMs();
+                addArrivalStats(result);
                 result.changedIsNative = true; // WGC compositor delivered a new frame
                 result.frameId = ++frameId;
                 if (!wgcReceivedFrame) {
@@ -1224,6 +1267,7 @@ struct DesktopFrameSource::Impl {
                 result.backend = DesktopCaptureBackend::Wgc;
                 result.changed = false;
                 result.frameId = frameId;
+                addArrivalStats(result);
                 return result;
             }
             // Before the first WGC compositor frame, continue live GDI.
