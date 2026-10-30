@@ -135,7 +135,7 @@ jobs:
           & $readobj --file-headers --coff-debug-directory "$exe"
           Write-Host 'PDB_SUMMARY'
           & $pdbutil dump -summary "$pdb"
-          $vswhere="\${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vswhere="${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs=& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           Write-Host ('DIA_SDK_INCLUDE_EXISTS='+(Test-Path (Join-Path $vs 'DIA SDK\include\dia2.h')))
           Write-Host ('DIA_SDK_LIB_EXISTS='+(Test-Path (Join-Path $vs 'DIA SDK\lib\amd64\diaguids.lib')))
