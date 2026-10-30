@@ -859,6 +859,27 @@ namespace hi5 {
         double wgcGpuMapTotalMs = 0.0;
         double wgcBufferCopyTotalMs = 0.0;
         double wgcConversionTotalMs = 0.0;
+        uint64_t wgcArrivals = 0;
+        uint64_t previousWgcArrivalTotal = 0;
+        uint64_t previousWgcArrivalGapCount = 0;
+        uint64_t previousWgcArrivalGapTotalNs = 0;
+        uint64_t wgcArrivalGapSamples = 0;
+        uint64_t wgcArrivalGapNs = 0;
+        uint64_t wgcArrivalGapMaxNs = 0;
+        uint64_t wgcSourceGapSamples = 0;
+        int64_t wgcSourceGapTotal100ns = 0;
+        int64_t wgcSourceGapMax100ns = 0;
+        int64_t wgcFirstSourceTimestamp100ns = 0;
+        int64_t wgcLastSourceTimestamp100ns = 0;
+        uint64_t wgcMultipleArrivalsPerConsumed = 0;
+        uint64_t wgcParallelConversions = 0;
+        uint64_t wgcSerialConversions = 0;
+        double wgcParallelConversionTotalMs = 0.0;
+        double wgcSerialConversionTotalMs = 0.0;
+        bool lastConverterQualified = false;
+        bool lastConverterParallel = false;
+        double lastSerialTrialAvgMs = 0.0;
+        double lastParallelTrialAvgMs = 0.0;
         uint64_t pollGapCount = 0;
         double pollGapTotalMs = 0.0;
         std::chrono::steady_clock::time_point previousCaptureAt{};
@@ -960,7 +981,49 @@ namespace hi5 {
                     FrameCaptureResult captured = source.nextFrameEx();
                     lastCaptureBackend = captured.backend;
                     if (captured.backend == DesktopCaptureBackend::Wgc) {
+                        // FrameArrived is a separate WinRT callback. Count
+                        // those events independently of TryGetNextFrame and
+                        // monitor the compositor's real source timestamps.
+                        if (captured.wgcArrivalEventsTotal < previousWgcArrivalTotal) {
+                            previousWgcArrivalTotal = 0; // new frame pool after reset
+                            previousWgcArrivalGapCount = 0;
+                            previousWgcArrivalGapTotalNs = 0;
+                        }
+                        wgcArrivals += captured.wgcArrivalEventsTotal - previousWgcArrivalTotal;
+                        previousWgcArrivalTotal = captured.wgcArrivalEventsTotal;
+                        if (captured.wgcArrivalGapCount >= previousWgcArrivalGapCount &&
+                            captured.wgcArrivalGapTotalNs >= previousWgcArrivalGapTotalNs) {
+                            wgcArrivalGapSamples += captured.wgcArrivalGapCount - previousWgcArrivalGapCount;
+                            wgcArrivalGapNs += captured.wgcArrivalGapTotalNs - previousWgcArrivalGapTotalNs;
+                        }
+                        previousWgcArrivalGapCount = captured.wgcArrivalGapCount;
+                        previousWgcArrivalGapTotalNs = captured.wgcArrivalGapTotalNs;
+                        wgcArrivalGapMaxNs = std::max(wgcArrivalGapMaxNs, captured.wgcArrivalGapMaxNs);
                         if (captured.changed && captured.hasFrame) {
+                            if (captured.wgcArrivalsSincePreviousFrame > 1)
+                                wgcMultipleArrivalsPerConsumed += captured.wgcArrivalsSincePreviousFrame - 1;
+                            if (captured.wgcSourceTimestamp100ns > 0) {
+                                if (wgcFirstSourceTimestamp100ns == 0)
+                                    wgcFirstSourceTimestamp100ns = captured.wgcSourceTimestamp100ns;
+                                wgcLastSourceTimestamp100ns = captured.wgcSourceTimestamp100ns;
+                            }
+                            if (captured.wgcSourceTimestampGap100ns > 0) {
+                                ++wgcSourceGapSamples;
+                                wgcSourceGapTotal100ns += captured.wgcSourceTimestampGap100ns;
+                                wgcSourceGapMax100ns = std::max(
+                                    wgcSourceGapMax100ns, captured.wgcSourceTimestampGap100ns);
+                            }
+                            if (captured.wgcConversionParallel) {
+                                ++wgcParallelConversions;
+                                wgcParallelConversionTotalMs += captured.wgcConversionMs;
+                            } else {
+                                ++wgcSerialConversions;
+                                wgcSerialConversionTotalMs += captured.wgcConversionMs;
+                            }
+                            lastConverterQualified = captured.wgcConverterQualified;
+                            lastConverterParallel = captured.wgcConverterPrefersParallel;
+                            lastSerialTrialAvgMs = captured.wgcConversionSerialTrialAvgMs;
+                            lastParallelTrialAvgMs = captured.wgcConversionParallelTrialAvgMs;
                             ++wgcNew;
                             wgcReadbackTotalMs += captured.wgcReadbackMs;
                             wgcGpuMapTotalMs += captured.wgcGpuCopyMapMs;
@@ -1082,6 +1145,30 @@ namespace hi5 {
                         wgcBufferCopyTotalMs / std::max<uint64_t>(1, wgcNew)) +
                     " wgc_conversion_avg_ms=" + std::to_string(
                         wgcConversionTotalMs / std::max<uint64_t>(1, wgcNew)) +
+                    " wgc_arrival_events=" + std::to_string(wgcArrivals) +
+                    " wgc_arrival_gap_avg_ms=" + std::to_string(
+                        static_cast<double>(wgcArrivalGapNs) / 1000000.0 /
+                        std::max<uint64_t>(1, wgcArrivalGapSamples)) +
+                    " wgc_arrival_gap_session_max_ms=" + std::to_string(
+                        static_cast<double>(wgcArrivalGapMaxNs) / 1000000.0) +
+                    " wgc_source_gap_avg_ms=" + std::to_string(
+                        static_cast<double>(wgcSourceGapTotal100ns) / 10000.0 /
+                        std::max<uint64_t>(1, wgcSourceGapSamples)) +
+                    " wgc_source_gap_max_ms=" + std::to_string(
+                        static_cast<double>(wgcSourceGapMax100ns) / 10000.0) +
+                    " wgc_source_first_100ns=" + std::to_string(wgcFirstSourceTimestamp100ns) +
+                    " wgc_source_last_100ns=" + std::to_string(wgcLastSourceTimestamp100ns) +
+                    " wgc_extra_arrivals_before_consume=" + std::to_string(wgcMultipleArrivalsPerConsumed) +
+                    " wgc_parallel_frames=" + std::to_string(wgcParallelConversions) +
+                    " wgc_serial_frames=" + std::to_string(wgcSerialConversions) +
+                    " wgc_parallel_convert_avg_ms=" + std::to_string(
+                        wgcParallelConversionTotalMs / std::max<uint64_t>(1, wgcParallelConversions)) +
+                    " wgc_serial_convert_avg_ms=" + std::to_string(
+                        wgcSerialConversionTotalMs / std::max<uint64_t>(1, wgcSerialConversions)) +
+                    " wgc_converter_qualified=" + std::to_string(lastConverterQualified ? 1 : 0) +
+                    " wgc_converter_mode=" + std::string(lastConverterParallel ? "two_strip" : "serial") +
+                    " wgc_converter_serial_trial_avg_ms=" + std::to_string(lastSerialTrialAvgMs) +
+                    " wgc_converter_parallel_trial_avg_ms=" + std::to_string(lastParallelTrialAvgMs) +
                     " poll_gap_avg_ms=" + std::to_string(
                         pollGapTotalMs / std::max<uint64_t>(1, pollGapCount)) +
                     " target_poll_fps=" + std::to_string(lastTargetFps) +
@@ -1132,6 +1219,21 @@ namespace hi5 {
                 wgcGpuMapTotalMs = 0.0;
                 wgcBufferCopyTotalMs = 0.0;
                 wgcConversionTotalMs = 0.0;
+                wgcArrivals = 0;
+                wgcArrivalGapSamples = 0;
+                wgcArrivalGapNs = 0;
+                wgcArrivalGapMaxNs = 0;
+                wgcSourceGapSamples = 0;
+                wgcSourceGapTotal100ns = 0;
+                wgcSourceGapMax100ns = 0;
+                wgcFirstSourceTimestamp100ns = 0;
+                wgcLastSourceTimestamp100ns = 0;
+                wgcMultipleArrivalsPerConsumed = 0;
+                wgcParallelConversions = 0;
+                wgcSerialConversions = 0;
+                wgcParallelConversionTotalMs = 0.0;
+                wgcSerialConversionTotalMs = 0.0;
+                // Keep previous source-event totals across stats windows.
                 pollGapTotalMs = 0.0;
                 pollGapCount = 0;
                 wgcHighResWaits = 0;
