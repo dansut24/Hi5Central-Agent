@@ -1,4 +1,4 @@
-name: Publish verified Agent 1.0.196 test installer
+name: Publish verified Agent 1.0.202 test installer
 on:
   push:
     branches:
@@ -12,11 +12,11 @@ jobs:
   publish-test-installer:
     runs-on: ubuntu-latest
     steps:
-      - name: Download already green Windows template artifact (run 196)
+      - name: Download already green Windows template artifact (run 202)
         uses: actions/download-artifact@v4
         with:
-          run-id: 41017289555
-          artifact-ids: 12960154714
+          run-id: 41024908160
+          artifact-ids: 12964560057
           github-token: ${{ github.token }}
           path: artifact
       - name: Extract installer and verify pinned SHA-256
@@ -51,19 +51,19 @@ jobs:
           payload=data[offs(rva):offs(rva)+size]
           assert len(payload)>4000000 and payload[:2]==b'MZ'
           actual=hashlib.sha256(payload).hexdigest()
-          expected='145e6c98583c7bcfc2fc5fb377aa53c023ed36904b9703c623ca2536d440b0c3'
+          expected='8f4e46b8223391e11b62bf48ac573d42567a2afaa32a065425944816b1c5f345'
           assert actual==expected,(actual,expected)
-          out=Path('Hi5CentralAgentSetup-1.0.196.exe')
+          out=Path('Hi5CentralAgentSetup-1.0.202.exe')
           out.write_bytes(payload)
-          print('VERIFIED_AGENT196_SHA256',actual,'size',len(payload))
+          print('VERIFIED_AGENT202_SHA256',actual,'size',len(payload))
           PY
       - name: Publish test release asset for checksum-verified VPS handoff
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create agent-1.0.196-test Hi5CentralAgentSetup-1.0.196.exe \
+          gh release create agent-1.0.202-test Hi5CentralAgentSetup-1.0.202.exe \
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
-            --title "Agent 1.0.196 controlled test artifact" \
-            --notes "Verified artifact from GitHub Actions Windows installer run 41017289555. SHA256: 145e6c98583c7bcfc2fc5fb377aa53c023ed36904b9703c623ca2536d440b0c3. Not a production fleet release." \
+            --title "Agent 1.0.202 controlled test artifact" \
+            --notes "Verified artifact from GitHub Actions Windows installer run 41024908160. SHA256: 8f4e46b8223391e11b62bf48ac573d42567a2afaa32a065425944816b1c5f345. Not a production fleet release." \
             --prerelease
