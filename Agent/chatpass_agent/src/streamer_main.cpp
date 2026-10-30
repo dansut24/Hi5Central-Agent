@@ -1152,15 +1152,23 @@ namespace hi5 {
                 nextStatsAt = currentTime + statsEvery;
             }
 
+            const bool explicitWgcTiming =
+                lastCaptureBackend == DesktopCaptureBackend::Wgc &&
+                !isSecureHelper && !lastSecureState &&
+                (manualCaptureFps == 15 || manualCaptureFps == 30 ||
+                 manualCaptureFps == 45 || manualCaptureFps == 60);
+            // Release a scoped timer request even when capture processing is
+            // busy enough that this loop skips its sleep altogether.
+            if (!explicitWgcTiming) {
+                wgcPacer.Release();
+                wgcTimerStatusLogged = false;
+            }
             const auto sleepUntil = std::min(nextCaptureAt, currentTime + std::chrono::milliseconds(25));
             if (sleepUntil > currentTime) {
                 // The scoped 1ms fallback must be limited to an explicit
                 // 15/30/45/60 FPS WGC selection. Automatic, secure desktop,
                 // DXGI and GDI keep the existing system timer behaviour.
-                if (lastCaptureBackend == DesktopCaptureBackend::Wgc &&
-                    !isSecureHelper && !lastSecureState &&
-                    (manualCaptureFps == 15 || manualCaptureFps == 30 ||
-                     manualCaptureFps == 45 || manualCaptureFps == 60)) {
+                if (explicitWgcTiming) {
                     if (wgcPacer.WaitUntil(sleepUntil)) {
                         ++wgcHighResWaits;
                     } else {
@@ -1184,8 +1192,6 @@ namespace hi5 {
                 } else {
                     // Release scoped timer-resolution requests immediately
                     // when switching back to Automatic or GDI/UAC.
-                    wgcPacer.Release();
-                    wgcTimerStatusLogged = false;
                     std::this_thread::sleep_until(sleepUntil);
                 }
             }
