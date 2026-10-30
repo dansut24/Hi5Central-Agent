@@ -52,10 +52,14 @@ int main(int argc, char** argv) {
         width = 1280; height = 720; bitrateKbps = 4000; frames = 30;
     } else if (argc == 2 && std::string(argv[1]) == "--1080p") {
         width = 1920; height = 1080; bitrateKbps = 6000; frames = 24;
+    } else if (argc == 2 && std::string(argv[1]) == "--720p30") {
+        width = 1280; height = 720; bitrateKbps = 5000; frames = 60; fps = 30;
+    } else if (argc == 2 && std::string(argv[1]) == "--1080p30") {
+        width = 1920; height = 1080; bitrateKbps = 7000; frames = 48; fps = 30;
     } else if (argc == 2 && std::string(argv[1]) == "--720p60") {
         width = 1280; height = 720; bitrateKbps = 6000; frames = 90; fps = 60;
     } else if (argc != 1) {
-        std::cerr << "Usage: av1_software_encoder_test [--720p|--1080p|--720p60]\n";
+        std::cerr << "Usage: av1_software_encoder_test [--720p|--1080p|--720p30|--1080p30|--720p60]\n";
         return 2;
     }
     hi5::SoftwareAv1EncoderExperiment encoder;
@@ -163,10 +167,10 @@ int main(int argc, char** argv) {
     // Per-frame latency qualification. The 60-FPS budget is 16.67 ms;
     // keep the 20-FPS historical thresholds unchanged for comparability.
     const double budgetMs = 1000.0 / fps;
-    const double p95BudgetMs = fps == 60 ? budgetMs * 0.75 : 35.0;
-    const double worstBudgetMs = fps == 60 ? budgetMs * 1.50 : 50.0;
+    const double p95BudgetMs = fps >= 30 ? budgetMs * 0.75 : 35.0;
+    const double worstBudgetMs = fps >= 30 ? budgetMs * 1.50 : 50.0;
     const bool realtime = p95 <= p95BudgetMs && steadyWorst <= worstBudgetMs;
-    std::cout << "LIBAOM_REALTIME_SCREEN_AV1_PASS"
+    std::cout << "LIBAOM_SYNTHETIC_AV1_DECODE_RTP_RECOVERY_PASS"
               << " resolution=" << width << "x" << height
               << " target_fps=" << fps
               << " budget_ms=" << budgetMs
@@ -178,7 +182,10 @@ int main(int argc, char** argv) {
               << " p95_steady_ms=" << p95
               << " worst_steady_ms=" << steadyWorst
               << " worst_including_startup_ms=" << worstMs
-              << " realtime_20fps_qualified=" << (realtime ? "yes" : "no")
+              << " encode_p95_budget_ms=" << p95BudgetMs
+              << " encode_worst_budget_ms=" << worstBudgetMs
+              << " synthetic_encode_latency_qualified_for_requested_fps=" << (realtime ? "yes" : "no")
+              << " live_viewer_fps_qualified=no"
               << " environment=synthetic_no_capture_network_or_browser\n";
     return 0;
 }
