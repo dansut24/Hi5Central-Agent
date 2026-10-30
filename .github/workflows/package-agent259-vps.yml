@@ -18,7 +18,7 @@ jobs:
         run: |
           set -euo pipefail
           gh api repos/${{ github.repository }}/actions/runs/41118227313 --jq '[.head_sha,.conclusion,.run_number] | join(" ")' > source-run.txt
-          grep -Fx '7a888404923a5a9f284ba67d6ad6a3197dcb4774 success 234' source-run.txt
+          grep -Fx '7a888404923a5a9f284ba67d6ad6a3197dcb4774 success 259' source-run.txt
       - name: Download exact green Windows artifact
         uses: actions/download-artifact@v4
         with:
