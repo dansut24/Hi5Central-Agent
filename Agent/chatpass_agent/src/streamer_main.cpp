@@ -856,6 +856,8 @@ namespace hi5 {
         uint64_t dxgiNew = 0;
         uint64_t gdiPolls = 0;
         double wgcReadbackTotalMs = 0.0;
+        double wgcGpuMapTotalMs = 0.0;
+        double wgcBufferCopyTotalMs = 0.0;
         double wgcConversionTotalMs = 0.0;
         uint64_t pollGapCount = 0;
         double pollGapTotalMs = 0.0;
@@ -961,6 +963,8 @@ namespace hi5 {
                         if (captured.changed && captured.hasFrame) {
                             ++wgcNew;
                             wgcReadbackTotalMs += captured.wgcReadbackMs;
+                            wgcGpuMapTotalMs += captured.wgcGpuCopyMapMs;
+                            wgcBufferCopyTotalMs += captured.wgcCpuBufferCopyMs;
                             wgcConversionTotalMs += captured.wgcConversionMs;
                         } else {
                             ++wgcEmpty;
@@ -1072,6 +1076,10 @@ namespace hi5 {
                     " gdi_polls=" + std::to_string(gdiPolls) +
                     " wgc_readback_avg_ms=" + std::to_string(
                         wgcReadbackTotalMs / std::max<uint64_t>(1, wgcNew)) +
+                    " wgc_gpu_map_avg_ms=" + std::to_string(
+                        wgcGpuMapTotalMs / std::max<uint64_t>(1, wgcNew)) +
+                    " wgc_cpu_copy_avg_ms=" + std::to_string(
+                        wgcBufferCopyTotalMs / std::max<uint64_t>(1, wgcNew)) +
                     " wgc_conversion_avg_ms=" + std::to_string(
                         wgcConversionTotalMs / std::max<uint64_t>(1, wgcNew)) +
                     " poll_gap_avg_ms=" + std::to_string(
@@ -1121,6 +1129,8 @@ namespace hi5 {
                 dxgiNew = 0;
                 gdiPolls = 0;
                 wgcReadbackTotalMs = 0.0;
+                wgcGpuMapTotalMs = 0.0;
+                wgcBufferCopyTotalMs = 0.0;
                 wgcConversionTotalMs = 0.0;
                 pollGapTotalMs = 0.0;
                 pollGapCount = 0;
