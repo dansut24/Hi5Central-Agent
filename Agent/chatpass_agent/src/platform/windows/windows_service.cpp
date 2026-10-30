@@ -6722,6 +6722,30 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " requested=" + std::to_string(requested));
             }
 
+            // If WGC kills the opted-in interactive capture helper or never
+            // delivers its first frame, permanently quarantine that trial on
+            // THIS device. A per-session fallback alone allows the next
+            // session to crash again, producing black frames and CAD loops.
+            // We intentionally do not touch InteractiveCaptureTrial or the
+            // proven GDI/DXGI fallback or restart the Agent service.
+            static void QuarantineWgcAfterHelperFailure(
+                const std::string& sessionId, const char* reason) {
+                DWORD enabled = 0;
+                DWORD bytes = sizeof(enabled);
+                constexpr const char* key = "SOFTWARE\\Hi5Central\\Agent";
+                if (RegGetValueA(HKEY_LOCAL_MACHINE, key, "WgcCaptureTrial",
+                        RRF_RT_REG_DWORD, nullptr, &enabled, &bytes) != ERROR_SUCCESS ||
+                    enabled != 1) return;
+                const DWORD disabled = 0;
+                const LSTATUS status = RegSetKeyValueA(HKEY_LOCAL_MACHINE, key,
+                    "WgcCaptureTrial", REG_DWORD, &disabled, sizeof(disabled));
+                LogW("[capture-test] WGC trial quarantined session=" + sessionId +
+                    " reason=" + reason + " registry_result=" +
+                    std::to_string(status) + " action=" +
+                    std::string(status == ERROR_SUCCESS ? "disable_wgc_for_next_session" :
+                        "registry_disable_failed"));
+            }
+
             // This is only enabled on explicitly opted-in test machines via
             // HKLM\SOFTWARE\Hi5Central\Agent\InteractiveCaptureTrial=1.
             // Reading at launch makes the switch reversible without an Agent
@@ -7354,6 +7378,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             LogW("normal streamer exited session=" + ctx.sessionId +
                                 " exitCode=" + std::to_string(exitCode));
                             if (ctx.normalInteractiveTrial) {
+                                // WGC can fault in a background compositor thread
+                                // before our normal 4s first-frame timeout runs.
+                                // Quarantine on an abnormal interactive-helper
+                                // exit rather than repeatedly crashing next time.
+                                if (exitCode != 0 ||
+                                    ctx.lastNormalFrameAt.time_since_epoch().count() == 0) {
+                                    QuarantineWgcAfterHelperFailure(
+                                        ctx.sessionId, "interactive_helper_exited");
+                                }
                                 ctx.normalInteractiveTrial = false;
                                 ctx.normalInteractiveFallbackUsed = true;
                                 LogW("[capture-test] user-token helper exited; reverting to elevated next launch session=" +
@@ -7542,6 +7575,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         now - ctx.normalInteractiveStarted >= std::chrono::seconds(6)) {
                         LogW("[capture-test] user-token helper produced no frames in 6s; reverting elevated helper session=" +
                             ctx.sessionId);
+                        QuarantineWgcAfterHelperFailure(ctx.sessionId, "no_first_frame_6s");
                         ctx.normalInteractiveFallbackUsed = true;
                         ctx.normalInteractiveTrial = false;
                         StopNormalStreamer(ctx);
