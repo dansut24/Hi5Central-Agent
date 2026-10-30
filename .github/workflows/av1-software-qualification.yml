@@ -32,8 +32,9 @@ jobs:
           set -o pipefail
           timeout 90s dist/av1_software_encoder_test | tee dist/av1-360p.txt
           timeout 120s dist/av1_software_encoder_test --720p | tee dist/av1-720p.txt
+          timeout 120s dist/av1_software_encoder_test --720p30 | tee dist/av1-720p30.txt
           timeout 160s dist/av1_software_encoder_test --1080p | tee dist/av1-1080p.txt
-          cat dist/av1-360p.txt dist/av1-720p.txt dist/av1-1080p.txt > dist/av1-software-qualification.txt
+          cat dist/av1-360p.txt dist/av1-720p.txt dist/av1-720p30.txt dist/av1-1080p.txt > dist/av1-software-qualification.txt
       - uses: actions/upload-artifact@v4
         with:
           name: libaom-av1-qualification-report
