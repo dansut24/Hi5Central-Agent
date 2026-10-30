@@ -72,12 +72,17 @@ jobs:
           #include <dbghelp.h>
           #include <cstdio>
           #include <cstdlib>
+          #include <string>
           #pragma comment(lib, "dbghelp.lib")
           int main(int argc,char** argv) {
             if(argc<2) return 3;
             HANDLE p=GetCurrentProcess();
             SymSetOptions(SYMOPT_UNDNAME|SYMOPT_DEFERRED_LOADS|SYMOPT_LOAD_LINES);
-            if(!SymInitialize(p, nullptr, FALSE)){printf("sym-init-fail=%lu\n",GetLastError());return 4;}
+            std::string exePath(argv[1]);
+            const auto separator=exePath.find_last_of("\\/");
+            const std::string pdbDir=separator==std::string::npos?".":exePath.substr(0,separator);
+            printf("PDB_SEARCH_DIR=%s\n",pdbDir.c_str());
+            if(!SymInitialize(p, pdbDir.c_str(), FALSE)){printf("sym-init-fail=%lu\n",GetLastError());return 4;}
             DWORD64 base=SymLoadModuleEx(p,nullptr,argv[1],nullptr,0x100000000ULL,0,nullptr,0);
             if(!base){printf("sym-load-fail=%lu\n",GetLastError());return 5;}
             IMAGEHLP_MODULE64 mod{};mod.SizeOfStruct=sizeof(mod);
