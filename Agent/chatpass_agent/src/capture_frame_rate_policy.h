@@ -48,4 +48,14 @@ inline CaptureFrameRateDecision ApplyManualCaptureFps(
         decision.targetFps = std::min(manualFps, std::max(1, maxFps));
     return decision;
 }
+// Explicit session ceiling. Older endpoint installers wrote
+// HI5_STREAM_FPS=20 into machine environment; that legacy Automatic default
+// cannot constrain newer manual Viewer selections. Round an administrator's
+// optional ceiling DOWN to a supported manual rate.
+inline int SelectManualSessionCeilingFps(int requested) {
+    if (requested >= 60) return 60;
+    if (requested >= 45) return 45;
+    if (requested >= 30) return 30;
+    return 15;
+}
 } // namespace hi5
