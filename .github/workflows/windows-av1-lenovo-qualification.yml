@@ -57,6 +57,11 @@ jobs:
         run: |
           & dist/av1_lenovo_qualifier.exe | Tee-Object -FilePath dist/windows-av1-ci-smoke.txt
           if ($LASTEXITCODE -ne 0) { throw 'Windows AV1 synthetic smoke failed' }
+      - name: Run 720p software AV1 at a true 60 FPS encoder setting
+        shell: pwsh
+        run: |
+          & dist/av1_lenovo_qualifier.exe --720p60 | Tee-Object -FilePath dist/windows-av1-720p60-ci.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Windows AV1 720p60 synthetic run failed' }
       - name: Publish unsigned, portable experimental test (not an Agent installer)
         uses: actions/upload-artifact@v4
         with:
@@ -64,5 +69,6 @@ jobs:
           path: |
             dist/av1_lenovo_qualifier.exe
             dist/windows-av1-ci-smoke.txt
+            dist/windows-av1-720p60-ci.txt
           retention-days: 14
           if-no-files-found: error

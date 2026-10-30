@@ -46,20 +46,22 @@ static bool Reassemble(const hi5::Av1RtpPayloads& rtp, std::vector<uint8_t>& out
 }
 
 int main(int argc, char** argv) {
-    int width = 640, height = 360, frames = 40;
+    int width = 640, height = 360, frames = 40, fps = 20;
     int bitrateKbps = 2500;
     if (argc == 2 && std::string(argv[1]) == "--720p") {
         width = 1280; height = 720; bitrateKbps = 4000; frames = 30;
     } else if (argc == 2 && std::string(argv[1]) == "--1080p") {
         width = 1920; height = 1080; bitrateKbps = 6000; frames = 24;
+    } else if (argc == 2 && std::string(argv[1]) == "--720p60") {
+        width = 1280; height = 720; bitrateKbps = 6000; frames = 90; fps = 60;
     } else if (argc != 1) {
-        std::cerr << "Usage: av1_software_encoder_test [--720p|--1080p]\n";
+        std::cerr << "Usage: av1_software_encoder_test [--720p|--1080p|--720p60]\n";
         return 2;
     }
     hi5::SoftwareAv1EncoderExperiment encoder;
     std::string err;
     assert(!encoder.initialize(639, 360, 20, 2500, 4, &err));
-    if (!encoder.initialize(width, height, 20, bitrateKbps, 4, &err)) {
+    if (!encoder.initialize(width, height, fps, bitrateKbps, 4, &err)) {
         std::cerr << "AV1 software init failed: " << err << "\n";
         return 2;
     }
@@ -158,9 +160,16 @@ int main(int argc, char** argv) {
     std::sort(steadyMs.begin(), steadyMs.end());
     const double p95 = steadyMs[(steadyMs.size() * 95 + 99) / 100 - 1];
     const double steadyWorst = steadyMs.back();
-    const bool realtime = p95 <= 35.0 && steadyWorst <= 50.0;
+    // Per-frame latency qualification. The 60-FPS budget is 16.67 ms;
+    // keep the 20-FPS historical thresholds unchanged for comparability.
+    const double budgetMs = 1000.0 / fps;
+    const double p95BudgetMs = fps == 60 ? budgetMs * 0.75 : 35.0;
+    const double worstBudgetMs = fps == 60 ? budgetMs * 1.50 : 50.0;
+    const bool realtime = p95 <= p95BudgetMs && steadyWorst <= worstBudgetMs;
     std::cout << "LIBAOM_REALTIME_SCREEN_AV1_PASS"
               << " resolution=" << width << "x" << height
+              << " target_fps=" << fps
+              << " budget_ms=" << budgetMs
               << " frames=" << frames << " encoded_frames=" << encoded
               << " decoded_frames=" << decoded
               << " post_reset_decoded_frames=" << recoveredFrames
