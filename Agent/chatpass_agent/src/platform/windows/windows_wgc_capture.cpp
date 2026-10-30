@@ -183,10 +183,17 @@ struct WgcMonitorCapture::Impl {
                 throw std::runtime_error(FormatError("RoInitialize", initHr));
             }
 
-            stage = "GraphicsCaptureSession.IsSupported";
-            if (!WGC::GraphicsCaptureSession::IsSupported()) {
-                throw std::runtime_error("GraphicsCaptureSession::IsSupported=false");
-            }
+            // Agent 1.0.205 WER / matching PDB showed a repeatable
+            // 0xC0000005 at GraphicsCaptureSession::IsSupported()'s
+            // virtual interface call (RVA 0x319473). The capture service
+            // may exist yet the WinRT support-probe interface be invalid.
+            // Do not invoke that crashing preflight. This backend is
+            // already opt-in and normal-desktop-only. CreateForMonitor()
+            // and later CreateCaptureSession()/StartCapture() each validate
+            // support via HRESULT; errors are caught below and return to
+            // GDI without replacing the active video stream.
+            // Keep the operating-system privacy border unchanged.
+            stage = "GraphicsCaptureItem activation";
 
             MonitorLookup lookup{};
             lookup.center = { x + w / 2, y + h / 2 };
