@@ -1,5 +1,6 @@
 #include "../src/codec_universal_connection.h"
 #include "../src/codec_qualification_keyframe.h"
+#include "../src/codec_auto_fps.h"
 #include <cassert>
 #include <iostream>
 using namespace hi5::universal_codec;
@@ -65,6 +66,36 @@ int main() {
   SingleQualificationKeyframe disabled;
   for(int seconds=0;seconds<120;++seconds)
    assert(!disabled.requestIfDue(false,origin+std::chrono::seconds(seconds)));
+ }
+ // Automatic FPS must never interpret a synthetic AV1 benchmark as
+ // successful browser streaming, nor advertise 120 on a 60Hz receiver.
+ {
+  FpsQualification q;
+  q.codec="av1"; q.testedFps=60; q.width=1280; q.height=720;
+  q.encodedFrames=120; q.capturedFrames=120; q.decodedFrames=120;
+  q.recoveredKeyframes=1; q.measuredEncodeP95Ms=9.60;
+  q.measuredEncodeWorstMs=20.0; q.decodedFps=59;
+  q.droppedFraction=0; q.lossFraction=0;
+  assert(selectAutomaticFps("av1",{q}).targetFps==20);
+  assert(selectAutomaticFps("av1",{},0,15).targetFps==15);
+  q.actualViewer=true; q.rtpPacketizationVerified=true;
+  assert(fpsProven(q));
+  assert(selectAutomaticFps("av1",{q},60).targetFps==60);
+  assert(selectAutomaticFps("av1",{q},60,45).targetFps==45);
+  assert(selectAutomaticFps("h264",{q},60).targetFps==20);
+  q.measuredEncodeWorstMs=35.0;
+  assert(!fpsProven(q));
+  assert(selectAutomaticFps("av1",{q},60).targetFps==20);
+  q.measuredEncodeWorstMs=20.0;
+  q.testedFps=120; q.encodedFrames=240; q.capturedFrames=240;
+  q.decodedFrames=240; q.decodedFps=119;
+  q.measuredEncodeP95Ms=4.0; q.measuredEncodeWorstMs=8.0;
+  assert(fpsProven(q));
+  assert(selectAutomaticFps("av1",{q},120,120).targetFps==120);
+  assert(selectAutomaticFps("av1",{q},60,120).targetFps==60);
+  assert(selectAutomaticFps("av1",{q},0,120).targetFps==60);
+  q.lossFraction=0.05;
+  assert(selectAutomaticFps("av1",{q},120,120).targetFps==20);
  }
  auto av1=intel;av1.codec="av1";
  assert(chooseForConnection(true,"auto","vp8",viewer,{av1},link,true).mode=="vp8");

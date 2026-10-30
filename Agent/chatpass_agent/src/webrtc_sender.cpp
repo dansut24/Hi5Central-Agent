@@ -1,4 +1,5 @@
 ﻿#include "webrtc_sender.h"
+#include "codec_auto_fps.h"
 #include "frame_source.h"
 #include "frame_scale_bilinear.h"
 #include "util/log.h"
@@ -474,14 +475,51 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         if (pref == "native") { w = 0; h = 0; }
                         else if (pref == "1080p") { w = 1920; h = 1080; }
                         else if (pref == "720p") { w = 1280; h = 720; }
-                        const int fps = std::clamp(msg.value("target_fps", 0), 0, 60);
+                        const int requestedFps = std::clamp(msg.value("target_fps", 0), 0, 60);
                         const int kbps = std::clamp(msg.value("target_bitrate_kbps", 0), 0, 20000);
+                        const std::string fpsMode = msg.value("fps_mode", std::string("legacy"));
+                        // Auto must be evidence-driven. At present no live
+                        // capture+browser FPS qualifications are persisted, so
+                        // keep the current 20 FPS ceiling even when a machine
+                        // supports a faster encoder. The independent development
+                        // override can request higher speeds within m_fps.
+                        const auto automatic = hi5::universal_codec::selectAutomaticFps(
+                            m_codecMode, {}, 0, std::max(1, m_fps), 120);
+                        const int fps = fpsMode == "auto"
+                            ? std::min(requestedFps, automatic.targetFps)
+                            : requestedFps;
                         const int prevW = m_viewerMaxWidth.exchange(w);
                         const int prevH = m_viewerMaxHeight.exchange(h);
-                        m_viewerTargetFps = fps;
+                        const int prevFps = m_viewerTargetFps.exchange(fps);
                         m_viewerTargetBitrateKbps = kbps;
-                        if (prevW != w || prevH != h) {
-                            m_forceKeyframe = true;
+                        if (prevW != w || prevH != h) m_forceKeyframe = true;
+                        // Authoritative reply on the already-authenticated
+                        // control channel. The Viewer can promote Automatic only
+                        // after the Agent exposes a truly qualified ceiling;
+                        // older agents omit this message and remain at 20 FPS.
+                        try {
+                            json ack = {
+                                {"type", "viewer_stream_profile_result"},
+                                {"fps_mode", fpsMode},
+                                {"requested_fps", requestedFps},
+                                {"accepted_fps", std::min(fps > 0 ? fps : m_fps, m_fps)},
+                                {"qualified_max_fps", std::min(automatic.targetFps, m_fps)},
+                                {"agent_max_fps", m_fps},
+                                {"fps_qualified", automatic.qualified}
+                            };
+                            sendControlMessageText(ack.dump());
+                        } catch (...) {
+                            // A diagnostic reply must never interrupt the media.
+                        }
+                        if (prevW != w || prevH != h || prevFps != fps) {
+                            LogInfo("[fps-policy] mode=" + fpsMode +
+                                " requested=" + std::to_string(requestedFps) +
+                                " accepted=" + std::to_string(fps) +
+                                " agent_ceiling=" + std::to_string(m_fps) +
+                                " automatic_qualified=" +
+                                    (automatic.qualified ? "1" : "0") +
+                                " reason=" + automatic.reason +
+                                " session=" + m_sessionId);
                             LogInfo("[quality] viewer=" + pref +
                                 " cap=" + std::to_string(w) + "x" + std::to_string(h) +
                                 " target=" + std::to_string(fps) + "fps/" + std::to_string(kbps) +
