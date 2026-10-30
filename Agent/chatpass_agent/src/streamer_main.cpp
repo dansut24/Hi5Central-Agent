@@ -841,6 +841,18 @@ namespace hi5 {
         std::chrono::steady_clock::time_point fastMouseNextLog{};
         const int cursorRefreshFps = 0; // disabled: mouse movement must not force video frames
         uint64_t resetCount = 0;
+        // The actual capture provider may be WGC even if legacy displayIndex
+        // remains -1 because DXGI DuplicateOutput was access-denied.
+        DesktopCaptureBackend lastCaptureBackend = DesktopCaptureBackend::Unknown;
+        uint64_t wgcNew = 0;
+        uint64_t wgcEmpty = 0;
+        uint64_t dxgiNew = 0;
+        uint64_t gdiPolls = 0;
+        double wgcReadbackTotalMs = 0.0;
+        double wgcConversionTotalMs = 0.0;
+        uint64_t pollGapCount = 0;
+        double pollGapTotalMs = 0.0;
+        std::chrono::steady_clock::time_point previousCaptureAt{};
         uint64_t measuredCaptures = 0;
         uint64_t measuredWrites = 0;
         double captureTotalMs = 0.0;
@@ -930,7 +942,27 @@ namespace hi5 {
                 if (now >= nextCaptureAt) {
                     ++captureAttempts;
                     const auto captureStart = std::chrono::steady_clock::now();
+                    if (previousCaptureAt.time_since_epoch().count() != 0) {
+                        pollGapTotalMs += std::chrono::duration<double, std::milli>(
+                            captureStart - previousCaptureAt).count();
+                        ++pollGapCount;
+                    }
+                    previousCaptureAt = captureStart;
                     FrameCaptureResult captured = source.nextFrameEx();
+                    lastCaptureBackend = captured.backend;
+                    if (captured.backend == DesktopCaptureBackend::Wgc) {
+                        if (captured.changed && captured.hasFrame) {
+                            ++wgcNew;
+                            wgcReadbackTotalMs += captured.wgcReadbackMs;
+                            wgcConversionTotalMs += captured.wgcConversionMs;
+                        } else {
+                            ++wgcEmpty;
+                        }
+                    } else if (captured.backend == DesktopCaptureBackend::Dxgi) {
+                        if (captured.changed && captured.hasFrame) ++dxgiNew;
+                    } else if (captured.backend == DesktopCaptureBackend::Gdi) {
+                        ++gdiPolls;
+                    }
                     const double captureMs = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - captureStart).count();
                     captureTotalMs += captureMs;
@@ -948,8 +980,16 @@ namespace hi5 {
                         now, lastInputAt, lastChangedFrameAt, changedThisCapture,
                         requestedMaxFps, activeFps, motionFps, idleFps,
                         activeHold, motionHold);
-                    const auto chosenRate = hi5::ApplyManualCaptureFps(
+                    const auto selectedRate = hi5::ApplyManualCaptureFps(
                         rate, manualCaptureFps, requestedMaxFps);
+                    // WGC empty polls are cheap and no longer duplicate a
+                    // cached I420 frame. Keep explicitly selected polling
+                    // responsive at 15/30/45/60 even after desktop idle.
+                    // GDI, DXGI and secure/UAC retain existing pacing.
+                    const auto chosenRate = hi5::ApplyWgcManualPollingFloor(
+                        selectedRate, manualCaptureFps, requestedMaxFps,
+                        captured.backend == DesktopCaptureBackend::Wgc,
+                        isSecureHelper || lastSecureState);
                     lastTargetFps = chosenRate.targetFps;
                     lastStreamMode = chosenRate.mode;
                     // Use the rate of the *newly observed* frame, not the
@@ -1013,6 +1053,19 @@ namespace hi5 {
 
             const auto currentTime = std::chrono::steady_clock::now();
             if (currentTime >= nextStatsAt) {
+                LogInfo("[streamer] capture-provider-stats session=" + args.sessionId +
+                    " backend=" + DesktopCaptureBackendName(lastCaptureBackend) +
+                    " wgc_new=" + std::to_string(wgcNew) +
+                    " wgc_empty=" + std::to_string(wgcEmpty) +
+                    " dxgi_new=" + std::to_string(dxgiNew) +
+                    " gdi_polls=" + std::to_string(gdiPolls) +
+                    " wgc_readback_avg_ms=" + std::to_string(
+                        wgcReadbackTotalMs / std::max<uint64_t>(1, wgcNew)) +
+                    " wgc_conversion_avg_ms=" + std::to_string(
+                        wgcConversionTotalMs / std::max<uint64_t>(1, wgcNew)) +
+                    " poll_gap_avg_ms=" + std::to_string(
+                        pollGapTotalMs / std::max<uint64_t>(1, pollGapCount)) +
+                    " target_poll_fps=" + std::to_string(lastTargetFps));
                 LogInfo("[streamer] low-cpu stats session=" + args.sessionId +
                     " attempts=" + std::to_string(captureAttempts) +
                     " changed=" + std::to_string(changedFrames) +
@@ -1050,6 +1103,15 @@ namespace hi5 {
                 }
 
                 captureAttempts = 0;
+                wgcNew = 0;
+                wgcEmpty = 0;
+                dxgiNew = 0;
+                gdiPolls = 0;
+                wgcReadbackTotalMs = 0.0;
+                wgcConversionTotalMs = 0.0;
+                pollGapTotalMs = 0.0;
+                pollGapCount = 0;
+                // Keep previousCaptureAt across windows to measure gaps.
                 changedFrames = 0;
                 cursorOnlyFrames = 0;
                 skippedFrames = 0;
