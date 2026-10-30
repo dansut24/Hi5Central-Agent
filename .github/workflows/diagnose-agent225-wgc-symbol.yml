@@ -139,3 +139,28 @@ jobs:
           $vs=& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           Write-Host ('DIA_SDK_INCLUDE_EXISTS='+(Test-Path (Join-Path $vs 'DIA SDK\include\dia2.h')))
           Write-Host ('DIA_SDK_LIB_EXISTS='+(Test-Path (Join-Path $vs 'DIA SDK\lib\amd64\diaguids.lib')))
+
+      - name: Checkout isolated diagnostics helper
+        uses: actions/checkout@v4
+      - name: Resolve WGC fault RVA with Visual Studio DIA SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $pdb=(Get-ChildItem symbols -Recurse -File -Filter Hi5CentralAgent.pdb | Select-Object -First 1).FullName
+          $vswhere=Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs=& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if(-not $vs){throw 'Visual Studio C++ build tools not available'}
+          $include=Join-Path $vs 'DIA SDK\include'
+          $lib=Join-Path $vs 'DIA SDK\lib\amd64'
+          $dll=Join-Path $vs 'DIA SDK\bin\amd64\msdia140.dll'
+          $src=(Resolve-Path 'tools/windows/resolve-pdb-rva.cpp').Path
+          $exe=Join-Path (Get-Location).Path 'resolve-pdb-rva.exe'
+          $cmd=Join-Path (Get-Location).Path 'build-dia.cmd'
+          $nl=[Environment]::NewLine
+          $cmdText='@echo off'+$nl+'call "'+(Join-Path $vs 'Common7\Tools\VsDevCmd.bat')+'" -arch=x64 -host_arch=x64'+$nl+
+            'cl.exe /nologo /EHsc /std:c++17 /MD /I "'+$include+'" /Fe:"'+$exe+'" "'+$src+'" /link /LIBPATH:"'+$lib+'" ole32.lib oleaut32.lib diaguids.lib'+$nl
+          [IO.File]::WriteAllText($cmd,$cmdText,[Text.Encoding]::ASCII)
+          & cmd.exe /d /c $cmd
+          if($LASTEXITCODE -ne 0){throw "DIA compile failed $LASTEXITCODE"}
+          & $exe $pdb $dll
+          if($LASTEXITCODE -ne 0){throw "DIA lookup failed $LASTEXITCODE"}
