@@ -12,7 +12,24 @@ struct I420Frame {
     std::vector<uint8_t> v;
 };
 
+// Actual provider of this particular poll; not the requested display index.
+// DXGI access-denied can leave displayIndex=-1 while WGC streams normally.
+enum class DesktopCaptureBackend : uint8_t {
+    Unknown = 0, Gdi = 1, Dxgi = 2, Wgc = 3
+};
+inline const char* DesktopCaptureBackendName(DesktopCaptureBackend backend) {
+    switch (backend) {
+        case DesktopCaptureBackend::Gdi: return "gdi";
+        case DesktopCaptureBackend::Dxgi: return "dxgi";
+        case DesktopCaptureBackend::Wgc: return "wgc";
+        default: return "unknown";
+    }
+}
 struct FrameCaptureResult {
+    DesktopCaptureBackend backend = DesktopCaptureBackend::Unknown;
+    // Per-new-WGC-frame timings; zero for empty polls and other backends.
+    double wgcReadbackMs = 0.0;
+    double wgcConversionMs = 0.0;
     I420Frame frame;
     bool hasFrame = false;
     bool changed = false;
