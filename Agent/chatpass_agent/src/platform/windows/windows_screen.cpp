@@ -665,6 +665,9 @@ struct DesktopFrameSource::Impl {
     // Reuse the multi-megabyte intermediate buffer instead of allocating a
     // new one on every capture. Streamer owns this frame source on one thread.
     std::vector<uint8_t> gdiBgraBuffer;
+    // Reuse the ~16MB GPU-readback buffer across WGC compositor updates.
+    // Streamer owns this source on one thread; no per-frame allocations.
+    std::vector<uint8_t> wgcBgraBuffer;
     uint64_t gdiProfileSamples = 0;
     double gdiCopyMs = 0;
     double gdiConvertMs = 0;
@@ -1111,7 +1114,7 @@ struct DesktopFrameSource::Impl {
         refreshDisplaysLocked();
 
         if (wgc && wgc->IsRunning()) {
-            std::vector<uint8_t> bgra;
+            auto& bgra = wgcBgraBuffer;
             int w = 0, h = 0, pitch = 0;
             std::string error;
             const auto wgcReadStarted = std::chrono::steady_clock::now();
@@ -1180,7 +1183,10 @@ struct DesktopFrameSource::Impl {
                 bgraToI420(bgra.data(), pitch, w, h, frame);
                 const double convertMs = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - convertStarted).count();
-                lastFrame = frame;
+                // Do not clone a new 6MB I420 frame into lastFrame on
+                // every successful WGC update. WGC itself signals changed
+                // frames; no unchanged video is written. Retaining an old
+                // GDI lastFrame is harmless if WGC later fails over.
                 FrameCaptureResult result;
                 result.frame = std::move(frame);
                 result.hasFrame = true;
@@ -1207,11 +1213,10 @@ struct DesktopFrameSource::Impl {
                     " action=continue_gdi");
                 wgc.reset();
                 lastDxgiRetry = std::chrono::steady_clock::now();
-            } else if (wgcReceivedFrame && !lastFrame.y.empty()) {
-                // TryGetNextFrame returned no compositor update. The streamer
-                // will not publish an unchanged frame. Avoid copying the
-                // cached multi-megabyte I420 image on every empty WGC poll;
-                // it remains in lastFrame for recovery and other APIs.
+            } else if (wgcReceivedFrame) {
+                // An empty compositor poll must neither republish the last
+                // image nor fall back to a costly GDI capture. The screen
+                // remains visible from the preceding published WGC frame.
                 FrameCaptureResult result;
                 result.backend = DesktopCaptureBackend::Wgc;
                 result.changed = false;
