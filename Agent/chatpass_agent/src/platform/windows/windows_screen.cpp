@@ -748,6 +748,15 @@ struct DesktopFrameSource::Impl {
                     " action=gdi_fallback");
             return;
         }
+        const auto interval = candidate->GetUpdateIntervalStatus();
+        LogInfo("[capture] WGC session update-interval" +
+            std::string(" property_supported=") + (interval.propertySupported ? "1" : "0") +
+            " requested=" + (interval.requested ? "1" : "0") +
+            " requested_us=" + std::to_string(interval.requestedUs) +
+            " applied=" + (interval.applied ? "1" : "0") +
+            " default_100ns=" + std::to_string(interval.default100ns) +
+            " active_100ns=" + std::to_string(interval.active100ns) +
+            " error_hresult=" + std::to_string(interval.errorHresult));
         wgc = std::move(candidate);
         wgcReceivedFrame = false;
         wgcStarted = std::chrono::steady_clock::now();
