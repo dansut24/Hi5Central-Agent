@@ -218,7 +218,10 @@ std::string DxgiCheck(HMONITOR target) {
                 " DEVICE_ID="+std::to_string(desc.DeviceId)+
                 " DUPLICATEOUTPUT="+Hex(legacy)+
                 " OUTPUT5_QI="+Hex(check5)+
-                " DUPLICATEOUTPUT1="+Hex(result1);
+                " DUPLICATEOUTPUT1="+Hex(result1)+
+                " OUTPUT_ATTACHED_TO_DESKTOP="+std::to_string(d.AttachedToDesktop?1:0)+
+                " OUTPUT_WIDTH="+std::to_string(d.DesktopCoordinates.right-d.DesktopCoordinates.left)+
+                " OUTPUT_HEIGHT="+std::to_string(d.DesktopCoordinates.bottom-d.DesktopCoordinates.top);
         }
     }
     return "DXGI_NO_MATCHING_MONITOR";
@@ -247,6 +250,34 @@ int RunProbe(std::ostream& out) {
     if(sessionId!=active || t!="Default" || i!="Default") {
         out << "ABORT_NO_NORMAL_INTERACTIVE_DESKTOP\n";return 11;
     }
+    // Read-only DXGI access triage; no token or desktop ACL mutations.
+    auto station=GetProcessWindowStation();
+    const std::string stationName=DesktopName(reinterpret_cast<HDESK>(station));
+    HDESK verify=OpenDesktopW(L"Default",0,FALSE,
+        DESKTOP_READOBJECTS|DESKTOP_ENUMERATE);
+    const DWORD verifyError=verify?ERROR_SUCCESS:GetLastError();
+    if(verify)CloseDesktop(verify);
+    DWORD tokenLevel=0;
+    HANDLE processToken=nullptr;
+    if(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&processToken)) {
+        DWORD bytes=0;
+        GetTokenInformation(processToken,TokenIntegrityLevel,nullptr,0,&bytes);
+        if(bytes>=sizeof(TOKEN_MANDATORY_LABEL)&&bytes<4096) {
+            std::vector<BYTE> buf(bytes);
+            if(GetTokenInformation(processToken,TokenIntegrityLevel,
+                buf.data(),bytes,&bytes)) {
+                auto sid=reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buf.data())->Label.Sid;
+                const DWORD count=*GetSidSubAuthorityCount(sid);
+                if(count)tokenLevel=*GetSidSubAuthority(sid,count-1);
+            }
+        }
+        CloseHandle(processToken);
+    }
+    out<<"ACCESS_WINDOW_STATION="<<stationName
+       <<" DEFAULT_DESKTOP_READ_ENUM="<<(verify?1:0)
+       <<" ACCESS_ERROR="<<verifyError
+       <<" TOKEN_INTEGRITY_RID="<<tokenLevel
+       <<" REMOTE_SESSION_FLAG="<<GetSystemMetrics(SM_REMOTESESSION)<<"\\n";
     Monitor monitor;
     EnumDisplayMonitors(nullptr,nullptr,VisitMon,reinterpret_cast<LPARAM>(&monitor));
     if(!monitor.handle) {out<<"NO_PRIMARY_MONITOR\n";return 12;}
