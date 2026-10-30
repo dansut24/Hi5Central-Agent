@@ -249,6 +249,12 @@ namespace {
     static bool captureRectBgraGdi(int x, int y, int srcW, int srcH, int dstW, int dstH,
         std::vector<uint8_t>& bgraOut, int& strideOut) {
         if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return false;
+        // The broad gdi-stage-stats previously grouped BitBlt, GdiFlush,
+        // cursor composition and memory copy into one 75-80ms operation.
+        // Measure each stage to identify the actual cost before changing
+        // layered-window semantics or sacrificing desktop quality.
+        using GdiClock = std::chrono::steady_clock;
+        const auto stageBegin = GdiClock::now();
         HDC screenDC = GetDC(nullptr);
         if (!screenDC) return false;
         static thread_local GdiCaptureSurface scratch;
@@ -257,6 +263,7 @@ namespace {
             return false;
         }
 
+        const auto stagePrepared = GdiClock::now();
         // BitBlt avoids the HALFTONE scaler for full-resolution capture.
         // StretchBlt remains available for bounded preview thumbnails.
         BOOL copied = FALSE;
@@ -268,6 +275,7 @@ namespace {
             copied = StretchBlt(scratch.memDc, 0, 0, dstW, dstH,
                                 screenDC, x, y, srcW, srcH, SRCCOPY | CAPTUREBLT);
         }
+        const auto stageBlt = GdiClock::now();
         ReleaseDC(nullptr, screenDC);
         if (!copied) {
             // A Windows desktop switch can invalidate old DC contents.
@@ -280,10 +288,40 @@ namespace {
         // batch drawing commands: flush BitBlt/StretchBlt before memcpy so a
         // reused surface never yields pixels from the previous desktop frame.
         compositeCursorOnGdiSurface(scratch.memDc, x, y, dstW, dstH);
+        const auto stageCursor = GdiClock::now();
         GdiFlush();
+        const auto stageFlush = GdiClock::now();
         strideOut = dstW * 4;
         bgraOut.resize(static_cast<size_t>(strideOut) * dstH);
         std::memcpy(bgraOut.data(), scratch.bits, bgraOut.size());
+        const auto stageCopy = GdiClock::now();
+
+        struct GdiTiming {
+            uint64_t count = 0;
+            double acquireMs = 0, blitMs = 0, cursorMs = 0;
+            double flushMs = 0, memcpyMs = 0;
+        };
+        static thread_local GdiTiming timing{};
+        auto ms = [](GdiClock::time_point a, GdiClock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        timing.acquireMs += ms(stageBegin, stagePrepared);
+        timing.blitMs += ms(stagePrepared, stageBlt);
+        timing.cursorMs += ms(stageBlt, stageCursor);
+        timing.flushMs += ms(stageCursor, stageFlush);
+        timing.memcpyMs += ms(stageFlush, stageCopy);
+        if (++timing.count == 50) {
+            const double n = static_cast<double>(timing.count);
+            LogInfo("[capture] gdi-copy-breakdown samples=" +
+                std::to_string(timing.count) +
+                " display=" + std::to_string(dstW) + "x" + std::to_string(dstH) +
+                " acquire_avg_ms=" + std::to_string(timing.acquireMs / n) +
+                " blit_avg_ms=" + std::to_string(timing.blitMs / n) +
+                " cursor_avg_ms=" + std::to_string(timing.cursorMs / n) +
+                " flush_avg_ms=" + std::to_string(timing.flushMs / n) +
+                " memcpy_avg_ms=" + std::to_string(timing.memcpyMs / n));
+            timing = {};
+        }
         return true;
     }
 
