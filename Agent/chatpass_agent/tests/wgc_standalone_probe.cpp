@@ -87,6 +87,9 @@ BOOL CALLBACK VisitMon(HMONITOR h,HDC,LPRECT rect,LPARAM param) {
 }
 class AnimatedWindow {
 public:
+    int targetWidth=480;
+    int targetHeight=210;
+    explicit AnimatedWindow(int w=480,int h=210):targetWidth(w),targetHeight(h){}
     std::atomic<uint64_t> paints{0},ticks{0};
     std::atomic<bool> ready{false};
     std::atomic<HWND> hwnd{nullptr};
@@ -130,7 +133,7 @@ public:
             // Small, non-topmost, non-activating visible diagnostic window.
             HWND h=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
                 cls,L"Hi5Central WGC 60Hz local animation diagnostic",
-                WS_POPUP|WS_VISIBLE,85,90,480,210,nullptr,nullptr,
+                WS_POPUP|WS_VISIBLE,85,90,targetWidth,targetHeight,nullptr,nullptr,
                 GetModuleHandleW(nullptr),this);
             hwnd.store(h,std::memory_order_release);
             ready.store(true,std::memory_order_release);
@@ -237,7 +240,7 @@ struct Samples {
         count.fetch_add(1,std::memory_order_relaxed);
     }
 };
-int RunProbe(std::ostream& out) {
+int RunProbe(std::ostream& out, const std::wstring& mode) {
     DWORD sessionId=0;ProcessIdToSessionId(GetCurrentProcessId(),&sessionId);
     const auto active=WTSGetActiveConsoleSessionId();
     auto d=GetThreadDesktop(GetCurrentThreadId());
@@ -294,12 +297,30 @@ int RunProbe(std::ostream& out) {
     }
     const bool uninit=SUCCEEDED(init);
     try {
+        const bool useWindow=mode==L"--run-user-window-small"||mode==L"--run-user-window-1080";
+        const int width=mode==L"--run-user-window-1080"?1920:480;
+        const int height=mode==L"--run-user-window-1080"?1080:210;
+        AnimatedWindow animation(width,height);
+        if(useWindow && !animation.Start()) {
+            out<<"WINDOW_START_FAILED\n";
+            if(uninit)RoUninitialize();return 17;
+        }
+        out<<"CAPTURE_TARGET="<<(useWindow?"WINDOW":"MONITOR")
+           <<" TARGET_WINDOW_SIZE="<<(useWindow?width:0)<<"x"<<(useWindow?height:0)<<"\n";
         auto activation=winrt::get_activation_factory<WGC::GraphicsCaptureItem>();
         auto interop=activation.as<IGraphicsCaptureItemInterop>();
         WGC::GraphicsCaptureItem item{nullptr};
-        winrt::check_hresult(interop->CreateForMonitor(monitor.handle,
-            winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
-            winrt::put_abi(item)));
+        if(useWindow) {
+            HWND h=animation.hwnd.load(std::memory_order_acquire);
+            if(!h) {out<<"WINDOW_INVALID_BEFORE_CAPTURE\n";return 18;}
+            winrt::check_hresult(interop->CreateForWindow(h,
+                winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+                winrt::put_abi(item)));
+        } else {
+            winrt::check_hresult(interop->CreateForMonitor(monitor.handle,
+                winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+                winrt::put_abi(item)));
+        }
         ComPtr<ID3D11Device> device;
         ComPtr<ID3D11DeviceContext> context;
         winrt::check_hresult(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,
@@ -316,7 +337,6 @@ int RunProbe(std::ostream& out) {
         auto session=pool.CreateCaptureSession(item);
         out<<"WGC_ITEM_SIZE="<<item.Size().Width<<"x"<<item.Size().Height
            <<" WGC_MIN_INTERVAL_100NS="<<session.MinUpdateInterval().count()<<"\n";
-        AnimatedWindow animation;
         auto samples=std::make_shared<Samples>();
         auto token=pool.FrameArrived([samples](
             WGC::Direct3D11CaptureFramePool const& sender,
@@ -348,10 +368,12 @@ int RunProbe(std::ostream& out) {
             } catch (...) {samples->exceptions.fetch_add(1,std::memory_order_relaxed);}
         });
         session.StartCapture();
-        out << "WGC_STARTED probe_seconds=15 baseline_first_3sec then_60Hz_GDI_local_animation_12sec privacy_border=default\n";
+        out << "WGC_STARTED probe_seconds=15 target="<<(useWindow?"window":"monitor")
+            <<" baseline_first_3sec="<<(useWindow?0:1)
+            <<" local_animation_60hz=1 privacy_border=default\n";
         uint64_t prev=0,priorPaints=0,priorTicks=0;
         for(int i=1;i<=5;++i) {
-            if(i==2) {
+            if(i==2 && !useWindow) {
                 bool started=animation.Start();
                 out<<"LOCAL_ANIMATION_STARTED="<<(started?1:0)<<"\n";
                 if(!started) {out<<"LOCAL_ANIMATION_UNAVAILABLE\n";break;}
@@ -392,7 +414,7 @@ int RunProbe(std::ostream& out) {
     if(uninit)RoUninitialize();
     return 0;
 }
-int Spawn(bool useSystem) {
+int Spawn(bool useSystem, const wchar_t* childMode=nullptr) {
     const DWORD active=WTSGetActiveConsoleSessionId();
     if(active==0xffffffff) {std::cout<<"NO_ACTIVE_CONSOLE\n";return 21;}
     if(!Enable(L"SeTcbPrivilege")) std::cout<<"WARN_NO_TCB_PRIVILEGE\n";
@@ -423,8 +445,9 @@ int Spawn(bool useSystem) {
     }
     const wchar_t* resultPath=useSystem?kOutSystem:kOutUser;
     DeleteFileW(resultPath);
-    std::wstring cmd=L"\""+std::wstring(path)+
-        (useSystem?L"\" --run-system":L"\" --run-user");
+    std::wstring cmd=L"\""+std::wstring(path)+L"\" "+
+        (childMode?std::wstring(childMode):
+            (useSystem?L"--run-system":L"--run-user"));
     std::vector<wchar_t> mutableCmd(cmd.begin(),cmd.end());mutableCmd.push_back(0);
     STARTUPINFOW startup{};startup.cb=sizeof(startup);
     startup.lpDesktop=const_cast<wchar_t*>(L"winsta0\\default");
@@ -438,7 +461,7 @@ int Spawn(bool useSystem) {
     if(env)DestroyEnvironmentBlock(env);
     CloseHandle(token);
     if(!launched){std::cout<<"SPAWN_FAIL="<<err<<"\n";return 27;}
-    DWORD wait=WaitForSingleObject(pi.hProcess,35000);
+    DWORD wait=WaitForSingleObject(pi.hProcess,38000);
     DWORD exitCode=0;GetExitCodeProcess(pi.hProcess,&exitCode);
     CloseHandle(pi.hThread);CloseHandle(pi.hProcess);
     std::cout<<"CHILD="<<(useSystem?"SYSTEM":"USER")
@@ -465,10 +488,28 @@ int wmain(int argc,wchar_t** argv) {
         std::cout<<"FINAL user_exit="<<user<<" system_exit="<<system<<"\n";
         return user==0&&system==0?0:3;
     }
-    if(mode==L"--run-user"||mode==L"--run-system") {
-        std::ofstream out(mode==L"--run-user"?kOutUser:kOutSystem,std::ios::trunc);
+    if(mode==L"--launch-ab") {
+        std::cout<<"H5C_WGC_AB_READ_ONLY no_gpu_readback no_encode no_network\n";
+        int failures=0;
+        const wchar_t* modes[]={L"--run-user-window-small",
+                                L"--run-user-window-1080",
+                                L"--run-user-monitor"};
+        for(const auto* m:modes) {
+            std::wcout<<L"START_TEST="<<m<<L"\n";
+            const int code=Spawn(false,m);
+            std::cout<<"TEST_EXIT="<<code<<"\n";
+            if(code!=0)++failures;
+        }
+        std::cout<<"AB_DONE failures="<<failures<<"\n";
+        return failures?5:0;
+    }
+    if(mode==L"--run-user"||mode==L"--run-system"||
+       mode==L"--run-user-window-small"||
+       mode==L"--run-user-window-1080"||
+       mode==L"--run-user-monitor") {
+        std::ofstream out(mode==L"--run-system"?kOutSystem:kOutUser,std::ios::trunc);
         if(!out) {std::cout<<"OUTPUT_OPEN_FAILED\n";return 31;}
-        return RunProbe(out);
+        return RunProbe(out,mode);
     }
     return 2;
 }
