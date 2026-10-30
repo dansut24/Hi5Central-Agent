@@ -3,6 +3,7 @@
 #include "vp8_encoder.h"
 #include "vp9_mf_encoder.h"
 #include "encoding/sustained_encoder_health.h"
+#include "codec_qualification_keyframe.h"
 #include "h264_mf_encoder.h"
 #include "input_injector.h"
 
@@ -170,6 +171,7 @@ private:
     std::atomic<uint64_t> m_lastViewerNetworkLogMs{0};
 
     int m_externalFrameCounter = 0;
+    hi5::universal_codec::SingleQualificationKeyframe m_h264QualificationKeyframe;
     int m_externalEncoderWidth = 0;
     int m_externalEncoderHeight = 0;
 

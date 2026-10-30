@@ -1,4 +1,5 @@
 #include "../src/codec_universal_connection.h"
+#include "../src/codec_qualification_keyframe.h"
 #include <cassert>
 #include <iostream>
 using namespace hi5::universal_codec;
@@ -48,6 +49,23 @@ int main() {
  noH264Again.receiveCodecs={"vp8","vp9"};
  assert(!enforceSharpH264ViewerLevel(noH264Again,true));
  assert(chooseForConnection(true,"auto","vp8",noH264Again,{real},link,true).mode=="vp8");
+ // Bounded one-shot keyframe works at idle frame rates without
+ // introducing repeated recovery traffic or changing legacy policy.
+ {
+  using Clock=std::chrono::steady_clock;
+  SingleQualificationKeyframe gate;
+  const auto origin=Clock::now();
+  assert(!gate.requestIfDue(false,origin));
+  assert(!gate.requestIfDue(true,origin));
+  assert(!gate.requestIfDue(true,origin+std::chrono::seconds(5)));
+  assert(!gate.requestIfDue(true,origin+std::chrono::seconds(19)));
+  assert(gate.requestIfDue(true,origin+std::chrono::seconds(20)));
+  assert(!gate.requestIfDue(true,origin+std::chrono::seconds(21)));
+  assert(!gate.requestIfDue(true,origin+std::chrono::seconds(200)));
+  SingleQualificationKeyframe disabled;
+  for(int seconds=0;seconds<120;++seconds)
+   assert(!disabled.requestIfDue(false,origin+std::chrono::seconds(seconds)));
+ }
  auto av1=intel;av1.codec="av1";
  assert(chooseForConnection(true,"auto","vp8",viewer,{av1},link,true).mode=="vp8");
  Viewer missing;

@@ -1781,7 +1781,23 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
     // recovery keyframes are much less frequent while idle and profile-aware.
     m_externalKeyframeEvery = std::max(profile.fps, std::max(1, profile.fps) * profile.keyframeSeconds);
     const bool periodicKeyframe = (m_externalFrameCounter % m_externalKeyframeEvery) == 0;
-    const bool keyframe = forceKeyframe || periodicKeyframe || m_forceKeyframe.exchange(false);
+    // One recovery IDR after 20 seconds when end-to-end codec learning is
+    // explicitly enabled. The current frame-only cadence can take minutes
+    // to reach the next IDR on a quiet 2-FPS desktop, preventing the browser
+    // from qualifying an otherwise healthy H.264 session. No repeated IDRs.
+    const bool qualificationKeyframe = m_h264QualificationKeyframe.requestIfDue(
+        m_videoCodec == VideoCodec::H264 &&
+            readEnvInt("HI5_UNIVERSAL_CODEC_LEARN", 0, 0, 1) == 1,
+        nowForProfile);
+    if (qualificationKeyframe) {
+        LogInfo("[codec-universal] one-shot H264 recovery IDR "
+                "reason=qualify_subsequent_browser_decoded_keyframe");
+    }
+    // Consume any pending keyframe request even if the qualification IDR
+    // satisfies it; otherwise the next idle frame emits a duplicate IDR.
+    const bool queuedKeyframe = m_forceKeyframe.exchange(false);
+    const bool keyframe = forceKeyframe || periodicKeyframe ||
+        qualificationKeyframe || queuedKeyframe;
 
     if (m_videoCodec == VideoCodec::VP9 && !m_vp9Failed) {
         bool vp9Scaled = false;
