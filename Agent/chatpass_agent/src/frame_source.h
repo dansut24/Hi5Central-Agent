@@ -12,10 +12,46 @@ struct I420Frame {
     std::vector<uint8_t> v;
 };
 
+// Actual provider of this particular poll; not the requested display index.
+// DXGI access-denied can leave displayIndex=-1 while WGC streams normally.
+enum class DesktopCaptureBackend : uint8_t {
+    Unknown = 0, Gdi = 1, Dxgi = 2, Wgc = 3
+};
+inline const char* DesktopCaptureBackendName(DesktopCaptureBackend backend) {
+    switch (backend) {
+        case DesktopCaptureBackend::Gdi: return "gdi";
+        case DesktopCaptureBackend::Dxgi: return "dxgi";
+        case DesktopCaptureBackend::Wgc: return "wgc";
+        default: return "unknown";
+    }
+}
 struct FrameCaptureResult {
+    DesktopCaptureBackend backend = DesktopCaptureBackend::Unknown;
+    // Per-new-WGC-frame timings; zero for empty polls and other backends.
+    double wgcReadbackMs = 0.0;
+    double wgcGpuCopyMapMs = 0.0;
+    double wgcCpuBufferCopyMs = 0.0;
+    double wgcConversionMs = 0.0;
+    bool wgcConversionParallel = false;
+    bool wgcConverterQualified = false;
+    bool wgcConverterPrefersParallel = false;
+    double wgcConversionSerialTrialAvgMs = 0.0;
+    double wgcConversionParallelTrialAvgMs = 0.0;
+    uint64_t wgcArrivalEventsTotal = 0;
+    uint64_t wgcArrivalGapCount = 0;
+    uint64_t wgcArrivalGapTotalNs = 0;
+    uint64_t wgcArrivalGapMaxNs = 0;
+    uint64_t wgcFramesConsumedTotal = 0;
+    uint64_t wgcArrivalsSincePreviousFrame = 0;
+    int64_t wgcSourceTimestamp100ns = 0;
+    int64_t wgcSourceTimestampGap100ns = 0;
     I420Frame frame;
     bool hasFrame = false;
     bool changed = false;
+    // True only when the capture provider itself reported a new desktop
+    // frame (DXGI dirty frame or WGC compositor event). GDI BitBlt has no
+    // change signal, so its successful copies need sparse pixel comparison.
+    bool changedIsNative = false;
     bool cursorOnly = false;
     uint64_t frameId = 0;
 };

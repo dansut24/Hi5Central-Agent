@@ -1,0 +1,74 @@
+name: Publish verified Lenovo Agent 1.0.227 test installer
+on:
+  push:
+    branches: [feature/av1-hardware-qualification-20261029]
+    paths:
+      - .github/workflows/publish-agent227-test-asset.yml
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish-test-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify immutable source run and download Windows artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/${{ github.repository }}/actions/runs/41097806664 --jq '[.head_sha,.conclusion,.run_number] | join(" ")' > source-run.txt
+          grep -Fx 'e62f9a23ca25ac2f2f613dd25813be5cd1e72f07 success 227' source-run.txt
+      - name: Download exact green Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 41097806664
+          artifact-ids: 12997448233
+          github-token: ${{ github.token }}
+          path: artifact
+      - name: Extract original Inno installer and publish checksum
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct,hashlib
+          data=Path('artifact/Hi5Central-Windows-Tenant-Template/Hi5CentralAgentTemplate.exe').read_bytes()
+          u16=lambda i:struct.unpack_from('<H',data,i)[0]
+          u32=lambda i:struct.unpack_from('<I',data,i)[0]
+          pe=u32(0x3c)
+          assert data[pe:pe+4]==b'PE\x00\x00'
+          opt=pe+24
+          res_rva=u32(opt+(96 if u16(opt)==0x10b else 112)+16)
+          sections=[]
+          for j in range(u16(pe+6)):
+              k=opt+u16(pe+20)+j*40
+              sections.append((u32(k+12),max(u32(k+8),u32(k+16)),u32(k+20)))
+          def offs(rva):
+              for va,size,raw in sections:
+                  if va<=rva<va+size:return raw+rva-va
+              raise ValueError('resource RVA outside PE')
+          base=offs(res_rva)
+          def entries(rel):
+              k=base+rel
+              return [(u32(k+16+8*i),u32(k+20+8*i)) for i in range(u16(k+12)+u16(k+14))]
+          typ=next(b for a,b in entries(0) if a==10)
+          name=next(b for a,b in entries(typ&0x7fffffff) if a==101)
+          leaf=entries(name&0x7fffffff)[0][1]
+          rva,size=u32(base+leaf),u32(base+leaf+4)
+          payload=data[offs(rva):offs(rva)+size]
+          assert len(payload)>4000000 and payload[:2]==b'MZ'
+          out=Path('Hi5CentralAgentSetup-1.0.227.exe')
+          out.write_bytes(payload)
+          digest=hashlib.sha256(payload).hexdigest()
+          Path('Hi5CentralAgentSetup-1.0.227.exe.sha256').write_text(digest+'  '+out.name+'\n')
+          print('LENOVO_227_SHA256',digest,'SIZE',len(payload),'SOURCE_SHA','e62f9a23ca25ac2f2f613dd25813be5cd1e72f07')
+          PY
+      - name: Publish single-device prerelease; never customer fleet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create agent-1.0.227-test Hi5CentralAgentSetup-1.0.227.exe Hi5CentralAgentSetup-1.0.227.exe.sha256 \
+            --repo "${{ github.repository }}" --target e62f9a23ca25ac2f2f613dd25813be5cd1e72f07 \
+            --title "Agent 1.0.227 Lenovo-only controlled test artifact" \
+            --notes "Immutable Windows installer source run 41097806664, artifact 12997448233, source SHA e62f9a23ca25ac2f2f613dd25813be5cd1e72f07. The accompanying .sha256 is mandatory. NOT a fleet release." \
+            --prerelease

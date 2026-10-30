@@ -1,0 +1,69 @@
+name: Publish verified Agent 1.0.218 test installer
+on:
+  push:
+    branches:
+      - feature/av1-hardware-qualification-20261029
+    paths:
+      - .github/workflows/publish-agent196-test-asset.yml
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish-test-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download already green Windows template artifact (run 218)
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 41076211793
+          artifact-ids: 12987648361
+          github-token: ${{ github.token }}
+          path: artifact
+      - name: Extract installer and verify pinned SHA-256
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,struct,zipfile
+          data=Path('artifact/Hi5Central-Windows-Tenant-Template/Hi5CentralAgentTemplate.exe').read_bytes()
+          u16=lambda i:struct.unpack_from('<H',data,i)[0]
+          u32=lambda i:struct.unpack_from('<I',data,i)[0]
+          pe=u32(0x3c)
+          assert data[pe:pe+4]==b'PE\x00\x00'
+          opt=pe+24
+          res_rva=u32(opt+(96 if u16(opt)==0x10b else 112)+16)
+          sections=[]
+          for j in range(u16(pe+6)):
+            k=opt+u16(pe+20)+j*40
+            sections.append((u32(k+12),max(u32(k+8),u32(k+16)),u32(k+20)))
+          def offs(rva):
+            for va,size,raw in sections:
+              if va<=rva<va+size:return raw+rva-va
+            raise ValueError('Resource RVA outside PE')
+          base=offs(res_rva)
+          def entries(rel):
+            k=base+rel
+            return [(u32(k+16+8*i),u32(k+20+8*i)) for i in range(u16(k+12)+u16(k+14))]
+          type_dir=next(b for a,b in entries(0) if a==10)
+          name_dir=next(b for a,b in entries(type_dir&0x7fffffff) if a==101)
+          leaf=entries(name_dir&0x7fffffff)[0][1]
+          rva,size=u32(base+leaf),u32(base+leaf+4)
+          payload=data[offs(rva):offs(rva)+size]
+          assert len(payload)>4000000 and payload[:2]==b'MZ'
+          actual=hashlib.sha256(payload).hexdigest()
+          expected='f00d461137f05efd6d0fd668045a309038ceaaa5d268cce8a47e48eb10ff9fd8'
+          assert actual==expected,(actual,expected)
+          out=Path('Hi5CentralAgentSetup-1.0.218.exe')
+          out.write_bytes(payload)
+          print('VERIFIED_AGENT218_SHA256',actual,'size',len(payload))
+          PY
+      - name: Publish test release asset for checksum-verified VPS handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create agent-1.0.218-test Hi5CentralAgentSetup-1.0.218.exe \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Agent 1.0.218 controlled test artifact" \
+            --notes "Verified artifact from GitHub Actions Windows installer run 41076211793. SHA256: f00d461137f05efd6d0fd668045a309038ceaaa5d268cce8a47e48eb10ff9fd8. Not a production fleet release." \
+            --prerelease

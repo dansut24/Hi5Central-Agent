@@ -17,7 +17,7 @@ public:
     H264MfEncoder();
     ~H264MfEncoder();
 
-    bool init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error = nullptr);
+    bool init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error = nullptr, bool strictHardwareOnly = false);
     void shutdown();
 
     bool encode(const I420Frame& frame, bool forceKeyframe, H264EncodedFrame& out, std::string* error = nullptr);

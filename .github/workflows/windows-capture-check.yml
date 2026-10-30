@@ -4,7 +4,17 @@ on:
   pull_request:
     paths:
       - 'Agent/chatpass_agent/src/platform/windows/windows_screen.cpp'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_wgc_capture.cpp'
       - 'Agent/chatpass_agent/src/frame_source.h'
+      - 'Agent/chatpass_agent/src/streamer_main.cpp'
+      - 'Agent/chatpass_agent/src/wgc_high_resolution_pacer_win.h'
+      - 'Agent/chatpass_agent/src/platform/windows/windows_wgc_capture.h'
+      - 'Agent/chatpass_agent/src/wgc_adaptive_i420.h'
+      - 'Agent/chatpass_agent/tests/wgc_adaptive_i420_test.cpp'
+      - 'Agent/chatpass_agent/tests/wgc_high_resolution_pacer_test.cpp'
+      - 'Agent/chatpass_agent/src/capture_frame_rate_policy.h'
+      - 'Agent/chatpass_agent/src/capture_publish_policy.h'
+      - 'Agent/chatpass_agent/tests/capture_frame_rate_policy_test.cpp'
       - 'Agent/chatpass_agent/src/ipc/input_pipe.h'
       - 'Agent/chatpass_agent/tests/stream_stats_ipc_test.cpp'
       - '.github/workflows/windows-capture-check.yml'
@@ -37,6 +47,58 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "DXGI/GDI capture compile failed" }
           if (-not (Test-Path dist/windows_screen.obj)) { throw "Capture object missing" }
           Write-Host "Shipping Windows screen capture translation unit compiled successfully"
+
+      - name: Compile WinRT WGC frame reader using the Windows SDK
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++20 /EHsc /W3 /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I Agent/chatpass_agent/src /c Agent/chatpass_agent/src/platform/windows/windows_wgc_capture.cpp /Fodist\windows_wgc_capture.obj'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "WGC frame capture translation unit failed compilation" }
+          if (-not (Test-Path dist/windows_wgc_capture.obj)) { throw "WGC object missing" }
+      - name: Compile shipping Windows streamer and high-resolution WGC pacer
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I Agent/chatpass_agent/src /c Agent/chatpass_agent/src/streamer_main.cpp /Fodist\wgc_streamer.obj'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Shipping WGC streamer timing integration failed compilation" }
+          if (-not (Test-Path dist/wgc_streamer.obj)) { throw "WGC streamer object missing" }
+      - name: Exercise high-resolution WGC waitable timer
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN Agent/chatpass_agent/tests/wgc_high_resolution_pacer_test.cpp /Fe:dist\wgc_high_resolution_pacer_test.exe && dist\wgc_high_resolution_pacer_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "WGC high-resolution waitable-timer regression failed" }
+
+      - name: WGC manual FPS and empty-compositor regression
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 Agent/chatpass_agent/tests/capture_frame_rate_policy_test.cpp /Fe:dist\capture_frame_rate_policy_test.exe && dist\capture_frame_rate_policy_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "WGC capture frame-rate and publish-policy regressions failed" }
+
+      - name: Check adaptive libyuv pixel fidelity and SIMD capability
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $yuv = 'C:\vcpkg\installed\x64-windows-static\lib\yuv.lib'
+          if (-not (Test-Path $yuv)) { throw 'libyuv static library missing' }
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /MT /O2 /DNOMINMAX /I C:\vcpkg\installed\x64-windows-static\include /I Agent/chatpass_agent/src Agent/chatpass_agent/tests/wgc_adaptive_i420_test.cpp /Fe:dist\wgc_adaptive_i420_test.exe /link "' + $yuv + '" && dist\wgc_adaptive_i420_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw 'WGC libyuv adaptive conversion pixel regression failed' }
 
       - name: Windows helper IPC timing roundtrip
         shell: pwsh

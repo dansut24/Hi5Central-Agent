@@ -2,6 +2,7 @@
 #include <libyuv/convert.h>
 #include "util/log.h"
 #include "windows_wgc_capture.h"
+#include "wgc_adaptive_i420.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -31,6 +32,17 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+    // Set HI5_WGC_ADAPTIVE_I420=0 to fall back instantly to the proven
+    // single-call libyuv path. WGC is already normal-desktop opt-in only.
+    static bool Hi5WgcAdaptiveI420Enabled() {
+        static const bool enabled = []() {
+            char value[8]{};
+            const DWORD n = GetEnvironmentVariableA(
+                "HI5_WGC_ADAPTIVE_I420", value, static_cast<DWORD>(sizeof(value)));
+            return !(n == 1 && value[0] == '0');
+        }();
+        return enabled;
+    }
     static bool Hi5CompositeCursorEnabled() {
         static const bool enabled = []() {
             char buf[16]{};
@@ -171,57 +183,251 @@ namespace {
     static void compositeCursorBgra(int originX, int originY, int width, int height,
         std::vector<uint8_t>& bgra, int stride);
 
-    static bool captureRectBgraGdi(int x, int y, int srcW, int srcH, int dstW, int dstH,
-        std::vector<uint8_t>& bgraOut, int& strideOut) {
-        HDC screenDC = GetDC(nullptr);
-        if (!screenDC) return false;
+    struct GdiCaptureSurface {
+        HDC memDc = nullptr;
+        HBITMAP dib = nullptr;
+        HGDIOBJ original = nullptr;
+        uint8_t* bits = nullptr;
+        int width = 0;
+        int height = 0;
+        HDESK threadDesktop = nullptr;
 
-        HDC memDC = CreateCompatibleDC(screenDC);
-        if (!memDC) {
-            ReleaseDC(nullptr, screenDC);
-            return false;
+        void reset() {
+            if (memDc && original && original != HGDI_ERROR) {
+                SelectObject(memDc, original);
+            }
+            if (dib) DeleteObject(dib);
+            if (memDc) DeleteDC(memDc);
+            memDc = nullptr;
+            dib = nullptr;
+            original = nullptr;
+            bits = nullptr;
+            width = 0;
+            height = 0;
+            threadDesktop = nullptr;
         }
+        ~GdiCaptureSurface() { reset(); }
 
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = dstW;
-        bmi.bmiHeader.biHeight = -dstH;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-
-        void* bits = nullptr;
-        HBITMAP bmp = CreateDIBSection(screenDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!bmp || !bits) {
-            if (bmp) DeleteObject(bmp);
-            DeleteDC(memDC);
-            ReleaseDC(nullptr, screenDC);
-            return false;
+        bool prepare(HDC screenDc, int w, int h) {
+            const HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+            if (memDc && dib && bits && width == w && height == h &&
+                threadDesktop == desktop) return true;
+            reset();
+            memDc = CreateCompatibleDC(screenDc);
+            if (!memDc) return false;
+            BITMAPINFO bmi{};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            void* pixels = nullptr;
+            dib = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &pixels, nullptr, 0);
+            if (!dib || !pixels) { reset(); return false; }
+            original = SelectObject(memDc, dib);
+            if (!original || original == HGDI_ERROR) { reset(); return false; }
+            bits = static_cast<uint8_t*>(pixels);
+            width = w;
+            height = h;
+            threadDesktop = desktop;
+            return true;
         }
+    };
 
-        HGDIOBJ old = SelectObject(memDC, bmp);
-        SetStretchBltMode(memDC, HALFTONE);
-
-        StretchBlt(
-            memDC,
-            0, 0, dstW, dstH,
-            screenDC,
-            x, y, srcW, srcH,
-            SRCCOPY | CAPTUREBLT
-        );
-
-        strideOut = dstW * 4;
-        bgraOut.resize(static_cast<size_t>(strideOut) * dstH);
-        std::memcpy(bgraOut.data(), bits, bgraOut.size());
-        compositeCursorBgra(x, y, dstW, dstH, bgraOut, strideOut);
-
-        SelectObject(memDC, old);
-        DeleteObject(bmp);
-        DeleteDC(memDC);
-        ReleaseDC(nullptr, screenDC);
-        return true;
+    static void compositeCursorOnGdiSurface(HDC targetDc, int originX, int originY,
+                                            int width, int height) {
+        if (!targetDc || width <= 0 || height <= 0) return;
+        CURSORINFO ci{};
+        ci.cbSize = sizeof(ci);
+        if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
+        ICONINFO info{};
+        POINT hotspot{0, 0};
+        if (GetIconInfo(ci.hCursor, &info)) {
+            hotspot.x = static_cast<LONG>(info.xHotspot);
+            hotspot.y = static_cast<LONG>(info.yHotspot);
+            if (info.hbmMask) DeleteObject(info.hbmMask);
+            if (info.hbmColor) DeleteObject(info.hbmColor);
+        }
+        const int drawX = ci.ptScreenPos.x - originX - hotspot.x;
+        const int drawY = ci.ptScreenPos.y - originY - hotspot.y;
+        if (drawX > width || drawY > height || drawX < -256 || drawY < -256) return;
+        // GDI source already has a compatible, writable 32-bit DIB. Compose
+        // directly onto that cached surface instead of constructing/copying
+        // a second full-frame bitmap solely to draw the pointer.
+        DrawIconEx(targetDc, drawX, drawY, ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
     }
 
+    static bool captureRectBgraGdi(int x, int y, int srcW, int srcH, int dstW, int dstH,
+        std::vector<uint8_t>& bgraOut, int& strideOut) {
+        if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return false;
+        // The broad gdi-stage-stats previously grouped BitBlt, GdiFlush,
+        // cursor composition and memory copy into one 75-80ms operation.
+        // Measure each stage to identify the actual cost before changing
+        // layered-window semantics or sacrificing desktop quality.
+        using GdiClock = std::chrono::steady_clock;
+        const auto stageBegin = GdiClock::now();
+        HDC screenDC = GetDC(nullptr);
+        if (!screenDC) return false;
+        static thread_local GdiCaptureSurface scratch;
+        if (!scratch.prepare(screenDC, dstW, dstH)) {
+            ReleaseDC(nullptr, screenDC);
+            return false;
+        }
+
+        const auto stagePrepared = GdiClock::now();
+        // BitBlt avoids the HALFTONE scaler for full-resolution capture.
+        // StretchBlt remains available for bounded preview thumbnails.
+        BOOL copied = FALSE;
+        if (srcW == dstW && srcH == dstH) {
+            copied = BitBlt(scratch.memDc, 0, 0, dstW, dstH,
+                            screenDC, x, y, SRCCOPY | CAPTUREBLT);
+        } else {
+            SetStretchBltMode(scratch.memDc, HALFTONE);
+            copied = StretchBlt(scratch.memDc, 0, 0, dstW, dstH,
+                                screenDC, x, y, srcW, srcH, SRCCOPY | CAPTUREBLT);
+        }
+        const auto stageBlt = GdiClock::now();
+        ReleaseDC(nullptr, screenDC);
+        if (!copied) {
+            // A Windows desktop switch can invalidate old DC contents.
+            // Never serve stale pixels; rebuild the surface on next attempt.
+            scratch.reset();
+            return false;
+        }
+
+        // CreateDIBSection exposes direct CPU pixel memory. Windows GDI can
+        // batch drawing commands: flush BitBlt/StretchBlt before memcpy so a
+        // reused surface never yields pixels from the previous desktop frame.
+        compositeCursorOnGdiSurface(scratch.memDc, x, y, dstW, dstH);
+        const auto stageCursor = GdiClock::now();
+        GdiFlush();
+        const auto stageFlush = GdiClock::now();
+        strideOut = dstW * 4;
+        bgraOut.resize(static_cast<size_t>(strideOut) * dstH);
+        std::memcpy(bgraOut.data(), scratch.bits, bgraOut.size());
+        const auto stageCopy = GdiClock::now();
+
+        // Diagnostic only. An administrator may opt into a small, bounded
+        // A/B probe with HKLM\SOFTWARE\Hi5Central\Agent\GdiBitBltProbe=1.
+        // The stream ALWAYS uses the original CAPTUREBLT image. No user
+        // desktop or secure/UAC capture semantics change in this build.
+        // Benchmark plain SRCCOPY into a separate cached surface, never
+        // replacing the pixels already copied into the live frame.
+        struct BltProbe {
+            GdiCaptureSurface surface;
+            unsigned long captures = 0;
+            unsigned int samples = 0;
+        };
+        static thread_local BltProbe bltProbe{};
+        if (bltProbe.samples < 12 && (++bltProbe.captures % 60) == 0) {
+            DWORD enabled = 0;
+            DWORD bytes = sizeof(enabled);
+            const bool enabledByAdmin =
+                RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Hi5Central\\Agent",
+                    "GdiBitBltProbe", RRF_RT_REG_DWORD, nullptr,
+                    &enabled, &bytes) == ERROR_SUCCESS && enabled == 1;
+            if (enabledByAdmin) {
+                wchar_t desktopName[64]{};
+                DWORD nameBytes = 0;
+                const HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+                const bool onDefaultDesktop =
+                    desktop && GetUserObjectInformationW(desktop, UOI_NAME,
+                        desktopName, sizeof(desktopName), &nameBytes) &&
+                    _wcsicmp(desktopName, L"Default") == 0;
+                // Never benchmark the Winlogon/secure desktop.
+                if (onDefaultDesktop) {
+                    HDC probeSource = GetDC(nullptr);
+                    if (probeSource) {
+                        if (bltProbe.surface.prepare(probeSource, dstW, dstH)) {
+                            const auto probeStart = GdiClock::now();
+                            BOOL probeOk = FALSE;
+                            if (srcW == dstW && srcH == dstH) {
+                                probeOk = BitBlt(bltProbe.surface.memDc,
+                                    0, 0, dstW, dstH, probeSource, x, y, SRCCOPY);
+                            } else {
+                                SetStretchBltMode(bltProbe.surface.memDc, HALFTONE);
+                                probeOk = StretchBlt(bltProbe.surface.memDc,
+                                    0, 0, dstW, dstH, probeSource, x, y,
+                                    srcW, srcH, SRCCOPY);
+                            }
+                            GdiFlush();
+                            const auto probeEnd = GdiClock::now();
+                            if (probeOk) {
+                                // Sparse pixel difference is a diagnostic,
+                                // not proof of visual equivalence: the desktop
+                                // may change between the two captures.
+                                int differing = 0;
+                                int sampled = 0;
+                                const size_t stepX = std::max(1, dstW / 96);
+                                const size_t stepY = std::max(1, dstH / 54);
+                                for (int yy = 0; yy < dstH; yy += static_cast<int>(stepY)) {
+                                    for (int xx = 0; xx < dstW; xx += static_cast<int>(stepX)) {
+                                        const size_t pixel = (static_cast<size_t>(yy) *
+                                            static_cast<size_t>(dstW) +
+                                            static_cast<size_t>(xx)) * 4;
+                                        const uint8_t* baseline = bgraOut.data() + pixel;
+                                        const uint8_t* candidate = bltProbe.surface.bits + pixel;
+                                        ++sampled;
+                                        if (std::abs(int(baseline[0]) - int(candidate[0])) > 12 ||
+                                            std::abs(int(baseline[1]) - int(candidate[1])) > 12 ||
+                                            std::abs(int(baseline[2]) - int(candidate[2])) > 12) {
+                                            ++differing;
+                                        }
+                                    }
+                                }
+                                LogInfo("[capture] gdi-blt-probe mode=nonvisible " +
+                                    std::string("default_desktop=1") +
+                                    " display=" + std::to_string(dstW) + "x" +
+                                    std::to_string(dstH) +
+                                    " baseline_capblt_ms=" +
+                                    std::to_string(std::chrono::duration<double, std::milli>(
+                                        stageBlt - stagePrepared).count()) +
+                                    " candidate_srcopy_ms=" +
+                                    std::to_string(std::chrono::duration<double, std::milli>(
+                                        probeEnd - probeStart).count()) +
+                                    " pixels_different=" + std::to_string(differing) +
+                                    " pixels_sampled=" + std::to_string(sampled));
+                                ++bltProbe.samples;
+                            } else {
+                                LogWarn("[capture] gdi-blt-probe plain SRCCOPY failed; "
+                                    "live CAPTUREBLT unaffected");
+                            }
+                        }
+                        ReleaseDC(nullptr, probeSource);
+                    }
+                }
+            }
+        }
+
+        struct GdiTiming {
+            uint64_t count = 0;
+            double acquireMs = 0, blitMs = 0, cursorMs = 0;
+            double flushMs = 0, memcpyMs = 0;
+        };
+        static thread_local GdiTiming timing{};
+        auto ms = [](GdiClock::time_point a, GdiClock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        timing.acquireMs += ms(stageBegin, stagePrepared);
+        timing.blitMs += ms(stagePrepared, stageBlt);
+        timing.cursorMs += ms(stageBlt, stageCursor);
+        timing.flushMs += ms(stageCursor, stageFlush);
+        timing.memcpyMs += ms(stageFlush, stageCopy);
+        if (++timing.count == 50) {
+            const double n = static_cast<double>(timing.count);
+            LogInfo("[capture] gdi-copy-breakdown samples=" +
+                std::to_string(timing.count) +
+                " display=" + std::to_string(dstW) + "x" + std::to_string(dstH) +
+                " acquire_avg_ms=" + std::to_string(timing.acquireMs / n) +
+                " blit_avg_ms=" + std::to_string(timing.blitMs / n) +
+                " cursor_avg_ms=" + std::to_string(timing.cursorMs / n) +
+                " flush_avg_ms=" + std::to_string(timing.flushMs / n) +
+                " memcpy_avg_ms=" + std::to_string(timing.memcpyMs / n));
+            timing = {};
+        }
+        return true;
+    }
 
     static void compositeCursorBgra(int originX, int originY, int width, int height,
         std::vector<uint8_t>& bgra, int stride) {
@@ -468,6 +674,17 @@ struct DesktopFrameSource::Impl {
     int height = 0;
 
     I420Frame lastFrame;
+    // Reuse the multi-megabyte intermediate buffer instead of allocating a
+    // new one on every capture. Streamer owns this frame source on one thread.
+    std::vector<uint8_t> gdiBgraBuffer;
+    // Reuse the ~16MB GPU-readback buffer across WGC compositor updates.
+    // Streamer owns this source on one thread; no per-frame allocations.
+    std::vector<uint8_t> wgcBgraBuffer;
+    hi5::WgcAdaptiveI420Converter wgcI420Converter;
+    bool wgcI420ChoiceLogged = false;
+    uint64_t gdiProfileSamples = 0;
+    double gdiCopyMs = 0;
+    double gdiConvertMs = 0;
     std::chrono::steady_clock::time_point lastGdiRefresh{};
     uint64_t frameId = 0;
 
@@ -531,6 +748,15 @@ struct DesktopFrameSource::Impl {
                     " action=gdi_fallback");
             return;
         }
+        const auto interval = candidate->GetUpdateIntervalStatus();
+        LogInfo("[capture] WGC session update-interval" +
+            std::string(" property_supported=") + (interval.propertySupported ? "1" : "0") +
+            " requested=" + (interval.requested ? "1" : "0") +
+            " requested_us=" + std::to_string(interval.requestedUs) +
+            " applied=" + (interval.applied ? "1" : "0") +
+            " default_100ns=" + std::to_string(interval.default100ns) +
+            " active_100ns=" + std::to_string(interval.active100ns) +
+            " error_hresult=" + std::to_string(interval.errorHresult));
         wgc = std::move(candidate);
         wgcReceivedFrame = false;
         wgcStarted = std::chrono::steady_clock::now();
@@ -706,6 +932,45 @@ struct DesktopFrameSource::Impl {
         }
 
         if (const HRESULT hr = output1->DuplicateOutput(device.Get(), &duplication); FAILED(hr)) {
+            if (hr == E_ACCESSDENIED) {
+                // Read-only context: distinguishes wrong desktop/session from
+                // a GPU/driver refusal. No SetThreadDesktop, privilege change
+                // or secure desktop switch is attempted here.
+                wchar_t threadDesktop[96]{};
+                wchar_t inputDesktop[96]{};
+                DWORD ignored = 0;
+                DWORD inputError = 0;
+                const HDESK thread = GetThreadDesktop(GetCurrentThreadId());
+                if (!thread || !GetUserObjectInformationW(thread, UOI_NAME,
+                        threadDesktop, sizeof(threadDesktop), &ignored)) {
+                    wcscpy_s(threadDesktop, L"unavailable");
+                }
+                const HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+                if (input) {
+                    ignored = 0;
+                    if (!GetUserObjectInformationW(input, UOI_NAME,
+                            inputDesktop, sizeof(inputDesktop), &ignored)) {
+                        wcscpy_s(inputDesktop, L"unavailable");
+                    }
+                    CloseDesktop(input);
+                } else {
+                    inputError = GetLastError();
+                    wcscpy_s(inputDesktop, L"unavailable");
+                }
+                DWORD processSession = 0;
+                ProcessIdToSessionId(GetCurrentProcessId(), &processSession);
+                DXGI_OUTPUT_DESC outputDesc{};
+                const HRESULT descResult = output->GetDesc(&outputDesc);
+                LogWarn("[capture] dxgi-access-context" +
+                    std::string(" process_session=") + std::to_string(processSession) +
+                    " console_session=" + std::to_string(WTSGetActiveConsoleSessionId()) +
+                    " thread_desktop=" + wideToUtf8(threadDesktop) +
+                    " input_desktop=" + wideToUtf8(inputDesktop) +
+                    " input_error=" + std::to_string(inputError) +
+                    " adapter_index=" + std::to_string(target->adapterIndex) +
+                    " output_index=" + std::to_string(target->outputIndex) +
+                    " output_desc_ok=" + std::to_string(SUCCEEDED(descResult) ? 1 : 0));
+            }
             throw DxgiError("DuplicateOutput", hr);
         }
 
@@ -732,6 +997,22 @@ struct DesktopFrameSource::Impl {
     }
 
     bool setDisplayIndexLocked(int index) {
+        // The normal capture helper is constructed before RunStreamerMain
+        // explicitly selects args.display. If DXGI duplication fails, that
+        // constructor already starts the opt-in WGC trial on requestedIndex.
+        // Selecting the *same* output moments later must not close a running
+        // capture session and synchronously reactivate its WinRT factory.
+        // Physical Lenovo Agent 1.0.225: that duplicate activation crashed
+        // (0xC0000005 RVA 0x31C8EF, windows_wgc_capture.cpp:207), while
+        // its first WGC trial had started successfully 30 ms earlier.
+        // Switching to a different display still recreates WGC below.
+        if (index >= 0 && index == requestedIndex &&
+            wgc && wgc->IsRunning()) {
+            LogInfo("[capture] retain running WGC trial for unchanged display=" +
+                std::to_string(index) + " action=skip_duplicate_winrt_activation");
+            return true;
+        }
+
         refreshDisplaysLocked(true);
 
         // Switching monitors discards the old monitor's WGC capture item.
@@ -783,74 +1064,99 @@ struct DesktopFrameSource::Impl {
         return t->info;
     }
 
-    FrameCaptureResult captureAllMonitorsGdiLocked() {
+    FrameCaptureResult captureGdiDisplayLocked(const DisplayInfo& display) {
         FrameCaptureResult result;
-        const DisplayInfo d = buildAllMonitorsInfo();
-        if (d.width <= 0 || d.height <= 0) {
+        result.backend = DesktopCaptureBackend::Gdi;
+        if (display.width <= 0 || display.height <= 0) {
             result.frame = lastFrame;
             result.hasFrame = !lastFrame.y.empty();
             result.frameId = frameId;
             return result;
         }
 
-        std::vector<uint8_t> bgra;
+        // Profile the real compiled Windows GDI backend, not the unused
+        // alternate frame_source.cpp implementation. Separate screen-copy
+        // latency from BGRA->I420 conversion for the next capture tuning pass.
+        const auto copyStart = std::chrono::steady_clock::now();
         int stride = 0;
-        if (!captureRectBgraGdi(d.x, d.y, d.width, d.height, d.width, d.height, bgra, stride)) {
+        const bool copied = captureRectBgraGdi(
+            display.x, display.y, display.width, display.height,
+            display.width, display.height, gdiBgraBuffer, stride);
+        const auto copyEnd = std::chrono::steady_clock::now();
+        if (!copied) {
+            // Preserve the previous valid frame on transient desktop changes.
             result.frame = lastFrame;
             result.hasFrame = !lastFrame.y.empty();
             result.frameId = frameId;
             return result;
         }
 
-        I420Frame out;
-        bgraToI420(bgra.data(), stride, d.width, d.height, out);
-        lastFrame = out;
+        I420Frame converted;
+        bgraToI420(gdiBgraBuffer.data(), stride,
+                   display.width, display.height, converted);
+        const auto convertEnd = std::chrono::steady_clock::now();
+        gdiCopyMs += std::chrono::duration<double, std::milli>(
+            copyEnd - copyStart).count();
+        gdiConvertMs += std::chrono::duration<double, std::milli>(
+            convertEnd - copyEnd).count();
+        if (++gdiProfileSamples >= 25) {
+            LogInfo("[capture] gdi-stage-stats samples=" +
+                std::to_string(gdiProfileSamples) +
+                " display=" + std::to_string(display.width) + "x" +
+                std::to_string(display.height) +
+                " copy_avg_ms=" + std::to_string(
+                    gdiCopyMs / static_cast<double>(gdiProfileSamples)) +
+                " convert_avg_ms=" + std::to_string(
+                    gdiConvertMs / static_cast<double>(gdiProfileSamples)));
+            gdiProfileSamples = 0;
+            gdiCopyMs = 0;
+            gdiConvertMs = 0;
+        }
+
+        // Exactly one I420 copy remains: lastFrame is a recovery image used
+        // when DXGI/WGC times out or a display is switching. Move the fresh
+        // frame into the result to avoid the former second full-frame copy.
+        lastFrame = converted;
+        result.frame = std::move(converted);
         lastGdiRefresh = std::chrono::steady_clock::now();
-        result.frame = out;
         result.hasFrame = true;
-        result.changed = true;
+        result.changed = true; // GDI has no dirty-frame signal; sampled upstream
         result.frameId = ++frameId;
         return result;
     }
 
+    FrameCaptureResult captureAllMonitorsGdiLocked() {
+        return captureGdiDisplayLocked(buildAllMonitorsInfo());
+    }
+
     FrameCaptureResult captureCurrentDisplayGdiLocked() {
-        FrameCaptureResult result;
-        const DisplayInfo d = currentDisplayInfoLocked();
-        if (d.width <= 0 || d.height <= 0) {
-            result.frame = lastFrame;
-            result.hasFrame = !lastFrame.y.empty();
-            result.frameId = frameId;
-            return result;
-        }
-
-        std::vector<uint8_t> bgra;
-        int stride = 0;
-        if (!captureRectBgraGdi(d.x, d.y, d.width, d.height, d.width, d.height, bgra, stride)) {
-            result.frame = lastFrame;
-            result.hasFrame = !lastFrame.y.empty();
-            result.frameId = frameId;
-            return result;
-        }
-
-        I420Frame out;
-        bgraToI420(bgra.data(), stride, d.width, d.height, out);
-        lastFrame = out;
-        lastGdiRefresh = std::chrono::steady_clock::now();
-        result.frame = out;
-        result.hasFrame = true;
-        result.changed = true;
-        result.frameId = ++frameId;
-        return result;
+        return captureGdiDisplayLocked(currentDisplayInfoLocked());
     }
 
     FrameCaptureResult captureOneLocked() {
         refreshDisplaysLocked();
 
         if (wgc && wgc->IsRunning()) {
-            std::vector<uint8_t> bgra;
+            auto& bgra = wgcBgraBuffer;
             int w = 0, h = 0, pitch = 0;
             std::string error;
-            if (wgc->TryReadBgra(bgra, w, h, pitch, error)) {
+            WgcReadbackTimings readbackStages{};
+            WgcFrameArrivalDiagnostics arrivals{};
+            auto addArrivalStats = [&arrivals](FrameCaptureResult& r) {
+                r.wgcArrivalEventsTotal = arrivals.eventsTotal;
+                r.wgcArrivalGapCount = arrivals.arrivalGapCount;
+                r.wgcArrivalGapTotalNs = arrivals.arrivalGapTotalNs;
+                r.wgcArrivalGapMaxNs = arrivals.arrivalGapMaxNs;
+                r.wgcFramesConsumedTotal = arrivals.framesConsumedTotal;
+                r.wgcArrivalsSincePreviousFrame = arrivals.eventsSincePreviousFrame;
+                r.wgcSourceTimestamp100ns = arrivals.sourceTimestamp100ns;
+                r.wgcSourceTimestampGap100ns = arrivals.sourceTimestampGap100ns;
+            };
+            const auto wgcReadStarted = std::chrono::steady_clock::now();
+            if (wgc->TryReadBgra(bgra, w, h, pitch, error, &readbackStages, &arrivals)) {
+                // Includes WGC frame acquisition, GPU staging map and CPU readback.
+                const double readbackMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - wgcReadStarted).count();
                 // Compare suspected empty compositor output against GDI.
                 // Truly dark desktops remain valid; nonempty GDI means WGC
                 // returned an unusable frame, so stop WGC for this session.
@@ -908,12 +1214,42 @@ struct DesktopFrameSource::Impl {
                     compositeCursorBgra(target->info.x, target->info.y,
                                         w, h, bgra, pitch);
                 }
-                bgraToI420(bgra.data(), pitch, w, h, frame);
-                lastFrame = frame;
+                const auto convertStarted = std::chrono::steady_clock::now();
+                if (!wgcI420Converter.Convert(
+                    bgra.data(), pitch, w, h, frame, Hi5WgcAdaptiveI420Enabled())) {
+                    throw std::runtime_error("WGC libyuv ARGBToI420 conversion failed");
+                }
+                const double convertMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - convertStarted).count();
+                if (wgcI420Converter.Qualified() && !wgcI420ChoiceLogged) {
+                    wgcI420ChoiceLogged = true;
+                    LogInfo("[capture] WGC I420 adaptive decision=" +
+                        std::string(wgcI420Converter.UsingParallel() ? "two_strip" : "serial") +
+                        " serial_trial_avg_ms=" +
+                        std::to_string(wgcI420Converter.SerialTrialAvgMs()) +
+                        " parallel_trial_avg_ms=" +
+                        std::to_string(wgcI420Converter.ParallelTrialAvgMs()));
+                }
+                // Do not clone a new 6MB I420 frame into lastFrame on
+                // every successful WGC update. WGC itself signals changed
+                // frames; no unchanged video is written. Retaining an old
+                // GDI lastFrame is harmless if WGC later fails over.
                 FrameCaptureResult result;
                 result.frame = std::move(frame);
                 result.hasFrame = true;
                 result.changed = true;
+                result.backend = DesktopCaptureBackend::Wgc;
+                result.wgcReadbackMs = readbackMs;
+                result.wgcGpuCopyMapMs = readbackStages.gpuCopyMapMs;
+                result.wgcCpuBufferCopyMs = readbackStages.cpuBufferCopyMs;
+                result.wgcConversionMs = convertMs;
+                result.wgcConversionParallel = wgcI420Converter.ParallelLast();
+                result.wgcConverterQualified = wgcI420Converter.Qualified();
+                result.wgcConverterPrefersParallel = wgcI420Converter.UsingParallel();
+                result.wgcConversionSerialTrialAvgMs = wgcI420Converter.SerialTrialAvgMs();
+                result.wgcConversionParallelTrialAvgMs = wgcI420Converter.ParallelTrialAvgMs();
+                addArrivalStats(result);
+                result.changedIsNative = true; // WGC compositor delivered a new frame
                 result.frameId = ++frameId;
                 if (!wgcReceivedFrame) {
                     wgcReceivedFrame = true;
@@ -932,12 +1268,15 @@ struct DesktopFrameSource::Impl {
                     " action=continue_gdi");
                 wgc.reset();
                 lastDxgiRetry = std::chrono::steady_clock::now();
-            } else if (wgcReceivedFrame && !lastFrame.y.empty()) {
+            } else if (wgcReceivedFrame) {
+                // An empty compositor poll must neither republish the last
+                // image nor fall back to a costly GDI capture. The screen
+                // remains visible from the preceding published WGC frame.
                 FrameCaptureResult result;
-                result.frame = lastFrame;
-                result.hasFrame = true;
+                result.backend = DesktopCaptureBackend::Wgc;
                 result.changed = false;
                 result.frameId = frameId;
+                addArrivalStats(result);
                 return result;
             }
             // Before the first WGC compositor frame, continue live GDI.
@@ -979,6 +1318,7 @@ struct DesktopFrameSource::Impl {
             }
 
             FrameCaptureResult result;
+            result.backend = DesktopCaptureBackend::Dxgi;
             result.frame = lastFrame;
             result.hasFrame = true;
             result.changed = false;
@@ -1000,6 +1340,7 @@ struct DesktopFrameSource::Impl {
             }
 
             FrameCaptureResult result;
+            result.backend = DesktopCaptureBackend::Dxgi;
             result.frame = lastFrame;
             result.hasFrame = true;
             result.changed = false;
@@ -1047,6 +1388,8 @@ struct DesktopFrameSource::Impl {
         result.frame = out;
         result.hasFrame = true;
         result.changed = true;
+        result.changedIsNative = true; // DXGI reported a new acquired frame
+        result.backend = DesktopCaptureBackend::Dxgi;
         result.cursorOnly = cursorOnly;
         result.frameId = ++frameId;
         return result;

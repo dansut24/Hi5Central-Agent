@@ -1,5 +1,7 @@
 ﻿#include "webrtc_sender.h"
+#include "codec_auto_fps.h"
 #include "frame_source.h"
+#include "frame_scale_bilinear.h"
 #include "util/log.h"
 
 #include <rtc/rtc.hpp>
@@ -60,6 +62,16 @@ namespace {
     }
 
 
+    // Exact p95 of bounded, actually measured encoder frame times.
+    // A rare slow frame is recorded in max, but not mislabeled as p95.
+    static double encodeP95Ms(const std::vector<double>& samples) {
+        if (samples.empty()) return 0.0;
+        auto ordered = samples;
+        std::sort(ordered.begin(), ordered.end());
+        const size_t index = (ordered.size() * 95 + 99) / 100 - 1;
+        return ordered[std::min(index, ordered.size() - 1)];
+    }
+
     static int makeEvenAtLeast2(int v) {
         v = std::max(2, v);
         if (v & 1) --v;
@@ -89,7 +101,7 @@ namespace {
     }
 
     static I420Frame scaleI420ToWebRtcBounds(const I420Frame& src, int maxW, int maxH,
-        bool* scaledOut = nullptr) {
+        bool* scaledOut = nullptr, bool filteredScaling = false) {
         if (scaledOut) *scaledOut = false;
         if (src.width <= 0 || src.height <= 0) return src;
 
@@ -110,24 +122,52 @@ namespace {
         dst.width = dstW;
         dst.height = dstH;
 
-        scalePlaneNearest(src.y, src.width, src.height, dst.y, dstW, dstH);
+        if (filteredScaling) {
+            hi5::quality::ScalePlaneBilinear(src.y, src.width, src.height, dst.y, dstW, dstH);
+        } else {
+            scalePlaneNearest(src.y, src.width, src.height, dst.y, dstW, dstH);
+        }
 
         const int srcUw = (src.width + 1) / 2;
         const int srcUh = (src.height + 1) / 2;
         const int dstUw = (dstW + 1) / 2;
         const int dstUh = (dstH + 1) / 2;
-        scalePlaneNearest(src.u, srcUw, srcUh, dst.u, dstUw, dstUh);
-        scalePlaneNearest(src.v, srcUw, srcUh, dst.v, dstUw, dstUh);
+        if (filteredScaling) {
+            hi5::quality::ScalePlaneBilinear(src.u, srcUw, srcUh, dst.u, dstUw, dstUh);
+            hi5::quality::ScalePlaneBilinear(src.v, srcUw, srcUh, dst.v, dstUw, dstUh);
+        } else {
+            scalePlaneNearest(src.u, srcUw, srcUh, dst.u, dstUw, dstUh);
+            scalePlaneNearest(src.v, srcUw, srcUh, dst.v, dstUw, dstUh);
+        }
 
         if (scaledOut) *scaledOut = true;
         return dst;
     }
 
+    static bool h264SharpTextTrialEnabled() {
+        // Opt-in only: generic H.264 WebRTC continues to advertise Level 3.1.
+        // The higher resolution must be signalled with a matching SDP level.
+        return readEnvInt("HI5_H264_SHARP_TEXT", 0, 0, 1) == 1;
+    }
+
     static I420Frame scaleI420ForH264WebRtc(const I420Frame& src, bool* scaledOut = nullptr) {
-        // Browser H.264 Constrained Baseline level 3.1 requires 720p.
-        return scaleI420ToWebRtcBounds(src,
-            readEnvInt("HI5_H264_MAX_WIDTH", 1280, 0, 7680),
-            readEnvInt("HI5_H264_MAX_HEIGHT", 720, 0, 4320), scaledOut);
+        const bool sharp = h264SharpTextTrialEnabled();
+        // Constrained Baseline L3.1 = 720p; opt-in L4.0 = up to 1080p.
+        // Older deployments may have MACHINE-SCOPE HI5_H264_MAX_* = 1280/720
+        // from historical L3.1 testing. Do not let that stale global setting
+        // silently defeat an explicit service-scoped sharp-text trial.
+        // Sharp mode has its OWN independent bounds, clamped to L4.0.
+        const int maxW = sharp
+            ? readEnvInt("HI5_H264_SHARP_MAX_WIDTH", 1920, 2, 1920)
+            : readEnvInt("HI5_H264_MAX_WIDTH", 1280, 2, 1280);
+        const int maxH = sharp
+            ? readEnvInt("HI5_H264_SHARP_MAX_HEIGHT", 1080, 2, 1080)
+            : readEnvInt("HI5_H264_MAX_HEIGHT", 720, 2, 720);
+        // Opt-in filtered scaler only for sharp-text H.264. The generic
+        // nearest-neighbour scaler remains unchanged for proven codecs.
+        const bool filtered = sharp &&
+            readEnvInt("HI5_H264_SHARP_FILTER", 1, 0, 1) == 1;
+        return scaleI420ToWebRtcBounds(src, maxW, maxH, scaledOut, filtered);
     }
 
     struct Vp8RuntimeProfile {
@@ -435,14 +475,72 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         if (pref == "native") { w = 0; h = 0; }
                         else if (pref == "1080p") { w = 1920; h = 1080; }
                         else if (pref == "720p") { w = 1280; h = 720; }
-                        const int fps = std::clamp(msg.value("target_fps", 0), 0, 60);
+                        const int requestedFps = std::clamp(msg.value("target_fps", 0), 0, 60);
                         const int kbps = std::clamp(msg.value("target_bitrate_kbps", 0), 0, 20000);
+                        const std::string fpsMode = msg.value("fps_mode", std::string("legacy"));
+                        // Auto must be evidence-driven. At present no live
+                        // capture+browser FPS qualifications are persisted, so
+                        // keep the current 20 FPS ceiling even when a machine
+                        // supports a faster encoder. The independent development
+                        // override can request higher speeds within m_fps.
+                        const auto automatic = hi5::universal_codec::selectAutomaticFps(
+                            m_codecMode, {}, 0, std::max(1, m_fps), 120);
+                        // Automatic stays evidence-based. Manual is an explicit
+                        // viewer-requested experiment; it never asserts actual
+                        // delivered FPS, and cannot exceed this sender's ceiling.
+                        const bool manual = (fpsMode == "manual" || fpsMode == "development_override") &&
+                            hi5::universal_codec::manualFpsAllowed(requestedFps);
+                        const int fps = manual
+                            ? std::min(requestedFps, m_fps)
+                            : std::min(requestedFps > 0 ? requestedFps : 20,
+                                       automatic.targetFps);
                         const int prevW = m_viewerMaxWidth.exchange(w);
                         const int prevH = m_viewerMaxHeight.exchange(h);
-                        m_viewerTargetFps = fps;
+                        const int prevFps = m_viewerTargetFps.exchange(fps);
+                        const int prevManual = m_viewerManualFps.exchange(
+                            manual ? fps : 0);
+                        // The authenticated Viewer control also updates actual
+                        // capture-helper pacing. Otherwise a 60 FPS request
+                        // changes only the encoder while GDI stays capped at 20.
+                        if (m_mode == Mode::ExternalFeed && m_inputEventFn &&
+                            (prevManual != (manual ? fps : 0))) {
+                            m_inputEventFn(json{
+                                {"kind", "viewer_frame_rate"},
+                                {"target_fps", manual ? fps : 0}
+                            });
+                        }
+
                         m_viewerTargetBitrateKbps = kbps;
-                        if (prevW != w || prevH != h) {
-                            m_forceKeyframe = true;
+                        if (prevW != w || prevH != h) m_forceKeyframe = true;
+                        // Authoritative reply on the already-authenticated
+                        // control channel. The Viewer can promote Automatic only
+                        // after the Agent exposes a truly qualified ceiling;
+                        // older agents omit this message and remain at 20 FPS.
+                        try {
+                            json ack = {
+                                {"type", "viewer_stream_profile_result"},
+                                {"fps_mode", fpsMode},
+                                {"requested_fps", requestedFps},
+                                {"accepted_fps", std::min(fps > 0 ? fps : m_fps, m_fps)},
+                                {"qualified_max_fps", std::min(automatic.targetFps, m_fps)},
+                                {"agent_max_fps", m_fps},
+                                {"fps_qualified", !manual && automatic.qualified},
+                                {"manual_override", manual},
+                                {"target_is_not_measured_fps", true}
+                            };
+                            sendControlMessageText(ack.dump());
+                        } catch (...) {
+                            // A diagnostic reply must never interrupt the media.
+                        }
+                        if (prevW != w || prevH != h || prevFps != fps || prevManual != (manual ? fps : 0)) {
+                            LogInfo("[fps-policy] mode=" + fpsMode +
+                                " requested=" + std::to_string(requestedFps) +
+                                " accepted=" + std::to_string(fps) +
+                                " agent_ceiling=" + std::to_string(m_fps) +
+                                " automatic_qualified=" +
+                                    (automatic.qualified ? "1" : "0") +
+                                " reason=" + automatic.reason +
+                                " session=" + m_sessionId);
                             LogInfo("[quality] viewer=" + pref +
                                 " cap=" + std::to_string(w) + "x" + std::to_string(h) +
                                 " target=" + std::to_string(fps) + "fps/" + std::to_string(kbps) +
@@ -724,15 +822,18 @@ static void replaceAllInPlace(std::string& s, const std::string& from, const std
     }
 }
 
-static std::string normalizeOutgoingH264SdpForDesktop(std::string sdp, int bitrateKbps) {
-    // Keep the SDP at Constrained Baseline level 3.1 (42e01f) and cap the
-    // encoded H.264 resolution to 720p in the sender. Chromium/WebView was
-    // answering with 42e01f even when the offer advertised a higher level, so
-    // sending oversized desktop frames produced a connected black video track.
-    replaceAllInPlace(sdp, "profile-level-id=42e034", "profile-level-id=42e01f");
-    replaceAllInPlace(sdp, "profile-level-id=420034", "profile-level-id=42e01f");
-    replaceAllInPlace(sdp, "profile-level-id=42C034", "profile-level-id=42e01f");
-    replaceAllInPlace(sdp, "profile-level-id=42c034", "profile-level-id=42e01f");
+static std::string normalizeOutgoingH264SdpForDesktop(std::string sdp, int bitrateKbps, bool sharp1080p) {
+    // L3.1 is the known-good 720p baseline. The explicit higher-clarity
+    // experiment uses Constrained Baseline L4.0 (42e028). Never send 1080p
+    // under a falsely advertised L3.1 profile-level-id.
+    const std::string profile = sharp1080p ? "profile-level-id=42e028" : "profile-level-id=42e01f";
+    for (const char* source : {
+            "profile-level-id=42e034", "profile-level-id=420034",
+            "profile-level-id=42C034", "profile-level-id=42c034",
+            "profile-level-id=42e01f", "profile-level-id=42001f",
+            "profile-level-id=42e028", "profile-level-id=420028" }) {
+        replaceAllInPlace(sdp, source, profile);
+    }
 
     // If a previous pass accidentally produced an enormous AS value, normalise
     // it to the configured kbps. b=AS is in kbps in SDP.
@@ -767,9 +868,10 @@ void WebRtcSender::signalLocalOfferIfReady() {
     std::string sdp = std::string(desc.value());
 
     if (m_videoCodec == VideoCodec::H264) {
-        sdp = normalizeOutgoingH264SdpForDesktop(sdp, m_bitrateKbps);
+        const bool sharp = h264SharpTextTrialEnabled();
+        sdp = normalizeOutgoingH264SdpForDesktop(sdp, m_bitrateKbps, sharp);
         std::cout << "[codec] outgoing H.264 SDP normalized session=" << m_sessionId
-            << " profile_level_id=42e01f"
+            << " profile_level_id=" << (sharp ? "42e028" : "42e01f")
             << " bitrate_kbps=" << m_bitrateKbps << "\n";
     }
 
@@ -1619,6 +1721,27 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             readEnvInt("HI5_VP9_DESKTOP_KBPS", 6000, 500, 20000)));
     }
 
+    // H.264 must NOT inherit the VP8 idle profile (2fps / 1200kbps).
+    // H.264 Media Foundation currently sets bitrate at encoder creation and
+    // does not retune it on every wake/motion transition. Its first frame is
+    // normally an idle frame, which previously locked the entire session to
+    // a 1200kbps encode even with "Prioritise clarity" / 8000kbps selected.
+    // Keep a stable real-time encoder configuration; capture cadence still
+    // saves resources whenever the desktop is truly idle.
+    if (m_videoCodec == VideoCodec::H264 && !m_externalHintBackstage.load()) {
+        profile.name = "h264-desktop-clarity";
+        profile.fps = std::max(1, std::min(m_fps,
+            readEnvInt("HI5_H264_DESKTOP_FPS", 20, 1, 60)));
+        profile.bitrateKbps = std::max(250, std::min(m_bitrateKbps,
+            readEnvInt("HI5_H264_DESKTOP_KBPS", 8000, 250, 20000)));
+        const int requestedFps = m_viewerTargetFps.load();
+        const int manualFps = m_viewerManualFps.load();
+        const int requestedKbps = m_viewerTargetBitrateKbps.load();
+        if (manualFps > 0) profile.fps = std::min(m_fps, manualFps);
+        else if (requestedFps > 0) profile.fps = std::min(profile.fps, requestedFps);
+        if (requestedKbps > 0) profile.bitrateKbps = std::min(profile.bitrateKbps, requestedKbps);
+    }
+
     // The feedback-driven Viewer caps both VP8 and VP9. Previously these
     // limits were applied only to VP9, which left VP8 at full resolution and
     // bitrate on poor links even when Viewer requested 720p.
@@ -1719,7 +1842,23 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
     // recovery keyframes are much less frequent while idle and profile-aware.
     m_externalKeyframeEvery = std::max(profile.fps, std::max(1, profile.fps) * profile.keyframeSeconds);
     const bool periodicKeyframe = (m_externalFrameCounter % m_externalKeyframeEvery) == 0;
-    const bool keyframe = forceKeyframe || periodicKeyframe || m_forceKeyframe.exchange(false);
+    // One recovery IDR after 20 seconds when end-to-end codec learning is
+    // explicitly enabled. The current frame-only cadence can take minutes
+    // to reach the next IDR on a quiet 2-FPS desktop, preventing the browser
+    // from qualifying an otherwise healthy H.264 session. No repeated IDRs.
+    const bool qualificationKeyframe = m_h264QualificationKeyframe.requestIfDue(
+        m_videoCodec == VideoCodec::H264 &&
+            readEnvInt("HI5_UNIVERSAL_CODEC_LEARN", 0, 0, 1) == 1,
+        nowForProfile);
+    if (qualificationKeyframe) {
+        LogInfo("[codec-universal] one-shot H264 recovery IDR "
+                "reason=qualify_subsequent_browser_decoded_keyframe");
+    }
+    // Consume any pending keyframe request even if the qualification IDR
+    // satisfies it; otherwise the next idle frame emits a duplicate IDR.
+    const bool queuedKeyframe = m_forceKeyframe.exchange(false);
+    const bool keyframe = forceKeyframe || periodicKeyframe ||
+        qualificationKeyframe || queuedKeyframe;
 
     if (m_videoCodec == VideoCodec::VP9 && !m_vp9Failed) {
         bool vp9Scaled = false;
@@ -1897,6 +2036,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     }
                 }
                 m_externalEncodeMsTotal += encodeMs;
+        // Rolling 512-frame history survives five-second diagnostics
+                    // windows. At 2 idle fps, ten samples would make the
+                    // nearest-rank p95 equal to the single worst spike.
+                    if (m_externalEncodeMsSamples.size() >= 512)
+                        m_externalEncodeMsSamples.erase(m_externalEncodeMsSamples.begin());
+                    m_externalEncodeMsSamples.push_back(encodeMs);
                 m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
                 ++m_externalEncodedFrames;
 
@@ -1957,10 +2102,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                             {"type", "stream_encoder_diagnostics"},
                             {"session_id", m_sessionId},
                             {"codec", "VP9"},
+                            {"encoder_mode", m_codecMode},
                             {"encoded_frames", m_externalEncodedFrames},
                             {"sent_frames", m_externalSentFrames},
                             {"encode_avg_ms", m_externalEncodeMsTotal / encodedCount},
                             {"encode_max_ms", m_externalEncodeMsMax},
+                            {"encode_p95_ms", encodeP95Ms(m_externalEncodeMsSamples)},
                             {"send_avg_ms", m_externalSendMsTotal / sentCount},
                             {"send_max_ms", m_externalSendMsMax},
                             {"target_fps", m_externalConfiguredFps},
@@ -1977,6 +2124,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     m_externalSentFrames = 0;
                     m_externalEncodeMsTotal = 0.0;
                     m_externalEncodeMsMax = 0.0;
+                    // Retain recent encoder latency history across stats windows.
                     m_externalSendMsTotal = 0.0;
                     m_externalSendMsMax = 0.0;
                     m_externalNextStatsLog = healthNow + std::chrono::seconds(5);
@@ -2008,7 +2156,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         const bool profileChangedH264 = profile.fps != m_externalConfiguredFps ||
             profile.bitrateKbps != m_externalConfiguredBitrateKbps;
 
-        if (!m_h264Encoder || sizeChangedH264) {
+        // Media Foundation's nominal frame rate is set at encoder
+        // creation. Reinitialise on an explicit rate change so asking for
+        // 30/45/60 does not keep the old 20 FPS encoder configuration.
+        // This is one swap per user change, not a new encoder per frame.
+        if (!m_h264Encoder || sizeChangedH264 ||
+            profile.fps != m_externalConfiguredFps) {
             m_externalEncoderWidth = h264Frame.width;
             m_externalEncoderHeight = h264Frame.height;
             m_externalConfiguredFps = profile.fps;
@@ -2029,6 +2182,9 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 m_h264Encoder = std::move(enc);
                 LogInfo(
                     "[h264] encoder created session=" + m_sessionId +
+                    " sharp_text_trial=" + std::string(h264SharpTextTrialEnabled() ? "1" : "0") +
+                    " filtered_scaler=" + std::string(h264SharpTextTrialEnabled() &&
+                        readEnvInt("HI5_H264_SHARP_FILTER", 1, 0, 1) == 1 ? "bilinear" : "nearest") +
                     " name=" + m_h264Encoder->encoderName() +
                     " source=" + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
                     " encoded_size=" + std::to_string(h264Frame.width) + "x" + std::to_string(h264Frame.height) +
@@ -2111,6 +2267,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
                 const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
                 m_externalEncodeMsTotal += encodeMs;
+        // Rolling 512-frame history survives five-second diagnostics
+                    // windows. At 2 idle fps, ten samples would make the
+                    // nearest-rank p95 equal to the single worst spike.
+                    if (m_externalEncodeMsSamples.size() >= 512)
+                        m_externalEncodeMsSamples.erase(m_externalEncodeMsSamples.begin());
+                    m_externalEncodeMsSamples.push_back(encodeMs);
                 m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
                 ++m_externalEncodedFrames;
 
@@ -2150,10 +2312,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                             {"type", "stream_encoder_diagnostics"},
                             {"session_id", m_sessionId},
                             {"codec", "H264"},
+                            {"encoder_mode", m_codecMode},
                             {"encoded_frames", m_externalEncodedFrames},
                             {"sent_frames", m_externalSentFrames},
                             {"encode_avg_ms", m_externalEncodeMsTotal / encodedCount},
                             {"encode_max_ms", m_externalEncodeMsMax},
+                            {"encode_p95_ms", encodeP95Ms(m_externalEncodeMsSamples)},
                             {"send_avg_ms", m_externalSendMsTotal / sentCount},
                             {"send_max_ms", m_externalSendMsMax},
                             {"target_fps", m_externalConfiguredFps},
@@ -2170,6 +2334,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     m_externalSentFrames = 0;
                     m_externalEncodeMsTotal = 0.0;
                     m_externalEncodeMsMax = 0.0;
+                    // Retain recent encoder latency history across stats windows.
                     m_externalSendMsTotal = 0.0;
                     m_externalSendMsMax = 0.0;
                     m_externalNextStatsLog = now + std::chrono::seconds(5);
@@ -2201,6 +2366,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
 
         const double encodeMs = std::chrono::duration<double, std::milli>(encodeEnd - encodeStart).count();
         m_externalEncodeMsTotal += encodeMs;
+        // Rolling 512-frame history survives five-second diagnostics
+        // windows. At 2 idle fps, ten samples would make the
+        // nearest-rank p95 equal to the single worst spike.
+        if (m_externalEncodeMsSamples.size() >= 512)
+            m_externalEncodeMsSamples.erase(m_externalEncodeMsSamples.begin());
+        m_externalEncodeMsSamples.push_back(encodeMs);
         m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
         ++m_externalEncodedFrames;
 
@@ -2243,6 +2414,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     {"type", "stream_encoder_diagnostics"},
                     {"session_id", m_sessionId},
                     {"codec", "VP8"},
+                    {"codec_runtime_mode", "vp8"},
                     {"profile", m_externalProfileName},
                     {"encoder_mode", m_externalProfileName},
                     {"stream_mode", m_externalHintMode.load()},
@@ -2256,13 +2428,18 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     {"sent_frames", m_externalSentFrames},
                     {"encode_avg_ms", encodeAvgMs},
                     {"encode_max_ms", m_externalEncodeMsMax},
+                    {"encode_p95_ms", encodeP95Ms(m_externalEncodeMsSamples)},
                     {"send_avg_ms", sendAvgMs},
                     {"send_max_ms", m_externalSendMsMax},
                     {"bitrate_kbps", m_externalConfiguredBitrateKbps},
                     {"target_fps", m_externalConfiguredFps},
                     {"cpu_used", m_externalConfiguredCpuUsed},
                     {"max_quantizer", m_externalConfiguredMaxQuantizer},
-                    {"keyframe_every_frames", m_externalKeyframeEvery}
+                    {"keyframe_every_frames", m_externalKeyframeEvery},
+                    // The actual VP8 encoder dimensions are needed to pair
+                    // Agent frame evidence with the Viewer decode report.
+                    {"width", m_externalEncoderWidth},
+                    {"height", m_externalEncoderHeight}
                 };
                 m_signalSend(diag.dump());
                 sendControlMessage(diag);
@@ -2274,6 +2451,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             m_externalSentFrames = 0;
             m_externalEncodeMsTotal = 0.0;
             m_externalEncodeMsMax = 0.0;
+            // Retain recent encoder latency history across stats windows.
             m_externalSendMsTotal = 0.0;
             m_externalSendMsMax = 0.0;
             m_externalNextStatsLog = now + std::chrono::seconds(5);

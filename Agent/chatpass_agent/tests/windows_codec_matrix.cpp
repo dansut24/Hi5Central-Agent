@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <d3d11.h>
 #include "h264_mf_encoder.h"
 #include "av1_mf_encoder.h"
 #include "h265_mf_encoder.h"
@@ -15,23 +16,26 @@
 #include <mferror.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
+#include <numeric>
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "d3d11.lib")
 
 using Microsoft::WRL::ComPtr;
 
 // Default smoke runs quickly on a Windows CI runner. --1080p uses the
 // endpoint's actual Full HD workload and 40 frames, still synthetic.
-struct BenchmarkConfig { int width=640; int height=360; int fps=20; int frames=16; };
+struct BenchmarkConfig { int width=640; int height=360; int fps=20; int frames=16; bool hardwareOnly=false; };
 static BenchmarkConfig config;
 
 static GUID subtype(char a, char b, char c, char d) {
@@ -55,10 +59,104 @@ struct Result {
     int attempts = 0;
     double avgMs = 0;
     double worstMs = 0;
+    double p95Ms = 0;
+    std::string encoderName;
+    std::string deviceManagerStatus;
+    std::string asyncEventStatus;
+    std::string outputStreamInfo;
+    std::string firstOutputObservation;
+    std::string postChangeOutputObservation;
+    UINT32 encoderCandidates = 0;
+    UINT32 candidateNumber = 0;
+    UINT32 outputEventsConsumed = 0;
+    UINT32 emptyOutputSamples = 0;
+    UINT32 streamChanges = 0;
+    UINT32 completedRenegotiations = 0;
+    std::string renegotiationStatus;
     std::string note;
 };
 
-static Result run(const char* name, const GUID& outSubtype) {
+static std::string formatHr(HRESULT hr) {
+    char buf[20]{};
+    std::snprintf(buf, sizeof(buf), "0x%08lX", static_cast<unsigned long>(hr));
+    return buf;
+}
+struct HardwareMfContext {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> deviceContext;
+    ComPtr<IMFDXGIDeviceManager> manager;
+    HRESULT deviceHr = E_FAIL;
+    HRESULT managerHr = E_FAIL;
+    HardwareMfContext() {
+        D3D_FEATURE_LEVEL feature{};
+        deviceHr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
+                                    nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                                    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, nullptr,
+                                    0, D3D11_SDK_VERSION, &device, &feature,
+                                    &deviceContext);
+        if (FAILED(deviceHr)) {
+            deviceHr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
+                                        nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                        nullptr, 0, D3D11_SDK_VERSION, &device,
+                                        &feature, &deviceContext);
+        }
+        if (FAILED(deviceHr)) return;
+        UINT resetToken = 0;
+        managerHr = MFCreateDXGIDeviceManager(&resetToken, &manager);
+        if (SUCCEEDED(managerHr)) managerHr = manager->ResetDevice(device.Get(), resetToken);
+    }
+};
+// Hardware video MFTs are usually asynchronous. They must request an
+// input sample (METransformNeedInput) before ProcessInput is legal, and
+// signal METransformHaveOutput before ProcessOutput. A synthetic qualifier
+// that ignores those events can falsely report a broken GPU encoder.
+struct AsyncMfEventState {
+    ComPtr<IMFMediaEventGenerator> generator;
+    unsigned int needInput = 0;
+    unsigned int haveOutput = 0;
+    unsigned int needInputEvents = 0;
+    unsigned int haveOutputEvents = 0;
+    unsigned int otherEvents = 0;
+    bool waitFor(bool input, DWORD timeoutMs, std::string& diagnostic) {
+        if (!generator) { diagnostic = "asynchronous MFT has no event generator"; return false; }
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeoutMs);
+        for (;;) {
+            auto& pending = input ? needInput : haveOutput;
+            if (pending != 0) { --pending; return true; }
+            ComPtr<IMFMediaEvent> event;
+            const HRESULT hr = generator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+            if (SUCCEEDED(hr) && event) {
+                MediaEventType type = MEUnknown;
+                if (FAILED(event->GetType(&type))) {
+                    diagnostic = "async MFT GetType failed"; return false;
+                }
+                if (type == METransformNeedInput) { ++needInput; ++needInputEvents; }
+                else if (type == METransformHaveOutput) { ++haveOutput; ++haveOutputEvents; }
+                else if (type == MEError) {
+                    HRESULT status = S_OK;
+                    event->GetStatus(&status);
+                    diagnostic = "async MFT reported MEError " + formatHr(status);
+                    return false;
+                } else ++otherEvents;
+                continue;
+            }
+            if (hr != MF_E_NO_EVENTS_AVAILABLE) {
+                diagnostic = "async MFT GetEvent failed " + formatHr(hr);
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                diagnostic = input ? "timeout waiting for METransformNeedInput"
+                                   : "timeout waiting for METransformHaveOutput";
+                return false;
+            }
+            Sleep(2);
+        }
+    }
+};
+
+static Result run(const char* name, const GUID& outSubtype,
+                  HardwareMfContext* hardware) {
     Result r{};
     r.name = name;
     const int width=config.width, height=config.height, fps=config.fps;
@@ -66,8 +164,12 @@ static Result run(const char* name, const GUID& outSubtype) {
     MFT_REGISTER_TYPE_INFO outInfo{MFMediaType_Video, outSubtype};
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
-    const UINT32 flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_LOCALMFT |
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
+    // Hardware-only mode must not enumerate generic software MFTs and
+    // must not silently fall back to CPU encoding.
+    const UINT32 flags = config.hardwareOnly
+        ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
+        : (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_LOCALMFT |
+           MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER);
     const HRESULT found = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags,
         &inInfo, &outInfo, &activates, &count);
     if (FAILED(found) || count == 0 || !activates) {
@@ -76,14 +178,70 @@ static Result run(const char* name, const GUID& outSubtype) {
         return r;
     }
     r.discovered = true;
+    r.encoderCandidates = count;
     for (UINT32 i = 0; i < count && !r.produced; ++i) {
         ComPtr<IMFTransform> transform;
         if (!activates[i] || FAILED(activates[i]->ActivateObject(IID_PPV_ARGS(&transform))) || !transform) continue;
         r.activated = true;
+        r.candidateNumber = i + 1;
+        r.firstOutputObservation.clear();
+        r.postChangeOutputObservation.clear();
+        r.outputEventsConsumed = 0;
+        r.emptyOutputSamples = 0;
+        r.streamChanges = 0;
+        r.completedRenegotiations = 0;
+        r.renegotiationStatus.clear();
+        r.outputStreamInfo.clear();
+        r.note.clear();
+        // Query D3D awareness before supplying a manager. Microsoft explicitly
+        // prohibits sending SET_D3D_MANAGER to an MFT without D3D awareness.
+        // A registered hardware encoder can still accept system-memory NV12.
+        WCHAR* friendly = nullptr;
+        UINT32 friendlyLen = 0;
+        if (SUCCEEDED(activates[i]->GetAllocatedString(
+                MFT_FRIENDLY_NAME_Attribute, &friendly, &friendlyLen)) && friendly) {
+            const int bytes = WideCharToMultiByte(CP_UTF8, 0, friendly, -1, nullptr, 0, nullptr, nullptr);
+            if (bytes > 1) {
+                std::string name(static_cast<size_t>(bytes), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, friendly, -1, name.data(), bytes, nullptr, nullptr);
+                name.resize(static_cast<size_t>(bytes - 1));
+                r.encoderName = name;
+            }
+            CoTaskMemFree(friendly);
+        }
         ComPtr<IMFAttributes> attrs;
+        UINT32 asyncFlag = FALSE, d3d11Aware = FALSE, d3d9Aware = FALSE;
         if (SUCCEEDED(transform->GetAttributes(&attrs)) && attrs) {
-            attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            attrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag);
+            attrs->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware);
+            attrs->GetUINT32(MF_SA_D3D_AWARE, &d3d9Aware);
+            if (asyncFlag) attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
             attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+        }
+        if (d3d11Aware && hardware && SUCCEEDED(hardware->managerHr) && hardware->manager) {
+            const HRESULT hr = transform->ProcessMessage(
+                MFT_MESSAGE_SET_D3D_MANAGER,
+                reinterpret_cast<ULONG_PTR>(hardware->manager.Get()));
+            r.deviceManagerStatus = "d3d11_aware=1 attach=" + formatHr(hr);
+        } else if (d3d11Aware) {
+            r.deviceManagerStatus = "d3d11_aware=1 manager_unavailable";
+        } else {
+            r.deviceManagerStatus = d3d9Aware
+                ? "d3d11_aware=0 d3d9_aware=1 manager_skipped"
+                : "d3d11_aware=0 manager_skipped";
+        }
+        // Hardware MFTs normally require event-driven input/output.
+        const bool asynchronous = asyncFlag != FALSE;
+        AsyncMfEventState asyncEvents;
+        if (asynchronous) {
+            const HRESULT hr = transform.As(&asyncEvents.generator);
+            r.asyncEventStatus = "async=1 generator=" + formatHr(hr);
+            if (FAILED(hr) || !asyncEvents.generator) {
+                r.note = "async MFT without accessible IMFMediaEventGenerator";
+                continue;
+            }
+        } else {
+            r.asyncEventStatus = "async=0 (synchronous MFT)";
         }
         ComPtr<IMFMediaType> output, input;
         if (FAILED(MFCreateMediaType(&output)) || FAILED(MFCreateMediaType(&input))) continue;
@@ -102,12 +260,25 @@ static Result run(const char* name, const GUID& outSubtype) {
         }
         r.configured = true;
         MFT_OUTPUT_STREAM_INFO outputInfo{};
-        transform->GetOutputStreamInfo(0, &outputInfo);
-        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,0);
-        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM,0);
+        const HRESULT outInfoHr = transform->GetOutputStreamInfo(0, &outputInfo);
+        r.outputStreamInfo = "stream_flags=" + std::to_string(outputInfo.dwFlags) +
+            " cbSize=" + std::to_string(outputInfo.cbSize);
+        if (FAILED(outInfoHr)) {
+            r.note = "GetOutputStreamInfo failed " + formatHr(outInfoHr);
+            continue;
+        }
+        const HRESULT beginHr = transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,0);
+        const HRESULT startHr = transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM,0);
+        if (FAILED(beginHr) || FAILED(startHr)) {
+            r.note = "stream start failed begin=" + formatHr(beginHr) +
+                     " start=" + formatHr(startHr);
+            transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING,0);
+            continue;
+        }
         const size_t imageSize = size_t(width) * size_t(height) * 3 / 2;
         const auto wholeStart = std::chrono::steady_clock::now();
         double totalMs = 0, worst = 0;
+        std::vector<double> encodeSamples;
         for (int frame = 0; frame < config.frames; ++frame) {
             const auto tick = std::chrono::steady_clock::now();
             ComPtr<IMFSample> sample;
@@ -132,11 +303,46 @@ static Result run(const char* name, const GUID& outSubtype) {
             const LONGLONG duration = 10000000LL / fps;
             sample->SetSampleTime(LONGLONG(frame) * duration);
             sample->SetSampleDuration(duration);
-            if (FAILED(transform->ProcessInput(0,sample.Get(),0))) {
-                r.note = "MFT ProcessInput failed";
+            DWORD inputFlags=0;
+            const HRESULT ready = transform->GetInputStatus(0,&inputFlags);
+            // Calling ProcessInput before METransformNeedInput is a documented
+            // MF_E_NOTACCEPTING failure for async hardware MFTs.
+            if (asynchronous) {
+                std::string waitStatus;
+                if (!asyncEvents.waitFor(true, 750, waitStatus)) {
+                    r.note = "MFT input event: " + waitStatus;
+                    break;
+                }
+            }
+            const HRESULT inputHr = transform->ProcessInput(0,sample.Get(),0);
+            if (FAILED(inputHr)) {
+                r.note = "MFT ProcessInput failed hr=" + formatHr(inputHr) +
+                         " input_status=" + formatHr(ready) +
+                         " flags=" + std::to_string(inputFlags);
                 break;
             }
-            for (int poll=0;poll<2;++poll) {
+            // Asynchronous MFTs permit *one* ProcessOutput per
+            // METransformHaveOutput. In particular, after a format-change
+            // response and SetOutputType, the next output event must be
+            // consumed before retrying. Previously we called ProcessOutput
+            // a second time without waiting for its event, which could
+            // return E_UNEXPECTED while leaving HaveOutput pending.
+            bool stopEncoder = false;
+            bool outputRenegotiatedThisFrame = false;
+            for (int poll=0;poll<6;++poll) {
+                if (asynchronous) {
+                    std::string waitStatus;
+                    if (!asyncEvents.waitFor(false, 1000, waitStatus)) {
+                        if (outputRenegotiatedThisFrame) {
+                            r.note = "no new METransformHaveOutput after successful "
+                                     "SetOutputType: " + waitStatus;
+                            stopEncoder = true;
+                        } else if (!r.produced && r.note.empty()) {
+                            r.note = "MFT output event: " + waitStatus;
+                        }
+                        break;
+                    }
+                }
                 ComPtr<IMFSample> outSample;
                 ComPtr<IMFMediaBuffer> outBuffer;
                 MFT_OUTPUT_DATA_BUFFER packet{};
@@ -146,32 +352,147 @@ static Result run(const char* name, const GUID& outSubtype) {
                     outSample->AddBuffer(outBuffer.Get());
                     packet.pSample=outSample.Get();
                 }
-                DWORD status=0;
-                HRESULT hr=transform->ProcessOutput(0,1,&packet,&status);
-                if (hr==MF_E_TRANSFORM_NEED_MORE_INPUT) break;
-                if (hr==MF_E_TRANSFORM_STREAM_CHANGE) {
-                    transform->GetOutputStreamInfo(0,&outputInfo);
+                DWORD status = 0;
+                const HRESULT hr = transform->ProcessOutput(0,1,&packet,&status);
+                ++r.outputEventsConsumed;
+                // A driver can return an error, a stream-format change, a
+                // zero-length sample, or a caller/encoder-owned sample. Keep
+                // the first observation even if a later input wait times out.
+                const bool samplePresent = packet.pSample != nullptr;
+                const std::string observed = "hr=" + formatHr(hr) +
+                    " status=" + std::to_string(status) +
+                    " packet_status=" + std::to_string(packet.dwStatus) +
+                    " sample_present=" + std::to_string(samplePresent ? 1 : 0);
+                if (r.firstOutputObservation.empty())
+                    r.firstOutputObservation = observed;
+                if (r.completedRenegotiations > 0 &&
+                    r.postChangeOutputObservation.empty())
+                    r.postChangeOutputObservation = observed;
+                if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+                    if (asynchronous) {
+                        r.note = "async MFT ProcessOutput unexpectedly requested more input";
+                        stopEncoder = true;
+                    }
+                    if (packet.pEvents) packet.pEvents->Release();
+                    break;
+                }
+                if (hr == MF_E_TRANSFORM_STREAM_CHANGE ||
+                    packet.dwStatus == MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE) {
+                    if (packet.pEvents) packet.pEvents->Release();
+                    if (packet.pSample && packet.pSample != outSample.Get())
+                        packet.pSample->Release();
+                    ++r.streamChanges;
+                    if (r.streamChanges > 3) {
+                        r.note = "excessive output format changes (max 3)";
+                        stopEncoder = true;
+                        break;
+                    }
+                    // The physical Lenovo's Quick Sync H.264 MFT returns
+                    // 0xC00D6D61 with packet status 0x100. Refreshing
+                    // GetOutputStreamInfo alone does NOT reset its format.
+                    // Microsoft prescribes selecting an offered media type
+                    // and calling SetOutputType before requesting output.
+                    HRESULT selectedHr = MF_E_INVALIDMEDIATYPE;
+                    HRESULT lastListHr = S_OK;
+                    UINT32 offeredCount = 0;
+                    bool selected = false;
+                    for (DWORD typeIndex = 0; typeIndex < 16; ++typeIndex) {
+                        ComPtr<IMFMediaType> offered;
+                        lastListHr = transform->GetOutputAvailableType(
+                            0, typeIndex, &offered);
+                        if (lastListHr == MF_E_NO_MORE_TYPES) break;
+                        if (FAILED(lastListHr) || !offered) break;
+                        ++offeredCount;
+                        GUID offeredSubtype{};
+                        if (FAILED(offered->GetGUID(MF_MT_SUBTYPE, &offeredSubtype)) ||
+                            !IsEqualGUID(offeredSubtype, outSubtype)) continue;
+                        selectedHr = transform->SetOutputType(0, offered.Get(), 0);
+                        if (SUCCEEDED(selectedHr)) {
+                            selected = true;
+                            break;
+                        }
+                    }
+                    // Some encoders do not enumerate complete output types.
+                    // Permit one bounded reapply of the originally accepted
+                    // encoder type, but never switch codecs or stream shape.
+                    if (!selected) {
+                        const HRESULT retry = transform->SetOutputType(
+                            0, output.Get(), 0);
+                        selectedHr = retry;
+                        selected = SUCCEEDED(retry);
+                    }
+                    r.renegotiationStatus =
+                        "offered=" + std::to_string(offeredCount) +
+                        " list_hr=" + formatHr(lastListHr) +
+                        " set_hr=" + formatHr(selectedHr);
+                    if (!selected) {
+                        r.note = "H264 output type renegotiation failed: " +
+                            r.renegotiationStatus;
+                        stopEncoder = true;
+                        break;
+                    }
+                    ++r.completedRenegotiations;
+                    outputInfo = {};
+                    const HRESULT infoHr = transform->GetOutputStreamInfo(
+                        0, &outputInfo);
+                    if (FAILED(infoHr)) {
+                        r.note = "renegotiated GetOutputStreamInfo failed " +
+                            formatHr(infoHr);
+                        stopEncoder = true;
+                        break;
+                    }
+                    r.outputStreamInfo = "stream_flags=" +
+                        std::to_string(outputInfo.dwFlags) +
+                        " cbSize=" + std::to_string(outputInfo.cbSize);
+                    // The MFT may emit another HaveOutput event for the
+                    // original input after applying the output type.
+                    // The next iteration consumes that event *before* calling
+                    // ProcessOutput, never submitting new input prematurely.
+                    outputRenegotiatedThisFrame = true;
                     continue;
                 }
                 if (FAILED(hr)) {
-                    r.note="MFT ProcessOutput failed";
+                    if (r.note.empty()) r.note="MFT ProcessOutput failed hr=" + formatHr(hr);
+                    if (packet.pEvents) packet.pEvents->Release();
+                    stopEncoder = true;
                     break;
                 }
-                ComPtr<IMFSample> got=packet.pSample;
-                if(!got && outSample)got=outSample;
+                // pSample is a borrowed pointer when caller supplies it; an
+                // encoder-supplied output sample transfers one reference.
+                ComPtr<IMFSample> got;
+                if (packet.pSample == outSample.Get()) got = outSample;
+                else if (packet.pSample) got.Attach(packet.pSample);
+                else got = outSample;
                 ComPtr<IMFMediaBuffer> result;
-                DWORD encoded=0;
-                if(got && SUCCEEDED(got->ConvertToContiguousBuffer(&result)) && result)
-                    result->GetCurrentLength(&encoded);
-                if(packet.pEvents) packet.pEvents->Release();
-                if(encoded>0) {
+                DWORD encoded = 0;
+                HRESULT bufferHr = got ? got->ConvertToContiguousBuffer(&result) : E_POINTER;
+                if (SUCCEEDED(bufferHr) && result)
+                    bufferHr = result->GetCurrentLength(&encoded);
+                if (!samplePresent && r.firstOutputObservation.find(" sample_present=0") != std::string::npos) {
+                    // Retain this even if we supplied a buffer: it tells us
+                    // whether the MFT returned an output sample.
+                    r.firstOutputObservation += " caller_supplied=" +
+                        std::to_string(outSample ? 1 : 0);
+                }
+                auto& outputObservation = r.completedRenegotiations > 0
+                    ? r.postChangeOutputObservation : r.firstOutputObservation;
+                if (outputObservation.find(" encoded_bytes=") == std::string::npos)
+                    outputObservation += " buffer_hr=" + formatHr(bufferHr) +
+                        " encoded_bytes=" + std::to_string(encoded);
+                if (packet.pEvents) packet.pEvents->Release();
+                if (encoded > 0) {
                     r.produced=true;
                     ++r.frames;
+                } else {
+                    ++r.emptyOutputSamples;
+                    if (r.note.empty()) r.note = "MFT returned no nonempty encoded sample";
                 }
                 break;
             }
+            if (stopEncoder) break;
             const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tick).count();
             totalMs+=ms;
+            encodeSamples.push_back(ms);
             ++r.attempts;
             worst=std::max(worst,ms);
             if(std::chrono::steady_clock::now()-wholeStart>std::chrono::seconds(4)) {
@@ -181,6 +502,19 @@ static Result run(const char* name, const GUID& outSubtype) {
         }
         r.avgMs=totalMs/std::max(1,r.attempts);
         r.worstMs=worst;
+        if (!encodeSamples.empty()) {
+            std::sort(encodeSamples.begin(), encodeSamples.end());
+            const size_t rank = (encodeSamples.size()*95 + 99)/100 - 1;
+            r.p95Ms = encodeSamples[rank];
+        }
+        if (asynchronous) {
+            r.asyncEventStatus += " need_input_events=" +
+                std::to_string(asyncEvents.needInputEvents) +
+                " have_output_events=" + std::to_string(asyncEvents.haveOutputEvents) +
+                " other_events=" + std::to_string(asyncEvents.otherEvents) +
+                " pending_input=" + std::to_string(asyncEvents.needInput) +
+                " pending_output=" + std::to_string(asyncEvents.haveOutput);
+        }
         transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING,0);
     }
     for(UINT32 i=0;i<count;++i)if(activates[i])activates[i]->Release();
@@ -236,33 +570,61 @@ static void exerciseAgentEncoder(const char* codec) {
 }
 
 int main(int argc, char** argv) {
-    if (argc==2 && std::string(argv[1])=="--1080p") {
-        config={1920,1080,20,40};
-    } else if(argc>1) {
-        std::cerr << "Usage: windows_codec_matrix.exe [--1080p]\\n";
-        return 2;
+    // Strict hardware qualification is a separate, opt-in workload.
+    // It never captures the real desktop and does not enable SDP/RTP.
+    for (int i=1;i<argc;++i) {
+        const std::string arg(argv[i]);
+        if (arg=="--1080p") {
+            config.width=1920; config.height=1080; config.frames=40;
+        } else if (arg=="--hardware-only") {
+            config.hardwareOnly=true;
+        } else {
+            std::cerr << "Usage: windows_codec_matrix.exe [--1080p] [--hardware-only]\n";
+            return 2;
+        }
     }
     const HRESULT init=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(FAILED(MFStartup(MF_VERSION,MFSTARTUP_LITE))) {
         std::cerr<<"Media Foundation unavailable\n";
         return 1;
     }
+    HardwareMfContext hardware;
     const auto print=[](const Result& r) {
         std::cout<<r.name<<": detected="<<r.discovered
             <<" active="<<r.activated<<" configured="<<r.configured
             <<" frames="<<r.frames<<" attempts="<<r.attempts<<" avg_ms="<<std::fixed<<std::setprecision(1)
-            <<r.avgMs<<" max_ms="<<r.worstMs<<" note="<<r.note<<"\n";
+            <<r.avgMs<<" p95_ms="<<r.p95Ms<<" max_ms="<<r.worstMs
+            <<" encoder="<<r.encoderName
+            <<" d3d_manager="<<r.deviceManagerStatus
+            <<" events="<<r.asyncEventStatus
+            <<" candidate="<<r.candidateNumber<<"/"<<r.encoderCandidates
+            <<" output_stream="<<r.outputStreamInfo
+            <<" output_calls="<<r.outputEventsConsumed
+            <<" empty_output="<<r.emptyOutputSamples
+            <<" stream_changes="<<r.streamChanges
+            <<" renegotiated="<<r.completedRenegotiations
+            <<" renegotiation="<<r.renegotiationStatus
+            <<" first_output="<<r.firstOutputObservation
+            <<" post_change_output="<<r.postChangeOutputObservation
+            <<" note="<<r.note<<"\n";
     };
     std::cout<<"Synthetic Windows MFT encoder qualification (not browser RTP validation) "
-        <<config.width<<"x"<<config.height<<" @"<<config.fps<<"fps frames="<<config.frames<<"\n";
+        <<config.width<<"x"<<config.height<<" @"<<config.fps<<"fps frames="<<config.frames
+        <<" hardware_only="<<config.hardwareOnly<<"\n";
     std::cout<<"VP8: existing libvpx production encoder; not benchmarked by this MFT-only test\n";
-    print(run("H264",subtype('H','2','6','4')));
-    print(run("H265/HEVC",subtype('H','E','V','C')));
-    print(run("VP9",subtype('V','P','9','0')));
-    print(run("AV1",subtype('A','V','0','1')));
-    exerciseAgentEncoder<H264MfEncoder,H264EncodedFrame>("H264");
-    exerciseAgentEncoder<Av1MfEncoder,Av1EncodedFrame>("AV1");
-    exerciseAgentEncoder<H265MfEncoder,H265EncodedFrame>("H265/HEVC");
+    std::cout<<"D3D11 hardware device="<<formatHr(hardware.deviceHr)
+             <<" MF device manager="<<formatHr(hardware.managerHr)<<"\n";
+    print(run("H264",subtype('H','2','6','4'),&hardware));
+    print(run("H265/HEVC",subtype('H','E','V','C'),&hardware));
+    print(run("VP9",subtype('V','P','9','0'),&hardware));
+    print(run("AV1",subtype('A','V','0','1'),&hardware));
+    if (!config.hardwareOnly) {
+        // These encoder wrappers may fall back to software; never count
+        // their output as evidence of GPU encoding in hardware-only mode.
+        exerciseAgentEncoder<H264MfEncoder,H264EncodedFrame>("H264");
+        exerciseAgentEncoder<Av1MfEncoder,Av1EncodedFrame>("AV1");
+        exerciseAgentEncoder<H265MfEncoder,H265EncodedFrame>("H265/HEVC");
+    }
     MFShutdown();
     if(SUCCEEDED(init)) CoUninitialize();
     return 0; // Hardware absence is a capability result, not CI failure.

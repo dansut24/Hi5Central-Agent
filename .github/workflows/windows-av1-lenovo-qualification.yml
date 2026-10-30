@@ -1,0 +1,80 @@
+name: Portable Windows libaom AV1 Lenovo Qualification
+
+on:
+  pull_request:
+    paths:
+      - 'Agent/chatpass_agent/src/encoding/av1_software_encoder_experimental.*'
+      - 'Agent/chatpass_agent/src/encoding/av1_rtp_payload_experimental.h'
+      - 'Agent/chatpass_agent/tests/av1_software_encoder_test.cpp'
+      - '.github/workflows/windows-av1-lenovo-qualification.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-av1-standalone:
+    # Standalone, synthetic only. No Agent installer or production codec wiring.
+    runs-on: windows-2025
+    timeout-minutes: 35
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\\.vcpkg-binary-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore static libaom build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: windows-aom-static-v1-${{ runner.os }}
+      - name: Build static Windows libaom
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkg) { $vcpkg = 'C:\\vcpkg' }
+          if (-not (Test-Path (Join-Path $vcpkg 'vcpkg.exe'))) { throw "vcpkg not found at $vcpkg" }
+          & (Join-Path $vcpkg 'vcpkg.exe') install aom:x64-windows-static --classic
+          if ($LASTEXITCODE -ne 0) { throw 'libaom vcpkg install failed' }
+          "AOM_INCLUDE_DIR=$vcpkg\\installed\\x64-windows-static\\include" >> $env:GITHUB_ENV
+          "AOM_LIB_DIR=$vcpkg\\installed\\x64-windows-static\\lib" >> $env:GITHUB_ENV
+      - name: Compile self-contained Win64 software AV1 test
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio C++ compiler missing' }
+          $vcvars = Join-Path $vs 'Common7\\Tools\\VsDevCmd.bat'
+          $lib = Get-ChildItem -Path $env:AOM_LIB_DIR -Filter '*aom*.lib' -File |
+            Where-Object { $_.Name -eq 'aom.lib' -or $_.Name -eq 'aom_static.lib' } |
+            Select-Object -First 1
+          if (-not $lib) { throw "libaom static .lib not found in $env:AOM_LIB_DIR" }
+          $command = 'call "' + $vcvars + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /O2 /MT /W3 /I "' + $env:AOM_INCLUDE_DIR + '" Agent/chatpass_agent/tests/av1_software_encoder_test.cpp Agent/chatpass_agent/src/encoding/av1_software_encoder_experimental.cpp /link "' + $lib.FullName + '" /OUT:dist\\av1_lenovo_qualifier.exe'
+          cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw 'Windows AV1 qualifier compile/link failed' }
+      - name: Windows synthetic smoke and RTP decode check
+        shell: pwsh
+        run: |
+          & dist/av1_lenovo_qualifier.exe | Tee-Object -FilePath dist/windows-av1-ci-smoke.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Windows AV1 synthetic smoke failed' }
+      - name: Run 720p software AV1 at a true 30 FPS encoder setting
+        shell: pwsh
+        run: |
+          & dist/av1_lenovo_qualifier.exe --720p30 | Tee-Object -FilePath dist/windows-av1-720p30-ci.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Windows AV1 720p30 synthetic run failed' }
+      - name: Run 720p software AV1 at a true 60 FPS encoder setting
+        shell: pwsh
+        run: |
+          & dist/av1_lenovo_qualifier.exe --720p60 | Tee-Object -FilePath dist/windows-av1-720p60-ci.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Windows AV1 720p60 synthetic run failed' }
+      - name: Publish unsigned, portable experimental test (not an Agent installer)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-av1-lenovo-portable-qualifier
+          path: |
+            dist/av1_lenovo_qualifier.exe
+            dist/windows-av1-ci-smoke.txt
+            dist/windows-av1-720p30-ci.txt
+            dist/windows-av1-720p60-ci.txt
+          retention-days: 14
+          if-no-files-found: error

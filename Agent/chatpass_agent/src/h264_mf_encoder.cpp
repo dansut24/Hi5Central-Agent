@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <d3d11.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -12,6 +13,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <sstream>
 #include <fstream>
@@ -22,6 +24,7 @@
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "d3d11.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -277,8 +280,62 @@ namespace {
 
 } // namespace
 
+// This strict, opt-in event loop is used only by the Intel hardware experiment.
+ // A queued HaveOutput may arrive while waiting for NeedInput. Preserve it.
+struct HardwareAsyncMftEvents {
+    ComPtr<IMFMediaEventGenerator> generator;
+    UINT32 needInput = 0;
+    UINT32 haveOutput = 0;
+    bool waitFor(bool input, DWORD timeoutMs, std::string* error) {
+        if (!generator) {
+            if (error) *error = "hardware async MFT has no event generator";
+            return false;
+        }
+        const auto until = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeoutMs);
+        for (;;) {
+            auto& pending = input ? needInput : haveOutput;
+            if (pending) { --pending; return true; }
+            ComPtr<IMFMediaEvent> event;
+            const HRESULT hr = generator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+            if (SUCCEEDED(hr) && event) {
+                MediaEventType kind = MEUnknown;
+                if (FAILED(event->GetType(&kind))) {
+                    if (error) *error = "hardware async MFT event type unavailable";
+                    return false;
+                }
+                if (kind == METransformNeedInput) ++needInput;
+                else if (kind == METransformHaveOutput) ++haveOutput;
+                else if (kind == MEError) {
+                    HRESULT status = E_FAIL;
+                    event->GetStatus(&status);
+                    if (error) *error = "hardware MFT MEError " + HrToString(status);
+                    return false;
+                }
+                continue;
+            }
+            if (hr != MF_E_NO_EVENTS_AVAILABLE) {
+                if (error) *error = "hardware MFT GetEvent failed " + HrToString(hr);
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= until) {
+                if (error) *error = input
+                    ? "hardware MFT timed out waiting for METransformNeedInput"
+                    : "hardware MFT timed out waiting for METransformHaveOutput";
+                return false;
+            }
+            Sleep(2);
+        }
+    }
+};
+
 struct H264MfEncoder::Impl {
     ComPtr<IMFTransform> transform;
+    bool asyncHardwareExperiment = false;
+    HardwareAsyncMftEvents events;
+    ComPtr<ID3D11Device> d3dDevice;
+    ComPtr<ID3D11DeviceContext> d3dContext;
+    ComPtr<IMFDXGIDeviceManager> d3dManager;
     DWORD inputStreamId = 0;
     DWORD outputStreamId = 0;
     MFT_OUTPUT_STREAM_INFO outputInfo{};
@@ -307,7 +364,7 @@ void H264MfEncoder::shutdown() {
     m_open = false;
 }
 
-bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error) {
+bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error, bool strictHardwareOnly) {
     shutdown();
 
     if (width <= 0 || height <= 0) {
@@ -338,13 +395,20 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
 
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
-    UINT32 flags = MFT_ENUM_FLAG_SORTANDFILTER | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT;
-    if (preferHardware) flags |= MFT_ENUM_FLAG_HARDWARE;
-    else flags |= MFT_ENUM_FLAG_SYNCMFT;
+    // Never change the stable VP8 / existing H264 selection path by default.
+    // A deliberate HI5_CODEC=h264_hw + HI5_H264_ASYNC_HW=1 test opts into
+    // hardware-only enumeration: no silent software MFT masquerading as GPU.
+    const bool experiment = preferHardware && (strictHardwareOnly || EnvEnabled("HI5_H264_ASYNC_HW"));
+    m_impl->asyncHardwareExperiment = experiment;
+    UINT32 flags = experiment
+        ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
+        : (MFT_ENUM_FLAG_SORTANDFILTER | MFT_ENUM_FLAG_LOCALMFT |
+           MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT |
+           (preferHardware ? MFT_ENUM_FLAG_HARDWARE : 0));
 
     hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, &inInfo, &outInfo, &activates, &count);
-    if (FAILED(hr) || count == 0) {
-        // Retry without the strict hardware flag; this is still experimental and
+    if (!experiment && (FAILED(hr) || count == 0)) {
+        // Legacy fallback is permitted only outside the hardware-only experiment.
         // should fall back cleanly to VP8 at the caller if no MFT is usable.
         if (activates) {
             CoTaskMemFree(activates);
@@ -382,14 +446,60 @@ bool H264MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
         return false;
     }
 
-    // MFT hardware encoders are commonly async. Unlock async mode and ask for
-    // low latency where supported. Failures are non-fatal because some MFTs do
-    // not expose all attributes.
+    // The physical Lenovo proved that an async Intel MFT must be unlocked
+    // before attaching a D3D manager, and each ProcessOutput must consume its
+    // own METransformHaveOutput, including after a format-change event.
     {
         ComPtr<IMFAttributes> mftAttrs;
+        UINT32 asyncFlag = FALSE;
+        UINT32 d3d11Aware = FALSE;
         if (SUCCEEDED(m_impl->transform->GetAttributes(&mftAttrs)) && mftAttrs) {
-            mftAttrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            mftAttrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag);
+            mftAttrs->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware);
+            if (asyncFlag) mftAttrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
             mftAttrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+        }
+        if (experiment) {
+            // Windows hardware MFTs may be synchronous or asynchronous,
+            // depending on Intel/AMD/NVIDIA driver implementations. Only
+            // asynchronous transforms require NeedInput/HaveOutput events;
+            // do not reject a legitimate synchronous GPU encoder.
+            m_impl->asyncHardwareExperiment = asyncFlag != FALSE;
+            if (asyncFlag &&
+                (FAILED(m_impl->transform.As(&m_impl->events.generator)) ||
+                 !m_impl->events.generator)) {
+                if (error) *error = "async hardware H264 has no event generator";
+                return false;
+            }
+            if (d3d11Aware) {
+                D3D_FEATURE_LEVEL feature{};
+                HRESULT deviceHr = D3D11CreateDevice(
+                    nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                    nullptr, 0, D3D11_SDK_VERSION,
+                    &m_impl->d3dDevice, &feature, &m_impl->d3dContext);
+                if (FAILED(deviceHr)) {
+                    deviceHr = D3D11CreateDevice(
+                        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                        nullptr, 0, D3D11_SDK_VERSION,
+                        &m_impl->d3dDevice, &feature, &m_impl->d3dContext);
+                }
+                UINT resetToken = 0;
+                if (FAILED(deviceHr) || FAILED(MFCreateDXGIDeviceManager(
+                    &resetToken, &m_impl->d3dManager)) ||
+                    FAILED(m_impl->d3dManager->ResetDevice(
+                        m_impl->d3dDevice.Get(), resetToken)) ||
+                    FAILED(m_impl->transform->ProcessMessage(
+                        MFT_MESSAGE_SET_D3D_MANAGER,
+                        reinterpret_cast<ULONG_PTR>(m_impl->d3dManager.Get())))) {
+                    if (error) *error = "experimental hardware H264 D3D11 manager attachment failed";
+                    return false;
+                }
+            }
+            std::cout << "[h264] hardware Media Foundation encoder mode="
+                      << (asyncFlag ? "async" : "sync")
+                      << " d3d11_aware=" << d3d11Aware << "\n";
         }
     }
 
@@ -579,6 +689,9 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
     sample->SetSampleTime(frameTime);
     sample->SetSampleDuration(frameDuration);
 
+    if (m_impl->asyncHardwareExperiment &&
+        !m_impl->events.waitFor(true, 750, error)) return false;
+
     hr = m_impl->transform->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) {
         if (error) *error = "ProcessInput failed " + HrToString(hr);
@@ -587,7 +700,12 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
 
     ++m_frameIndex;
 
-    for (;;) {
+    // Strictly bounded output loop for opt-in async hardware encoding.
+    // The previous production wrapper called ProcessOutput without waiting
+    // for an async event; on Intel Quick Sync that stalled immediately.
+    for (int outputAttempt = 0; outputAttempt < 8; ++outputAttempt) {
+        if (m_impl->asyncHardwareExperiment &&
+            !m_impl->events.waitFor(false, 750, error)) return false;
         MFT_OUTPUT_DATA_BUFFER output{};
         DWORD status = 0;
 
@@ -603,32 +721,76 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
 
         hr = m_impl->transform->ProcessOutput(0, 1, &output, &status);
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            if (output.pEvents) output.pEvents->Release();
+            if (m_impl->asyncHardwareExperiment) {
+                if (error) *error = "async hardware H264 requested more input after HaveOutput";
+                return false;
+            }
             return !out.data.empty();
         }
-        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            ComPtr<IMFMediaType> newOut;
-            if (SUCCEEDED(m_impl->transform->GetOutputAvailableType(0, 0, &newOut)) && newOut) {
-                m_impl->transform->SetOutputType(0, newOut.Get(), 0);
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE ||
+            output.dwStatus == MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE) {
+            if (output.pEvents) output.pEvents->Release();
+            if (output.pSample && output.pSample != outSample.Get())
+                output.pSample->Release();
+            bool selected = false;
+            HRESULT selectionHr = MF_E_INVALIDMEDIATYPE;
+            // Actual Lenovo Quick Sync requires a complete SetOutputType
+            // after its first FORMAT_CHANGE, not only GetOutputStreamInfo.
+            for (DWORD typeIndex = 0; typeIndex < 16; ++typeIndex) {
+                ComPtr<IMFMediaType> offered;
+                const HRESULT offeredHr = m_impl->transform->GetOutputAvailableType(
+                    0, typeIndex, &offered);
+                if (FAILED(offeredHr) || !offered) break;
+                GUID subtype{};
+                if (FAILED(offered->GetGUID(MF_MT_SUBTYPE, &subtype)) ||
+                    !IsEqualGUID(subtype, MFVideoFormat_H264)) continue;
+                selectionHr = m_impl->transform->SetOutputType(
+                    0, offered.Get(), 0);
+                if (SUCCEEDED(selectionHr)) { selected = true; break; }
             }
-            m_impl->transform->GetOutputStreamInfo(0, &m_impl->outputInfo);
-            m_impl->sequenceHeaderAnnexB = ReadCurrentH264SequenceHeader(m_impl->transform.Get());
-            std::cout << "[h264] stream change handled sequence_header_bytes=" << m_impl->sequenceHeaderAnnexB.size() << "\n";
+            if (!selected) {
+                if (error) *error = "H264 output renegotiation failed " +
+                    HrToString(selectionHr);
+                return false;
+            }
+            if (FAILED(m_impl->transform->GetOutputStreamInfo(
+                0, &m_impl->outputInfo))) {
+                if (error) *error = "H264 output stream info failed after renegotiation";
+                return false;
+            }
+            m_impl->sequenceHeaderAnnexB = ReadCurrentH264SequenceHeader(
+                m_impl->transform.Get());
+            std::cout << "[h264] output format renegotiated sequence_header_bytes="
+                << m_impl->sequenceHeaderAnnexB.size()
+                << " async=" << (m_impl->asyncHardwareExperiment ? 1 : 0) << "\n";
+            // Critical: wait for the NEW HaveOutput event before another
+            // ProcessOutput call. Never submit another input first.
             continue;
         }
         if (FAILED(hr)) {
+            if (output.pEvents) output.pEvents->Release();
+            if (output.pSample && output.pSample != outSample.Get())
+                output.pSample->Release();
             if (error) *error = "ProcessOutput failed " + HrToString(hr);
             return false;
         }
 
-        ComPtr<IMFSample> got = output.pSample;
-        if (!got && outSample) got = outSample;
+        // Output-provided samples transfer ownership. Caller-provided
+        // samples are already held by outSample: avoid double release.
+        ComPtr<IMFSample> got;
+        if (output.pSample == outSample.Get()) got = outSample;
+        else if (output.pSample) got.Attach(output.pSample);
+        else got = outSample;
         if (!got) {
+            if (output.pEvents) output.pEvents->Release();
             continue;
         }
 
         ComPtr<IMFMediaBuffer> contiguous;
         hr = got->ConvertToContiguousBuffer(&contiguous);
         if (FAILED(hr) || !contiguous) {
+            if (output.pEvents) output.pEvents->Release();
             if (error) *error = "ConvertToContiguousBuffer failed " + HrToString(hr);
             return false;
         }
@@ -636,7 +798,12 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
         BYTE* p = nullptr;
         DWORD max = 0;
         DWORD len = 0;
-        contiguous->Lock(&p, &max, &len);
+        hr = contiguous->Lock(&p, &max, &len);
+        if (FAILED(hr)) {
+            if (output.pEvents) output.pEvents->Release();
+            if (error) *error = "H264 output buffer Lock failed " + HrToString(hr);
+            return false;
+        }
         if (len > 0) {
             const size_t old = out.data.size();
             out.data.resize(old + len);
@@ -652,7 +819,9 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
             // mixed Annex-B + AVCC output creates malformed NAL units and Chrome/WebView
             // commonly displays a black frame while data channels still work.
             out.data = ConvertAvccLengthPrefixedToAnnexB(out.data);
-            out.keyframe = ContainsH264Idr(out.data) || forceKeyframe;
+            // Only actual IDR NAL units establish decoder recovery. Do not
+            // claim a keyframe simply because the caller requested one.
+            out.keyframe = ContainsH264Idr(out.data);
 
             // Ensure browsers receive SPS/PPS. Some Media Foundation encoders
             // place SPS/PPS only in MF_MT_MPEG_SEQUENCE_HEADER, not in the first
@@ -678,4 +847,6 @@ bool H264MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H264Encod
             return true;
         }
     }
+    if (error) *error = "hardware H264 output retry limit reached";
+    return false;
 }

@@ -1,4 +1,9 @@
 #include "frame_source.h"
+#include "capture_frame_rate_policy.h"
+#include "codec_auto_fps.h"
+#include "capture_motion_samples.h"
+#include "capture_publish_policy.h"
+#include "wgc_high_resolution_pacer_win.h"
 #include "ipc/shmem_ring.h"
 #include "ipc/input_pipe.h"
 #include "util/log.h"
@@ -617,7 +622,8 @@ namespace {
     bool HandleInputPipe(hi5::InputPipeReader& pipe,
         DesktopFrameSource* source,
         int& currentDisplay,
-        const std::string& sessionId) {
+        const std::string& sessionId,
+        int* manualCaptureFps = nullptr) {
         // Low-latency input: mouse movement is latest-state only. Collapse
         // runs of MouseMove commands so clicks/keys are not delayed behind a
         // backlog of stale pointer locations.
@@ -637,7 +643,8 @@ namespace {
         bool hadInput = false;
         while (drained < kMaxDrainPerTick && pipe.Read(cmd)) {
             ++drained;
-            hadInput = true;
+            if (cmd.type != hi5::InputCmdType::SetCaptureFps)
+                hadInput = true;
             if (cmd.type == hi5::InputCmdType::MouseMove) {
                 pendingMove = cmd;
                 havePendingMove = true;
@@ -647,6 +654,18 @@ namespace {
             flushMove();
 
             switch (cmd.type) {
+            case hi5::InputCmdType::SetCaptureFps:
+                // A control message, not a mouse/key event. Preserve idle
+                // motion filtering and allow manual selection during session.
+                if (manualCaptureFps &&
+                    (cmd.captureFps.targetFps == 0 ||
+                     hi5::universal_codec::manualFpsAllowed(cmd.captureFps.targetFps))) {
+                    *manualCaptureFps = cmd.captureFps.targetFps;
+                    LogInfo("[fps-policy] capture-manual=" +
+                        std::to_string(*manualCaptureFps) +
+                        " session=" + sessionId);
+                }
+                break;
             case hi5::InputCmdType::MouseButton:
                 SendMouseButton(cmd.mouseButton.button, cmd.mouseButton.down != 0);
                 break;
@@ -823,14 +842,57 @@ namespace hi5 {
         std::chrono::steady_clock::time_point fastMouseNextLog{};
         const int cursorRefreshFps = 0; // disabled: mouse movement must not force video frames
         uint64_t resetCount = 0;
+        // The actual capture provider may be WGC even if legacy displayIndex
+        // remains -1 because DXGI DuplicateOutput was access-denied.
+        DesktopCaptureBackend lastCaptureBackend = DesktopCaptureBackend::Unknown;
+        // A local high-resolution waitable timer is enabled only when a
+        // live WGC poll is the active normal-desktop capture provider.
+        hi5::WgcHighResolutionPacer wgcPacer;
+        bool wgcTimerStatusLogged = false;
+        uint64_t wgcHighResWaits = 0;
+        uint64_t wgcFallbackWaits = 0;
+        uint64_t wgcNew = 0;
+        uint64_t wgcEmpty = 0;
+        uint64_t dxgiNew = 0;
+        uint64_t gdiPolls = 0;
+        double wgcReadbackTotalMs = 0.0;
+        double wgcGpuMapTotalMs = 0.0;
+        double wgcBufferCopyTotalMs = 0.0;
+        double wgcConversionTotalMs = 0.0;
+        uint64_t wgcArrivals = 0;
+        uint64_t previousWgcArrivalTotal = 0;
+        uint64_t previousWgcArrivalGapCount = 0;
+        uint64_t previousWgcArrivalGapTotalNs = 0;
+        uint64_t wgcArrivalGapSamples = 0;
+        uint64_t wgcArrivalGapNs = 0;
+        uint64_t wgcArrivalGapMaxNs = 0;
+        uint64_t wgcSourceGapSamples = 0;
+        int64_t wgcSourceGapTotal100ns = 0;
+        int64_t wgcSourceGapMax100ns = 0;
+        int64_t wgcFirstSourceTimestamp100ns = 0;
+        int64_t wgcLastSourceTimestamp100ns = 0;
+        uint64_t wgcMultipleArrivalsPerConsumed = 0;
+        uint64_t wgcParallelConversions = 0;
+        uint64_t wgcSerialConversions = 0;
+        double wgcParallelConversionTotalMs = 0.0;
+        double wgcSerialConversionTotalMs = 0.0;
+        bool lastConverterQualified = false;
+        bool lastConverterParallel = false;
+        double lastSerialTrialAvgMs = 0.0;
+        double lastParallelTrialAvgMs = 0.0;
+        uint64_t pollGapCount = 0;
+        double pollGapTotalMs = 0.0;
+        std::chrono::steady_clock::time_point previousCaptureAt{};
         uint64_t measuredCaptures = 0;
         uint64_t measuredWrites = 0;
         double captureTotalMs = 0.0;
         double captureWorstMs = 0.0;
         double ipcWriteTotalMs = 0.0;
         double ipcWriteWorstMs = 0.0;
+        int manualCaptureFps = 0;
         int lastTargetFps = idleFps;
         int lastStreamMode = 0;
+        hi5::SampledDesktopMotion sampledDesktopMotion;
 
         LogInfo("[streamer] low-cpu mode session=" + args.sessionId +
             " requested_fps=" + std::to_string(requestedMaxFps) +
@@ -856,7 +918,7 @@ namespace hi5 {
                     ApplyFastMouseTarget(fastTarget, args.sessionId, fastMouseNextLog, fastMouseApplied);
                 }
 
-                hadInput = HandleInputPipe(inputPipe, &source, currentDisplay, args.sessionId);
+                hadInput = HandleInputPipe(inputPipe, &source, currentDisplay, args.sessionId, &manualCaptureFps);
                 if (hadFastMouse) {
                     // Fast mouse movement is applied directly in the interactive streamer.
                     // Do not treat mouse-only movement as video activity: forcing captures
@@ -910,23 +972,111 @@ namespace hi5 {
                 if (now >= nextCaptureAt) {
                     ++captureAttempts;
                     const auto captureStart = std::chrono::steady_clock::now();
+                    if (previousCaptureAt.time_since_epoch().count() != 0) {
+                        pollGapTotalMs += std::chrono::duration<double, std::milli>(
+                            captureStart - previousCaptureAt).count();
+                        ++pollGapCount;
+                    }
+                    previousCaptureAt = captureStart;
                     FrameCaptureResult captured = source.nextFrameEx();
+                    lastCaptureBackend = captured.backend;
+                    if (captured.backend == DesktopCaptureBackend::Wgc) {
+                        // FrameArrived is a separate WinRT callback. Count
+                        // those events independently of TryGetNextFrame and
+                        // monitor the compositor's real source timestamps.
+                        if (captured.wgcArrivalEventsTotal < previousWgcArrivalTotal) {
+                            previousWgcArrivalTotal = 0; // new frame pool after reset
+                            previousWgcArrivalGapCount = 0;
+                            previousWgcArrivalGapTotalNs = 0;
+                        }
+                        wgcArrivals += captured.wgcArrivalEventsTotal - previousWgcArrivalTotal;
+                        previousWgcArrivalTotal = captured.wgcArrivalEventsTotal;
+                        if (captured.wgcArrivalGapCount >= previousWgcArrivalGapCount &&
+                            captured.wgcArrivalGapTotalNs >= previousWgcArrivalGapTotalNs) {
+                            wgcArrivalGapSamples += captured.wgcArrivalGapCount - previousWgcArrivalGapCount;
+                            wgcArrivalGapNs += captured.wgcArrivalGapTotalNs - previousWgcArrivalGapTotalNs;
+                        }
+                        previousWgcArrivalGapCount = captured.wgcArrivalGapCount;
+                        previousWgcArrivalGapTotalNs = captured.wgcArrivalGapTotalNs;
+                        wgcArrivalGapMaxNs = std::max(wgcArrivalGapMaxNs, captured.wgcArrivalGapMaxNs);
+                        if (captured.changed && captured.hasFrame) {
+                            if (captured.wgcArrivalsSincePreviousFrame > 1)
+                                wgcMultipleArrivalsPerConsumed += captured.wgcArrivalsSincePreviousFrame - 1;
+                            if (captured.wgcSourceTimestamp100ns > 0) {
+                                if (wgcFirstSourceTimestamp100ns == 0)
+                                    wgcFirstSourceTimestamp100ns = captured.wgcSourceTimestamp100ns;
+                                wgcLastSourceTimestamp100ns = captured.wgcSourceTimestamp100ns;
+                            }
+                            if (captured.wgcSourceTimestampGap100ns > 0) {
+                                ++wgcSourceGapSamples;
+                                wgcSourceGapTotal100ns += captured.wgcSourceTimestampGap100ns;
+                                wgcSourceGapMax100ns = std::max(
+                                    wgcSourceGapMax100ns, captured.wgcSourceTimestampGap100ns);
+                            }
+                            if (captured.wgcConversionParallel) {
+                                ++wgcParallelConversions;
+                                wgcParallelConversionTotalMs += captured.wgcConversionMs;
+                            } else {
+                                ++wgcSerialConversions;
+                                wgcSerialConversionTotalMs += captured.wgcConversionMs;
+                            }
+                            lastConverterQualified = captured.wgcConverterQualified;
+                            lastConverterParallel = captured.wgcConverterPrefersParallel;
+                            lastSerialTrialAvgMs = captured.wgcConversionSerialTrialAvgMs;
+                            lastParallelTrialAvgMs = captured.wgcConversionParallelTrialAvgMs;
+                            ++wgcNew;
+                            wgcReadbackTotalMs += captured.wgcReadbackMs;
+                            wgcGpuMapTotalMs += captured.wgcGpuCopyMapMs;
+                            wgcBufferCopyTotalMs += captured.wgcCpuBufferCopyMs;
+                            wgcConversionTotalMs += captured.wgcConversionMs;
+                        } else {
+                            ++wgcEmpty;
+                        }
+                    } else if (captured.backend == DesktopCaptureBackend::Dxgi) {
+                        if (captured.changed && captured.hasFrame) ++dxgiNew;
+                    } else if (captured.backend == DesktopCaptureBackend::Gdi) {
+                        ++gdiPolls;
+                    }
                     const double captureMs = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - captureStart).count();
                     captureTotalMs += captureMs;
                     captureWorstMs = std::max(captureWorstMs, captureMs);
                     ++measuredCaptures;
-                    const bool recentInput = (now - lastInputAt) <= activeHold;
-                    const bool recentMotion = (now - lastChangedFrameAt) <= std::chrono::milliseconds(ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
-                    const int targetFps = recentInput ? motionFps : (recentMotion ? activeFps : idleFps);
-                    lastTargetFps = targetFps;
-                    lastStreamMode = recentInput ? 2 : (recentMotion ? 1 : 0);
-                    const auto frameInterval = std::chrono::milliseconds(1000 / std::max(1, targetFps));
-                    nextCaptureAt = now + frameInterval;
+                    // DXGI and WGC already report new frames. Only GDI
+                    // BitBlt copies need sparse luma suppression: filtering
+                    // genuine compositor updates discards real small motion.
+                    const bool changedThisCapture =
+                        hi5::ShouldPublishDesktopFrame(captured, sampledDesktopMotion);
+                    if (changedThisCapture) lastChangedFrameAt = now;
+                    const auto motionHold = std::chrono::milliseconds(
+                        ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
+                    const auto rate = hi5::SelectCaptureFrameRate(
+                        now, lastInputAt, lastChangedFrameAt, changedThisCapture,
+                        requestedMaxFps, activeFps, motionFps, idleFps,
+                        activeHold, motionHold);
+                    const auto selectedRate = hi5::ApplyManualCaptureFps(
+                        rate, manualCaptureFps, requestedMaxFps);
+                    // WGC empty polls are cheap and no longer duplicate a
+                    // cached I420 frame. Keep explicitly selected polling
+                    // responsive at 15/30/45/60 even after desktop idle.
+                    // GDI, DXGI and secure/UAC retain existing pacing.
+                    const auto chosenRate = hi5::ApplyWgcManualPollingFloor(
+                        selectedRate, manualCaptureFps, requestedMaxFps,
+                        captured.backend == DesktopCaptureBackend::Wgc,
+                        isSecureHelper || lastSecureState);
+                    lastTargetFps = chosenRate.targetFps;
+                    lastStreamMode = chosenRate.mode;
+                    // Use the rate of the *newly observed* frame, not the
+                    // previous idle mode's 500ms interval. 500ms idle polls
+                    // otherwise outlive the 300ms motion hold indefinitely.
+                    // Preserve fractional frame periods (60 FPS = 16.667ms).
+                    // Integer millisecond truncation accumulated scheduling
+                    // phase error before the new high-resolution WGC wait.
+                    nextCaptureAt = now + std::chrono::nanoseconds(
+                        1000000000ll / std::max(1, chosenRate.targetFps));
 
-                    if (captured.hasFrame && captured.changed) {
+                    if (changedThisCapture) {
                         ++changedFrames;
-                        lastChangedFrameAt = now;
                         const uint64_t tsNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
                         const auto writeStart = std::chrono::steady_clock::now();
                         const bool writeOk = shmem.WriteRawI420Frame(captured.frame, tsNs);
@@ -981,6 +1131,49 @@ namespace hi5 {
 
             const auto currentTime = std::chrono::steady_clock::now();
             if (currentTime >= nextStatsAt) {
+                LogInfo("[streamer] capture-provider-stats session=" + args.sessionId +
+                    " backend=" + DesktopCaptureBackendName(lastCaptureBackend) +
+                    " wgc_new=" + std::to_string(wgcNew) +
+                    " wgc_empty=" + std::to_string(wgcEmpty) +
+                    " dxgi_new=" + std::to_string(dxgiNew) +
+                    " gdi_polls=" + std::to_string(gdiPolls) +
+                    " wgc_readback_avg_ms=" + std::to_string(
+                        wgcReadbackTotalMs / std::max<uint64_t>(1, wgcNew)) +
+                    " wgc_gpu_map_avg_ms=" + std::to_string(
+                        wgcGpuMapTotalMs / std::max<uint64_t>(1, wgcNew)) +
+                    " wgc_cpu_copy_avg_ms=" + std::to_string(
+                        wgcBufferCopyTotalMs / std::max<uint64_t>(1, wgcNew)) +
+                    " wgc_conversion_avg_ms=" + std::to_string(
+                        wgcConversionTotalMs / std::max<uint64_t>(1, wgcNew)) +
+                    " wgc_arrival_events=" + std::to_string(wgcArrivals) +
+                    " wgc_arrival_gap_avg_ms=" + std::to_string(
+                        static_cast<double>(wgcArrivalGapNs) / 1000000.0 /
+                        std::max<uint64_t>(1, wgcArrivalGapSamples)) +
+                    " wgc_arrival_gap_session_max_ms=" + std::to_string(
+                        static_cast<double>(wgcArrivalGapMaxNs) / 1000000.0) +
+                    " wgc_source_gap_avg_ms=" + std::to_string(
+                        static_cast<double>(wgcSourceGapTotal100ns) / 10000.0 /
+                        std::max<uint64_t>(1, wgcSourceGapSamples)) +
+                    " wgc_source_gap_max_ms=" + std::to_string(
+                        static_cast<double>(wgcSourceGapMax100ns) / 10000.0) +
+                    " wgc_source_first_100ns=" + std::to_string(wgcFirstSourceTimestamp100ns) +
+                    " wgc_source_last_100ns=" + std::to_string(wgcLastSourceTimestamp100ns) +
+                    " wgc_extra_arrivals_before_consume=" + std::to_string(wgcMultipleArrivalsPerConsumed) +
+                    " wgc_parallel_frames=" + std::to_string(wgcParallelConversions) +
+                    " wgc_serial_frames=" + std::to_string(wgcSerialConversions) +
+                    " wgc_parallel_convert_avg_ms=" + std::to_string(
+                        wgcParallelConversionTotalMs / std::max<uint64_t>(1, wgcParallelConversions)) +
+                    " wgc_serial_convert_avg_ms=" + std::to_string(
+                        wgcSerialConversionTotalMs / std::max<uint64_t>(1, wgcSerialConversions)) +
+                    " wgc_converter_qualified=" + std::to_string(lastConverterQualified ? 1 : 0) +
+                    " wgc_converter_mode=" + std::string(lastConverterParallel ? "two_strip" : "serial") +
+                    " wgc_converter_serial_trial_avg_ms=" + std::to_string(lastSerialTrialAvgMs) +
+                    " wgc_converter_parallel_trial_avg_ms=" + std::to_string(lastParallelTrialAvgMs) +
+                    " poll_gap_avg_ms=" + std::to_string(
+                        pollGapTotalMs / std::max<uint64_t>(1, pollGapCount)) +
+                    " target_poll_fps=" + std::to_string(lastTargetFps) +
+                    " wgc_high_res_waits=" + std::to_string(wgcHighResWaits) +
+                    " wgc_fallback_waits=" + std::to_string(wgcFallbackWaits));
                 LogInfo("[streamer] low-cpu stats session=" + args.sessionId +
                     " attempts=" + std::to_string(captureAttempts) +
                     " changed=" + std::to_string(changedFrames) +
@@ -1018,6 +1211,34 @@ namespace hi5 {
                 }
 
                 captureAttempts = 0;
+                wgcNew = 0;
+                wgcEmpty = 0;
+                dxgiNew = 0;
+                gdiPolls = 0;
+                wgcReadbackTotalMs = 0.0;
+                wgcGpuMapTotalMs = 0.0;
+                wgcBufferCopyTotalMs = 0.0;
+                wgcConversionTotalMs = 0.0;
+                wgcArrivals = 0;
+                wgcArrivalGapSamples = 0;
+                wgcArrivalGapNs = 0;
+                wgcArrivalGapMaxNs = 0;
+                wgcSourceGapSamples = 0;
+                wgcSourceGapTotal100ns = 0;
+                wgcSourceGapMax100ns = 0;
+                wgcFirstSourceTimestamp100ns = 0;
+                wgcLastSourceTimestamp100ns = 0;
+                wgcMultipleArrivalsPerConsumed = 0;
+                wgcParallelConversions = 0;
+                wgcSerialConversions = 0;
+                wgcParallelConversionTotalMs = 0.0;
+                wgcSerialConversionTotalMs = 0.0;
+                // Keep previous source-event totals across stats windows.
+                pollGapTotalMs = 0.0;
+                pollGapCount = 0;
+                wgcHighResWaits = 0;
+                wgcFallbackWaits = 0;
+                // Keep previousCaptureAt across windows to measure gaps.
                 changedFrames = 0;
                 cursorOnlyFrames = 0;
                 skippedFrames = 0;
@@ -1033,9 +1254,48 @@ namespace hi5 {
                 nextStatsAt = currentTime + statsEvery;
             }
 
+            const bool explicitWgcTiming =
+                lastCaptureBackend == DesktopCaptureBackend::Wgc &&
+                !isSecureHelper && !lastSecureState &&
+                (manualCaptureFps == 15 || manualCaptureFps == 30 ||
+                 manualCaptureFps == 45 || manualCaptureFps == 60);
+            // Release a scoped timer request even when capture processing is
+            // busy enough that this loop skips its sleep altogether.
+            if (!explicitWgcTiming) {
+                wgcPacer.Release();
+                wgcTimerStatusLogged = false;
+            }
             const auto sleepUntil = std::min(nextCaptureAt, currentTime + std::chrono::milliseconds(25));
             if (sleepUntil > currentTime) {
-                std::this_thread::sleep_until(sleepUntil);
+                // The scoped 1ms fallback must be limited to an explicit
+                // 15/30/45/60 FPS WGC selection. Automatic, secure desktop,
+                // DXGI and GDI keep the existing system timer behaviour.
+                if (explicitWgcTiming) {
+                    if (wgcPacer.WaitUntil(sleepUntil)) {
+                        ++wgcHighResWaits;
+                    } else {
+                        ++wgcFallbackWaits;
+                    }
+                    if (!wgcTimerStatusLogged) {
+                        wgcTimerStatusLogged = true;
+                        if (wgcPacer.Available()) {
+                            LogInfo("[streamer] WGC high-resolution capture pacing enabled session=" +
+                                args.sessionId + " mode=" + wgcPacer.Mode() +
+                                " waitable_error=" + std::to_string(wgcPacer.CreateError()) +
+                                " timer_period_error=" + std::to_string(wgcPacer.PeriodError()));
+                        } else {
+                            LogWarn("[streamer] WGC high-resolution pacing unavailable session=" +
+                                args.sessionId + " waitable_error=" +
+                                std::to_string(wgcPacer.CreateError()) +
+                                " timer_period_error=" + std::to_string(wgcPacer.PeriodError()) +
+                                " action=legacy_sleep");
+                        }
+                    }
+                } else {
+                    // Release scoped timer-resolution requests immediately
+                    // when switching back to Automatic or GDI/UAC.
+                    std::this_thread::sleep_until(sleepUntil);
+                }
             }
         }
 

@@ -3,6 +3,7 @@
 #include "vp8_encoder.h"
 #include "vp9_mf_encoder.h"
 #include "encoding/sustained_encoder_health.h"
+#include "codec_qualification_keyframe.h"
 #include "h264_mf_encoder.h"
 #include "input_injector.h"
 
@@ -170,6 +171,7 @@ private:
     std::atomic<uint64_t> m_lastViewerNetworkLogMs{0};
 
     int m_externalFrameCounter = 0;
+    hi5::universal_codec::SingleQualificationKeyframe m_h264QualificationKeyframe;
     int m_externalEncoderWidth = 0;
     int m_externalEncoderHeight = 0;
 
@@ -178,6 +180,8 @@ private:
     uint64_t m_externalSentFrames = 0;
     double m_externalEncodeMsTotal = 0.0;
     double m_externalEncodeMsMax = 0.0;
+    // Bounded per-frame encoder timings for a real five-second p95.
+    std::vector<double> m_externalEncodeMsSamples;
     double m_externalSendMsTotal = 0.0;
     double m_externalSendMsMax = 0.0;
     int m_externalKeyframeEvery = 30;
@@ -200,6 +204,7 @@ private:
     std::atomic<int> m_viewerMaxWidth{ -1 };
     std::atomic<int> m_viewerMaxHeight{ -1 };
     std::atomic<int> m_viewerTargetFps{ 0 };
+    std::atomic<int> m_viewerManualFps{ 0 };
     std::atomic<int> m_viewerTargetBitrateKbps{ 0 };
 
     int m_externalConfiguredFps = 0;

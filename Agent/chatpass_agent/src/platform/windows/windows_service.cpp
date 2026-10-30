@@ -6,6 +6,11 @@
 #include "webrtc_sender.h"
 #include "codec_capabilities.h"
 #include "codec_policy.h"
+#include "capture_frame_rate_policy.h"
+#include "codec_universal_connection.h"
+#include "codec_runtime_proof.h"
+#include "codec_windows_qual_identity.h"
+#include "codec_windows_idle_probe.h"
 #include "ipc/input_pipe.h"
 #include "ipc/session_launcher.h"
 #include "ipc/shmem_ring.h"
@@ -38,6 +43,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -2325,12 +2331,12 @@ class Worker {
                 constexpr int height = 0;
                 const auto codecDecision = hi5::SelectCodecPolicy();
 
-const int fps = ReadConfigInt(
-    "HI5_STREAM_FPS",
-    codecDecision.fps,
-    5,
-    60
-);
+// HI5_STREAM_FPS is a legacy default from early 20-FPS releases and
+// must NOT restrict an explicit 15/30/45/60 viewer override. Automatic
+// remains separately qualified at 20 FPS until live capture/browser proof.
+// Keep the maximum session budget independent of legacy machine settings.
+const int fps = hi5::SelectManualSessionCeilingFps(ReadConfigInt(
+    "HI5_STREAM_MANUAL_CEILING_FPS", 60, 15, 60));
 
 const int bitrateKbps = ReadConfigInt(
     "HI5_STREAM_BITRATE_KBPS",
@@ -2564,7 +2570,56 @@ LogI(
                 StartJobLoop(ident);
                 StartAppPortalBroker(ident);
 
-                auto sendFn = [this](const std::string& payload) {
+                if (ReadConfigInt("HI5_UNIVERSAL_CODEC_LEARN", 0, 0, 1) == 1) {
+                    // Never run synthetic GPU tests on an incoming remote
+                    // connection. Probe once at startup, after an idle grace
+                    // period, with no screen capture and below-normal priority.
+                    // A partially successful encoder probe cannot trigger auto
+                    // hardware selection: browser decode is still required.
+                    const std::string probeBuild = kAgentVersion;
+                    std::thread([probeBuild]() {
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        Sleep(45000);
+                        const std::filesystem::path path =
+                            L"C:\\ProgramData\\Hi5Central\\Agent\\codec-qualification-v1.cache";
+                        std::string probeReason;
+                        const bool ok =
+                            hi5::universal_codec::probeIdleHardwareH264(
+                                probeBuild, path, &probeReason);
+                        LogI(std::string("[codec-universal] idle hardware-only H264 "
+                            "synthetic probe ") +
+                            (ok ? "completed (decoder unverified)" :
+                                  "skipped or failed safely") +
+                            " reason=" + probeReason);
+                    }).detach();
+                }
+
+                auto codecProofs = std::make_shared<hi5::universal_codec::RuntimeProofStore>();
+                auto sendFn = [this, codecProofs](const std::string& payload) {
+                    // Encoder metrics originate in the actual RTP sender,
+                    // unlike an MFT inventory enumeration or a GPU name.
+                    if (ReadConfigInt("HI5_UNIVERSAL_CODEC_LEARN", 0, 0, 1) == 1) {
+                        const auto m = json::parse(payload, nullptr, false);
+                        if (!m.is_discarded() && m.is_object() &&
+                            m.value("type", "") == "stream_encoder_diagnostics") {
+                            hi5::universal_codec::EncoderWindow evidence;
+                            evidence.codec = m.value("codec", "");
+                            std::transform(evidence.codec.begin(), evidence.codec.end(),
+                                evidence.codec.begin(), [](unsigned char c) {
+                                    return static_cast<char>(std::tolower(c));
+                                });
+                            evidence.mode = m.value("codec_runtime_mode",
+                                m.value("encoder_mode", std::string()));
+                            evidence.frames = m.value("encoded_frames", 0u);
+                            evidence.sent = m.value("sent_frames", 0u);
+                            evidence.width = m.value("width", 0);
+                            evidence.height = m.value("height", 0);
+                            evidence.maxEncodeMs = m.value("encode_max_ms", 0.0);
+                            evidence.p95EncodeMs = m.value("encode_p95_ms", 0.0);
+                            codecProofs->recordEncoder(m.value("session_id", ""),
+                                evidence, static_cast<std::int64_t>(std::time(nullptr)));
+                        }
+                    }
                     if (signaling_) {
                         signaling_->send(payload);
                     }
@@ -2580,7 +2635,7 @@ LogI(
                     }
                     });
 
-                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident, autoSessionCodec](const std::string& text) {
+                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident, autoSessionCodec, codecProofs](const std::string& text) {
                     sessionBridge_.HandleIncomingJson(text);
 
                     const auto msg = json::parse(text, nullptr, false);
@@ -2624,6 +2679,66 @@ LogI(
                         sessionId = sessionBridge_.GetActiveSession();
                     }
 
+                    if (type == "viewer_codec_observation") {
+                        if (ReadConfigInt("HI5_UNIVERSAL_CODEC_LEARN", 0, 0, 1) != 1)
+                            return;
+                        hi5::universal_codec::DecoderReport obs;
+                        obs.codec = msg.value("codec", "");
+                        obs.decoded = msg.value("frames_decoded", 0ull);
+                        obs.keyframes = msg.value("keyframes_decoded", 0ull);
+                        obs.dropped = msg.value("frames_dropped", 0ull);
+                        obs.packets = msg.value("packets_received", 0ull);
+                        obs.width = msg.value("width", 0);
+                        obs.height = msg.value("height", 0);
+                        const bool asyncH264 = ReadConfigInt(
+                            "HI5_H264_ASYNC_HW", 0, 0, 1) == 1;
+                        const auto nowUtc = static_cast<std::int64_t>(std::time(nullptr));
+                        std::string proofReason;
+                        auto proof = codecProofs->confirm(
+                            sessionId, obs, nowUtc, asyncH264, &proofReason);
+                        if (proof.codec.empty()) {
+                            // At most one line per Viewer sample (normally 6s).
+                            // No account, device or session identifiers.
+                            LogI("[codec-universal] viewer evidence rejected codec=" +
+                                obs.codec + " reason=" + proofReason);
+                            return;
+                        }
+                        const auto identity =
+                            hi5::universal_codec::windowsCacheIdentity(
+                                kAgentVersion, nowUtc);
+                        if (identity.operatingSystem.empty() ||
+                            identity.gpuAndDriver.empty()) {
+                            LogW("[codec-universal] driver fingerprint unavailable; "
+                                "refusing to persist qualification");
+                            return;
+                        }
+                        const std::filesystem::path cachePath =
+                            L"C:\\ProgramData\\Hi5Central\\Agent\\codec-qualification-v1.cache";
+                        auto candidates =
+                            hi5::universal_codec::loadQualificationCache(
+                                cachePath, identity, nowUtc);
+                        candidates.erase(std::remove_if(candidates.begin(),
+                            candidates.end(), [&](const auto& c) {
+                                return c.codec == proof.codec &&
+                                    c.backend == proof.backend;
+                            }), candidates.end());
+                        candidates.push_back(proof);
+                        if (hi5::universal_codec::saveQualificationCache(
+                                cachePath, identity, candidates)) {
+                            LogI("[codec-universal] saved actual end-to-end " +
+                                proof.codec + " mode=" + proof.backend +
+                                " frames=" + std::to_string(proof.testedFrames) +
+                                " max_encode_ms=" +
+                                std::to_string(proof.worstEncodeMs) +
+                                " resolution=" + std::to_string(proof.maxWidth) +
+                                "x" + std::to_string(proof.maxHeight));
+                        } else {
+                            LogW("[codec-universal] could not persist proven " +
+                                proof.codec + "; preserving existing policy");
+                        }
+                        return;
+                    }
+
                     if (type == "start_webrtc") {
                         const SessionMode sessionMode = ParseSessionMode(msg.value("mode", std::string("console")));
                         LogI("start_webrtc session=" + sessionId + " mode=" + SessionModeName(sessionMode));
@@ -2632,7 +2747,105 @@ LogI(
                         // StartStreamerSession() calls StopSession(sessionId) as its first
                         // step. Start the consent/connected banner AFTER that cleanup:
                         // otherwise it is immediately closed, leaving no visible notice.
-                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode, autoSessionCodec);
+                        std::string connectionCodec = autoSessionCodec;
+                        const bool universalAutoEnabled =
+                            ReadConfigString("HI5_CODEC", "auto") == "auto" &&
+                            ReadConfigInt("HI5_UNIVERSAL_CODEC_AUTO", 0, 0, 1) == 1;
+                        const bool viewerCapsValid =
+                            msg.value("viewer_caps_v1", false) &&
+                            msg.contains("viewer_codecs") &&
+                            msg["viewer_codecs"].is_array();
+                        if (universalAutoEnabled && !viewerCapsValid) {
+                            LogI("[codec-universal] legacy fallback "
+                                "reason=viewer_capabilities_missing selected=" +
+                                connectionCodec);
+                        }
+                        if (universalAutoEnabled && viewerCapsValid) {
+                            hi5::universal_codec::Viewer viewer{};
+                            viewer.h264Level4 = msg.value("viewer_h264_level4", false);
+                            for (const auto& entry : msg["viewer_codecs"]) {
+                                if (!entry.is_string() ||
+                                    viewer.receiveCodecs.size() >= 6) continue;
+                                const std::string codec = entry.get<std::string>();
+                                if (codec != "vp8" && codec != "vp9" && codec != "h264")
+                                    continue;
+                                if (std::find(viewer.receiveCodecs.begin(),
+                                              viewer.receiveCodecs.end(), codec) ==
+                                    viewer.receiveCodecs.end())
+                                    viewer.receiveCodecs.push_back(codec);
+                            }
+                            // No device-model preference: previously verified
+                            // output, browser decode and cache identity must all
+                            // match. A missing/stale cache cannot qualify GPU.
+                            const auto nowUtc = static_cast<std::int64_t>(std::time(nullptr));
+                            const auto identity =
+                                hi5::universal_codec::windowsCacheIdentity(
+                                    kAgentVersion, nowUtc);
+                            const std::filesystem::path cachePath =
+                                L"C:\\ProgramData\\Hi5Central\\Agent\\codec-qualification-v1.cache";
+                            const auto candidates =
+                                hi5::universal_codec::loadQualificationCache(
+                                    cachePath, identity, nowUtc);
+                            const bool asyncHw = ReadConfigInt(
+                                "HI5_H264_ASYNC_HW", 0, 0, 1) == 1;
+                            const bool viewerVp8 =
+                                hi5::universal_codec::supports(viewer, "vp8");
+                            const bool viewerVp9 =
+                                hi5::universal_codec::supports(viewer, "vp9");
+                            const bool viewerH264 =
+                                hi5::universal_codec::supports(viewer, "h264");
+                            const bool cachedH264Proven = std::any_of(
+                                candidates.begin(), candidates.end(),
+                                [asyncHw](const auto& c) {
+                                    return c.codec == "h264" &&
+                                        hi5::universal_codec::proven(c, 20) &&
+                                        (!c.hardware || asyncHw);
+                                });
+                            // Do not guess L4 support from a GPU, model or
+                            // past Viewer. The current receiver must advertise
+                            // it when we request sharp-text H.264.
+                            const bool level4Excluded =
+                                hi5::universal_codec::enforceSharpH264ViewerLevel(
+                                    viewer, ReadConfigInt(
+                                        "HI5_H264_SHARP_TEXT", 0, 0, 1) == 1);
+                            const bool vp9Overloaded = autoVp9Overloaded_.load();
+                            const auto selection =
+                                hi5::universal_codec::chooseForConnection(
+                                    true, "auto",
+                                    vp9Overloaded ? "vp8" : autoSessionCodec,
+                                    viewer, candidates,
+                                    hi5::universal_codec::Link{}, asyncHw);
+                            if (!selection.compatible) {
+                                LogW("[codec-universal] rejecting incompatible " +
+                                    std::string("Viewer before SDP: ") +
+                                    selection.reason);
+                                sendFn(json{
+                                    {"type","viewer_error"},
+                                    {"session_id",sessionId},
+                                    {"error","No mutually supported, qualified video codec"}
+                                }.dump());
+                                return;
+                            }
+                            connectionCodec = selection.mode;
+                            LogI("[codec-universal] session=" + sessionId +
+                                " selected=" + connectionCodec +
+                                " qualified=" + (selection.qualified ? "1" : "0") +
+                                " cached_candidates=" +
+                                std::to_string(candidates.size()) +
+                                " viewer_vp8=" + (viewerVp8 ? "1" : "0") +
+                                " viewer_vp9=" + (viewerVp9 ? "1" : "0") +
+                                " viewer_h264=" + (viewerH264 ? "1" : "0") +
+                                " viewer_h264_level4=" +
+                                    (viewer.h264Level4 ? "1" : "0") +
+                                " h264_cached_proven=" +
+                                    (cachedH264Proven ? "1" : "0") +
+                                " h264_excluded_level4=" +
+                                    (level4Excluded ? "1" : "0") +
+                                " vp9_overload_latched=" +
+                                    (vp9Overloaded ? "1" : "0") +
+                                " reason=" + selection.reason);
+                        }
+                        StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode, connectionCodec);
                         bool sessionStarted = false;
                         {
                             std::lock_guard<std::mutex> lock(sessionsMu_);
@@ -5825,6 +6038,25 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 const std::string kind = msg.value("kind", "");
                 const std::string type = msg.value("type", "");
 
+                if (kind == "viewer_frame_rate") {
+                    const int fps = msg.value("target_fps", -1);
+                    if (fps != 0 && fps != 15 && fps != 30 && fps != 45 && fps != 60) {
+                        LogW("[fps-policy] rejected invalid capture rate");
+                        return;
+                    }
+                    InputCmd cmd{};
+                    cmd.type = InputCmdType::SetCaptureFps;
+                    cmd.captureFps.targetFps = fps;
+                    // Notify both desktop helpers: the inactive desktop
+                    // applies its next rate when it becomes active. Do not
+                    // send this to pointer/input injection logic.
+                    const bool normal = ctx.normalInputPipe.Write(cmd);
+                    const bool secure = ctx.secureInputPipe.Write(cmd);
+                    LogI("[fps-policy] capture manual=" + std::to_string(fps) +
+                        " normal_queued=" + (normal ? "1" : "0") +
+                        " secure_queued=" + (secure ? "1" : "0"));
+                    return;
+                }
                 if (kind == "request_keyframe") {
                     ctx.recoveryKeyframeRequested.store(true);
                     LogI("[video-recovery] frame requested session=" + ctx.sessionId);
@@ -6510,6 +6742,30 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " requested=" + std::to_string(requested));
             }
 
+            // If WGC kills the opted-in interactive capture helper or never
+            // delivers its first frame, permanently quarantine that trial on
+            // THIS device. A per-session fallback alone allows the next
+            // session to crash again, producing black frames and CAD loops.
+            // We intentionally do not touch InteractiveCaptureTrial or the
+            // proven GDI/DXGI fallback or restart the Agent service.
+            static void QuarantineWgcAfterHelperFailure(
+                const std::string& sessionId, const char* reason) {
+                DWORD enabled = 0;
+                DWORD bytes = sizeof(enabled);
+                constexpr const char* key = "SOFTWARE\\Hi5Central\\Agent";
+                if (RegGetValueA(HKEY_LOCAL_MACHINE, key, "WgcCaptureTrial",
+                        RRF_RT_REG_DWORD, nullptr, &enabled, &bytes) != ERROR_SUCCESS ||
+                    enabled != 1) return;
+                const DWORD disabled = 0;
+                const LSTATUS status = RegSetKeyValueA(HKEY_LOCAL_MACHINE, key,
+                    "WgcCaptureTrial", REG_DWORD, &disabled, sizeof(disabled));
+                LogW("[capture-test] WGC trial quarantined session=" + sessionId +
+                    " reason=" + reason + " registry_result=" +
+                    std::to_string(status) + " action=" +
+                    std::string(status == ERROR_SUCCESS ? "disable_wgc_for_next_session" :
+                        "registry_disable_failed"));
+            }
+
             // This is only enabled on explicitly opted-in test machines via
             // HKLM\SOFTWARE\Hi5Central\Agent\InteractiveCaptureTrial=1.
             // Reading at launch makes the switch reversible without an Agent
@@ -7142,6 +7398,15 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             LogW("normal streamer exited session=" + ctx.sessionId +
                                 " exitCode=" + std::to_string(exitCode));
                             if (ctx.normalInteractiveTrial) {
+                                // WGC can fault in a background compositor thread
+                                // before our normal 4s first-frame timeout runs.
+                                // Quarantine on an abnormal interactive-helper
+                                // exit rather than repeatedly crashing next time.
+                                if (exitCode != 0 ||
+                                    ctx.lastNormalFrameAt.time_since_epoch().count() == 0) {
+                                    QuarantineWgcAfterHelperFailure(
+                                        ctx.sessionId, "interactive_helper_exited");
+                                }
                                 ctx.normalInteractiveTrial = false;
                                 ctx.normalInteractiveFallbackUsed = true;
                                 LogW("[capture-test] user-token helper exited; reverting to elevated next launch session=" +
@@ -7330,6 +7595,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         now - ctx.normalInteractiveStarted >= std::chrono::seconds(6)) {
                         LogW("[capture-test] user-token helper produced no frames in 6s; reverting elevated helper session=" +
                             ctx.sessionId);
+                        QuarantineWgcAfterHelperFailure(ctx.sessionId, "no_first_frame_6s");
                         ctx.normalInteractiveFallbackUsed = true;
                         ctx.normalInteractiveTrial = false;
                         StopNormalStreamer(ctx);
