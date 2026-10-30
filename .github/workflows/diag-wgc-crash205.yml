@@ -40,7 +40,7 @@ jobs:
             HANDLE proc=GetCurrentProcess();
             SymSetOptions(SYMOPT_LOAD_LINES|SYMOPT_UNDNAME|SYMOPT_DEFERRED_LOADS);
             if(!SymInitialize(proc,".",FALSE)) { printf("SymInitialize failed=%lu\n",GetLastError());return 1; }
-            DWORD64 base=SymLoadModuleExA(proc,nullptr,"Hi5CentralAgent.exe",nullptr,0x140000000,0,nullptr,0);
+            DWORD64 base=SymLoadModuleExW(proc,nullptr,L"Hi5CentralAgent.exe",nullptr,0x140000000,0,nullptr,0);
             if(!base) {printf("SymLoadModuleEx failed=%lu\n",GetLastError());return 2;}
             std::vector<char> bytes(sizeof(SYMBOL_INFO)+MAX_SYM_NAME);
             auto* info=reinterpret_cast<SYMBOL_INFO*>(bytes.data());
