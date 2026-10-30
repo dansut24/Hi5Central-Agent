@@ -21,7 +21,10 @@
 namespace hi5 {
 class WgcHighResolutionPacer final {
 public:
-    WgcHighResolutionPacer() = default;
+    // Optional constructor switch exists for CI to exercise the same
+    // unsupported-high-resolution-timer path observed on the Lenovo.
+    explicit WgcHighResolutionPacer(bool tryHighResolutionTimer = true)
+        : tryHighResolutionTimer_(tryHighResolutionTimer) {}
     ~WgcHighResolutionPacer() { Release(); }
     WgcHighResolutionPacer(const WgcHighResolutionPacer&) = delete;
     WgcHighResolutionPacer& operator=(const WgcHighResolutionPacer&) = delete;
@@ -39,11 +42,13 @@ public:
         if (deadline <= std::chrono::steady_clock::now()) return false;
         if (!attempted_) {
             attempted_ = true;
-            timer_ = CreateWaitableTimerExW(
-                nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                TIMER_MODIFY_STATE | SYNCHRONIZE);
+            if (tryHighResolutionTimer_) {
+                timer_ = CreateWaitableTimerExW(
+                    nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_MODIFY_STATE | SYNCHRONIZE);
+            }
             if (!timer_) {
-                createError_ = GetLastError();
+                createError_ = tryHighResolutionTimer_ ? GetLastError() : ERROR_INVALID_PARAMETER;
                 // Tested on Windows 11 build 26200: ERROR_INVALID_PARAMETER
                 // for the high-res timer, but a scoped timeBeginPeriod(1)
                 // reduced 16ms Sleep from ~25ms to ~16.5ms.
@@ -79,6 +84,7 @@ private:
     HANDLE timer_ = nullptr;
     bool periodRaised_ = false;
     bool attempted_ = false;
+    bool tryHighResolutionTimer_ = true;
     DWORD createError_ = ERROR_SUCCESS;
     MMRESULT periodError_ = TIMERR_NOERROR;
 };
