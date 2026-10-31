@@ -6,6 +6,7 @@
 #include "encoding/hevc_rtp_payload_experimental.h"
 #include "encoding/av1_rtp_payload_experimental.h"
 #include "encoding/av1_rtp_webrtc_compatible.h"
+#include "encoding/av1_text_detail_policy.h"
 #include "encoding/av1_mf_output_adapter.h"
 #include "util/log.h"
 
@@ -2224,12 +2225,19 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         if (m_experimentalFailed) return;
         const bool isHevc = m_videoCodec == VideoCodec::H265;
         const bool softwareAv1 = m_codecMode == "av1_sw";
+        // Extra detail is opt-in, requires an explicit viewer 1080p request,
+        // and does not affect baseline AV1, HEVC or other stable codecs.
+        const auto av1TextDetail = hi5::quality::ChooseAv1TextDetailProfile(
+            softwareAv1,
+            softwareAv1 && readEnvInt("HI5_AV1_DETAIL_PILOT", 0, 0, 1) == 1,
+            m_viewerMaxWidth.load(), m_viewerMaxHeight.load(),
+            m_bitrateKbps, m_viewerTargetBitrateKbps.load());
         bool initialEncoderKeyframe = false;
         bool scaled = false;
         const I420Frame input = scaleI420ToWebRtcBounds(
-            frame, 1280, 720, &scaled, true);
+            frame, av1TextDetail.maxWidth, av1TextDetail.maxHeight, &scaled, true);
         const int encodeFps = std::max(1, std::min(m_fps, 20));
-        const int bitrate = std::max(500, std::min(m_bitrateKbps, 4500));
+        const int bitrate = av1TextDetail.bitrateKbps;
         if ((isHevc && !m_h265Encoder) ||
             (!isHevc && !softwareAv1 && !m_av1Encoder) ||
 #ifdef HI5_ENABLE_LIBAOM_AV1
@@ -2283,6 +2291,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 std::to_string(input.height) +
                 " fps=" + std::to_string(encodeFps) +
                 " bitrate_kbps=" + std::to_string(bitrate) +
+                " av1_detail_1080p=" + (av1TextDetail.enabled ? "1" : "0") +
                 " scaled=" + (scaled ? "1" : "0"));
         }
         try {
