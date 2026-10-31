@@ -1,6 +1,6 @@
 #pragma once
 
-#include "vp8_encoder.h"
+#include "../src/vp8_encoder.h"
 
 #include <cstdint>
 #include <memory>
