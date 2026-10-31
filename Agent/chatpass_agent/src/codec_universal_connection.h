@@ -27,24 +27,38 @@ inline ConnectionSelection chooseForConnection(
     const Viewer& viewer,
     const std::vector<Candidate>& cachedQualifications,
     const Link& link,
-    bool asyncHardwareH264Ready) {
+    bool asyncHardwareH264Ready,
+    bool endToEndFiveCodecPilot = false) {
     // An explicit operator choice always overrides the experiment. The
     // WebRtcSender must still fail closed if its encoder cannot initialise.
     if (operatorMode != "auto")
         return {operatorMode,false,true,"explicit operator codec remains unchanged"};
     if (!optIn || viewer.receiveCodecs.empty())
         return {legacyAutoMode,false,true,"legacy automatic codec preserved"};
-    // A live sender/packetiser must exist; AV1 and HEVC remain offline-only
-    // regardless of successful Media Foundation hardware enumeration.
+    // The experimental live senders are eligible ONLY after both an operator
+    // opt-in and verified sender + authenticated Viewer decoder/RTP evidence.
+    // Encoder enumeration or a successful manual session on a different Agent
+    // build is not sufficient. The cache invalidates on binary/driver change.
     std::vector<Candidate> supported;
-    for (const auto& c:cachedQualifications) {
-        if(c.codec=="av1" || c.codec=="h265" || c.codec=="hevc")continue;
-        if(c.codec=="h264" && c.hardware && !asyncHardwareH264Ready)continue;
-        if(c.codec!="vp8" && c.codec!="vp9" && c.codec!="h264")continue;
+    for (const auto& c : cachedQualifications) {
+        if (c.codec == "h264" && c.hardware && !asyncHardwareH264Ready) continue;
+        if (c.codec == "av1" || c.codec == "h265") {
+            if (!endToEndFiveCodecPilot) continue;
+            // The exact sender mode must exist. Do not select pseudo-codecs
+            // (e.g. generic MF enum) that cannot construct an RTP sender.
+            if (c.codec == "av1" &&
+                c.backend != "av1_sw" && c.backend != "av1_hw") continue;
+            if (c.codec == "h265" && c.backend != "h265_hw") continue;
+        } else if (c.codec != "vp8" && c.codec != "vp9" &&
+                   c.codec != "h264") continue;
         supported.push_back(c);
     }
     const Choice c=select(supported,viewer,link);
     if(c.qualified) {
+        if (c.codec == "av1") return {c.backend,true,true,
+            "qualified AV1 encoder, browser decoder, RTP and recovered keyframe"};
+        if (c.codec == "h265") return {c.backend,true,true,
+            "qualified HEVC encoder, browser decoder, RTP and recovered keyframe"};
         if(c.codec=="h264") return {c.hardware?"h264_hw":"h264_sw",true,true,
             "end-to-end qualified H264 for this device and Viewer"};
         if(c.codec=="vp9") return {c.hardware?"vp9_hw":"vp9_sw",true,true,

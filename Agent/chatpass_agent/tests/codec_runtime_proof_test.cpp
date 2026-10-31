@@ -110,6 +110,36 @@ int main() {
  store.recordEncoder("unproven-vp9-hw",vp9,1005);
  assert(store.confirm("unproven-vp9-hw",vp9report,1006,true).codec.empty());
 
+ // Future five-codec proof requires real RTP samples and a second
+ // browser-decoded keyframe; a manual AV1 session does not grant auto mode.
+ {
+  RuntimeProofStore five;
+  auto av1=e;av1.codec="av1";av1.mode="av1_sw";
+  av1.maxEncodeMs=30;av1.p95EncodeMs=12;
+  auto browser=d;browser.codec="av1";browser.width=1728;
+  auto recovered=browser;recovered.decoded=100;
+  recovered.keyframes=2;recovered.packets=400;
+  five.recordEncoder("av1-1080p",av1,2000);
+  five.recordEncoder("av1-1080p",av1,2005);
+  assert(five.confirm("av1-1080p",browser,2007,false).codec.empty());
+  auto qualified=five.confirm("av1-1080p",recovered,2011,false);
+  assert(qualified.codec=="av1" && qualified.backend=="av1_sw" && !qualified.hardware);
+  auto h265=av1;h265.codec="h265";h265.mode="h265_hw";
+  browser.codec="h265";recovered.codec="h265";
+  five.recordEncoder("hevc",h265,2010);
+  five.recordEncoder("hevc",h265,2015);
+  assert(five.confirm("hevc",browser,2016,false).codec.empty());
+  auto verified=five.confirm("hevc",recovered,2020,false);
+  assert(verified.codec=="h265" && verified.backend=="h265_hw" && verified.hardware);
+  auto fake=av1;fake.mode="av1_guess";
+  five.recordEncoder("fake",fake,2020);
+  five.recordEncoder("fake",fake,2025);
+  assert(five.confirm("fake",browser,2026,false).codec.empty());
+  auto slow=av1;slow.p95EncodeMs=45;slow.maxEncodeMs=90;
+  five.recordEncoder("overload",slow,2030);
+  five.recordEncoder("overload",slow,2035);
+  assert(five.confirm("overload",browser,2036,false).codec.empty());
+ }
  std::cout<<"CODEC_RUNTIME_PROOF_TESTS_PASSED sustained_headroom=2 "
              "second_idr=required no_unverified_vp9_gpu=1\n";
 }

@@ -26,6 +26,9 @@ public:
                     std::string* error);
     bool encode(const SoftwareAv1Frame& frame, bool keyframe,
                 std::vector<SoftwareAv1Packet>& packets, std::string* error);
+    // Change CBR bitrate in the existing libaom encoder without recreating
+    // the WebRTC sender or invalidating AV1 decoder reference frames.
+    bool setTargetBitrateKbps(int bitrateKbps, std::string* error);
     void shutdown();
 private:
     struct Impl;

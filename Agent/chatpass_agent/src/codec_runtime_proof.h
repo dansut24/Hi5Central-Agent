@@ -12,8 +12,8 @@
 namespace hi5::universal_codec {
 
 struct EncoderWindow {
-    std::string codec;           // h264, vp9, vp8
-    std::string mode;            // h264_hw, h264_sw, vp9_hw, vp9_sw, vp8
+    std::string codec;           // h264, vp9, vp8, av1, h265
+    std::string mode;            // exact RTP sender mode, e.g. av1_sw, h265_hw
     unsigned int frames = 0;
     unsigned int sent = 0;
     int width = 0;
@@ -52,7 +52,8 @@ public:
     void recordEncoder(const std::string& session, const EncoderWindow& metric,
                        std::int64_t timestamp) {
         if(session.empty() || session.size()>160 || timestamp<=0 ||
-           (metric.codec!="h264" && metric.codec!="vp9" && metric.codec!="vp8") ||
+           (metric.codec!="h264" && metric.codec!="vp9" && metric.codec!="vp8" &&
+            metric.codec!="av1" && metric.codec!="h265") ||
            metric.frames==0 || metric.frames>10000 || metric.sent>metric.frames ||
            metric.width<320 || metric.height<240 ||
            metric.width>7680 || metric.height>4320 ||
@@ -120,12 +121,16 @@ public:
         // transform. Until it exposes actual hardware-only MFT identity,
         // NEVER label a VP9 result as GPU accelerated.
         if(m.mode=="vp9_hw")return reject("vp9_hardware_transform_unverified");
-        const bool hardware=(m.mode=="h264_hw" && asyncH264);
+        const bool hardware=(m.mode=="h264_hw" && asyncH264) ||
+            m.mode=="av1_hw" || m.mode=="h265_hw";
         if(m.codec=="h264" && m.mode=="h264_hw" && !asyncH264)
             return reject("hardware_h264_async_not_confirmed");
         if((m.codec=="h264" && m.mode!="h264_hw" && m.mode!="h264_sw") ||
            (m.codec=="vp9" && m.mode!="vp9_hw" && m.mode!="vp9_sw") ||
-           (m.codec=="vp8" && m.mode!="vp8"))return reject("encoder_mode_unqualified");
+           (m.codec=="vp8" && m.mode!="vp8") ||
+           (m.codec=="av1" && m.mode!="av1_sw" && m.mode!="av1_hw") ||
+           (m.codec=="h265" && m.mode!="h265_hw"))
+            return reject("encoder_mode_unqualified");
         // The first keyframe generally arrives on initial connection;
         // this alone is NOT keyframe recovery. Wait for a later keyframe
         // and meaningful decoding progress before trusting this device.

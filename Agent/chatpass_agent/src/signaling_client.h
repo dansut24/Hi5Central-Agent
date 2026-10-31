@@ -1,9 +1,12 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace rtc {
     class WebSocket;
@@ -27,6 +30,10 @@ public:
 private:
     std::string m_url;
     std::shared_ptr<rtc::WebSocket> m_ws;
+    // Closed or timed-out generations must not deliver stale SDP/events. Keep
+    // a bounded set of retired sockets alive during async callback shutdown.
+    std::vector<std::shared_ptr<rtc::WebSocket>> m_retired;
+    std::atomic<std::uint64_t> m_generation{0};
 
     OpenHandler m_openHandler;
     MessageHandler m_messageHandler;

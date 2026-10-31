@@ -4,6 +4,16 @@
 #include <iostream>
 using hi5::quality::ChooseAv1TextDetailProfile;
 int main() {
+    using hi5::quality::ChooseAdaptiveAv1Bitrate;
+    // No new bitrate policy is permitted to alter the accepted AV1 baseline.
+    assert(ChooseAdaptiveAv1Bitrate(false,true,6000,3000)==6000);
+    assert(ChooseAdaptiveAv1Bitrate(true,true,6000,0)==6000);
+    assert(ChooseAdaptiveAv1Bitrate(true,true,6000,5400)==5400);
+    assert(ChooseAdaptiveAv1Bitrate(true,true,6000,3600)==3600);
+    assert(ChooseAdaptiveAv1Bitrate(true,false,4500,3600)==3600);
+    assert(ChooseAdaptiveAv1Bitrate(true,true,6000,500)==1500);
+    assert(ChooseAdaptiveAv1Bitrate(true,true,6000,9000)==6500);
+
  const auto normal=ChooseAv1TextDetailProfile(true,false,1920,1080,4500,6500);
  assert(normal.maxWidth==1280&&normal.maxHeight==720&&normal.bitrateKbps==4500&&!normal.enabled);
  const auto noRequest=ChooseAv1TextDetailProfile(true,true,0,0,4500,6500);

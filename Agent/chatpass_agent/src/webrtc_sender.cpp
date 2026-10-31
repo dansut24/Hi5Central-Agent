@@ -529,6 +529,7 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         }
 
                         m_viewerTargetBitrateKbps = kbps;
+                        m_sessionAdaptiveQuality.reset(kbps>0 ? kbps : m_bitrateKbps);
                         if (prevW != w || prevH != h) m_forceKeyframe = true;
                         // Authoritative reply on the already-authenticated
                         // control channel. The Viewer can promote Automatic only
@@ -600,6 +601,28 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                             const double n = msg.value(key, 0.0);
                             return std::max(0.0, std::min(limit, n));
                         };
+                        // Opt-in, session-isolated closed-loop bitrate policy.
+                        // Ignore idle/unknown receiver samples, preserve the
+                        // requested pixel resolution and manual FPS override.
+                        if (readEnvInt("HI5_UNIVERSAL_ADAPTIVE_QUALITY",0,0,1)==1 &&
+                            m_viewerManualFps.load()==0) {
+                            hi5::universal_codec::LinkSample sample;
+                            sample.rttMs=bounded("rtt_ms",60000.0);
+                            sample.lossFraction=bounded("packet_loss_rate",1.0);
+                            sample.jitterBufferMs=bounded("jitter_buffer_ms",60000.0);
+                            sample.packetsSampled=std::clamp(
+                                msg.value("packets_sampled",0),0,500000);
+                            const auto policy=m_sessionAdaptiveQuality.observe(
+                                sample,static_cast<std::int64_t>(ms/1000));
+                            if(policy.changed) {
+                                m_viewerTargetBitrateKbps=policy.bitrateKbps;
+                                LogInfo("[quality-adaptive] session="+m_sessionId+
+                                    " tier="+std::to_string(policy.tier)+
+                                    " bitrate_kbps="+std::to_string(policy.bitrateKbps)+
+                                    " reason="+policy.reason+
+                                    " resolution_unchanged=1");
+                            }
+                        }
                         LogInfo("[network-health] session=" + m_sessionId +
                             " viewer_rtt_ms=" + std::to_string(bounded("rtt_ms", 60000.0)) +
                             " viewer_jitter_ms=" + std::to_string(bounded("jitter_ms", 60000.0)) +
@@ -2237,7 +2260,11 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         const I420Frame input = scaleI420ToWebRtcBounds(
             frame, av1TextDetail.maxWidth, av1TextDetail.maxHeight, &scaled, true);
         const int encodeFps = std::max(1, std::min(m_fps, 20));
-        const int bitrate = av1TextDetail.bitrateKbps;
+        const bool softwareAv1DynamicRate = softwareAv1 &&
+            readEnvInt("HI5_UNIVERSAL_ADAPTIVE_QUALITY",0,0,1) == 1;
+        const int bitrate = hi5::quality::ChooseAdaptiveAv1Bitrate(
+            softwareAv1DynamicRate, av1TextDetail.enabled,
+            av1TextDetail.bitrateKbps, m_viewerTargetBitrateKbps.load());
         if ((isHevc && !m_h265Encoder) ||
             (!isHevc && !softwareAv1 && !m_av1Encoder) ||
 #ifdef HI5_ENABLE_LIBAOM_AV1
@@ -2255,6 +2282,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             m_externalEncoderHeight = input.height;
             m_externalConfiguredFps = encodeFps;
             m_externalConfiguredBitrateKbps = bitrate;
+            m_av1RejectedLiveBitrateKbps = 0;
             initialEncoderKeyframe = true;
             std::string reason;
             bool ok = false;
@@ -2294,6 +2322,28 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 " av1_detail_1080p=" + (av1TextDetail.enabled ? "1" : "0") +
                 " scaled=" + (scaled ? "1" : "0"));
         }
+        // CBR reconfiguration happens on the same encode thread. Never
+        // destroy/recreate an active AV1 encoder just to change bitrate:
+        // doing so breaks reference frames and previously caused freezing.
+#ifdef HI5_ENABLE_LIBAOM_AV1
+        if (softwareAv1DynamicRate && m_av1SoftwareEncoder &&
+            bitrate != m_externalConfiguredBitrateKbps &&
+            bitrate != m_av1RejectedLiveBitrateKbps) {
+            std::string error;
+            if (m_av1SoftwareEncoder->setTargetBitrateKbps(bitrate, &error)) {
+                m_externalConfiguredBitrateKbps = bitrate;
+                m_av1RejectedLiveBitrateKbps = 0;
+                LogInfo("[quality-adaptive] in-place AV1 CBR update session=" +
+                    m_sessionId + " bitrate_kbps=" + std::to_string(bitrate) +
+                    " encoder_recreated=0 resolution_unchanged=1");
+            } else {
+                m_av1RejectedLiveBitrateKbps = bitrate;
+                LogWarn("[quality-adaptive] AV1 CBR update rejected; "
+                    "keeping current encoder session=" + m_sessionId +
+                    " reason=" + error);
+            }
+        }
+#endif
         try {
             const auto begin = std::chrono::steady_clock::now();
             std::vector<uint8_t> accessUnit;
