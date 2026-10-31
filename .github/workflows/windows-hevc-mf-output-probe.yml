@@ -1,0 +1,53 @@
+name: Windows HEVC Media Foundation Actual Output Probe
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Agent/chatpass_agent/tests/windows_hevc_mf_output_probe.cpp'
+      - 'Agent/chatpass_agent/tests/hevc_rtp_experimental.h'
+      - 'Agent/chatpass_agent/tests/hevc_rtp_experimental_test.cpp'
+      - 'Agent/chatpass_agent/tests/hevc_mf_encoder_experimental.*'
+      - '.github/workflows/windows-hevc-mf-output-probe.yml'
+permissions:
+  contents: read
+jobs:
+  hevc-rtp-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile isolated HEVC RTP tests
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror Agent/chatpass_agent/tests/hevc_rtp_experimental_test.cpp -o /tmp/hevc_rtp_test
+          /tmp/hevc_rtp_test
+  standalone:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run HEVC RTP qualification tests on Windows
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio not found" }
+          $devcmd = Join-Path $vs 'Common7\\Tools\\VsDevCmd.bat'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/hevc_rtp_experimental_test.cpp /Fe:hevc_rtp_test.exe && hevc_rtp_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "HEVC RTP unit test failed" }
+      - name: Compile standalone HEVC Media Foundation output probe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio C++ tools missing" }
+          $devcmd = Join-Path $vs 'Common7\\Tools\\VsDevCmd.bat'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /DNOMINMAX /DHI5_MF_EVENT_PROBE Agent/chatpass_agent/tests/windows_hevc_mf_output_probe.cpp Agent/chatpass_agent/tests/hevc_mf_encoder_experimental.cpp /link mf.lib mfplat.lib mfuuid.lib ole32.lib /OUT:dist\\hevc_mf_output_probe.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "HEVC MF probe build failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-hevc-mf-output-probe-standalone
+          path: dist/hevc_mf_output_probe.exe
+          retention-days: 14
+          if-no-files-found: error
