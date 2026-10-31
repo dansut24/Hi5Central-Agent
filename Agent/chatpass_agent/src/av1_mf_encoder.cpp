@@ -11,6 +11,7 @@
 #include <mftransform.h>
 #include <mferror.h>
 #include <wrl/client.h>
+#include "mf_async_pilot_events.h"
 
 #include <algorithm>
 #include <cstring>
@@ -108,6 +109,8 @@ namespace {
 
 struct Av1MfEncoder::Impl {
     ComPtr<IMFTransform> transform;
+    bool asynchronous = false;
+    MfAsyncPilotEvents events;
     MFT_OUTPUT_STREAM_INFO outputInfo{};
     bool mfStarted = false;
 };
@@ -237,9 +240,18 @@ bool Av1MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool pr
 
     {
         ComPtr<IMFAttributes> attrs;
+        UINT32 asyncFlag = FALSE;
         if (SUCCEEDED(m_impl->transform->GetAttributes(&attrs)) && attrs) {
-            attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            attrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag);
+            if (asyncFlag) attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
             attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+        }
+        m_impl->asynchronous = asyncFlag != FALSE;
+        if (m_impl->asynchronous &&
+            (FAILED(m_impl->transform.As(&m_impl->events.generator)) ||
+             !m_impl->events.generator)) {
+            if (error) *error = "asynchronous MFT has no event generator";
+            return false;
         }
     }
 
@@ -356,6 +368,12 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
     sample->SetSampleTime(frameTime);
     sample->SetSampleDuration(frameDuration);
 
+    // Intel HEVC/AV1 hardware MFTs are asynchronous. The previous direct
+    // ProcessInput returned 0xC00D36B5 (MF_E_NOTACCEPTING) even on the first
+    // frame. Consume the encoder's NeedInput event before submitting a sample.
+    if (m_impl->asynchronous &&
+        !m_impl->events.waitFor(true, 750, error)) return false;
+
     hr = m_impl->transform->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) {
         if (error) *error = "ProcessInput failed " + HrToString(hr);
@@ -364,7 +382,21 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
 
     ++m_frameIndex;
 
-    for (;;) {
+    // Each output call on an asynchronous MFT must consume one HaveOutput
+    // event. A codec may buffer its first few frames without producing
+    // output, so a short no-output wait is not a fatal stream failure.
+    // Bound stream-change retry count: a broken driver must not spin forever.
+    for (int outputAttempt = 0; outputAttempt < 8; ++outputAttempt) {
+        if (m_impl->asynchronous) {
+            std::string eventError;
+            if (!m_impl->events.waitFor(false, 200, &eventError)) {
+                if (eventError ==
+                    "async Media Foundation timed out waiting for METransformHaveOutput")
+                    return true; // buffered frame; retry on the next capture
+                if (error) *error = eventError;
+                return false;
+            }
+        }
         MFT_OUTPUT_DATA_BUFFER output{};
         DWORD status = 0;
 
@@ -381,11 +413,16 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
         hr = m_impl->transform->ProcessOutput(0, 1, &output, &status);
 
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            if (output.pEvents) output.pEvents->Release();
             // An AV1 encoder may buffer initial frames; not an error.
             return true;
         }
 
-        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE ||
+            output.dwStatus == MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE) {
+            if (output.pEvents) output.pEvents->Release();
+            if (output.pSample && output.pSample != outSample.Get())
+                output.pSample->Release();
             ComPtr<IMFMediaType> newOut;
             if (SUCCEEDED(m_impl->transform->GetOutputAvailableType(0, 0, &newOut)) && newOut) {
                 m_impl->transform->SetOutputType(0, newOut.Get(), 0);
@@ -447,4 +484,6 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
             return true;
         }
     }
+    if (error) *error = "encoder returned repeated empty or changing output samples";
+    return false;
 }
