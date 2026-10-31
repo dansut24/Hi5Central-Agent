@@ -110,6 +110,29 @@ struct Av1MfEncoder::Impl {
     ComPtr<IMFTransform> transform;
     MFT_OUTPUT_STREAM_INFO outputInfo{};
     bool mfStarted = false;
+#ifdef HI5_MF_EVENT_PROBE
+    // Diagnostic-only asynchronous hardware MFT protocol. Production Agent
+    // does not compile this flag or use this standalone encoder.
+    ComPtr<IMFMediaEventGenerator> events;
+    unsigned inputCredits = 0;
+    unsigned outputCredits = 0;
+    bool waitForCredit(bool input) {
+        if (!events) return true;
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            if (input ? inputCredits > 0 : outputCredits > 0) return true;
+            ComPtr<IMFMediaEvent> event;
+            const HRESULT result = events->GetEvent(MF_EVENT_FLAG_NO_WAIT, event.GetAddressOf());
+            if (result == MF_E_NO_EVENTS_AVAILABLE) { Sleep(2); continue; }
+            if (FAILED(result) || !event) return false;
+            MediaEventType type = MEUnknown;
+            if (FAILED(event->GetType(&type))) return false;
+            if (type == METransformNeedInput) ++inputCredits;
+            if (type == METransformHaveOutput) ++outputCredits;
+            if (type == MEError) return false;
+        }
+        return input ? inputCredits > 0 : outputCredits > 0;
+    }
+#endif
 };
 
 Av1MfEncoder::Av1MfEncoder() = default;
@@ -235,6 +258,10 @@ bool Av1MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool pr
         return false;
     }
 
+#ifdef HI5_MF_EVENT_PROBE
+    m_impl->transform.As(&m_impl->events);
+#endif
+
     {
         ComPtr<IMFAttributes> attrs;
         if (SUCCEEDED(m_impl->transform->GetAttributes(&attrs)) && attrs) {
@@ -356,6 +383,15 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
     sample->SetSampleTime(frameTime);
     sample->SetSampleDuration(frameDuration);
 
+#ifdef HI5_MF_EVENT_PROBE
+    if (m_impl->events) {
+        if (!m_impl->waitForCredit(true)) {
+            if (error) *error = "async MFT never requested input";
+            return false;
+        }
+        --m_impl->inputCredits;
+    }
+#endif
     hr = m_impl->transform->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) {
         if (error) *error = "ProcessInput failed " + HrToString(hr);
@@ -363,6 +399,13 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
     }
 
     ++m_frameIndex;
+#ifdef HI5_MF_EVENT_PROBE
+    // Hardware MFTs must signal METransformHaveOutput before ProcessOutput.
+    if (m_impl->events) {
+        if (!m_impl->waitForCredit(false)) return true;
+        --m_impl->outputCredits;
+    }
+#endif
 
     for (;;) {
         MFT_OUTPUT_DATA_BUFFER output{};

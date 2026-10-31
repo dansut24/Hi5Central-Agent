@@ -1,0 +1,108 @@
+#include "../src/av1_mf_encoder.h"
+#include "../src/encoding/av1_rtp_payload_experimental.h"
+#include "../src/encoding/av1_ivf_experimental.h"
+#include <windows.h>
+#include <objbase.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <vector>
+
+// Standalone synthetic transform qualification, never installed as a service.
+// No desktop capture, credentials, WebRTC, or changes to agent configuration.
+int main() {
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(co) && co != RPC_E_CHANGED_MODE) {
+        std::cout << "AV1_MF_RESULT=coinit_failed\n";
+        return 0;
+    }
+    Av1MfEncoder encoder;
+    std::string error;
+    constexpr int width=1280, height=720, fps=30;
+    if (!encoder.init(width,height,fps,4000,true,&error)) {
+        std::cout << "AV1_MF_RESULT=init_failed reason=" << error << "\n";
+        if (SUCCEEDED(co)) CoUninitialize();
+        return 0;
+    }
+    std::cout << "AV1_MF_INIT_OK encoder=" << encoder.encoderName() << "\n";
+    I420Frame frame;
+    frame.width=width;
+    frame.height=height;
+    frame.y.assign(static_cast<size_t>(width)*height, 95);
+    frame.u.assign(static_cast<size_t>(width/2)*(height/2), 128);
+    frame.v.assign(static_cast<size_t>(width/2)*(height/2), 128);
+    int emitted=0, successfulInputs=0, rtpAccepted=0, rtpRejected=0;
+    int headerSamples=0;
+    hi5::ExperimentalAv1IvfExtractor ivfExtractor;
+    int ivfAccepted=0, ivfRejected=0;
+    size_t packetCount=0;
+    size_t emittedBytes=0;
+    double maxMs=0, totalMs=0;
+    for (int i=0;i<45;i++) {
+        frame.y[static_cast<size_t>((i*17)%height)*width + (i*23)%width] =
+            static_cast<uint8_t>(50+(i%120));
+        const auto start=std::chrono::steady_clock::now();
+        Av1EncodedFrame out;
+        error.clear();
+        if (!encoder.encode(frame,i==0,out,&error)) {
+            std::cout << "AV1_MF_RESULT=process_failed after=" << successfulInputs
+                      << " reason=" << error << "\n";
+            encoder.shutdown();
+            if (SUCCEEDED(co)) CoUninitialize();
+            return 0;
+        }
+        const double ms=std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-start).count();
+        maxMs=std::max(maxMs,ms);
+        totalMs+=ms;
+        successfulInputs++;
+        if (!out.data.empty()) {
+            emitted++;
+            emittedBytes+=out.data.size();
+            if (headerSamples < 4) {
+                std::ostringstream hex;
+                hex << std::hex << std::setfill('0');
+                for (size_t j=0;j<std::min<size_t>(24,out.data.size());++j)
+                    hex << std::setw(2) << static_cast<unsigned>(out.data[j]);
+                std::cout << "AV1_MF_FRAME_HEADER=" << hex.str()
+                          << " bytes=" << out.data.size() << "\n";
+                headerSamples++;
+            }
+            hi5::Av1RtpPayloads packetized;
+            std::string reason;
+            std::vector<uint8_t> temporalUnit;
+            if (!ivfExtractor.unwrap(out.data, temporalUnit, &reason)) {
+                ++ivfRejected;
+                if (ivfRejected <= 3) std::cout << "AV1_IVF_REJECT=" << reason << "\n";
+                continue;
+            }
+            ++ivfAccepted;
+            if (hi5::BuildAv1RtpPayloads(temporalUnit,1100,packetized,&reason)) {
+                ++rtpAccepted;
+                packetCount += packetized.packets.size();
+            } else {
+                ++rtpRejected;
+                if (rtpRejected <= 3)
+                    std::cout << "AV1_MF_RTP_REJECT=" << reason << "\n";
+            }
+        }
+    }
+    encoder.shutdown();
+    if (SUCCEEDED(co)) CoUninitialize();
+    std::cout << "AV1_MF_RESULT=" << (emitted>=20 ? "emitted" : "insufficient_output")
+              << " input_frames=" << successfulInputs
+              << " encoded_frames=" << emitted
+              << " encoded_bytes=" << emittedBytes
+              << " ivf_accepted_frames=" << ivfAccepted
+              << " ivf_rejected_frames=" << ivfRejected
+              << " rtp_accepted_frames=" << rtpAccepted
+              << " rtp_rejected_frames=" << rtpRejected
+              << " rtp_payloads=" << packetCount
+              << " encode_avg_ms=" << totalMs/std::max(1,successfulInputs)
+              << " encode_max_ms=" << maxMs
+              << " synthetic_only=1 live_browser_verified=0\n";
+}
