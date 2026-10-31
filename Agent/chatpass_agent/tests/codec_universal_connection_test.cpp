@@ -26,7 +26,8 @@ int main() {
  assert(chooseForConnection(true,"h264_sw","vp8",viewer,{},link,true).mode=="h264_sw");
  Viewer noH264;noH264.receiveCodecs={"vp8","vp9"};
  assert(chooseForConnection(true,"auto","vp8",noH264,{intel},link,true).mode=="vp8");
- assert(chooseForConnection(true,"auto","vp9_sw",noH264,{},link,true).mode=="vp9_sw");
+ // Startup synthetic VP9 timing is not live browser/RTP proof.
+ assert(chooseForConnection(true,"auto","vp9_sw",noH264,{},link,true).mode=="vp8");
  Viewer noCommon;noCommon.receiveCodecs={"h264"};
  auto blocked=chooseForConnection(true,"auto","vp8",noCommon,{},link,true);
  assert(!blocked.compatible && blocked.mode.empty());
