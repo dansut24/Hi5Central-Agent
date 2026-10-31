@@ -330,8 +330,11 @@ WebRtcSender::WebRtcSender(std::string sessionId,
         LogInfo("[codec] WebRtcSender VP9 requested mode=" + m_codecMode +
             " session=" + m_sessionId);
     }
-    else if ((m_codecMode == "h265_hw" || m_codecMode == "av1_hw") &&
-        readEnvInt("HI5_EXPERIMENTAL_LIVE_CODECS", 0, 0, 1) == 1) {
+    else if ((m_codecMode == "h265_hw" || m_codecMode == "av1_hw"
+#ifdef HI5_ENABLE_LIBAOM_AV1
+        || m_codecMode == "av1_sw"
+#endif
+        ) && readEnvInt("HI5_EXPERIMENTAL_LIVE_CODECS", 0, 0, 1) == 1) {
         // Explicit two-key opt-in, never selected by automatic codec policy.
         m_videoCodec = m_codecMode == "h265_hw" ? VideoCodec::H265 : VideoCodec::AV1;
         m_payloadType = m_videoCodec == VideoCodec::H265 ? 104 : 105;
@@ -2202,16 +2205,24 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
     if (m_videoCodec == VideoCodec::H265 || m_videoCodec == VideoCodec::AV1) {
         if (m_experimentalFailed) return;
         const bool isHevc = m_videoCodec == VideoCodec::H265;
+        const bool softwareAv1 = m_codecMode == "av1_sw";
         bool scaled = false;
         const I420Frame input = scaleI420ToWebRtcBounds(
             frame, 1280, 720, &scaled, true);
         const int encodeFps = std::max(1, std::min(m_fps, 20));
         const int bitrate = std::max(500, std::min(m_bitrateKbps, 4500));
-        if ((isHevc && !m_h265Encoder) || (!isHevc && !m_av1Encoder) ||
+        if ((isHevc && !m_h265Encoder) ||
+            (!isHevc && !softwareAv1 && !m_av1Encoder) ||
+#ifdef HI5_ENABLE_LIBAOM_AV1
+            (!isHevc && softwareAv1 && !m_av1SoftwareEncoder) ||
+#endif
             input.width != m_externalEncoderWidth ||
             input.height != m_externalEncoderHeight) {
             m_h265Encoder.reset();
             m_av1Encoder.reset();
+#ifdef HI5_ENABLE_LIBAOM_AV1
+            m_av1SoftwareEncoder.reset();
+#endif
             m_experimentalPrimed = false;
             m_externalEncoderWidth = input.width;
             m_externalEncoderHeight = input.height;
@@ -2224,6 +2235,16 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 ok = enc->init(input.width, input.height, encodeFps,
                     bitrate, true, &reason);
                 if (ok) m_h265Encoder = std::move(enc);
+#ifdef HI5_ENABLE_LIBAOM_AV1
+            } else if (softwareAv1) {
+                auto enc = std::make_unique<hi5::SoftwareAv1EncoderExperiment>();
+                const unsigned int cores = std::thread::hardware_concurrency();
+                const int threads = std::max(1, std::min(8,
+                    static_cast<int>(cores ? cores : 4)));
+                ok = enc->initialize(input.width, input.height, encodeFps,
+                    bitrate, threads, &reason);
+                if (ok) m_av1SoftwareEncoder = std::move(enc);
+#endif
             } else {
                 auto enc = std::make_unique<Av1MfEncoder>();
                 ok = enc->init(input.width, input.height, encodeFps,
@@ -2258,6 +2279,30 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 ok = m_h265Encoder->encode(input, keyframe, encoded, &reason);
                 accessUnit = std::move(encoded.data);
                 actualKeyframe = encoded.keyframe;
+#ifdef HI5_ENABLE_LIBAOM_AV1
+            } else if (softwareAv1) {
+                hi5::SoftwareAv1Frame frameForEncoder;
+                frameForEncoder.width = input.width;
+                frameForEncoder.height = input.height;
+                frameForEncoder.y = input.y;
+                frameForEncoder.u = input.u;
+                frameForEncoder.v = input.v;
+                std::vector<hi5::SoftwareAv1Packet> encodedPackets;
+                ok = m_av1SoftwareEncoder->encode(frameForEncoder, keyframe,
+                    encodedPackets, &reason);
+                if (ok && !encodedPackets.empty()) {
+                    // This sender uses a single WebRTC frame RTP timestamp.
+                    // Multiple AOM output frames must be handled separately;
+                    // failing closed avoids corrupt timestamps or loss recovery.
+                    if (encodedPackets.size() != 1) {
+                        ok = false;
+                        reason = "libaom returned multiple frames for one input";
+                    } else {
+                        accessUnit = std::move(encodedPackets[0].bytes);
+                        actualKeyframe = encodedPackets[0].keyframe;
+                    }
+                }
+#endif
             } else {
                 Av1EncodedFrame encoded{};
                 ok = m_av1Encoder->encode(input, keyframe, encoded, &reason);
@@ -2284,7 +2329,9 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 payloads = std::move(built.packets);
             } else {
                 hi5::Av1RtpPayloads built;
-                ok = hi5::BuildAv1MfRtpPayloads(accessUnit, 1200, built, &reason);
+                ok = softwareAv1
+                    ? hi5::BuildAv1RtpPayloads(accessUnit, 1200, built, &reason)
+                    : hi5::BuildAv1MfRtpPayloads(accessUnit, 1200, built, &reason);
                 if (ok && built.hasSequenceHeader)
                     m_experimentalPrimed = true;
                 payloads = std::move(built.packets);

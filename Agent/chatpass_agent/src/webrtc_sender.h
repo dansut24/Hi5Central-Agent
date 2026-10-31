@@ -7,6 +7,9 @@
 #include "h264_mf_encoder.h"
 #include "h265_mf_encoder.h"
 #include "av1_mf_encoder.h"
+#ifdef HI5_ENABLE_LIBAOM_AV1
+#include "encoding/av1_software_encoder_experimental.h"
+#endif
 #include "rtp_video_wall_clock.h"
 #include "input_injector.h"
 
@@ -155,6 +158,9 @@ private:
     std::unique_ptr<Vp9MfEncoder> m_vp9Encoder;
     std::unique_ptr<H265MfEncoder> m_h265Encoder;
     std::unique_ptr<Av1MfEncoder> m_av1Encoder;
+#ifdef HI5_ENABLE_LIBAOM_AV1
+    std::unique_ptr<hi5::SoftwareAv1EncoderExperiment> m_av1SoftwareEncoder;
+#endif
     bool m_experimentalFailed = false;
     bool m_experimentalPrimed = false;
     bool m_vp9Failed = false;

@@ -40,9 +40,18 @@ int main() {
     check("vp8", "vp8");
     check("av1", "vp8"); // Unsupported live AV1 must not be forced.
     check("av1_hw", "vp8");
+    check("av1_sw", "vp8"); // Even linked libaom requires explicit experiment flag.
     check("h265_hw", "vp8");
     setLiveExperiment(true);
     check("av1_hw", "av1_hw");
+#ifdef HI5_ENABLE_LIBAOM_AV1
+    check("av1_sw", "av1_sw");
+    assert(hi5::SelectCodecPolicy().encoder == "libaom-realtime-experimental");
+    assert(!hi5::SelectCodecPolicy().hardware);
+    assert(!hi5::SelectCodecPolicy().stable);
+#else
+    check("av1_sw", "vp8"); // Unlinked targets must never offer software AV1.
+#endif
     check(" H265_HW ", "h265_hw");
     assert(!hi5::SelectCodecPolicy().stable);
     setLiveExperiment(false);

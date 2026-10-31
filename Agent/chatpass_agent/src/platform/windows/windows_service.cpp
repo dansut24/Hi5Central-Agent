@@ -2761,7 +2761,8 @@ LogI(
                         // has explicitly requested the codec on the Agent.
                         const std::string explicitPilot =
                             hi5::SelectCodecPolicy().requestedMode;
-                        if (explicitPilot == "h265_hw" || explicitPilot == "av1_hw") {
+                        if (explicitPilot == "h265_hw" || explicitPilot == "av1_hw" ||
+                            explicitPilot == "av1_sw") {
                             const std::string required =
                                 explicitPilot == "h265_hw" ? "h265" : "av1";
                             bool receiverAdvertised = false;
@@ -7261,7 +7262,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         // Explicit operator choices take precedence. Automatic
                         // selection uses the successfully probed codec rather
                         // than the previous hardcoded H.264 experimental path.
-                        if (requestedCodec == "h265_hw" || requestedCodec == "av1_hw")
+                        if (requestedCodec == "h265_hw" || requestedCodec == "av1_hw" ||
+                            requestedCodec == "av1_sw")
                             return requestedCodec;
                         if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw") return requestedCodec;
                         if (requestedCodec == "vp8") return std::string("vp8");
