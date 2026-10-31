@@ -651,6 +651,19 @@ namespace {
 struct DesktopFrameSource::Impl {
     mutable std::mutex mu;
 
+    // Diagnostic-only aggregated DXGI timings. No frame pixels are logged.
+    // Count new frames only, never cached-frame or timeout polls.
+    uint64_t dxgiProfileSamples = 0;
+    double dxgiAcquireTotalMs = 0.0;
+    double dxgiSubmitTotalMs = 0.0;
+    double dxgiMapTotalMs = 0.0;
+    double dxgiCpuCopyTotalMs = 0.0;
+    double dxgiCursorTotalMs = 0.0;
+    double dxgiConvertTotalMs = 0.0;
+    double dxgiCacheCopyTotalMs = 0.0;
+    double dxgiPublishCopyTotalMs = 0.0;
+    std::chrono::steady_clock::time_point dxgiNextProfileLog{};
+
     std::vector<OutputTarget> targets;
     int currentIndex = 0;
     // Keep the requested monitor even when the safe GDI fallback sets -1.
@@ -1310,7 +1323,9 @@ struct DesktopFrameSource::Impl {
         // fresh dirty frame. On timeout we reuse the last frame, which lets the
         // service/encoder maintain smooth RTP pacing without changing capture architecture.
         constexpr UINT kAcquireTimeoutMs = 8;
+        const auto dxgiAcquireStart = std::chrono::steady_clock::now();
         HRESULT hr = duplication->AcquireNextFrame(kAcquireTimeoutMs, &frameInfo, &resource);
+        const auto dxgiAcquireEnd = std::chrono::steady_clock::now();
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
             const bool noFrameYet = lastFrame.y.empty() || lastFrame.width <= 0 || lastFrame.height <= 0;
             if (noFrameYet) {
@@ -1363,29 +1378,71 @@ struct DesktopFrameSource::Impl {
             throw std::runtime_error("Query ID3D11Texture2D failed");
         }
 
+        const auto dxgiSubmitStart = std::chrono::steady_clock::now();
         context->CopyResource(staging.Get(), tex.Get());
         duplication->ReleaseFrame();
+        const auto dxgiSubmitEnd = std::chrono::steady_clock::now();
 
         D3D11_MAPPED_SUBRESOURCE mapped{};
         if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
             throw std::runtime_error("Map staging failed");
         }
+        const auto dxgiMapEnd = std::chrono::steady_clock::now();
 
         const int rowPitch = static_cast<int>(mapped.RowPitch);
         std::vector<uint8_t> bgra(static_cast<size_t>(rowPitch) * static_cast<size_t>(height));
         std::memcpy(bgra.data(), mapped.pData, bgra.size());
         context->Unmap(staging.Get(), 0);
+        const auto dxgiCpuCopyEnd = std::chrono::steady_clock::now();
 
         const DisplayInfo d = currentDisplayInfoLocked();
         compositeCursorBgra(d.x, d.y, width, height, bgra, rowPitch);
+        const auto dxgiCursorEnd = std::chrono::steady_clock::now();
 
         I420Frame out;
         bgraToI420(bgra.data(), rowPitch, width, height, out);
+        const auto dxgiConvertEnd = std::chrono::steady_clock::now();
 
         lastFrame = out;
+        const auto dxgiCacheEnd = std::chrono::steady_clock::now();
 
         FrameCaptureResult result;
         result.frame = out;
+        const auto dxgiPublishEnd = std::chrono::steady_clock::now();
+
+        // Per-stage monotonic wall-clock timings include any GPU fence wait
+        // inside Map, and isolate two full I420 copies from the conversion.
+        auto millis = [](auto start, auto end) {
+            return std::chrono::duration<double, std::milli>(end - start).count();
+        };
+        ++dxgiProfileSamples;
+        dxgiAcquireTotalMs += millis(dxgiAcquireStart, dxgiAcquireEnd);
+        dxgiSubmitTotalMs += millis(dxgiSubmitStart, dxgiSubmitEnd);
+        dxgiMapTotalMs += millis(dxgiSubmitEnd, dxgiMapEnd);
+        dxgiCpuCopyTotalMs += millis(dxgiMapEnd, dxgiCpuCopyEnd);
+        dxgiCursorTotalMs += millis(dxgiCpuCopyEnd, dxgiCursorEnd);
+        dxgiConvertTotalMs += millis(dxgiCursorEnd, dxgiConvertEnd);
+        dxgiCacheCopyTotalMs += millis(dxgiConvertEnd, dxgiCacheEnd);
+        dxgiPublishCopyTotalMs += millis(dxgiCacheEnd, dxgiPublishEnd);
+        if (dxgiNextProfileLog.time_since_epoch().count() == 0)
+            dxgiNextProfileLog = dxgiPublishEnd + std::chrono::seconds(5);
+        if (dxgiPublishEnd >= dxgiNextProfileLog) {
+            const double count = static_cast<double>(std::max<uint64_t>(1, dxgiProfileSamples));
+            LogInfo("[capture] dxgi-stage-stats samples=" + std::to_string(dxgiProfileSamples) +
+                " acquire_avg_ms=" + std::to_string(dxgiAcquireTotalMs / count) +
+                " gpu_submit_avg_ms=" + std::to_string(dxgiSubmitTotalMs / count) +
+                " map_wait_avg_ms=" + std::to_string(dxgiMapTotalMs / count) +
+                " cpu_copy_avg_ms=" + std::to_string(dxgiCpuCopyTotalMs / count) +
+                " cursor_avg_ms=" + std::to_string(dxgiCursorTotalMs / count) +
+                " convert_avg_ms=" + std::to_string(dxgiConvertTotalMs / count) +
+                " cache_copy_avg_ms=" + std::to_string(dxgiCacheCopyTotalMs / count) +
+                " publish_copy_avg_ms=" + std::to_string(dxgiPublishCopyTotalMs / count));
+            dxgiProfileSamples = 0;
+            dxgiAcquireTotalMs = dxgiSubmitTotalMs = dxgiMapTotalMs = 0.0;
+            dxgiCpuCopyTotalMs = dxgiCursorTotalMs = dxgiConvertTotalMs = 0.0;
+            dxgiCacheCopyTotalMs = dxgiPublishCopyTotalMs = 0.0;
+            dxgiNextProfileLog = dxgiPublishEnd + std::chrono::seconds(5);
+        }
         result.hasFrame = true;
         result.changed = true;
         result.changedIsNative = true; // DXGI reported a new acquired frame
