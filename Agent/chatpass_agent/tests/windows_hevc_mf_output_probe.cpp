@@ -1,4 +1,5 @@
 #include "hevc_mf_encoder_experimental.h"
+#include "hevc_rtp_experimental.h"
 #include <windows.h>
 #include <objbase.h>
 #include <algorithm>
@@ -36,6 +37,8 @@ int main() {
     int emitted=0, successfulInputs=0;
     unsigned firstHeaderSamples=0;
     unsigned annexBStartFrames=0;
+    unsigned rtpAccepted=0, rtpRejected=0, packetTotal=0;
+    unsigned accessUnitsWithVps=0, accessUnitsWithSps=0, accessUnitsWithPps=0, accessUnitsWithIdr=0;
     size_t emittedBytes=0;
     double maxMs=0, totalMs=0;
     for (int i=0;i<45;i++) {
@@ -72,6 +75,19 @@ int main() {
             if (out.data.size() >= 4 && out.data[0] == 0 && out.data[1] == 0 &&
                 (out.data[2] == 1 || (out.data[2] == 0 && out.data[3] == 1)))
                 ++annexBStartFrames;
+            hi5::ExperimentalHevcPackets payloads;
+            std::string reason;
+            if (hi5::PacketizeHevcAnnexB(out.data, 1100, payloads, &reason)) {
+                ++rtpAccepted;
+                packetTotal += static_cast<unsigned>(payloads.packets.size());
+                accessUnitsWithVps += payloads.hasVps ? 1u : 0u;
+                accessUnitsWithSps += payloads.hasSps ? 1u : 0u;
+                accessUnitsWithPps += payloads.hasPps ? 1u : 0u;
+                accessUnitsWithIdr += payloads.hasRandomAccess ? 1u : 0u;
+            } else {
+                ++rtpRejected;
+                if (rtpRejected<=3) std::cout<<"HEVC_RTP_REJECT="<<reason<<"\n";
+            }
         }
     }
     encoder.shutdown();
@@ -81,6 +97,13 @@ int main() {
               << " encoded_frames=" << emitted
               << " encoded_bytes=" << emittedBytes
               << " annexb_start_frames=" << annexBStartFrames
+              << " rtp_accepted_frames=" << rtpAccepted
+              << " rtp_rejected_frames=" << rtpRejected
+              << " rtp_payloads=" << packetTotal
+              << " access_units_vps=" << accessUnitsWithVps
+              << " access_units_sps=" << accessUnitsWithSps
+              << " access_units_pps=" << accessUnitsWithPps
+              << " access_units_idr=" << accessUnitsWithIdr
               << " encode_avg_ms=" << totalMs/std::max(1,successfulInputs)
               << " encode_max_ms=" << maxMs
               << " synthetic_only=1 live_browser_verified=0\n";
