@@ -1,5 +1,6 @@
 #include "../src/av1_mf_encoder.h"
 #include "../src/encoding/av1_rtp_payload_experimental.h"
+#include "../src/encoding/av1_ivf_experimental.h"
 #include <windows.h>
 #include <objbase.h>
 #include <algorithm>
@@ -36,6 +37,8 @@ int main() {
     frame.v.assign(static_cast<size_t>(width/2)*(height/2), 128);
     int emitted=0, successfulInputs=0, rtpAccepted=0, rtpRejected=0;
     int headerSamples=0;
+    hi5::ExperimentalAv1IvfExtractor ivfExtractor;
+    int ivfAccepted=0, ivfRejected=0;
     size_t packetCount=0;
     size_t emittedBytes=0;
     double maxMs=0, totalMs=0;
@@ -71,7 +74,14 @@ int main() {
             }
             hi5::Av1RtpPayloads packetized;
             std::string reason;
-            if (hi5::BuildAv1RtpPayloads(out.data,1100,packetized,&reason)) {
+            std::vector<uint8_t> temporalUnit;
+            if (!ivfExtractor.unwrap(out.data, temporalUnit, &reason)) {
+                ++ivfRejected;
+                if (ivfRejected <= 3) std::cout << "AV1_IVF_REJECT=" << reason << "\n";
+                continue;
+            }
+            ++ivfAccepted;
+            if (hi5::BuildAv1RtpPayloads(temporalUnit,1100,packetized,&reason)) {
                 ++rtpAccepted;
                 packetCount += packetized.packets.size();
             } else {
@@ -87,6 +97,8 @@ int main() {
               << " input_frames=" << successfulInputs
               << " encoded_frames=" << emitted
               << " encoded_bytes=" << emittedBytes
+              << " ivf_accepted_frames=" << ivfAccepted
+              << " ivf_rejected_frames=" << ivfRejected
               << " rtp_accepted_frames=" << rtpAccepted
               << " rtp_rejected_frames=" << rtpRejected
               << " rtp_payloads=" << packetCount
