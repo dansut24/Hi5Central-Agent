@@ -248,6 +248,13 @@ $cmakeArgs += @(
     "-DLIBDATACHANNEL_ROOT=$LibDataChannelRoot"
 )
 
+# This only includes the software encoder in the binary. Live AV1 still
+# requires machine HI5_CODEC=av1_sw and HI5_EXPERIMENTAL_LIVE_CODECS=1.
+if ($env:HI5_AV1_SOFTWARE_LIVE_BUILD -eq '1') {
+    $cmakeArgs += '-DHI5_ENABLE_LIBAOM_AV1=ON'
+    Write-Host 'Explicit software AV1 pilot binary: libaom linked statically'
+}
+
 if (-not [string]::IsNullOrWhiteSpace($VcpkgRoot)) {
     $toolchainFile = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
 

@@ -47,7 +47,14 @@ namespace hi5 {
             requested == "none") requested = "auto";
         // Unsupported operator values fail closed to the stable RTP sender,
         // never to an unqualified hardware codec.
-        const bool recognized = requested == "auto" || requested == "vp8" ||
+        const bool experimental = getenvString("HI5_EXPERIMENTAL_LIVE_CODECS") == "1";
+        bool softwareAv1Available = false;
+#ifdef HI5_ENABLE_LIBAOM_AV1
+        softwareAv1Available = requested == "av1_sw";
+#endif
+        const bool recognized = (experimental &&
+            (requested == "av1_hw" || requested == "h265_hw" || softwareAv1Available)) ||
+            requested == "auto" || requested == "vp8" ||
             requested == "vp9" || requested == "vp9_hw" ||
             requested == "vp9_sw" || requested == "h264" ||
             requested == "h264_hw" || requested == "h264_sw";
@@ -55,6 +62,28 @@ namespace hi5 {
 
         CodecDecision decision;
         decision.requestedMode = requested;
+
+        if (requested == "av1_sw") {
+            decision.selectedCodec = "av1";
+            decision.encoder = "libaom-realtime-experimental";
+            decision.fps = 20;
+            decision.bitrateKbps = 4500;
+            decision.hardware = false;
+            decision.stable = false;
+            decision.reason = "Explicit isolated software AV1 RTP experiment, never automatic";
+            return decision;
+        }
+
+        if (requested == "av1_hw" || requested == "h265_hw") {
+            decision.selectedCodec = requested == "av1_hw" ? "av1" : "h265";
+            decision.encoder = "mediafoundation-experimental";
+            decision.fps = 20;
+            decision.bitrateKbps = 4500;
+            decision.hardware = true; // preference; actual encoder must be probed
+            decision.stable = false;
+            decision.reason = "Explicit isolated RTP experiment, never automatic";
+            return decision;
+        }
 
         if (requested == "vp8") {
             decision.selectedCodec = "vp8";

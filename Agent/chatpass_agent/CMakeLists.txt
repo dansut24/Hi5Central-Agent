@@ -182,6 +182,22 @@ add_executable(native_vp8_stream
 
 hi5_use_static_msvc_runtime(native_vp8_stream)
 
+# Windows-only, explicit experimental software AV1. Link libaom statically
+# into the Agent; never change the normal codec selector by enabling it.
+option(HI5_ENABLE_LIBAOM_AV1 "Include opt-in libaom AV1 live sender (Windows)" OFF)
+if(HI5_ENABLE_LIBAOM_AV1)
+  if(NOT WIN32)
+    message(FATAL_ERROR "HI5_ENABLE_LIBAOM_AV1 live pilot is Windows-only")
+  endif()
+  find_path(HI5_AOM_INCLUDE_DIR "aom/aom_encoder.h" REQUIRED)
+  find_library(HI5_AOM_LIBRARY NAMES aom aom_static REQUIRED)
+  target_sources(native_vp8_stream PRIVATE
+    src/encoding/av1_software_encoder_experimental.cpp)
+  target_include_directories(native_vp8_stream PRIVATE ${HI5_AOM_INCLUDE_DIR})
+  target_link_libraries(native_vp8_stream PRIVATE ${HI5_AOM_LIBRARY})
+  target_compile_definitions(native_vp8_stream PRIVATE HI5_ENABLE_LIBAOM_AV1=1)
+endif()
+
 if(WIN32)
   target_link_libraries(native_vp8_stream PRIVATE yuv)
 endif()

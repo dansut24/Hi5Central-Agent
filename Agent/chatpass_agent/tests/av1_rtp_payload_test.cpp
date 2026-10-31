@@ -1,4 +1,5 @@
 #include "../src/encoding/av1_rtp_payload_experimental.h"
+#include "../src/encoding/av1_mf_output_adapter.h"
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -39,5 +40,26 @@ int main() {
         assert(out.packets.empty());
     }
     assert(!BuildAv1RtpPayloads(unit,1201,out,&why));
+    // Intel Media Foundation output can use Annex B temporal units. Convert
+    // only fully validated, bounded Annex B lengths before RTP packetizing.
+    const std::vector<uint8_t> annex{9,8,3,0x08,0x11,0x22,3,0x30,0x44,0x55};
+    assert(BuildAv1MfRtpPayloads(annex,1200,out,&why));
+    assert(out.hasSequenceHeader && out.packets.size()==2);
+    assert(out.packets[0]==(std::vector<uint8_t>{0x18,0x08,0x11,0x22}));
+    assert(out.packets[1]==(std::vector<uint8_t>{0x10,0x30,0x44,0x55}));
+    const std::vector<uint8_t> annexWithSizes{11,10,4,0x0a,2,0x11,0x22,4,0x32,2,0x44,0x55};
+    assert(BuildAv1MfRtpPayloads(annexWithSizes,1200,out,&why));
+    assert(out.packets.size()==2 && out.hasSequenceHeader);
+    assert(BuildAv1MfRtpPayloads(unit,1200,out,&why));
+    assert(out.hasSequenceHeader && out.packets.size()==2);
+    for(const auto& malformed : std::vector<std::vector<uint8_t>>{
+        {0},{0x80},{9,8,3,0x08,0x11},
+        {9,8,3,0x08,0x11,0x22,3,0x30,0x44,0x55,0},
+        {9,8,3,0x80,0x11,0x22,3,0x30,0x44,0x55},
+        {9,8,4,0x0a,3,0x11,0x22,3,0x30,0x44,0x55},
+    }) {
+        assert(!BuildAv1MfRtpPayloads(malformed,1200,out,&why));
+        assert(out.packets.empty());
+    }
     std::cout<<"AV1 RTP unit and fragment qualification checks passed\n";
 }

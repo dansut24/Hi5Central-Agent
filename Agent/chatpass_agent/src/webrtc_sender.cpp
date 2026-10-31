@@ -1,8 +1,12 @@
-﻿#include "webrtc_sender.h"
+#include "webrtc_sender.h"
 #include "codec_auto_fps.h"
 #include "frame_source.h"
 #include "frame_scale_bilinear.h"
 #include "h264_scaling_policy.h"
+#include "encoding/hevc_rtp_payload_experimental.h"
+#include "encoding/av1_rtp_payload_experimental.h"
+#include "encoding/av1_rtp_webrtc_compatible.h"
+#include "encoding/av1_mf_output_adapter.h"
 #include "util/log.h"
 
 #include <rtc/rtc.hpp>
@@ -327,6 +331,17 @@ WebRtcSender::WebRtcSender(std::string sessionId,
         LogInfo("[codec] WebRtcSender VP9 requested mode=" + m_codecMode +
             " session=" + m_sessionId);
     }
+    else if ((m_codecMode == "h265_hw" || m_codecMode == "av1_hw"
+#ifdef HI5_ENABLE_LIBAOM_AV1
+        || m_codecMode == "av1_sw"
+#endif
+        ) && readEnvInt("HI5_EXPERIMENTAL_LIVE_CODECS", 0, 0, 1) == 1) {
+        // Explicit two-key opt-in, never selected by automatic codec policy.
+        m_videoCodec = m_codecMode == "h265_hw" ? VideoCodec::H265 : VideoCodec::AV1;
+        m_payloadType = m_videoCodec == VideoCodec::H265 ? 104 : 105;
+        LogInfo("[codec-pilot] isolated experimental sender " + m_codecMode +
+            " session=" + m_sessionId);
+    }
     else {
         m_videoCodec = VideoCodec::VP8;
         m_payloadType = 96;
@@ -590,7 +605,16 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                             " viewer_playout_buffer_ms=" + std::to_string(bounded("jitter_buffer_ms", 60000.0)) +
                             " viewer_decoded_fps=" + std::to_string(bounded("fps", 120.0)) +
                             " viewer_receive_kbps=" + std::to_string(bounded("bitrate_kbps", 100000.0)) +
-                            " viewer_packets_lost=" + std::to_string(bounded("packets_lost", 1e9)));
+                            " viewer_packets_lost=" + std::to_string(bounded("packets_lost", 1e9)) +
+                            " viewer_packets_received=" + std::to_string(bounded("packets_received", 1e9)) +
+                            " viewer_bytes_received=" + std::to_string(bounded("bytes_received", 1e12)) +
+                            " viewer_frames_received=" + std::to_string(bounded("frames_received", 1e9)) +
+                            " viewer_frames_assembled=" + std::to_string(bounded("frames_assembled", 1e9)) +
+                            " viewer_frames_decoded=" + std::to_string(bounded("frames_decoded", 1e9)) +
+                            " viewer_frames_dropped=" + std::to_string(bounded("frames_dropped", 1e9)) +
+                            " viewer_frames_rendered=" + std::to_string(bounded("frames_rendered", 1e9)) +
+                            " viewer_codec_pt=" + std::to_string(bounded("codec_pt", 127.0)) +
+                            " viewer_keyframes_decoded=" + std::to_string(bounded("keyframes_decoded", 1e8)));
                         return;
                     }
 
@@ -982,6 +1006,14 @@ void WebRtcSender::createPeerConnection() {
             media.addVP8Codec(m_payloadType);
         }
     }
+    else if (m_videoCodec == VideoCodec::H265 || m_videoCodec == VideoCodec::AV1) {
+        // Never offer VP8 as an experimental payload fallback after SDP.
+        // The service has already verified this exact Viewer's receive caps.
+        if (m_videoCodec == VideoCodec::H265) media.addH265Codec(m_payloadType);
+        else media.addAV1Codec(m_payloadType);
+        LogInfo("[codec-pilot] isolated SDP offer codec=" + m_codecMode +
+            " payload=" + std::to_string(m_payloadType));
+    }
     else {
         media.addVP8Codec(m_payloadType);
     }
@@ -995,6 +1027,14 @@ void WebRtcSender::createPeerConnection() {
     m_track->onOpen([this]() {
         LogInfo("[track] open session=" + m_sessionId);
         m_canSend = true;
+        // The capture helper may publish its initial requested keyframe
+        // before the WebRTC track opens. Preserve a first-frame request for
+        // experimental AV1 so the first transmitted frame is decodable.
+        if (m_videoCodec == VideoCodec::AV1) {
+            m_forceKeyframe = true;
+            LogInfo("[codec-pilot] AV1 first transmittable frame requires keyframe session=" +
+                m_sessionId);
+        }
 
         if (m_mode == Mode::DirectCapture) {
             startStreamingThread();
@@ -1409,7 +1449,7 @@ std::vector<std::vector<uint8_t>> WebRtcSender::packetizeVp9(const Vp9EncodedFra
     return packets;
 }
 
-void WebRtcSender::sendVp9PayloadPackets(const std::vector<std::vector<uint8_t>>& vp9Payloads,
+void WebRtcSender::sendRtpVideoPayloadPackets(const std::vector<std::vector<uint8_t>>& vp9Payloads,
     uint32_t rtpTimestamp) {
     std::lock_guard<std::mutex> lock(m_sendMu);
 
@@ -1468,7 +1508,7 @@ void WebRtcSender::sendRtpVp9Frame(const Vp9EncodedFrame& frame) {
         );
     }
 
-    sendVp9PayloadPackets(vp9Payloads, wireTimestamp);
+    sendRtpVideoPayloadPackets(vp9Payloads, wireTimestamp);
 }
 
 
@@ -1664,7 +1704,9 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             " codec=" + m_codecMode +
             " video_codec=" + std::string(
                 m_videoCodec == VideoCodec::H264 ? "h264" :
-                (m_videoCodec == VideoCodec::VP9 ? "vp9" : "vp8")) +
+                (m_videoCodec == VideoCodec::VP9 ? "vp9" :
+                 (m_videoCodec == VideoCodec::H265 ? "h265" :
+                  (m_videoCodec == VideoCodec::AV1 ? "av1" : "vp8")))) +
             " h264_failed=" + std::string(m_h264Failed ? "true" : "false") +
             " mode=" + std::string(m_mode == Mode::ExternalFeed ? "external" : "direct") +
             " can_send=" + std::string(m_canSend ? "true" : "false") +
@@ -1805,7 +1847,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         profile.cpuUsed != m_externalConfiguredCpuUsed ||
         profile.maxQuantizer != m_externalConfiguredMaxQuantizer;
 
-    if (((m_videoCodec == VideoCodec::VP8) || m_h264Failed) && (!m_encoder || sizeChanged)) {
+    if ((m_videoCodec == VideoCodec::VP8) && (!m_encoder || sizeChanged)) {
         m_externalEncoderWidth = vp8Frame.width;
         m_externalEncoderHeight = vp8Frame.height;
         m_externalConfiguredFps = profile.fps;
@@ -1834,7 +1876,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             << " qmax=" << profile.maxQuantizer
             << "\n";
     }
-    else if (((m_videoCodec == VideoCodec::VP8) || m_h264Failed) && profileChanged) {
+    else if ((m_videoCodec == VideoCodec::VP8) && profileChanged) {
         const bool ok = m_encoder->reconfigure(
             profile.fps,
             profile.bitrateKbps,
@@ -2172,6 +2214,231 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 return;
             }
         }
+    }
+
+    // Isolated manual-only HEVC/AV1 trial. Do not feed their compressed
+    // bytes to a VP8/H.264 track, and do not modify existing auto selection.
+    // Media Foundation may report an encoder as hardware but use a hybrid
+    // implementation; qualification depends on live results, not its name.
+    if (m_videoCodec == VideoCodec::H265 || m_videoCodec == VideoCodec::AV1) {
+        if (m_experimentalFailed) return;
+        const bool isHevc = m_videoCodec == VideoCodec::H265;
+        const bool softwareAv1 = m_codecMode == "av1_sw";
+        bool initialEncoderKeyframe = false;
+        bool scaled = false;
+        const I420Frame input = scaleI420ToWebRtcBounds(
+            frame, 1280, 720, &scaled, true);
+        const int encodeFps = std::max(1, std::min(m_fps, 20));
+        const int bitrate = std::max(500, std::min(m_bitrateKbps, 4500));
+        if ((isHevc && !m_h265Encoder) ||
+            (!isHevc && !softwareAv1 && !m_av1Encoder) ||
+#ifdef HI5_ENABLE_LIBAOM_AV1
+            (!isHevc && softwareAv1 && !m_av1SoftwareEncoder) ||
+#endif
+            input.width != m_externalEncoderWidth ||
+            input.height != m_externalEncoderHeight) {
+            m_h265Encoder.reset();
+            m_av1Encoder.reset();
+#ifdef HI5_ENABLE_LIBAOM_AV1
+            m_av1SoftwareEncoder.reset();
+#endif
+            m_experimentalPrimed = false;
+            m_externalEncoderWidth = input.width;
+            m_externalEncoderHeight = input.height;
+            m_externalConfiguredFps = encodeFps;
+            m_externalConfiguredBitrateKbps = bitrate;
+            initialEncoderKeyframe = true;
+            std::string reason;
+            bool ok = false;
+            if (isHevc) {
+                auto enc = std::make_unique<H265MfEncoder>();
+                ok = enc->init(input.width, input.height, encodeFps,
+                    bitrate, true, &reason);
+                if (ok) m_h265Encoder = std::move(enc);
+#ifdef HI5_ENABLE_LIBAOM_AV1
+            } else if (softwareAv1) {
+                auto enc = std::make_unique<hi5::SoftwareAv1EncoderExperiment>();
+                const unsigned int cores = std::thread::hardware_concurrency();
+                const int threads = std::max(1, std::min(8,
+                    static_cast<int>(cores ? cores : 4)));
+                ok = enc->initialize(input.width, input.height, encodeFps,
+                    bitrate, threads, &reason);
+                if (ok) m_av1SoftwareEncoder = std::move(enc);
+#endif
+            } else {
+                auto enc = std::make_unique<Av1MfEncoder>();
+                ok = enc->init(input.width, input.height, encodeFps,
+                    bitrate, true, &reason);
+                if (ok) m_av1Encoder = std::move(enc);
+            }
+            if (!ok) {
+                LogWarn("[codec-pilot] encoder init failed session=" + m_sessionId +
+                    " mode=" + m_codecMode + " reason=" + reason);
+                m_experimentalFailed = true;
+                return; // A negotiated RTP payload type must never change.
+            }
+            LogInfo("[codec-pilot] encoder initialised session=" + m_sessionId +
+                " codec=" + m_codecMode +
+                " size=" + std::to_string(input.width) + "x" +
+                std::to_string(input.height) +
+                " fps=" + std::to_string(encodeFps) +
+                " bitrate_kbps=" + std::to_string(bitrate) +
+                " scaled=" + (scaled ? "1" : "0"));
+        }
+        try {
+            const auto begin = std::chrono::steady_clock::now();
+            std::vector<uint8_t> accessUnit;
+            bool actualKeyframe = false;
+            bool ok = false;
+            std::string reason;
+            // An experimental request for a keyframe does not yet prove
+            // that a Media Foundation transform honoured it. Do not mark
+            // this codec qualified based solely on the requested flag.
+            if (isHevc) {
+                H265EncodedFrame encoded{};
+                ok = m_h265Encoder->encode(input, keyframe, encoded, &reason);
+                accessUnit = std::move(encoded.data);
+                actualKeyframe = encoded.keyframe;
+#ifdef HI5_ENABLE_LIBAOM_AV1
+            } else if (softwareAv1) {
+                hi5::SoftwareAv1Frame frameForEncoder;
+                frameForEncoder.width = input.width;
+                frameForEncoder.height = input.height;
+                frameForEncoder.y = input.y;
+                frameForEncoder.u = input.u;
+                frameForEncoder.v = input.v;
+                std::vector<hi5::SoftwareAv1Packet> encodedPackets;
+                ok = m_av1SoftwareEncoder->encode(frameForEncoder,
+                    keyframe || initialEncoderKeyframe, encodedPackets, &reason);
+                if (ok && !encodedPackets.empty()) {
+                    // This sender uses a single WebRTC frame RTP timestamp.
+                    // Multiple AOM output frames must be handled separately;
+                    // failing closed avoids corrupt timestamps or loss recovery.
+                    if (encodedPackets.size() != 1) {
+                        ok = false;
+                        reason = "libaom returned multiple frames for one input";
+                    } else {
+                        accessUnit = std::move(encodedPackets[0].bytes);
+                        actualKeyframe = encodedPackets[0].keyframe;
+                    }
+                }
+#endif
+            } else {
+                Av1EncodedFrame encoded{};
+                ok = m_av1Encoder->encode(input, keyframe, encoded, &reason);
+                accessUnit = std::move(encoded.data);
+                actualKeyframe = encoded.keyframe;
+            }
+            if (!ok) {
+                LogWarn("[codec-pilot] encode failed codec=" + m_codecMode +
+                    " session=" + m_sessionId + " reason=" + reason);
+                m_experimentalFailed = true;
+                return;
+            }
+            if (accessUnit.empty()) return; // MFT may legitimately buffer.
+            const double encodeMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin).count();
+            std::vector<std::vector<uint8_t>> payloads;
+            if (isHevc) {
+                hi5::HevcRtpPayloads built;
+                ok = hi5::BuildHevcRtpPayloads(accessUnit, 1200, built, &reason);
+                if (ok && !m_experimentalPrimed)
+                    m_experimentalPrimed =
+                        built.hasVps && built.hasSps && built.hasPps &&
+                        built.hasIrap;
+                payloads = std::move(built.packets);
+            } else {
+                hi5::Av1RtpPayloads built;
+                ok = softwareAv1
+                    ? hi5::BuildAv1WebRtcCompatibleRtpPayloads(
+                        accessUnit, 1200, actualKeyframe, built, &reason)
+                    : hi5::BuildAv1MfRtpPayloads(accessUnit, 1200, built, &reason);
+                if (ok && built.hasSequenceHeader)
+                    m_experimentalPrimed = true;
+                payloads = std::move(built.packets);
+            }
+            if (!ok || !m_experimentalPrimed) {
+                if (!isHevc && !accessUnit.empty()) {
+                    // Diagnostic limited to the first 16 compressed bytes,
+                    // emitted only on the first invalid experimental sample.
+                    // No video frames or full encoded buffers are retained.
+                    static constexpr char hex[] = "0123456789abcdef";
+                    std::string prefixHex;
+                    const size_t prefixLength = std::min<size_t>(16, accessUnit.size());
+                    prefixHex.reserve(prefixLength * 2);
+                    for (size_t i = 0; i < prefixLength; ++i) {
+                        const uint8_t b = accessUnit[i];
+                        prefixHex.push_back(hex[b >> 4]);
+                        prefixHex.push_back(hex[b & 15]);
+                    }
+                    reason += " sample_bytes=" + std::to_string(accessUnit.size()) +
+                        " first16_hex=" + prefixHex;
+                }
+                LogWarn("[codec-pilot] missing usable initial keyframe/config or "
+                    "unsupported bitstream codec=" + m_codecMode +
+                    " session=" + m_sessionId + " reason=" + reason);
+                m_experimentalFailed = true;
+                return;
+            }
+            const auto sendBegin = std::chrono::steady_clock::now();
+            sendRtpVideoPayloadPackets(payloads, m_videoRtpClock.stamp());
+            const double sendMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - sendBegin).count();
+            ++m_externalEncodedFrames;
+            ++m_externalSentFrames;
+            m_externalEncodeMsTotal += encodeMs;
+            m_externalEncodeMsMax = std::max(m_externalEncodeMsMax, encodeMs);
+            if (m_externalEncodeMsSamples.size() >= 512)
+                m_externalEncodeMsSamples.erase(m_externalEncodeMsSamples.begin());
+            m_externalEncodeMsSamples.push_back(encodeMs);
+            m_externalSendMsTotal += sendMs;
+            m_externalSendMsMax = std::max(m_externalSendMsMax, sendMs);
+            const auto now = std::chrono::steady_clock::now();
+            if (m_externalNextStatsLog.time_since_epoch().count() == 0)
+                m_externalNextStatsLog = now + std::chrono::seconds(5);
+            if (now >= m_externalNextStatsLog) {
+                LogInfo("[codec-pilot] codec=" + m_codecMode +
+                    " session=" + m_sessionId +
+                    " encoded=" + std::to_string(m_externalEncodedFrames) +
+                    " packets=" + std::to_string(payloads.size()) +
+                    " encode_p95_ms=" +
+                    std::to_string(encodeP95Ms(m_externalEncodeMsSamples)) +
+                    " encode_max_ms=" + std::to_string(m_externalEncodeMsMax) +
+                    " send_max_ms=" + std::to_string(m_externalSendMsMax) +
+                    " claimed_keyframe=" + (actualKeyframe ? "1" : "0") +
+                    " recovery_verified=0");
+                try {
+                    m_signalSend(json{
+                        {"type","stream_encoder_diagnostics"},
+                        {"session_id",m_sessionId},
+                        {"codec",isHevc ? "H265" : "AV1"},
+                        {"encoder_mode",m_codecMode},
+                        {"encoded_frames",m_externalEncodedFrames},
+                        {"sent_frames",m_externalSentFrames},
+                        {"encode_avg_ms",m_externalEncodeMsTotal /
+                            std::max<uint64_t>(1,m_externalEncodedFrames)},
+                        {"encode_max_ms",m_externalEncodeMsMax},
+                        {"encode_p95_ms",encodeP95Ms(m_externalEncodeMsSamples)},
+                        {"send_max_ms",m_externalSendMsMax},
+                        {"width",m_externalEncoderWidth},
+                        {"height",m_externalEncoderHeight},
+                        {"target_fps",m_externalConfiguredFps},
+                        {"bitrate_kbps",m_externalConfiguredBitrateKbps},
+                        {"recovery_verified",false}
+                    }.dump());
+                } catch (...) {}
+                m_externalEncodedFrames = 0;
+                m_externalSentFrames = 0;
+                m_externalEncodeMsTotal = m_externalEncodeMsMax = 0;
+                m_externalSendMsTotal = m_externalSendMsMax = 0;
+                m_externalNextStatsLog = now + std::chrono::seconds(5);
+            }
+        } catch (const std::exception& ex) {
+            LogWarn("[codec-pilot] codec exception session=" + m_sessionId +
+                " codec=" + m_codecMode + " error=" + ex.what());
+            m_experimentalFailed = true;
+        }
+        return;
     }
 
     // Important: if VP9 was negotiated in SDP, never send VP8/H.264 bytes on
