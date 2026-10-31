@@ -2756,7 +2756,10 @@ LogI(
                             msg.contains("viewer_codecs") &&
                             msg["viewer_codecs"].is_array();
                         if (universalAutoEnabled && !viewerCapsValid) {
-                            LogI("[codec-universal] legacy fallback "
+                            // A startup VP9 timing result is not proof that
+                            // this browser supports its RTP stream.
+                            connectionCodec = "vp8";
+                            LogI("[codec-universal] safe fallback "
                                 "reason=viewer_capabilities_missing selected=" +
                                 connectionCodec);
                         }
@@ -2812,7 +2815,7 @@ LogI(
                             const auto selection =
                                 hi5::universal_codec::chooseForConnection(
                                     true, "auto",
-                                    vp9Overloaded ? "vp8" : autoSessionCodec,
+                                    "vp8", // Only a proven cached codec can override.
                                     viewer, candidates,
                                     hi5::universal_codec::Link{}, asyncHw);
                             if (!selection.compatible) {
