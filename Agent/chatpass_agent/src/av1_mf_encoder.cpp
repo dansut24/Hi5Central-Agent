@@ -212,14 +212,65 @@ bool Av1MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool pr
         return false;
     }
 
+    // Chromium's Windows MF encoder skips this specific Intel *hybrid*
+    // AV1 transform, which can advertise encoding but produce unusable
+    // output. Do not select the first MFT blindly.
+    // Source: Chromium media_foundation_video_encode_accelerator_win.cc
+    // kIntelAV1HybridEncoderCLSID.
+    const GUID kUnsupportedIntelHybridAv1Clsid{
+        0x62c053ce, 0x5357, 0x4794,
+        {0x8c, 0x5a, 0xfb, 0xef, 0xfe, 0xff, 0xb8, 0x2d}
+    };
     ComPtr<IMFActivate> chosen;
-    chosen.Attach(activates[0]);
+    UINT32 skippedHybrid = 0;
 
-    for (UINT32 i = 1; i < count; ++i) {
-        if (activates[i]) activates[i]->Release();
+    // Prefer a genuine hardware AV1 MFT, then try eligible software MFTs
+    // if the hardware enumeration contains only the rejected hybrid.
+    for (int pass = 0; pass < 2 && !chosen; ++pass) {
+        if (pass == 1) {
+            if (activates) {
+                for (UINT32 i = 0; i < count; ++i) {
+                    if (activates[i]) activates[i]->Release();
+                }
+                CoTaskMemFree(activates);
+                activates = nullptr;
+            }
+            count = 0;
+            hr = MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_SORTANDFILTER |
+                MFT_ENUM_FLAG_LOCALMFT |
+                MFT_ENUM_FLAG_SYNCMFT |
+                MFT_ENUM_FLAG_ASYNCMFT,
+                &inInfo, &outInfo, &activates, &count);
+            if (FAILED(hr) || !activates) break;
+        }
+        for (UINT32 i = 0; i < count; ++i) {
+            if (!activates[i]) continue;
+            GUID clsid{};
+            if (SUCCEEDED(activates[i]->GetGUID(
+                    MFT_TRANSFORM_CLSID_Attribute, &clsid)) &&
+                IsEqualGUID(clsid, kUnsupportedIntelHybridAv1Clsid)) {
+                ++skippedHybrid;
+                continue;
+            }
+            chosen = activates[i];
+            break;
+        }
     }
-
-    CoTaskMemFree(activates);
+    if (activates) {
+        for (UINT32 i = 0; i < count; ++i) {
+            if (activates[i]) activates[i]->Release();
+        }
+        CoTaskMemFree(activates);
+    }
+    if (!chosen) {
+        if (error) {
+            *error = "No eligible AV1 Media Foundation encoder; skipped " +
+                std::to_string(skippedHybrid) + " known Intel hybrid AV1 MFT(s)";
+        }
+        return false;
+    }
 
     WCHAR* friendly = nullptr;
     UINT32 friendlyLen = 0;

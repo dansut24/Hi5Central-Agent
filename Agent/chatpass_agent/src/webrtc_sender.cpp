@@ -2291,11 +2291,20 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             }
             if (!ok || !m_experimentalPrimed) {
                 if (!isHevc && !accessUnit.empty()) {
-                    // Bounded format diagnostic; does not persist full
-                    // compressed screen content or an encoded frame sample.
-                    const uint8_t header = accessUnit.front();
+                    // Diagnostic limited to the first 16 compressed bytes,
+                    // emitted only on the first invalid experimental sample.
+                    // No video frames or full encoded buffers are retained.
+                    static constexpr char hex[] = "0123456789abcdef";
+                    std::string prefixHex;
+                    const size_t prefixLength = std::min<size_t>(16, accessUnit.size());
+                    prefixHex.reserve(prefixLength * 2);
+                    for (size_t i = 0; i < prefixLength; ++i) {
+                        const uint8_t b = accessUnit[i];
+                        prefixHex.push_back(hex[b >> 4]);
+                        prefixHex.push_back(hex[b & 15]);
+                    }
                     reason += " sample_bytes=" + std::to_string(accessUnit.size()) +
-                        " first_obu_header_flags=" + std::to_string(header & 0x87u);
+                        " first16_hex=" + prefixHex;
                 }
                 LogWarn("[codec-pilot] missing usable initial keyframe/config or "
                     "unsupported bitstream codec=" + m_codecMode +
