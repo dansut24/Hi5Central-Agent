@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -32,6 +34,8 @@ int main() {
     frame.u.assign(static_cast<size_t>(width/2)*(height/2), 128);
     frame.v.assign(static_cast<size_t>(width/2)*(height/2), 128);
     int emitted=0, successfulInputs=0;
+    unsigned firstHeaderSamples=0;
+    unsigned annexBStartFrames=0;
     size_t emittedBytes=0;
     double maxMs=0, totalMs=0;
     for (int i=0;i<45;i++) {
@@ -55,6 +59,19 @@ int main() {
         if (!out.data.empty()) {
             emitted++;
             emittedBytes+=out.data.size();
+            if (firstHeaderSamples < 4) {
+                std::ostringstream hex;
+                hex << std::hex << std::setfill('0');
+                for (size_t j=0;j<std::min<size_t>(16,out.data.size());++j)
+                    hex << std::setw(2) << static_cast<int>(out.data[j]);
+                std::cout << "HEVC_MF_FRAME_HEADER=" << hex.str()
+                          << " bytes=" << out.data.size()
+                          << " claimed_keyframe=" << out.keyframe << "\n";
+                ++firstHeaderSamples;
+            }
+            if (out.data.size() >= 4 && out.data[0] == 0 && out.data[1] == 0 &&
+                (out.data[2] == 1 || (out.data[2] == 0 && out.data[3] == 1)))
+                ++annexBStartFrames;
         }
     }
     encoder.shutdown();
@@ -63,6 +80,7 @@ int main() {
               << " input_frames=" << successfulInputs
               << " encoded_frames=" << emitted
               << " encoded_bytes=" << emittedBytes
+              << " annexb_start_frames=" << annexBStartFrames
               << " encode_avg_ms=" << totalMs/std::max(1,successfulInputs)
               << " encode_max_ms=" << maxMs
               << " synthetic_only=1 live_browser_verified=0\n";
