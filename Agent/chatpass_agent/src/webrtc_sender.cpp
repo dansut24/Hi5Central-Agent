@@ -5,6 +5,7 @@
 #include "h264_scaling_policy.h"
 #include "encoding/hevc_rtp_payload_experimental.h"
 #include "encoding/av1_rtp_payload_experimental.h"
+#include "encoding/av1_mf_output_adapter.h"
 #include "util/log.h"
 
 #include <rtc/rtc.hpp>
@@ -2283,12 +2284,19 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 payloads = std::move(built.packets);
             } else {
                 hi5::Av1RtpPayloads built;
-                ok = hi5::BuildAv1RtpPayloads(accessUnit, 1200, built, &reason);
+                ok = hi5::BuildAv1MfRtpPayloads(accessUnit, 1200, built, &reason);
                 if (ok && built.hasSequenceHeader)
                     m_experimentalPrimed = true;
                 payloads = std::move(built.packets);
             }
             if (!ok || !m_experimentalPrimed) {
+                if (!isHevc && !accessUnit.empty()) {
+                    // Bounded format diagnostic; does not persist full
+                    // compressed screen content or an encoded frame sample.
+                    const uint8_t header = accessUnit.front();
+                    reason += " sample_bytes=" + std::to_string(accessUnit.size()) +
+                        " first_obu_header_flags=" + std::to_string(header & 0x87u);
+                }
                 LogWarn("[codec-pilot] missing usable initial keyframe/config or "
                     "unsupported bitstream codec=" + m_codecMode +
                     " session=" + m_sessionId + " reason=" + reason);
