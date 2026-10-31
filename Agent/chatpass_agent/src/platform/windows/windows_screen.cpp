@@ -1537,8 +1537,12 @@ struct DesktopFrameSource::Impl {
             // two strips only when >=10% faster. No queued frames or new
             // frame-ordering path; safe normal-DXGI experiment only.
             if (!dxgiI420Converter.Convert(
-                    dxgiBgraBuffer.data(), rowPitch, width, height, out, true))
-                throw std::runtime_error("DXGI adaptive libyuv conversion failed");
+                    dxgiBgraBuffer.data(), rowPitch, width, height, out, true)) {
+                // Never drop a frame merely because the opt-in parallel
+                // experiment failed. Re-run the established serial conversion.
+                LogWarn("[capture] DXGI adaptive conversion failed; retrying proven serial path");
+                bgraToI420(dxgiBgraBuffer.data(), rowPitch, width, height, out);
+            }
             if (dxgiI420Converter.Qualified() && !dxgiI420ChoiceLogged) {
                 dxgiI420ChoiceLogged = true;
                 LogInfo("[capture] DXGI I420 adaptive decision=" +
@@ -1587,6 +1591,9 @@ struct DesktopFrameSource::Impl {
                 " cpu_copy_avg_ms=" + std::to_string(dxgiCpuCopyTotalMs / count) +
                 " cursor_avg_ms=" + std::to_string(dxgiCursorTotalMs / count) +
                 " convert_avg_ms=" + std::to_string(dxgiConvertTotalMs / count) +
+                " adaptive_enabled=" + std::string(Hi5DxgiAdaptiveI420Enabled() ? "1" : "0") +
+                " adaptive_mode=" + std::string(Hi5DxgiAdaptiveI420Enabled() && dxgiI420Converter.ParallelLast() ? "two_strip" : "serial") +
+                " adaptive_qualified=" + std::string(dxgiI420Converter.Qualified() ? "1" : "0") +
                 " cache_copy_avg_ms=" + std::to_string(dxgiCacheCopyTotalMs / count) +
                 " publish_copy_avg_ms=" + std::to_string(dxgiPublishCopyTotalMs / count));
             dxgiProfileSamples = 0;
