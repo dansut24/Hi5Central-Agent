@@ -607,7 +607,12 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                             " viewer_packets_lost=" + std::to_string(bounded("packets_lost", 1e9)) +
                             " viewer_packets_received=" + std::to_string(bounded("packets_received", 1e9)) +
                             " viewer_bytes_received=" + std::to_string(bounded("bytes_received", 1e12)) +
+                            " viewer_frames_received=" + std::to_string(bounded("frames_received", 1e9)) +
+                            " viewer_frames_assembled=" + std::to_string(bounded("frames_assembled", 1e9)) +
                             " viewer_frames_decoded=" + std::to_string(bounded("frames_decoded", 1e9)) +
+                            " viewer_frames_dropped=" + std::to_string(bounded("frames_dropped", 1e9)) +
+                            " viewer_frames_rendered=" + std::to_string(bounded("frames_rendered", 1e9)) +
+                            " viewer_codec_pt=" + std::to_string(bounded("codec_pt", 127.0)) +
                             " viewer_keyframes_decoded=" + std::to_string(bounded("keyframes_decoded", 1e8)));
                         return;
                     }
