@@ -7,23 +7,35 @@ SignalingClient::SignalingClient(std::string url)
 }
 
 void SignalingClient::connect() {
-    m_ws = std::make_shared<rtc::WebSocket>();
-
-    m_ws->onOpen([this]() {
-        if (m_openHandler) m_openHandler();
+    auto next = std::make_shared<rtc::WebSocket>();
+    const auto generation = m_generation.fetch_add(1) + 1;
+    next->onOpen([this, generation]() {
+        if (m_generation.load() == generation && m_openHandler) m_openHandler();
         });
-
-    m_ws->onMessage([this](rtc::message_variant data) {
+    next->onMessage([this, generation](rtc::message_variant data) {
+        if (m_generation.load() != generation) return;
         if (const auto* s = std::get_if<std::string>(&data)) {
             if (m_messageHandler) m_messageHandler(*s);
         }
         });
-
-    m_ws->onClosed([this]() {
-        if (m_closedHandler) m_closedHandler();
+    next->onClosed([this, generation]() {
+        if (m_generation.load() == generation && m_closedHandler)
+            m_closedHandler();
         });
 
-    m_ws->open(m_url);
+    std::shared_ptr<rtc::WebSocket> previous;
+    {
+        std::lock_guard<std::mutex> lock(m_sendMu);
+        previous = std::move(m_ws);
+        m_ws = next;
+        if (previous) m_retired.push_back(previous);
+        // A socket generation is retired only after it cannot be current.
+        if (m_retired.size() > 16) m_retired.erase(m_retired.begin());
+    }
+    if (previous) {
+        try { previous->close(); } catch (...) {}
+    }
+    next->open(m_url);
 }
 
 void SignalingClient::send(const std::string& text) {

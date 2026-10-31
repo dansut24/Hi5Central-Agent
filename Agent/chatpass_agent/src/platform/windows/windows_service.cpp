@@ -3,6 +3,7 @@
 #include "agent_version.h"
 
 #include "signaling_client.h"
+#include "signaling_reconnect_policy.h"
 #include "webrtc_sender.h"
 #include "codec_capabilities.h"
 #include "codec_policy.h"
@@ -2628,6 +2629,7 @@ LogI(
                     };
 
                 signaling_->onOpen([this, ident]() {
+                    reconnectPending_.store(false);
                     signalingConnected_.store(true);
                     LogI("websocket connected");
                     if (signaling_) {
@@ -3153,19 +3155,57 @@ LogI(
                         StopSession(nextId);
                     }
                     CleanupOrphanStreamerProcesses();
-                    stop_.store(true);
+                    // A transient signalling/API restart must never stop the
+                    // Windows service. The existing Worker preserves inventory
+                    // and patch threads; only the WebSocket is reconnected.
+                    if (!stop_.load()) reconnectPending_.store(true);
                     });
 
-                signaling_->connect();
+                try {
+                    signaling_->connect();
+                } catch (const std::exception& ex) {
+                    LogW(std::string("[signaling] startup WebSocket unavailable: ") +
+                         ex.what());
+                    reconnectPending_.store(true);
+                }
                 StartInventoryLoop(ident);
 
                 StartPatchDiscoveryLoop(ident);
                 LogI("[patchhost] standalone PatchHost architecture active; legacy in-process patch worker disabled");
 
                 auto nextUiCleanupSweep = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                auto nextSignalRetry = std::chrono::steady_clock::now();
+                auto lastSignalAttempt = std::chrono::steady_clock::now();
+                int signalRetryCount = 0;
                 while (!stop_.load()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     const auto now = std::chrono::steady_clock::now();
+                    if (signalingConnected_.load()) {
+                        signalRetryCount = 0;
+                    } else if (now - lastSignalAttempt > std::chrono::seconds(20)) {
+                        // Handle a blackholed handshake that emitted neither
+                        // onOpen nor onClosed. Old WebSocket generations are
+                        // discarded before the next authenticated session.
+                        reconnectPending_.store(true);
+                    }
+                    if (hi5::signaling::shouldReconnect(
+                            stop_.load(), signalingConnected_.load(),
+                            reconnectPending_.load(), now >= nextSignalRetry)) {
+                        reconnectPending_.store(false);
+                        const int delay = hi5::signaling::reconnectDelaySeconds(
+                            ++signalRetryCount);
+                        nextSignalRetry = now + std::chrono::seconds(delay);
+                        lastSignalAttempt = now;
+                        try {
+                            signaling_->connect();
+                            LogI("[signaling] reconnection attempt=" +
+                                 std::to_string(signalRetryCount) +
+                                 " next_backoff_seconds=" + std::to_string(delay));
+                        } catch (const std::exception& ex) {
+                            reconnectPending_.store(true);
+                            LogW(std::string("[signaling] reconnect setup failed: ") + ex.what());
+                        }
+                    }
                     if (now >= nextUiCleanupSweep) {
                         nextUiCleanupSweep = now + std::chrono::seconds(5);
                         bool hasSessions = false;
@@ -8033,6 +8073,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             ChatController chatController_;
             std::unique_ptr<SignalingClient> signaling_;
             std::atomic<bool> signalingConnected_{ false };
+            std::atomic<bool> reconnectPending_{ false };
             std::thread inventoryThread_;
 
             std::mutex sessionsMu_;
