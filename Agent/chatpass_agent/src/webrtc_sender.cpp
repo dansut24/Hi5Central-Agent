@@ -2215,8 +2215,10 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 LogInfo(
                     "[h264] encoder created session=" + m_sessionId +
                     " sharp_text_trial=" + std::string(h264SharpTextTrialEnabled() ? "1" : "0") +
-                    " filtered_scaler=" + std::string(h264SharpTextTrialEnabled() &&
-                        readEnvInt("HI5_H264_SHARP_FILTER", 1, 0, 1) == 1 ? "bilinear" : "nearest") +
+                    " filtered_scaler=" + std::string(hi5::quality::UseFilteredH264Scaling(
+                        h264SharpTextTrialEnabled(),
+                        readEnvInt("HI5_H264_SHARP_FILTER", 1, 0, 1) == 1,
+                        readEnvInt("HI5_H264_FILTERED_720P", 0, 0, 1) == 1) ? "bilinear" : "nearest") +
                     " name=" + m_h264Encoder->encoderName() +
                     " source=" + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
                     " encoded_size=" + std::to_string(h264Frame.width) + "x" + std::to_string(h264Frame.height) +
