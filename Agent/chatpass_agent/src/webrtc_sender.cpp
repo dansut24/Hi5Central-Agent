@@ -2,6 +2,7 @@
 #include "codec_auto_fps.h"
 #include "frame_source.h"
 #include "frame_scale_bilinear.h"
+#include "h264_scaling_policy.h"
 #include "util/log.h"
 
 #include <rtc/rtc.hpp>
@@ -165,8 +166,9 @@ namespace {
             : readEnvInt("HI5_H264_MAX_HEIGHT", 720, 2, 720);
         // Opt-in filtered scaler only for sharp-text H.264. The generic
         // nearest-neighbour scaler remains unchanged for proven codecs.
-        const bool filtered = sharp &&
-            readEnvInt("HI5_H264_SHARP_FILTER", 1, 0, 1) == 1;
+        const bool filtered = hi5::quality::UseFilteredH264Scaling(sharp,
+            readEnvInt("HI5_H264_SHARP_FILTER", 1, 0, 1) == 1,
+            readEnvInt("HI5_H264_FILTERED_720P", 0, 0, 1) == 1);
         return scaleI420ToWebRtcBounds(src, maxW, maxH, scaledOut, filtered);
     }
 
