@@ -51,12 +51,12 @@ inline ConnectionSelection chooseForConnection(
             "end-to-end qualified VP9 for this device and Viewer"};
         return {"vp8",true,true,"qualified VP8"};
     }
-    // The previous software VP9 benchmark is advisory but still useful.
-    // Never offer a codec that the connected Viewer cannot decode.
-    if(legacyAutoMode=="vp9_sw" && supports(viewer,"vp9"))
-        return {"vp9_sw",false,true,"legacy verified software VP9 fallback"};
+    // A short synthetic VP9 startup benchmark does not establish that this
+    // Viewer can decode a sustained full-resolution session. Only select a
+    // different codec automatically when the encoder, real decoder and RTP
+    // keyframe recovery have all been proven and cached above.
     if(supports(viewer,"vp8"))
-        return {"vp8",false,true,"safe software VP8 fallback"};
+        return {"vp8",false,true,"safe VP8 until end-to-end qualification"};
     // If a Viewer advertises neither VP8 nor a fully qualified codec, reject
     // BEFORE SDP. Do not substitute a different RTP payload mid-session.
     return {"",false,false,"no mutually qualified receive codec"};

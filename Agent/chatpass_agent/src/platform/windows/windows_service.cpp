@@ -2749,14 +2749,17 @@ LogI(
                         // otherwise it is immediately closed, leaving no visible notice.
                         std::string connectionCodec = autoSessionCodec;
                         const bool universalAutoEnabled =
-                            ReadConfigString("HI5_CODEC", "auto") == "auto" &&
+                            hi5::SelectCodecPolicy().requestedMode == "auto" &&
                             ReadConfigInt("HI5_UNIVERSAL_CODEC_AUTO", 0, 0, 1) == 1;
                         const bool viewerCapsValid =
                             msg.value("viewer_caps_v1", false) &&
                             msg.contains("viewer_codecs") &&
                             msg["viewer_codecs"].is_array();
                         if (universalAutoEnabled && !viewerCapsValid) {
-                            LogI("[codec-universal] legacy fallback "
+                            // A startup VP9 timing result is not proof that
+                            // this browser supports its RTP stream.
+                            connectionCodec = "vp8";
+                            LogI("[codec-universal] safe fallback "
                                 "reason=viewer_capabilities_missing selected=" +
                                 connectionCodec);
                         }
@@ -2812,7 +2815,7 @@ LogI(
                             const auto selection =
                                 hi5::universal_codec::chooseForConnection(
                                     true, "auto",
-                                    vp9Overloaded ? "vp8" : autoSessionCodec,
+                                    "vp8", // Only a proven cached codec can override.
                                     viewer, candidates,
                                     hi5::universal_codec::Link{}, asyncHw);
                             if (!selection.compatible) {
@@ -7208,7 +7211,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     bitrateKbps,
                     WebRtcSender::Mode::ExternalFeed,
                     ([&]() {
-                        const std::string requestedCodec = ReadConfigString("HI5_CODEC", "auto");
+                        const std::string requestedCodec = hi5::SelectCodecPolicy().requestedMode;
                         // Explicit operator choices take precedence. Automatic
                         // selection uses the successfully probed codec rather
                         // than the previous hardcoded H.264 experimental path.
@@ -7230,7 +7233,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         })()
                 );
 
-                if (ReadConfigString("HI5_CODEC", "auto") == "auto" &&
+                if (hi5::SelectCodecPolicy().requestedMode == "auto" &&
                     autoSessionCodec == "vp9_sw") {
                     ctx->sender->setEncoderOverloadHandler([this, sid = sessionId]() {
                         if (!autoVp9Overloaded_.exchange(true)) {
