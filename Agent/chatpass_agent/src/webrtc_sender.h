@@ -5,6 +5,7 @@
 #include "encoding/sustained_encoder_health.h"
 #include "codec_qualification_keyframe.h"
 #include "h264_mf_encoder.h"
+#include "rtp_video_wall_clock.h"
 #include "input_injector.h"
 
 #include <rtc/rtc.hpp>
@@ -133,6 +134,7 @@ private:
 
     uint32_t m_ssrc = 0;
     uint16_t m_sequence = 0;
+    RtpVideoWallClock m_videoRtpClock; // Actual frame delivery cadence, shared across codecs.
     int m_payloadType = 96;
 
     Mode m_mode = Mode::DirectCapture;

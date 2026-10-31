@@ -1424,6 +1424,7 @@ void WebRtcSender::sendVp9PayloadPackets(const std::vector<std::vector<uint8_t>>
 
 void WebRtcSender::sendRtpVp9Frame(const Vp9EncodedFrame& frame) {
     const auto vp9Payloads = packetizeVp9(frame);
+    const uint32_t wireTimestamp = m_videoRtpClock.stamp();
 
     static std::atomic<uint64_t> vp9FrameLogCounter{ 0 };
     const uint64_t c = ++vp9FrameLogCounter;
@@ -1433,12 +1434,13 @@ void WebRtcSender::sendRtpVp9Frame(const Vp9EncodedFrame& frame) {
             "[vp9] rtp packetize frame=" + std::to_string(c) +
             " payload_count=" + std::to_string(vp9Payloads.size()) +
             " bytes=" + std::to_string(frame.data.size()) +
-            " ts=" + std::to_string(frame.timestamp90k) +
+            " ts=" + std::to_string(wireTimestamp) +
+            " encoder_ts=" + std::to_string(frame.timestamp90k) +
             " keyframe=" + std::string(frame.keyframe ? "1" : "0")
         );
     }
 
-    sendVp9PayloadPackets(vp9Payloads, frame.timestamp90k);
+    sendVp9PayloadPackets(vp9Payloads, wireTimestamp);
 }
 
 
@@ -1504,6 +1506,7 @@ std::vector<std::vector<uint8_t>> WebRtcSender::splitH264NalUnits(const std::vec
 
 void WebRtcSender::sendRtpH264Frame(const H264EncodedFrame& frame) {
     const auto nalUnits = splitH264NalUnits(frame.data);
+    const uint32_t wireTimestamp = m_videoRtpClock.stamp();
     static std::atomic<uint64_t> h264FrameLogCounter{ 0 };
     const uint64_t c = ++h264FrameLogCounter;
     if (c <= 5 || (c % 60) == 0) {
@@ -1525,11 +1528,12 @@ void WebRtcSender::sendRtpH264Frame(const H264EncodedFrame& frame) {
             " sps=" + std::to_string(sps) +
             " pps=" + std::to_string(pps) +
             " idr=" + std::to_string(idr) +
-            " ts=" + std::to_string(frame.timestamp90k) +
+            " ts=" + std::to_string(wireTimestamp) +
+            " encoder_ts=" + std::to_string(frame.timestamp90k) +
             " keyframe=" + std::string(frame.keyframe ? "1" : "0")
         );
     }
-    sendH264NalPayloads(nalUnits, frame.timestamp90k);
+    sendH264NalPayloads(nalUnits, wireTimestamp);
 }
 
 void WebRtcSender::sendH264NalPayloads(const std::vector<std::vector<uint8_t>>& nalUnits, uint32_t rtpTimestamp) {
@@ -2480,10 +2484,10 @@ void WebRtcSender::sendExternalEncodedVp8(const uint8_t* data,
     frame.rtpTimestamp = rtpTimestamp;
 
     const auto vp8Payloads = packetizeVp8(frame);
-    sendVp8PayloadPackets(vp8Payloads, frame.rtpTimestamp);
+    sendVp8PayloadPackets(vp8Payloads, m_videoRtpClock.stamp());
 }
 
 void WebRtcSender::sendRtpVp8Frame(const EncodedFrame& frame) {
     const auto vp8Payloads = packetizeVp8(frame);
-    sendVp8PayloadPackets(vp8Payloads, frame.rtpTimestamp);
+    sendVp8PayloadPackets(vp8Payloads, m_videoRtpClock.stamp());
 }
