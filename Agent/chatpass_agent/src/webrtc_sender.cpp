@@ -800,6 +800,32 @@ void WebRtcSender::setExternalStreamHint(int streamMode, int targetFps, bool bac
 
     m_externalHintBackstage = backstageMode;
     m_externalHintSecure = secureDesktop;
+
+    // The Viewer cannot infer intentional desktop idleness from a zero
+    // decoded-FPS sample alone: missing RTP and a stopped screen look alike.
+    // Send an authenticated, content-free capture state over the established
+    // WebRTC control channel; refresh every five seconds so stale messages
+    // cannot hide a genuine media stall. Retry when the channel is not open.
+    const int currentMode = m_externalHintMode.load();
+    if (currentMode != m_lastCaptureStatusMode ||
+        m_lastCaptureStatusSentAt.time_since_epoch().count() == 0 ||
+        now - m_lastCaptureStatusSentAt >= std::chrono::seconds(5)) {
+        const char* modeLabel = currentMode == 0 ? "idle" :
+                                currentMode == 1 ? "active" : "motion";
+        try {
+            const json status = {
+                {"type", "stream_capture_status"},
+                {"mode", modeLabel},
+                {"target_fps", requestedFps}
+            };
+            if (sendControlMessage(status)) {
+                m_lastCaptureStatusMode = currentMode;
+                m_lastCaptureStatusSentAt = now;
+            }
+        } catch (...) {
+            // Telemetry must never block capture or remote input.
+        }
+    }
 }
 
 void WebRtcSender::createInputDataChannel() {

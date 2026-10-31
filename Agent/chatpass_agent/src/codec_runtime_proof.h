@@ -37,6 +37,7 @@ class RuntimeProofStore {
         unsigned int sent = 0;
         double maxEncodeMs = 0;
         double p95EncodeMs = 0;
+        unsigned int consecutiveHealthyWindows = 0;
         std::int64_t lastReportUnix = 0;
         // A startup IDR is not evidence that the decoder can recover later.
         // Require a SECOND decoded keyframe after a later observation.
@@ -68,10 +69,22 @@ public:
         evidence.last=metric;
         evidence.encoded=std::min(100000u,evidence.encoded+metric.frames);
         evidence.sent=std::min(100000u,evidence.sent+metric.sent);
-        evidence.maxEncodeMs=std::max(evidence.maxEncodeMs,metric.maxEncodeMs);
-        // The sender sends an exact rolling-window p95 on each report.
-        // Keeping the maximum of old p95 readings would permanently poison
-        // a healthy 2fps idle stream after one ten-frame sample spikes.
+        // Qualify on sustained live encoder headroom, not the all-time worst
+        // startup frame. One cold-start 77 ms output must not permanently
+        // disqualify a healthy Intel Quick Sync stream. Equally, one good
+        // frame after sustained overload is not enough to qualify it.
+        // Retain the SAME strict 20 FPS / 75%-p95 / 150%-worst limits:
+        // the change is two consecutive passing telemetry windows.
+        constexpr double kQualificationIntervalMs = 1000.0 / 20.0;
+        const bool healthyWindow =
+            metric.p95EncodeMs < kQualificationIntervalMs * 0.75 &&
+            metric.maxEncodeMs < kQualificationIntervalMs * 1.5;
+        evidence.consecutiveHealthyWindows = healthyWindow
+            ? std::min(12u, evidence.consecutiveHealthyWindows + 1)
+            : 0u;
+        evidence.maxEncodeMs=metric.maxEncodeMs;
+        // Reported p95 is measured from the sender's rolling frame samples,
+        // not inferred from its maximum or reset on an idle transition.
         evidence.p95EncodeMs=metric.p95EncodeMs;
         evidence.lastReportUnix=timestamp;
     }
@@ -101,6 +114,8 @@ public:
             return reject("encoder_decoder_resolution_mismatch");
         if(e.maxEncodeMs<=0 || e.p95EncodeMs<=0)
             return reject("measured_encoder_latency_missing");
+        if(e.consecutiveHealthyWindows<2)
+            return reject("awaiting_two_healthy_encoder_windows");
         // VP9's current "prefer hardware" MFT path may select a software
         // transform. Until it exposes actual hardware-only MFT identity,
         // NEVER label a VP9 result as GPU accelerated.
