@@ -43,6 +43,17 @@ namespace {
         }();
         return enabled;
     }
+    // DXGI trial is separately opt-in. The existing serial conversion stays
+    // default for customer devices until benchmarked on a real Dell session.
+    static bool Hi5DxgiAdaptiveI420Enabled() {
+        static const bool enabled = []() {
+            char value[12]{};
+            const DWORD n = GetEnvironmentVariableA(
+                "HI5_DXGI_ADAPTIVE_I420", value, static_cast<DWORD>(sizeof(value)));
+            return n == 1 && value[0] == '1';
+        }();
+        return enabled;
+    }
     static bool Hi5CompositeCursorEnabled() {
         static const bool enabled = []() {
             char buf[16]{};
@@ -806,6 +817,11 @@ struct DesktopFrameSource::Impl {
     std::vector<uint8_t> wgcBgraBuffer;
     hi5::WgcAdaptiveI420Converter wgcI420Converter;
     bool wgcI420ChoiceLogged = false;
+    // Reuse the already tested, pixel-identical serial/two-strip libyuv
+    // converter in DXGI only when the operator enables this experiment.
+    hi5::WgcAdaptiveI420Converter dxgiI420Converter;
+    bool dxgiI420ChoiceLogged = false;
+    std::vector<uint8_t> dxgiBgraBuffer;
     uint64_t gdiProfileSamples = 0;
     double gdiCopyMs = 0;
     double gdiConvertMs = 0;
@@ -1501,22 +1517,44 @@ struct DesktopFrameSource::Impl {
         const auto dxgiMapEnd = std::chrono::steady_clock::now();
 
         const int rowPitch = static_cast<int>(mapped.RowPitch);
-        std::vector<uint8_t> bgra(static_cast<size_t>(rowPitch) * static_cast<size_t>(height));
-        std::memcpy(bgra.data(), mapped.pData, bgra.size());
+        dxgiBgraBuffer.resize(static_cast<size_t>(rowPitch) * static_cast<size_t>(height));
+        std::memcpy(dxgiBgraBuffer.data(), mapped.pData, dxgiBgraBuffer.size());
         context->Unmap(staging.Get(), 0);
         const auto dxgiCpuCopyEnd = std::chrono::steady_clock::now();
 
         const DisplayInfo d = currentDisplayInfoLocked();
-        if (compositeCursorBgraDxgiRoi(d.x, d.y, width, height, bgra, rowPitch)) {
+        if (compositeCursorBgraDxgiRoi(d.x, d.y, width, height, dxgiBgraBuffer, rowPitch)) {
             ++dxgiRoiCursorFrames;
         } else {
             ++dxgiFallbackCursorFrames;
-            compositeCursorBgra(d.x, d.y, width, height, bgra, rowPitch);
+            compositeCursorBgra(d.x, d.y, width, height, dxgiBgraBuffer, rowPitch);
         }
         const auto dxgiCursorEnd = std::chrono::steady_clock::now();
 
         I420Frame out;
-        bgraToI420(bgra.data(), rowPitch, width, height, out);
+        if (Hi5DxgiAdaptiveI420Enabled()) {
+            // Eight sampled frames (four serial, four parallel), then use
+            // two strips only when >=10% faster. No queued frames or new
+            // frame-ordering path; safe normal-DXGI experiment only.
+            if (!dxgiI420Converter.Convert(
+                    dxgiBgraBuffer.data(), rowPitch, width, height, out, true)) {
+                // Never drop a frame merely because the opt-in parallel
+                // experiment failed. Re-run the established serial conversion.
+                LogWarn("[capture] DXGI adaptive conversion failed; retrying proven serial path");
+                bgraToI420(dxgiBgraBuffer.data(), rowPitch, width, height, out);
+            }
+            if (dxgiI420Converter.Qualified() && !dxgiI420ChoiceLogged) {
+                dxgiI420ChoiceLogged = true;
+                LogInfo("[capture] DXGI I420 adaptive decision=" +
+                    std::string(dxgiI420Converter.UsingParallel() ? "two_strip" : "serial") +
+                    " serial_trial_avg_ms=" +
+                    std::to_string(dxgiI420Converter.SerialTrialAvgMs()) +
+                    " parallel_trial_avg_ms=" +
+                    std::to_string(dxgiI420Converter.ParallelTrialAvgMs()));
+            }
+        } else {
+            bgraToI420(dxgiBgraBuffer.data(), rowPitch, width, height, out);
+        }
         const auto dxgiConvertEnd = std::chrono::steady_clock::now();
 
         lastFrame = std::move(out);
@@ -1553,6 +1591,9 @@ struct DesktopFrameSource::Impl {
                 " cpu_copy_avg_ms=" + std::to_string(dxgiCpuCopyTotalMs / count) +
                 " cursor_avg_ms=" + std::to_string(dxgiCursorTotalMs / count) +
                 " convert_avg_ms=" + std::to_string(dxgiConvertTotalMs / count) +
+                " adaptive_enabled=" + std::string(Hi5DxgiAdaptiveI420Enabled() ? "1" : "0") +
+                " adaptive_mode=" + std::string(Hi5DxgiAdaptiveI420Enabled() && dxgiI420Converter.ParallelLast() ? "two_strip" : "serial") +
+                " adaptive_qualified=" + std::string(dxgiI420Converter.Qualified() ? "1" : "0") +
                 " cache_copy_avg_ms=" + std::to_string(dxgiCacheCopyTotalMs / count) +
                 " publish_copy_avg_ms=" + std::to_string(dxgiPublishCopyTotalMs / count));
             dxgiProfileSamples = 0;
