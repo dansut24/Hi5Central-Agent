@@ -5,15 +5,35 @@ on:
     paths:
       - 'Agent/chatpass_agent/tests/windows_av1_mf_output_probe.cpp'
       - 'Agent/chatpass_agent/src/av1_mf_encoder.*'
+      - 'Agent/chatpass_agent/src/encoding/av1_ivf_experimental.h'
+      - 'Agent/chatpass_agent/tests/av1_ivf_extraction_test.cpp'
       - '.github/workflows/windows-av1-mf-output-probe.yml'
 permissions:
   contents: read
 jobs:
+  ivf-test-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify IVF extraction and RTP on Linux
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror Agent/chatpass_agent/tests/av1_ivf_extraction_test.cpp -o /tmp/ivf_test
+          /tmp/ivf_test
   standalone:
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Validate IVF container extraction and RTP on Windows
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio not found" }
+          $devcmd = Join-Path $vs 'Common7\\Tools\\VsDevCmd.bat'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W4 /WX Agent/chatpass_agent/tests/av1_ivf_extraction_test.cpp /Fe:ivf_test.exe && ivf_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "AV1 IVF extraction unit test failed" }
       - name: Compile standalone AV1 Media Foundation output probe
         shell: pwsh
         run: |
