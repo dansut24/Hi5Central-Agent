@@ -6,7 +6,9 @@ on:
     paths:
       - 'Agent/chatpass_agent/tests/windows_codec_matrix.cpp'
       - 'Agent/chatpass_agent/tests/av1_rtp_payload_test.cpp'
+      - 'Agent/chatpass_agent/tests/hevc_rtp_payload_test.cpp'
       - 'Agent/chatpass_agent/src/encoding/av1_rtp_payload_experimental.h'
+      - 'Agent/chatpass_agent/src/encoding/hevc_rtp_payload_experimental.h'
       - 'Agent/chatpass_agent/src/av1_mf_encoder.cpp'
       - 'Agent/chatpass_agent/src/h265_mf_encoder.cpp'
       - 'Agent/chatpass_agent/src/h265_mf_encoder.h'
@@ -16,7 +18,9 @@ on:
     paths:
       - 'Agent/chatpass_agent/tests/windows_codec_matrix.cpp'
       - 'Agent/chatpass_agent/tests/av1_rtp_payload_test.cpp'
+      - 'Agent/chatpass_agent/tests/hevc_rtp_payload_test.cpp'
       - 'Agent/chatpass_agent/src/encoding/av1_rtp_payload_experimental.h'
+      - 'Agent/chatpass_agent/src/encoding/hevc_rtp_payload_experimental.h'
       - 'Agent/chatpass_agent/src/av1_mf_encoder.cpp'
       - 'Agent/chatpass_agent/src/h265_mf_encoder.cpp'
       - 'Agent/chatpass_agent/src/h265_mf_encoder.h'
@@ -51,6 +55,15 @@ jobs:
           $cmd = 'call "' + $vcvars + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 Agent/chatpass_agent/tests/av1_rtp_payload_test.cpp /Fe:dist\av1_rtp_payload_test.exe && dist\av1_rtp_payload_test.exe'
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "experimental AV1 packetization test failed" }
+      - name: Validate HEVC RFC 7798 packetizer with MSVC
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $vcvars = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $cmd = 'call "' + $vcvars + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /W3 /O2 Agent/chatpass_agent/tests/hevc_rtp_payload_test.cpp /Fe:dist\hevc_rtp_payload_test.exe && dist\hevc_rtp_payload_test.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "experimental HEVC packetization test failed" }
       - name: Probe H264 HEVC VP9 AV1 synthetic encoding
         shell: pwsh
         run: |
@@ -77,6 +90,7 @@ jobs:
             dist/windows-codec-hardware-only.txt
             dist/windows-codec-hardware-1080p.txt
             dist/av1_rtp_payload_test.exe
+            dist/hevc_rtp_payload_test.exe
             dist/windows_codec_matrix.exe
           retention-days: 14
           if-no-files-found: error

@@ -17,7 +17,16 @@ static void check(const char* input, const char* expected) {
     const auto decision = hi5::SelectCodecPolicy();
     assert(decision.requestedMode == expected);
 }
+static void setLiveExperiment(bool enabled) {
+#ifdef _WIN32
+    assert(_putenv_s("HI5_EXPERIMENTAL_LIVE_CODECS", enabled ? "1" : "") == 0);
+#else
+    if (enabled) assert(setenv("HI5_EXPERIMENTAL_LIVE_CODECS", "1", 1) == 0);
+    else assert(unsetenv("HI5_EXPERIMENTAL_LIVE_CODECS") == 0);
+#endif
+}
 int main() {
+    setLiveExperiment(false);
     check(nullptr, "auto");
     check("", "auto");
     check("$null", "auto");
@@ -30,6 +39,14 @@ int main() {
     check("h264_sw", "h264_sw");
     check("vp8", "vp8");
     check("av1", "vp8"); // Unsupported live AV1 must not be forced.
+    check("av1_hw", "vp8");
+    check("h265_hw", "vp8");
+    setLiveExperiment(true);
+    check("av1_hw", "av1_hw");
+    check(" H265_HW ", "h265_hw");
+    assert(!hi5::SelectCodecPolicy().stable);
+    setLiveExperiment(false);
+    check("h265_hw", "vp8");
     check("gibberish", "vp8");
     setCodec(nullptr);
     std::cout << "CODEC_POLICY_ENV_NORMALIZATION_PASSED\n";

@@ -47,7 +47,10 @@ namespace hi5 {
             requested == "none") requested = "auto";
         // Unsupported operator values fail closed to the stable RTP sender,
         // never to an unqualified hardware codec.
-        const bool recognized = requested == "auto" || requested == "vp8" ||
+        const bool experimental = getenvString("HI5_EXPERIMENTAL_LIVE_CODECS") == "1";
+        const bool recognized = (experimental &&
+            (requested == "av1_hw" || requested == "h265_hw")) ||
+            requested == "auto" || requested == "vp8" ||
             requested == "vp9" || requested == "vp9_hw" ||
             requested == "vp9_sw" || requested == "h264" ||
             requested == "h264_hw" || requested == "h264_sw";
@@ -55,6 +58,17 @@ namespace hi5 {
 
         CodecDecision decision;
         decision.requestedMode = requested;
+
+        if (requested == "av1_hw" || requested == "h265_hw") {
+            decision.selectedCodec = requested == "av1_hw" ? "av1" : "h265";
+            decision.encoder = "mediafoundation-experimental";
+            decision.fps = 20;
+            decision.bitrateKbps = 4500;
+            decision.hardware = true; // preference; actual encoder must be probed
+            decision.stable = false;
+            decision.reason = "Explicit isolated RTP experiment, never automatic";
+            return decision;
+        }
 
         if (requested == "vp8") {
             decision.selectedCodec = "vp8";

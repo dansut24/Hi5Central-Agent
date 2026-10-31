@@ -1,4 +1,4 @@
-﻿#include "service/service_main.h"
+#include "service/service_main.h"
 #include "agent_identity.h"
 #include "agent_version.h"
 
@@ -2755,6 +2755,38 @@ LogI(
                             msg.value("viewer_caps_v1", false) &&
                             msg.contains("viewer_codecs") &&
                             msg["viewer_codecs"].is_array();
+                        // Manual HEVC/AV1 trials are per-session only. A
+                        // Viewer without verified receive advertisement must
+                        // NEVER get experimental SDP, even when the operator
+                        // has explicitly requested the codec on the Agent.
+                        const std::string explicitPilot =
+                            hi5::SelectCodecPolicy().requestedMode;
+                        if (explicitPilot == "h265_hw" || explicitPilot == "av1_hw") {
+                            const std::string required =
+                                explicitPilot == "h265_hw" ? "h265" : "av1";
+                            bool receiverAdvertised = false;
+                            if (viewerCapsValid) {
+                                for (const auto& advertised : msg["viewer_codecs"]) {
+                                    if (advertised.is_string() &&
+                                        hi5::universal_codec::normalizeCodec(
+                                            advertised.get<std::string>()) == required)
+                                        receiverAdvertised = true;
+                                }
+                            }
+                            if (!receiverAdvertised) {
+                                LogW("[codec-pilot] rejecting incompatible/missing " +
+                                    required + " Viewer capabilities before SDP");
+                                sendFn(json{
+                                    {"type","viewer_error"},
+                                    {"session_id",sessionId},
+                                    {"error","Experimental video codec not advertised by Viewer"}
+                                }.dump());
+                                return;
+                            }
+                            connectionCodec = explicitPilot;
+                            LogI("[codec-pilot] receiver advertised " + required +
+                                "; experimental RTP allowed for this session only");
+                        }
                         if (universalAutoEnabled && !viewerCapsValid) {
                             // A startup VP9 timing result is not proof that
                             // this browser supports its RTP stream.
@@ -7229,6 +7261,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         // Explicit operator choices take precedence. Automatic
                         // selection uses the successfully probed codec rather
                         // than the previous hardcoded H.264 experimental path.
+                        if (requestedCodec == "h265_hw" || requestedCodec == "av1_hw")
+                            return requestedCodec;
                         if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw") return requestedCodec;
                         if (requestedCodec == "vp8") return std::string("vp8");
                         if (requestedCodec == "h264" || requestedCodec == "h264_hw" ||
