@@ -1,0 +1,33 @@
+name: Windows AV1 Media Foundation Actual Output Probe
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Agent/chatpass_agent/tests/windows_av1_mf_output_probe.cpp'
+      - 'Agent/chatpass_agent/src/av1_mf_encoder.*'
+      - '.github/workflows/windows-av1-mf-output-probe.yml'
+permissions:
+  contents: read
+jobs:
+  standalone:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile standalone AV1 Media Foundation output probe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio C++ tools missing" }
+          $devcmd = Join-Path $vs 'Common7\\Tools\\VsDevCmd.bat'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /O2 /MD /W3 Agent/chatpass_agent/tests/windows_av1_mf_output_probe.cpp Agent/chatpass_agent/src/av1_mf_encoder.cpp /link mf.lib mfplat.lib mfuuid.lib ole32.lib /OUT:dist\\av1_mf_output_probe.exe'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "AV1 MF probe build failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-av1-mf-output-probe-standalone
+          path: dist/av1_mf_output_probe.exe
+          retention-days: 14
+          if-no-files-found: error
