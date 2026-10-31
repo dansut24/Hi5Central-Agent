@@ -17,9 +17,9 @@ namespace universal_codec {
 
 inline std::string normalizeCodec(std::string name) {
     for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    const auto first = name.find_first_not_of(" \\t\\r\\n");
+    const auto first = name.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
-    const auto last = name.find_last_not_of(" \\t\\r\\n");
+    const auto last = name.find_last_not_of(" \t\r\n");
     name = name.substr(first, last - first + 1);
     return name == "hevc" ? "h265" : name;
 }
