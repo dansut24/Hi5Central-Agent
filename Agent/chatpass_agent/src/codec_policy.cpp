@@ -32,11 +32,29 @@ namespace hi5 {
     }
 
     CodecDecision SelectCodecPolicy() {
-        const std::string requestedRaw = getenvString("HI5_CODEC");
-        const std::string requested = lower(requestedRaw);
+        std::string requested = lower(getenvString("HI5_CODEC"));
+        // PowerShell or an installer can accidentally persist the literal
+        // string "$null" instead of clearing the machine environment value.
+        // Such sentinels must not bypass normal automatic qualification.
+        const auto first = requested.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) requested.clear();
+        else {
+            const auto last = requested.find_last_not_of(" \t\r\n");
+            requested = requested.substr(first, last - first + 1);
+        }
+        if (requested.empty() || requested == "$null" ||
+            requested == "null" || requested == "undefined" ||
+            requested == "none") requested = "auto";
+        // Unsupported operator values fail closed to the stable RTP sender,
+        // never to an unqualified hardware codec.
+        const bool recognized = requested == "auto" || requested == "vp8" ||
+            requested == "vp9" || requested == "vp9_hw" ||
+            requested == "vp9_sw" || requested == "h264" ||
+            requested == "h264_hw" || requested == "h264_sw";
+        if (!recognized) requested = "vp8";
 
         CodecDecision decision;
-        decision.requestedMode = requested.empty() ? "auto" : requested;
+        decision.requestedMode = requested;
 
         if (requested == "vp8") {
             decision.selectedCodec = "vp8";
