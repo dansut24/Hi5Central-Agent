@@ -2769,8 +2769,12 @@ LogI(
                             for (const auto& entry : msg["viewer_codecs"]) {
                                 if (!entry.is_string() ||
                                     viewer.receiveCodecs.size() >= 6) continue;
-                                const std::string codec = entry.get<std::string>();
-                                if (codec != "vp8" && codec != "vp9" && codec != "h264")
+                                const std::string codec =
+                                    hi5::universal_codec::normalizeCodec(
+                                        entry.get<std::string>());
+                                if (codec != "vp8" && codec != "vp9" &&
+                                    codec != "h264" && codec != "av1" &&
+                                    codec != "h265")
                                     continue;
                                 if (std::find(viewer.receiveCodecs.begin(),
                                               viewer.receiveCodecs.end(), codec) ==
@@ -2797,6 +2801,13 @@ LogI(
                                 hi5::universal_codec::supports(viewer, "vp9");
                             const bool viewerH264 =
                                 hi5::universal_codec::supports(viewer, "h264");
+                            // AV1 and HEVC discovery is read-only. The live
+                            // sender deliberately excludes both until RTP,
+                            // browser decoder and keyframe recovery pass.
+                            const bool viewerAv1 =
+                                hi5::universal_codec::supports(viewer, "av1");
+                            const bool viewerH265 =
+                                hi5::universal_codec::supports(viewer, "h265");
                             const bool cachedH264Proven = std::any_of(
                                 candidates.begin(), candidates.end(),
                                 [asyncHw](const auto& c) {
@@ -2838,6 +2849,9 @@ LogI(
                                 " viewer_vp8=" + (viewerVp8 ? "1" : "0") +
                                 " viewer_vp9=" + (viewerVp9 ? "1" : "0") +
                                 " viewer_h264=" + (viewerH264 ? "1" : "0") +
+                                " viewer_av1=" + (viewerAv1 ? "1" : "0") +
+                                " viewer_h265=" + (viewerH265 ? "1" : "0") +
+                                " av1_h265_sender_ready=0" +
                                 " viewer_h264_level4=" +
                                     (viewer.h264Level4 ? "1" : "0") +
                                 " h264_cached_proven=" +

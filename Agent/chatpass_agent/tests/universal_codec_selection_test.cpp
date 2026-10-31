@@ -44,7 +44,13 @@ int main() {
     assert(legacy.codec=="vp8" || (legacy.codec=="h264" && legacy.maxHeight<=720));
     Viewer noH264=v; noH264.receiveCodecs={"vp8","vp9"};
     assert(select({h264Intel,vp8},noH264,good).codec=="vp8");
-    Viewer noCommon=v; noCommon.receiveCodecs={"h265"};
+    auto h265Proof=candidate("h265","Intel HEVC MFT",true,1280,720,10,22);
+    Viewer hevcViewer;hevcViewer.receiveCodecs={"h265"};
+    // The generic future scoring layer can understand HEVC, but the
+    // connection gate above forbids it until the RTP sender is integrated.
+    auto hevcScored=select({h265Proof},hevcViewer,good,1280,720);
+    assert(hevcScored.qualified && hevcScored.codec=="h265");
+        Viewer noCommon=v; noCommon.receiveCodecs={"h265"};
     assert(select({h264Intel,vp8},noCommon,good).codec.empty());
     Link limited;limited.estimatedKbps=1800;limited.rttMs=220;
     auto noFast=select({vp8,h264Intel},v,limited);

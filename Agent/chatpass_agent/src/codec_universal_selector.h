@@ -3,6 +3,7 @@
 // "Available" hardware MFT enumeration is NOT a successful qualification.
 // Callers must provide real emitted/decoded frames, IDR recovery and timings.
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -14,8 +15,17 @@
 namespace hi5 {
 namespace universal_codec {
 
+inline std::string normalizeCodec(std::string name) {
+    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const auto first = name.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const auto last = name.find_last_not_of(" \t\r\n");
+    name = name.substr(first, last - first + 1);
+    return name == "hevc" ? "h265" : name;
+}
+
 struct Candidate {
-    std::string codec;              // h264, vp9, vp8, av1 (RTP-ready only)
+    std::string codec;              // h264, vp9, vp8, av1, h265; RTP-ready only after proof
     std::string backend;            // Media Foundation, libvpx, VideoToolbox, ...
     bool hardware = false;
     bool emittedFrames = false;
@@ -62,6 +72,7 @@ inline int requiredKbps(const std::string& codec, int width, int height) {
     const double pixels = static_cast<double>(width) * height;
     const double factor = pixels / (1280.0 * 720.0);
     const int base = codec == "av1" ? 2700 :
+                     codec == "h265" ? 3300 :
                      codec == "vp9" ? 3400 :
                      codec == "h264" ? 5200 : 6100;
     return static_cast<int>(std::ceil(base * factor));
@@ -69,7 +80,7 @@ inline int requiredKbps(const std::string& codec, int width, int height) {
 
 inline bool proven(const Candidate& c, int targetFps) {
     if (c.codec != "h264" && c.codec != "vp9" &&
-        c.codec != "vp8" && c.codec != "av1") return false;
+        c.codec != "vp8" && c.codec != "av1" && c.codec != "h265") return false;
     const double interval = 1000.0 / std::max(1, targetFps);
     return c.emittedFrames && c.decodedFrames && c.keyframeRecovery &&
         c.packetizationVerified && c.testedFrames >= 20 &&
