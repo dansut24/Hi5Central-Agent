@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -33,6 +35,7 @@ int main() {
     frame.u.assign(static_cast<size_t>(width/2)*(height/2), 128);
     frame.v.assign(static_cast<size_t>(width/2)*(height/2), 128);
     int emitted=0, successfulInputs=0, rtpAccepted=0, rtpRejected=0;
+    int headerSamples=0;
     size_t packetCount=0;
     size_t emittedBytes=0;
     double maxMs=0, totalMs=0;
@@ -57,6 +60,15 @@ int main() {
         if (!out.data.empty()) {
             emitted++;
             emittedBytes+=out.data.size();
+            if (headerSamples < 4) {
+                std::ostringstream hex;
+                hex << std::hex << std::setfill('0');
+                for (size_t j=0;j<std::min<size_t>(24,out.data.size());++j)
+                    hex << std::setw(2) << static_cast<unsigned>(out.data[j]);
+                std::cout << "AV1_MF_FRAME_HEADER=" << hex.str()
+                          << " bytes=" << out.data.size() << "\n";
+                headerSamples++;
+            }
             hi5::Av1RtpPayloads packetized;
             std::string reason;
             if (hi5::BuildAv1RtpPayloads(out.data,1100,packetized,&reason)) {
