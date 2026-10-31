@@ -604,7 +604,11 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                             " viewer_playout_buffer_ms=" + std::to_string(bounded("jitter_buffer_ms", 60000.0)) +
                             " viewer_decoded_fps=" + std::to_string(bounded("fps", 120.0)) +
                             " viewer_receive_kbps=" + std::to_string(bounded("bitrate_kbps", 100000.0)) +
-                            " viewer_packets_lost=" + std::to_string(bounded("packets_lost", 1e9)));
+                            " viewer_packets_lost=" + std::to_string(bounded("packets_lost", 1e9)) +
+                            " viewer_packets_received=" + std::to_string(bounded("packets_received", 1e9)) +
+                            " viewer_bytes_received=" + std::to_string(bounded("bytes_received", 1e12)) +
+                            " viewer_frames_decoded=" + std::to_string(bounded("frames_decoded", 1e9)) +
+                            " viewer_keyframes_decoded=" + std::to_string(bounded("keyframes_decoded", 1e8)));
                         return;
                     }
 
@@ -1017,6 +1021,14 @@ void WebRtcSender::createPeerConnection() {
     m_track->onOpen([this]() {
         LogInfo("[track] open session=" + m_sessionId);
         m_canSend = true;
+        // The capture helper may publish its initial requested keyframe
+        // before the WebRTC track opens. Preserve a first-frame request for
+        // experimental AV1 so the first transmitted frame is decodable.
+        if (m_videoCodec == VideoCodec::AV1) {
+            m_forceKeyframe = true;
+            LogInfo("[codec-pilot] AV1 first transmittable frame requires keyframe session=" +
+                m_sessionId);
+        }
 
         if (m_mode == Mode::DirectCapture) {
             startStreamingThread();
@@ -2206,6 +2218,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         if (m_experimentalFailed) return;
         const bool isHevc = m_videoCodec == VideoCodec::H265;
         const bool softwareAv1 = m_codecMode == "av1_sw";
+        bool initialEncoderKeyframe = false;
         bool scaled = false;
         const I420Frame input = scaleI420ToWebRtcBounds(
             frame, 1280, 720, &scaled, true);
@@ -2228,6 +2241,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             m_externalEncoderHeight = input.height;
             m_externalConfiguredFps = encodeFps;
             m_externalConfiguredBitrateKbps = bitrate;
+            initialEncoderKeyframe = true;
             std::string reason;
             bool ok = false;
             if (isHevc) {
@@ -2288,8 +2302,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 frameForEncoder.u = input.u;
                 frameForEncoder.v = input.v;
                 std::vector<hi5::SoftwareAv1Packet> encodedPackets;
-                ok = m_av1SoftwareEncoder->encode(frameForEncoder, keyframe,
-                    encodedPackets, &reason);
+                ok = m_av1SoftwareEncoder->encode(frameForEncoder,
+                    keyframe || initialEncoderKeyframe, encodedPackets, &reason);
                 if (ok && !encodedPackets.empty()) {
                     // This sender uses a single WebRTC frame RTP timestamp.
                     // Multiple AOM output frames must be handled separately;
