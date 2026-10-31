@@ -7353,6 +7353,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t framesForwarded = 0;
                 DesktopMode lastForwardedMode = DesktopMode::Normal;
                 bool hasForwardedSource = false;
+                // Reuse the last already-encoded-source frame only for a
+                // bounded receiver keyframe recovery when the desktop is idle.
+                // Move the captured I420 planes instead of copying each frame.
+                I420Frame lastRecoveryFrame;
+                DesktopMode lastRecoveryMode = DesktopMode::Normal;
+                std::chrono::steady_clock::time_point lastRecoveryReplayAt{};
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -7710,6 +7716,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             receivedAtNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
                             ctx.sender->sendExternalRawI420(secureFrame, forceKf);
                             sendEnd = std::chrono::steady_clock::now();
+                            lastRecoveryFrame = std::move(secureFrame);
+                            lastRecoveryMode = DesktopMode::Secure;
                         }
                         sent = true;
                     }
@@ -7757,8 +7765,42 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             receivedAtNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
                             ctx.sender->sendExternalRawI420(normalFrame, forceKf);
                             sendEnd = std::chrono::steady_clock::now();
+                            lastRecoveryFrame = std::move(normalFrame);
+                            lastRecoveryMode = DesktopMode::Normal;
                         }
                         sent = true;
+                    }
+
+                    // Receiver recovery must not depend on changed pixels:
+                    // a lost initial IDR on an idle desktop otherwise leaves
+                    // Safari with incoming RTP but zero decodable frames.
+                    // Never replay an old normal frame across CAD/UAC, or a
+                    // secure frame after returning to the normal desktop.
+                    const bool lastSourceStillActive = useSecure
+                        ? (lastRecoveryMode == DesktopMode::Secure &&
+                           ctx.secureReady && ctx.secureStreamerProcess != nullptr)
+                        : (lastRecoveryMode == DesktopMode::Normal &&
+                           ctx.normalStreamerProcess != nullptr &&
+                           !ctx.secureStateAnnounced);
+                    const bool recoveryCooldownPassed =
+                        lastRecoveryReplayAt.time_since_epoch().count() == 0 ||
+                        now - lastRecoveryReplayAt >= std::chrono::seconds(3);
+                    if (!sent && ctx.sender && hasForwardedSource &&
+                        ctx.recoveryKeyframeRequested.load() &&
+                        lastRecoveryFrame.width > 0 && lastRecoveryFrame.height > 0 &&
+                        !lastRecoveryFrame.y.empty() &&
+                        !ctx.consoleSwitchInProgress && !ctx.handoffStateAnnounced &&
+                        lastSourceStillActive && recoveryCooldownPassed &&
+                        ctx.recoveryKeyframeRequested.exchange(false)) {
+                        sendBegin = std::chrono::steady_clock::now();
+                        ctx.sender->sendExternalRawI420(lastRecoveryFrame, true);
+                        sendEnd = std::chrono::steady_clock::now();
+                        lastRecoveryReplayAt = now;
+                        ++framesForwarded;
+                        sent = true;
+                        LogI("[video-recovery] cached source keyframe sent session=" +
+                            ctx.sessionId + " mode=" +
+                            (lastRecoveryMode == DesktopMode::Secure ? "secure" : "normal"));
                     }
 
                     if (sent && sendEnd.time_since_epoch().count() != 0) {
