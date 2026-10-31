@@ -192,6 +192,8 @@ private:
     std::chrono::steady_clock::time_point m_externalLastFrameAt{};
     std::chrono::steady_clock::time_point m_externalWakeUntil{};
     std::chrono::steady_clock::time_point m_externalLastNonIdleHintAt{};
+    std::chrono::steady_clock::time_point m_lastCaptureStatusSentAt{};
+    int m_lastCaptureStatusMode = -1;
     int m_externalEffectiveMode = 0; // 0=idle, 1=active/wake, 2=motion, 3=wake
     bool m_externalWasIdle = true;
 
