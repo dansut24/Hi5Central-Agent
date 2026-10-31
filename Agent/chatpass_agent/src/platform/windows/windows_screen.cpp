@@ -515,6 +515,115 @@ namespace {
         if (screenDC) ReleaseDC(nullptr, screenDC);
     }
 
+
+    // The existing pointer compositor creates an entire 1920x1080 DIB,
+    // copies the whole BGRA screen into it, draws a tiny pointer, then
+    // copies the whole screen back. The real Dell session measured 20-36ms
+    // for this step alone. Draw in a clipped, cursor-sized DIB instead.
+    // Limit the new path to normal DXGI desktop capture; WGC, GDI, secure
+    // desktop and the previous full-frame path remain unchanged.
+    static bool compositeCursorBgraDxgiRoi(int originX, int originY, int width,
+                                            int height, std::vector<uint8_t>& bgra,
+                                            int stride) {
+        if (width <= 0 || height <= 0 || stride < width * 4 ||
+            bgra.size() < static_cast<size_t>(stride) * static_cast<size_t>(height))
+            return false;
+
+        CURSORINFO ci{};
+        ci.cbSize = sizeof(ci);
+        if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor)
+            return true; // No visible pointer; no pixels need to change.
+
+        ICONINFO info{};
+        if (!GetIconInfo(ci.hCursor, &info))
+            return false; // Preserve old compositor for unusual pointers.
+
+        BITMAP bitmap{};
+        HBITMAP shape = info.hbmColor ? info.hbmColor : info.hbmMask;
+        const bool validBitmap = shape &&
+            GetObjectW(shape, sizeof(bitmap), &bitmap) == sizeof(bitmap);
+        const int cursorWidth = validBitmap ? bitmap.bmWidth : 0;
+        // Monochrome AND/XOR masks contain two vertically stacked planes.
+        const int cursorHeight = validBitmap ?
+            (info.hbmColor ? bitmap.bmHeight : bitmap.bmHeight / 2) : 0;
+        const int cursorX = ci.ptScreenPos.x - originX -
+            static_cast<int>(info.xHotspot);
+        const int cursorY = ci.ptScreenPos.y - originY -
+            static_cast<int>(info.yHotspot);
+
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+
+        // Reject unbounded/malformed shapes and retain the previous
+        // compositor instead of silently omitting the desktop pointer.
+        if (cursorWidth <= 0 || cursorHeight <= 0 ||
+            cursorWidth > 512 || cursorHeight > 512)
+            return false;
+
+        const int left = std::max(0, cursorX);
+        const int top = std::max(0, cursorY);
+        const int right = std::min(width, cursorX + cursorWidth);
+        const int bottom = std::min(height, cursorY + cursorHeight);
+        if (right <= left || bottom <= top)
+            return true; // Pointer is outside this monitor.
+
+        const int patchWidth = right - left;
+        const int patchHeight = bottom - top;
+        const size_t rowBytes = static_cast<size_t>(patchWidth) * 4u;
+
+        HDC dc = CreateCompatibleDC(nullptr);
+        if (!dc) return false;
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = patchWidth;
+        bmi.bmiHeader.biHeight = -patchHeight;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* pixels = nullptr;
+        HBITMAP dib = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        if (!dib || !pixels) {
+            if (dib) DeleteObject(dib);
+            DeleteDC(dc);
+            return false;
+        }
+
+        // The staging texture's RowPitch may exceed width*4, but the
+        // cursor-sized DIB is tightly packed. Copy only the clipped ROI.
+        for (int row = 0; row < patchHeight; ++row) {
+            std::memcpy(static_cast<uint8_t*>(pixels) +
+                            static_cast<size_t>(row) * rowBytes,
+                        bgra.data() + static_cast<size_t>(top + row) *
+                            static_cast<size_t>(stride) +
+                            static_cast<size_t>(left) * 4u, rowBytes);
+        }
+        HGDIOBJ old = SelectObject(dc, dib);
+        if (!old || old == HGDI_ERROR) {
+            DeleteObject(dib);
+            DeleteDC(dc);
+            return false;
+        }
+        const BOOL drawn = DrawIconEx(dc, cursorX - left, cursorY - top,
+                                     ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+        // DIB pixels must be ready before copying back to the capture buffer.
+        GdiFlush();
+        SelectObject(dc, old);
+        if (drawn) {
+            for (int row = 0; row < patchHeight; ++row) {
+                std::memcpy(bgra.data() +
+                                static_cast<size_t>(top + row) *
+                                static_cast<size_t>(stride) +
+                                static_cast<size_t>(left) * 4u,
+                            static_cast<const uint8_t*>(pixels) +
+                                static_cast<size_t>(row) * rowBytes,
+                            rowBytes);
+            }
+        }
+        DeleteObject(dib);
+        DeleteDC(dc);
+        return drawn != FALSE;
+    }
+
     static std::vector<uint8_t> encodeJpegWic(const uint8_t* bgra, int width, int height, int stride, int quality) {
         std::vector<uint8_t> out;
 
@@ -654,6 +763,8 @@ struct DesktopFrameSource::Impl {
     // Diagnostic-only aggregated DXGI timings. No frame pixels are logged.
     // Count new frames only, never cached-frame or timeout polls.
     uint64_t dxgiProfileSamples = 0;
+    uint64_t dxgiRoiCursorFrames = 0;
+    uint64_t dxgiFallbackCursorFrames = 0;
     double dxgiAcquireTotalMs = 0.0;
     double dxgiSubmitTotalMs = 0.0;
     double dxgiMapTotalMs = 0.0;
@@ -1396,18 +1507,23 @@ struct DesktopFrameSource::Impl {
         const auto dxgiCpuCopyEnd = std::chrono::steady_clock::now();
 
         const DisplayInfo d = currentDisplayInfoLocked();
-        compositeCursorBgra(d.x, d.y, width, height, bgra, rowPitch);
+        if (compositeCursorBgraDxgiRoi(d.x, d.y, width, height, bgra, rowPitch)) {
+            ++dxgiRoiCursorFrames;
+        } else {
+            ++dxgiFallbackCursorFrames;
+            compositeCursorBgra(d.x, d.y, width, height, bgra, rowPitch);
+        }
         const auto dxgiCursorEnd = std::chrono::steady_clock::now();
 
         I420Frame out;
         bgraToI420(bgra.data(), rowPitch, width, height, out);
         const auto dxgiConvertEnd = std::chrono::steady_clock::now();
 
-        lastFrame = out;
+        lastFrame = std::move(out);
         const auto dxgiCacheEnd = std::chrono::steady_clock::now();
 
         FrameCaptureResult result;
-        result.frame = out;
+        result.frame = lastFrame;
         const auto dxgiPublishEnd = std::chrono::steady_clock::now();
 
         // Per-stage monotonic wall-clock timings include any GPU fence wait
@@ -1429,6 +1545,8 @@ struct DesktopFrameSource::Impl {
         if (dxgiPublishEnd >= dxgiNextProfileLog) {
             const double count = static_cast<double>(std::max<uint64_t>(1, dxgiProfileSamples));
             LogInfo("[capture] dxgi-stage-stats samples=" + std::to_string(dxgiProfileSamples) +
+                " cursor_roi_frames=" + std::to_string(dxgiRoiCursorFrames) +
+                " cursor_fallback_frames=" + std::to_string(dxgiFallbackCursorFrames) +
                 " acquire_avg_ms=" + std::to_string(dxgiAcquireTotalMs / count) +
                 " gpu_submit_avg_ms=" + std::to_string(dxgiSubmitTotalMs / count) +
                 " map_wait_avg_ms=" + std::to_string(dxgiMapTotalMs / count) +
@@ -1438,6 +1556,7 @@ struct DesktopFrameSource::Impl {
                 " cache_copy_avg_ms=" + std::to_string(dxgiCacheCopyTotalMs / count) +
                 " publish_copy_avg_ms=" + std::to_string(dxgiPublishCopyTotalMs / count));
             dxgiProfileSamples = 0;
+            dxgiRoiCursorFrames = dxgiFallbackCursorFrames = 0;
             dxgiAcquireTotalMs = dxgiSubmitTotalMs = dxgiMapTotalMs = 0.0;
             dxgiCpuCopyTotalMs = dxgiCursorTotalMs = dxgiConvertTotalMs = 0.0;
             dxgiCacheCopyTotalMs = dxgiPublishCopyTotalMs = 0.0;
