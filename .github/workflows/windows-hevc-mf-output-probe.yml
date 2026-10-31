@@ -22,7 +22,7 @@ jobs:
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw "Visual Studio C++ tools missing" }
           $devcmd = Join-Path $vs 'Common7\\Tools\\VsDevCmd.bat'
-          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /DNOMINMAX Agent/chatpass_agent/tests/windows_hevc_mf_output_probe.cpp Agent/chatpass_agent/tests/hevc_mf_encoder_experimental.cpp /link mf.lib mfplat.lib mfuuid.lib ole32.lib /OUT:dist\\hevc_mf_output_probe.exe'
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /DNOMINMAX /DHI5_MF_EVENT_PROBE Agent/chatpass_agent/tests/windows_hevc_mf_output_probe.cpp Agent/chatpass_agent/tests/hevc_mf_encoder_experimental.cpp /link mf.lib mfplat.lib mfuuid.lib ole32.lib /OUT:dist\\hevc_mf_output_probe.exe'
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "HEVC MF probe build failed" }
       - uses: actions/upload-artifact@v4
