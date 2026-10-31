@@ -5,6 +5,7 @@
 #include "h264_scaling_policy.h"
 #include "encoding/hevc_rtp_payload_experimental.h"
 #include "encoding/av1_rtp_payload_experimental.h"
+#include "encoding/av1_rtp_webrtc_compatible.h"
 #include "encoding/av1_mf_output_adapter.h"
 #include "util/log.h"
 
@@ -2349,7 +2350,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             } else {
                 hi5::Av1RtpPayloads built;
                 ok = softwareAv1
-                    ? hi5::BuildAv1RtpPayloads(accessUnit, 1200, built, &reason)
+                    ? hi5::BuildAv1WebRtcCompatibleRtpPayloads(
+                        accessUnit, 1200, actualKeyframe, built, &reason)
                     : hi5::BuildAv1MfRtpPayloads(accessUnit, 1200, built, &reason);
                 if (ok && built.hasSequenceHeader)
                     m_experimentalPrimed = true;
