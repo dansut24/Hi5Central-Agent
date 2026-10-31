@@ -100,6 +100,31 @@ int main() {
  }
  auto av1=intel;av1.codec="av1";
  assert(chooseForConnection(true,"auto","vp8",viewer,{av1},link,true).mode=="vp8");
+ // Five-codec auto must never infer qualification from a codec name,
+ // a successful manual session, or a decoder-only capability enumeration.
+ {
+  Viewer capable; capable.receiveCodecs={"vp8","av1","h265"};
+  auto fastAv1=intel; fastAv1.codec="av1"; fastAv1.backend="av1_sw";
+  fastAv1.hardware=false;fastAv1.p95EncodeMs=8;fastAv1.worstEncodeMs=25;
+  auto fastHevc=intel; fastHevc.codec="h265"; fastHevc.backend="h265_hw";
+  fastHevc.p95EncodeMs=10;fastHevc.worstEncodeMs=25;
+  assert(chooseForConnection(true,"auto","vp8",capable,{fastAv1},link,true).mode=="vp8");
+  assert(chooseForConnection(true,"auto","vp8",capable,{fastAv1},link,true,true).mode=="av1_sw");
+  auto noLive=fastAv1; noLive.decodedFrames=false;
+  assert(chooseForConnection(true,"auto","vp8",capable,{noLive},link,true,true).mode=="vp8");
+  auto badMode=fastAv1;badMode.backend="Media Foundation enumeration";
+  assert(chooseForConnection(true,"auto","vp8",capable,{badMode},link,true,true).mode=="vp8");
+  Viewer hevcOnly;hevcOnly.receiveCodecs={"h265"};
+  assert(chooseForConnection(true,"auto","vp8",hevcOnly,{fastHevc},link,true,true).mode=="h265_hw");
+  assert(!chooseForConnection(true,"auto","vp8",hevcOnly,{fastHevc},link,true).compatible);
+  Viewer noHevc;noHevc.receiveCodecs={"vp8"};
+  assert(chooseForConnection(true,"auto","vp8",noHevc,{fastHevc},link,true,true).mode=="vp8");
+  Link slow;slow.estimatedKbps=1000;
+  assert(chooseForConnection(true,"auto","vp8",capable,{fastAv1},slow,true,true).mode=="vp8");
+  auto unstable=fastAv1;unstable.worstEncodeMs=400;
+  assert(chooseForConnection(true,"auto","vp8",capable,{unstable},link,true,true).mode=="vp8");
+  assert(chooseForConnection(true,"av1_sw","vp8",capable,{},link,true,false).mode=="av1_sw");
+ }
  Viewer missing;
  assert(chooseForConnection(true,"auto","vp9_sw",missing,{intel},link,true).mode=="vp9_sw");
  // Browser-supported AV1 and HEVC alone must NEVER cause unsupported SDP.

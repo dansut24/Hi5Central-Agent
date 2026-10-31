@@ -1,4 +1,5 @@
 #pragma once
+#include "codec_adaptive_quality.h"
 
 #include "vp8_encoder.h"
 #include "vp9_mf_encoder.h"
@@ -224,6 +225,9 @@ private:
     std::atomic<int> m_viewerTargetFps{ 0 };
     std::atomic<int> m_viewerManualFps{ 0 };
     std::atomic<int> m_viewerTargetBitrateKbps{ 0 };
+    // Separate bounded Agent-side adaptation; off unless the operator opts
+    // in, and never overrides an explicit manual frame-rate experiment.
+    hi5::universal_codec::AdaptiveQuality m_sessionAdaptiveQuality;
 
     int m_externalConfiguredFps = 0;
     int m_externalConfiguredBitrateKbps = 0;

@@ -8,6 +8,7 @@
 #include "codec_policy.h"
 #include "capture_frame_rate_policy.h"
 #include "codec_universal_connection.h"
+#include "codec_universal_failover.h"
 #include "codec_runtime_proof.h"
 #include "codec_windows_qual_identity.h"
 #include "codec_windows_idle_probe.h"
@@ -2594,6 +2595,7 @@ LogI(
                     }).detach();
                 }
 
+                auto codecFailover = std::make_shared<hi5::universal_codec::SessionCodecFailover>();
                 auto codecProofs = std::make_shared<hi5::universal_codec::RuntimeProofStore>();
                 auto sendFn = [this, codecProofs](const std::string& payload) {
                     // Encoder metrics originate in the actual RTP sender,
@@ -2635,7 +2637,7 @@ LogI(
                     }
                     });
 
-                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident, autoSessionCodec, codecProofs](const std::string& text) {
+                signaling_->onMessage([this, sendFn, width, height, fps, bitrateKbps, ident, autoSessionCodec, codecProofs, codecFailover](const std::string& text) {
                     sessionBridge_.HandleIncomingJson(text);
 
                     const auto msg = json::parse(text, nullptr, false);
@@ -2739,6 +2741,22 @@ LogI(
                         return;
                     }
 
+                    if (type == "viewer_codec_failure") {
+                        // A Viewer can reject only the codec selected for its
+                        // own authenticated session. Never poison fleet cache.
+                        // Recovery is via a NEW SDP after reconnect, not by
+                        // relabelling existing RTP packets.
+                        if (ReadConfigInt("HI5_UNIVERSAL_CODEC_AUTO",0,0,1) == 1 &&
+                            codecFailover->failure(
+                                sessionId, msg.value("codec",std::string()),
+                                msg.value("reason",std::string()))) {
+                            LogW("[codec-auto] receiver failure quarantined " +
+                                msg.value("codec",std::string()) +
+                                " for current session; renegotiate on reconnect");
+                        }
+                        return;
+                    }
+
                     if (type == "start_webrtc") {
                         const SessionMode sessionMode = ParseSessionMode(msg.value("mode", std::string("console")));
                         LogI("start_webrtc session=" + sessionId + " mode=" + SessionModeName(sessionMode));
@@ -2823,9 +2841,17 @@ LogI(
                                     kAgentVersion, nowUtc);
                             const std::filesystem::path cachePath =
                                 L"C:\\ProgramData\\Hi5Central\\Agent\\codec-qualification-v1.cache";
-                            const auto candidates =
+                            const auto cached =
                                 hi5::universal_codec::loadQualificationCache(
                                     cachePath, identity, nowUtc);
+                            const auto candidates =
+                                codecFailover->allowed(sessionId, cached);
+                            // Not a fleet flag: an Agent needs both the live
+                            // experimental sender gate and this separate
+                            // all-five automatic-selection pilot switch.
+                            const bool allowFiveCodecs =
+                                ReadConfigInt("HI5_UNIVERSAL_FIVE_CODEC_AUTO", 0, 0, 1) == 1 &&
+                                ReadConfigInt("HI5_EXPERIMENTAL_LIVE_CODECS", 0, 0, 1) == 1;
                             const bool asyncHw = ReadConfigInt(
                                 "HI5_H264_ASYNC_HW", 0, 0, 1) == 1;
                             const bool viewerVp8 =
@@ -2834,9 +2860,10 @@ LogI(
                                 hi5::universal_codec::supports(viewer, "vp9");
                             const bool viewerH264 =
                                 hi5::universal_codec::supports(viewer, "h264");
-                            // AV1 and HEVC discovery is read-only. The live
-                            // sender deliberately excludes both until RTP,
-                            // browser decoder and keyframe recovery pass.
+                            // Browser advertisement is only a prerequisite.
+                            // Both codecs remain blocked unless the exact
+                            // runtime sender and recovered browser decode have
+                            // been qualified for this Agent build and driver.
                             const bool viewerAv1 =
                                 hi5::universal_codec::supports(viewer, "av1");
                             const bool viewerH265 =
@@ -2861,7 +2888,8 @@ LogI(
                                     true, "auto",
                                     "vp8", // Only a proven cached codec can override.
                                     viewer, candidates,
-                                    hi5::universal_codec::Link{}, asyncHw);
+                                    hi5::universal_codec::Link{}, asyncHw,
+                                    allowFiveCodecs);
                             if (!selection.compatible) {
                                 LogW("[codec-universal] rejecting incompatible " +
                                     std::string("Viewer before SDP: ") +
@@ -2874,6 +2902,16 @@ LogI(
                                 return;
                             }
                             connectionCodec = selection.mode;
+                            // If even fallback VP8 failed in this authenticated
+                            // session, do not retry it indefinitely.
+                            if (codecFailover->denied(sessionId,"vp8") &&
+                                connectionCodec=="vp8") {
+                                sendFn(json{{"type","viewer_error"},
+                                    {"session_id",sessionId},
+                                    {"error","No working video codec for this session"}}
+                                    .dump());
+                                return;
+                            }
                             LogI("[codec-universal] session=" + sessionId +
                                 " selected=" + connectionCodec +
                                 " qualified=" + (selection.qualified ? "1" : "0") +
@@ -2884,7 +2922,8 @@ LogI(
                                 " viewer_h264=" + (viewerH264 ? "1" : "0") +
                                 " viewer_av1=" + (viewerAv1 ? "1" : "0") +
                                 " viewer_h265=" + (viewerH265 ? "1" : "0") +
-                                " av1_h265_sender_ready=0" +
+                                " av1_h265_auto_gate=" +
+                                    (allowFiveCodecs ? "1" : "0") +
                                 " viewer_h264_level4=" +
                                     (viewer.h264Level4 ? "1" : "0") +
                                 " h264_cached_proven=" +
@@ -2895,6 +2934,8 @@ LogI(
                                     (vp9Overloaded ? "1" : "0") +
                                 " reason=" + selection.reason);
                         }
+                        if (universalAutoEnabled)
+                            codecFailover->selected(sessionId,connectionCodec);
                         StartStreamerSession(sessionId, iceServers, sendFn, width, height, fps, bitrateKbps, sessionMode, connectionCodec);
                         bool sessionStarted = false;
                         {

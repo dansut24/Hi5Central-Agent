@@ -529,6 +529,7 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                         }
 
                         m_viewerTargetBitrateKbps = kbps;
+                        m_sessionAdaptiveQuality.reset(kbps>0 ? kbps : m_bitrateKbps);
                         if (prevW != w || prevH != h) m_forceKeyframe = true;
                         // Authoritative reply on the already-authenticated
                         // control channel. The Viewer can promote Automatic only
@@ -600,6 +601,28 @@ void WebRtcSender::attachInputDataChannelHandlers(const std::shared_ptr<rtc::Dat
                             const double n = msg.value(key, 0.0);
                             return std::max(0.0, std::min(limit, n));
                         };
+                        // Opt-in, session-isolated closed-loop bitrate policy.
+                        // Ignore idle/unknown receiver samples, preserve the
+                        // requested pixel resolution and manual FPS override.
+                        if (readEnvInt("HI5_UNIVERSAL_ADAPTIVE_QUALITY",0,0,1)==1 &&
+                            m_viewerManualFps.load()==0) {
+                            hi5::universal_codec::LinkSample sample;
+                            sample.rttMs=bounded("rtt_ms",60000.0);
+                            sample.lossFraction=bounded("packet_loss_rate",1.0);
+                            sample.jitterBufferMs=bounded("jitter_buffer_ms",60000.0);
+                            sample.packetsSampled=std::clamp(
+                                msg.value("packets_sampled",0),0,500000);
+                            const auto policy=m_sessionAdaptiveQuality.observe(
+                                sample,static_cast<std::int64_t>(ms/1000));
+                            if(policy.changed) {
+                                m_viewerTargetBitrateKbps=policy.bitrateKbps;
+                                LogInfo("[quality-adaptive] session="+m_sessionId+
+                                    " tier="+std::to_string(policy.tier)+
+                                    " bitrate_kbps="+std::to_string(policy.bitrateKbps)+
+                                    " reason="+policy.reason+
+                                    " resolution_unchanged=1");
+                            }
+                        }
                         LogInfo("[network-health] session=" + m_sessionId +
                             " viewer_rtt_ms=" + std::to_string(bounded("rtt_ms", 60000.0)) +
                             " viewer_jitter_ms=" + std::to_string(bounded("jitter_ms", 60000.0)) +
