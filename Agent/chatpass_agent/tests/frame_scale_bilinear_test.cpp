@@ -1,4 +1,5 @@
 #include "../src/frame_scale_bilinear.h"
+#include "../src/h264_scaling_policy.h"
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -6,6 +7,12 @@
 using hi5::quality::ScalePlaneBilinear;
 
 int main() {
+    using hi5::quality::UseFilteredH264Scaling;
+    assert(!UseFilteredH264Scaling(false, false, false));
+    assert(!UseFilteredH264Scaling(false, true, false));
+    assert(UseFilteredH264Scaling(false, false, true));
+    assert(UseFilteredH264Scaling(true, true, false));
+    assert(!UseFilteredH264Scaling(true, false, true));
     std::vector<std::uint8_t> src(16);
     for (int y=0;y<4;++y) for (int x=0;x<4;++x)
         src[static_cast<std::size_t>(y)*4+x] = static_cast<std::uint8_t>(x*32+y*24);
