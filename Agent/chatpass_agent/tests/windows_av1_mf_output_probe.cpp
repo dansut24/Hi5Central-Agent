@@ -1,4 +1,5 @@
 #include "../src/av1_mf_encoder.h"
+#include "../src/encoding/av1_rtp_payload_experimental.h"
 #include <windows.h>
 #include <objbase.h>
 #include <algorithm>
@@ -31,7 +32,8 @@ int main() {
     frame.y.assign(static_cast<size_t>(width)*height, 95);
     frame.u.assign(static_cast<size_t>(width/2)*(height/2), 128);
     frame.v.assign(static_cast<size_t>(width/2)*(height/2), 128);
-    int emitted=0, successfulInputs=0;
+    int emitted=0, successfulInputs=0, rtpAccepted=0, rtpRejected=0;
+    size_t packetCount=0;
     size_t emittedBytes=0;
     double maxMs=0, totalMs=0;
     for (int i=0;i<45;i++) {
@@ -55,6 +57,16 @@ int main() {
         if (!out.data.empty()) {
             emitted++;
             emittedBytes+=out.data.size();
+            hi5::Av1RtpPayloads packetized;
+            std::string reason;
+            if (hi5::BuildAv1RtpPayloads(out.data,1100,packetized,&reason)) {
+                ++rtpAccepted;
+                packetCount += packetized.packets.size();
+            } else {
+                ++rtpRejected;
+                if (rtpRejected <= 3)
+                    std::cout << "AV1_MF_RTP_REJECT=" << reason << "\n";
+            }
         }
     }
     encoder.shutdown();
@@ -63,6 +75,9 @@ int main() {
               << " input_frames=" << successfulInputs
               << " encoded_frames=" << emitted
               << " encoded_bytes=" << emittedBytes
+              << " rtp_accepted_frames=" << rtpAccepted
+              << " rtp_rejected_frames=" << rtpRejected
+              << " rtp_payloads=" << packetCount
               << " encode_avg_ms=" << totalMs/std::max(1,successfulInputs)
               << " encode_max_ms=" << maxMs
               << " synthetic_only=1 live_browser_verified=0\n";
