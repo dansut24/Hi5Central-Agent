@@ -11,6 +11,14 @@ struct Av1TextDetailProfile {
     int bitrateKbps = 4500;
     bool enabled = false;
 };
+// Adaptive bitrate is a separate opt-in from 1080p detail. Never modify the
+// accepted 1.0.286 behaviour unless the additional quality pilot is enabled.
+inline int ChooseAdaptiveAv1Bitrate(
+    bool adaptiveOptIn, bool detail1080p,
+    int originalKbps, int viewerTargetKbps) {
+    if (!adaptiveOptIn || viewerTargetKbps <= 0) return originalKbps;
+    return std::clamp(viewerTargetKbps, 1500, detail1080p ? 6500 : 4500);
+}
 inline Av1TextDetailProfile ChooseAv1TextDetailProfile(
     bool isSoftwareAv1, bool operatorOptIn,
     int requestedWidth, int requestedHeight,

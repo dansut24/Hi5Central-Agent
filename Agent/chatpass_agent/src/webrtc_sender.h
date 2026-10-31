@@ -231,6 +231,9 @@ private:
 
     int m_externalConfiguredFps = 0;
     int m_externalConfiguredBitrateKbps = 0;
+    // A rejected libaom reconfiguration is reported once per requested
+    // rate, not every frame. The working encoder remains alive.
+    int m_av1RejectedLiveBitrateKbps = 0;
     int m_externalConfiguredCpuUsed = 0;
     int m_externalConfiguredMaxQuantizer = 0;
     std::string m_externalProfileName = "software-vp8-lowcpu";

@@ -80,6 +80,29 @@ bool SoftwareAv1EncoderExperiment::initialize(int width, int height, int fps,
     impl_->imageReady = true;
     return true;
 }
+bool SoftwareAv1EncoderExperiment::setTargetBitrateKbps(
+    int bitrateKbps, std::string* error) {
+    if (!impl_ || !impl_->initialized || bitrateKbps < 500 ||
+        bitrateKbps > 20000) {
+        if (error) *error = "libaom dynamic bitrate configuration invalid";
+        return false;
+    }
+    if (impl_->cfg.rc_target_bitrate == static_cast<unsigned int>(bitrateKbps))
+        return true;
+    auto next = impl_->cfg;
+    next.rc_target_bitrate = static_cast<unsigned int>(bitrateKbps);
+    const aom_codec_err_t result = aom_codec_enc_config_set(&impl_->codec, &next);
+    if (result != AOM_CODEC_OK) {
+        if (error) {
+            const char* text = aom_codec_error(&impl_->codec);
+            *error = std::string("libaom runtime bitrate update failed: ") +
+                (text ? text : "unknown error");
+        }
+        return false;
+    }
+    impl_->cfg = next;
+    return true;
+}
 bool SoftwareAv1EncoderExperiment::encode(const SoftwareAv1Frame& frame, bool keyframe,
                                           std::vector<SoftwareAv1Packet>& packets,
                                           std::string* error) {
