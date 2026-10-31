@@ -5,6 +5,11 @@
 #include "encoding/sustained_encoder_health.h"
 #include "codec_qualification_keyframe.h"
 #include "h264_mf_encoder.h"
+#include "h265_mf_encoder.h"
+#include "av1_mf_encoder.h"
+#ifdef HI5_ENABLE_LIBAOM_AV1
+#include "encoding/av1_software_encoder_experimental.h"
+#endif
 #include "rtp_video_wall_clock.h"
 #include "input_injector.h"
 
@@ -40,7 +45,9 @@ public:
     enum class VideoCodec {
         VP8,
         H264,
-        VP9
+        VP9,
+        H265,
+        AV1
     };
 
     WebRtcSender(
@@ -110,7 +117,7 @@ private:
 
     std::vector<std::vector<uint8_t>> packetizeVp9(const Vp9EncodedFrame& frame);
     void sendRtpVp9Frame(const Vp9EncodedFrame& frame);
-    void sendVp9PayloadPackets(const std::vector<std::vector<uint8_t>>& vp9Payloads,
+    void sendRtpVideoPayloadPackets(const std::vector<std::vector<uint8_t>>& vp9Payloads,
         uint32_t rtpTimestamp);
 
     bool shouldUseH264Experiment() const;
@@ -149,6 +156,13 @@ private:
     std::unique_ptr<Vp8Encoder> m_encoder;
     std::unique_ptr<H264MfEncoder> m_h264Encoder;
     std::unique_ptr<Vp9MfEncoder> m_vp9Encoder;
+    std::unique_ptr<H265MfEncoder> m_h265Encoder;
+    std::unique_ptr<Av1MfEncoder> m_av1Encoder;
+#ifdef HI5_ENABLE_LIBAOM_AV1
+    std::unique_ptr<hi5::SoftwareAv1EncoderExperiment> m_av1SoftwareEncoder;
+#endif
+    bool m_experimentalFailed = false;
+    bool m_experimentalPrimed = false;
     bool m_vp9Failed = false;
     bool m_vp9NativeFailed = false; // Only downgrade native resolution, never discard the stream.
     int m_vp9SlowNativeFrames = 0;

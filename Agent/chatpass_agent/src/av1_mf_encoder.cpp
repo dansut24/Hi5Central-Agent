@@ -11,6 +11,7 @@
 #include <mftransform.h>
 #include <mferror.h>
 #include <wrl/client.h>
+#include "mf_async_pilot_events.h"
 
 #include <algorithm>
 #include <cstring>
@@ -108,6 +109,8 @@ namespace {
 
 struct Av1MfEncoder::Impl {
     ComPtr<IMFTransform> transform;
+    bool asynchronous = false;
+    MfAsyncPilotEvents events;
     MFT_OUTPUT_STREAM_INFO outputInfo{};
     bool mfStarted = false;
 };
@@ -209,14 +212,65 @@ bool Av1MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool pr
         return false;
     }
 
+    // Chromium's Windows MF encoder skips this specific Intel *hybrid*
+    // AV1 transform, which can advertise encoding but produce unusable
+    // output. Do not select the first MFT blindly.
+    // Source: Chromium media_foundation_video_encode_accelerator_win.cc
+    // kIntelAV1HybridEncoderCLSID.
+    const GUID kUnsupportedIntelHybridAv1Clsid{
+        0x62c053ce, 0x5357, 0x4794,
+        {0x8c, 0x5a, 0xfb, 0xef, 0xfe, 0xff, 0xb8, 0x2d}
+    };
     ComPtr<IMFActivate> chosen;
-    chosen.Attach(activates[0]);
+    UINT32 skippedHybrid = 0;
 
-    for (UINT32 i = 1; i < count; ++i) {
-        if (activates[i]) activates[i]->Release();
+    // Prefer a genuine hardware AV1 MFT, then try eligible software MFTs
+    // if the hardware enumeration contains only the rejected hybrid.
+    for (int pass = 0; pass < 2 && !chosen; ++pass) {
+        if (pass == 1) {
+            if (activates) {
+                for (UINT32 i = 0; i < count; ++i) {
+                    if (activates[i]) activates[i]->Release();
+                }
+                CoTaskMemFree(activates);
+                activates = nullptr;
+            }
+            count = 0;
+            hr = MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_SORTANDFILTER |
+                MFT_ENUM_FLAG_LOCALMFT |
+                MFT_ENUM_FLAG_SYNCMFT |
+                MFT_ENUM_FLAG_ASYNCMFT,
+                &inInfo, &outInfo, &activates, &count);
+            if (FAILED(hr) || !activates) break;
+        }
+        for (UINT32 i = 0; i < count; ++i) {
+            if (!activates[i]) continue;
+            GUID clsid{};
+            if (SUCCEEDED(activates[i]->GetGUID(
+                    MFT_TRANSFORM_CLSID_Attribute, &clsid)) &&
+                IsEqualGUID(clsid, kUnsupportedIntelHybridAv1Clsid)) {
+                ++skippedHybrid;
+                continue;
+            }
+            chosen = activates[i];
+            break;
+        }
     }
-
-    CoTaskMemFree(activates);
+    if (activates) {
+        for (UINT32 i = 0; i < count; ++i) {
+            if (activates[i]) activates[i]->Release();
+        }
+        CoTaskMemFree(activates);
+    }
+    if (!chosen) {
+        if (error) {
+            *error = "No eligible AV1 Media Foundation encoder; skipped " +
+                std::to_string(skippedHybrid) + " known Intel hybrid AV1 MFT(s)";
+        }
+        return false;
+    }
 
     WCHAR* friendly = nullptr;
     UINT32 friendlyLen = 0;
@@ -237,9 +291,18 @@ bool Av1MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool pr
 
     {
         ComPtr<IMFAttributes> attrs;
+        UINT32 asyncFlag = FALSE;
         if (SUCCEEDED(m_impl->transform->GetAttributes(&attrs)) && attrs) {
-            attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            attrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag);
+            if (asyncFlag) attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
             attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+        }
+        m_impl->asynchronous = asyncFlag != FALSE;
+        if (m_impl->asynchronous &&
+            (FAILED(m_impl->transform.As(&m_impl->events.generator)) ||
+             !m_impl->events.generator)) {
+            if (error) *error = "asynchronous MFT has no event generator";
+            return false;
         }
     }
 
@@ -356,6 +419,12 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
     sample->SetSampleTime(frameTime);
     sample->SetSampleDuration(frameDuration);
 
+    // Intel HEVC/AV1 hardware MFTs are asynchronous. The previous direct
+    // ProcessInput returned 0xC00D36B5 (MF_E_NOTACCEPTING) even on the first
+    // frame. Consume the encoder's NeedInput event before submitting a sample.
+    if (m_impl->asynchronous &&
+        !m_impl->events.waitFor(true, 750, error)) return false;
+
     hr = m_impl->transform->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) {
         if (error) *error = "ProcessInput failed " + HrToString(hr);
@@ -364,7 +433,21 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
 
     ++m_frameIndex;
 
-    for (;;) {
+    // Each output call on an asynchronous MFT must consume one HaveOutput
+    // event. A codec may buffer its first few frames without producing
+    // output, so a short no-output wait is not a fatal stream failure.
+    // Bound stream-change retry count: a broken driver must not spin forever.
+    for (int outputAttempt = 0; outputAttempt < 8; ++outputAttempt) {
+        if (m_impl->asynchronous) {
+            std::string eventError;
+            if (!m_impl->events.waitFor(false, 200, &eventError)) {
+                if (eventError ==
+                    "async Media Foundation timed out waiting for METransformHaveOutput")
+                    return true; // buffered frame; retry on the next capture
+                if (error) *error = eventError;
+                return false;
+            }
+        }
         MFT_OUTPUT_DATA_BUFFER output{};
         DWORD status = 0;
 
@@ -381,11 +464,16 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
         hr = m_impl->transform->ProcessOutput(0, 1, &output, &status);
 
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            if (output.pEvents) output.pEvents->Release();
             // An AV1 encoder may buffer initial frames; not an error.
             return true;
         }
 
-        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE ||
+            output.dwStatus == MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE) {
+            if (output.pEvents) output.pEvents->Release();
+            if (output.pSample && output.pSample != outSample.Get())
+                output.pSample->Release();
             ComPtr<IMFMediaType> newOut;
             if (SUCCEEDED(m_impl->transform->GetOutputAvailableType(0, 0, &newOut)) && newOut) {
                 m_impl->transform->SetOutputType(0, newOut.Get(), 0);
@@ -447,4 +535,6 @@ bool Av1MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Av1Encoded
             return true;
         }
     }
+    if (error) *error = "encoder returned repeated empty or changing output samples";
+    return false;
 }

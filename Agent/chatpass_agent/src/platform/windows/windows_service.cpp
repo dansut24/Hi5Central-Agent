@@ -1,4 +1,4 @@
-﻿#include "service/service_main.h"
+#include "service/service_main.h"
 #include "agent_identity.h"
 #include "agent_version.h"
 
@@ -2755,6 +2755,39 @@ LogI(
                             msg.value("viewer_caps_v1", false) &&
                             msg.contains("viewer_codecs") &&
                             msg["viewer_codecs"].is_array();
+                        // Manual HEVC/AV1 trials are per-session only. A
+                        // Viewer without verified receive advertisement must
+                        // NEVER get experimental SDP, even when the operator
+                        // has explicitly requested the codec on the Agent.
+                        const std::string explicitPilot =
+                            hi5::SelectCodecPolicy().requestedMode;
+                        if (explicitPilot == "h265_hw" || explicitPilot == "av1_hw" ||
+                            explicitPilot == "av1_sw") {
+                            const std::string required =
+                                explicitPilot == "h265_hw" ? "h265" : "av1";
+                            bool receiverAdvertised = false;
+                            if (viewerCapsValid) {
+                                for (const auto& advertised : msg["viewer_codecs"]) {
+                                    if (advertised.is_string() &&
+                                        hi5::universal_codec::normalizeCodec(
+                                            advertised.get<std::string>()) == required)
+                                        receiverAdvertised = true;
+                                }
+                            }
+                            if (!receiverAdvertised) {
+                                LogW("[codec-pilot] rejecting incompatible/missing " +
+                                    required + " Viewer capabilities before SDP");
+                                sendFn(json{
+                                    {"type","viewer_error"},
+                                    {"session_id",sessionId},
+                                    {"error","Experimental video codec not advertised by Viewer"}
+                                }.dump());
+                                return;
+                            }
+                            connectionCodec = explicitPilot;
+                            LogI("[codec-pilot] receiver advertised " + required +
+                                "; experimental RTP allowed for this session only");
+                        }
                         if (universalAutoEnabled && !viewerCapsValid) {
                             // A startup VP9 timing result is not proof that
                             // this browser supports its RTP stream.
@@ -7229,6 +7262,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         // Explicit operator choices take precedence. Automatic
                         // selection uses the successfully probed codec rather
                         // than the previous hardcoded H.264 experimental path.
+                        if (requestedCodec == "h265_hw" || requestedCodec == "av1_hw" ||
+                            requestedCodec == "av1_sw")
+                            return requestedCodec;
                         if (requestedCodec == "vp9_hw" || requestedCodec == "vp9" || requestedCodec == "vp9_sw") return requestedCodec;
                         if (requestedCodec == "vp8") return std::string("vp8");
                         if (requestedCodec == "h264" || requestedCodec == "h264_hw" ||
@@ -7317,6 +7353,12 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t framesForwarded = 0;
                 DesktopMode lastForwardedMode = DesktopMode::Normal;
                 bool hasForwardedSource = false;
+                // Reuse the last already-encoded-source frame only for a
+                // bounded receiver keyframe recovery when the desktop is idle.
+                // Move the captured I420 planes instead of copying each frame.
+                I420Frame lastRecoveryFrame;
+                DesktopMode lastRecoveryMode = DesktopMode::Normal;
+                std::chrono::steady_clock::time_point lastRecoveryReplayAt{};
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -7674,6 +7716,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             receivedAtNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
                             ctx.sender->sendExternalRawI420(secureFrame, forceKf);
                             sendEnd = std::chrono::steady_clock::now();
+                            lastRecoveryFrame = std::move(secureFrame);
+                            lastRecoveryMode = DesktopMode::Secure;
                         }
                         sent = true;
                     }
@@ -7721,8 +7765,42 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             receivedAtNs = static_cast<uint64_t>(GetTickCount64()) * 1000000ull;
                             ctx.sender->sendExternalRawI420(normalFrame, forceKf);
                             sendEnd = std::chrono::steady_clock::now();
+                            lastRecoveryFrame = std::move(normalFrame);
+                            lastRecoveryMode = DesktopMode::Normal;
                         }
                         sent = true;
+                    }
+
+                    // Receiver recovery must not depend on changed pixels:
+                    // a lost initial IDR on an idle desktop otherwise leaves
+                    // Safari with incoming RTP but zero decodable frames.
+                    // Never replay an old normal frame across CAD/UAC, or a
+                    // secure frame after returning to the normal desktop.
+                    const bool lastSourceStillActive = useSecure
+                        ? (lastRecoveryMode == DesktopMode::Secure &&
+                           ctx.secureReady && ctx.secureStreamerProcess != nullptr)
+                        : (lastRecoveryMode == DesktopMode::Normal &&
+                           ctx.normalStreamerProcess != nullptr &&
+                           !ctx.secureStateAnnounced);
+                    const bool recoveryCooldownPassed =
+                        lastRecoveryReplayAt.time_since_epoch().count() == 0 ||
+                        now - lastRecoveryReplayAt >= std::chrono::seconds(3);
+                    if (!sent && ctx.sender && hasForwardedSource &&
+                        ctx.recoveryKeyframeRequested.load() &&
+                        lastRecoveryFrame.width > 0 && lastRecoveryFrame.height > 0 &&
+                        !lastRecoveryFrame.y.empty() &&
+                        !ctx.consoleSwitchInProgress && !ctx.handoffStateAnnounced &&
+                        lastSourceStillActive && recoveryCooldownPassed &&
+                        ctx.recoveryKeyframeRequested.exchange(false)) {
+                        sendBegin = std::chrono::steady_clock::now();
+                        ctx.sender->sendExternalRawI420(lastRecoveryFrame, true);
+                        sendEnd = std::chrono::steady_clock::now();
+                        lastRecoveryReplayAt = now;
+                        ++framesForwarded;
+                        sent = true;
+                        LogI("[video-recovery] cached source keyframe sent session=" +
+                            ctx.sessionId + " mode=" +
+                            (lastRecoveryMode == DesktopMode::Secure ? "secure" : "normal"));
                     }
 
                     if (sent && sendEnd.time_since_epoch().count() != 0) {

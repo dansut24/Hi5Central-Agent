@@ -1,5 +1,6 @@
 #include "../src/encoding/av1_software_encoder_experimental.h"
 #include "../src/encoding/av1_rtp_payload_experimental.h"
+#include "../src/encoding/av1_rtp_webrtc_compatible.h"
 #include <aom/aom_decoder.h>
 #include <aom/aomdx.h>
 #include <algorithm>
@@ -10,8 +11,9 @@
 #include <string>
 #include <vector>
 
-// Rebuild low-overhead AV1 OBUs from our one-element-per-RTP-packet prototype.
-// This intentionally checks the actual Z/Y/W fragmentation, not just size.
+// Reassemble RFC 9364 RTP from the WebRTC-compatible packetizer into
+// low-overhead OBUs and submit the result to a real libaom AV1 decoder.
+// Supports W=1..3, OBU LEB128 sizes, Z/Y continuation and header extension.
 static bool Reassemble(const hi5::Av1RtpPayloads& rtp, std::vector<uint8_t>& out) {
     out.clear();
     std::vector<uint8_t> partial;
@@ -21,25 +23,46 @@ static bool Reassemble(const hi5::Av1RtpPayloads& rtp, std::vector<uint8_t>& out
         const uint8_t agg = packet[0];
         const bool z = (agg & 0x80u) != 0;
         const bool y = (agg & 0x40u) != 0;
-        if (((agg >> 4) & 0x03u) != 1 || (agg & 0x07u) != 0 ||
-            z != awaitingContinuation) return false;
-        partial.insert(partial.end(), packet.begin() + 1, packet.end());
+        const unsigned count = (agg >> 4) & 0x03u;
+        if (count == 0 || (agg & 0x07u) != 0 ||
+            z != awaitingContinuation || (z && (agg & 0x08u))) return false;
+        size_t offset = 1;
+        for (unsigned i = 0; i < count; ++i) {
+            size_t fragmentSize = 0;
+            if (i + 1 == count) {
+                fragmentSize = packet.size() - offset;
+            } else {
+                uint32_t declared = 0;
+                if (!hi5::Av1ReadLeb128(packet, offset, declared)) return false;
+                fragmentSize = declared;
+            }
+            if (fragmentSize == 0 || fragmentSize > packet.size() - offset)
+                return false;
+            const bool continuing = (i == 0 && z);
+            if (!continuing && !partial.empty()) return false;
+            partial.insert(partial.end(), packet.begin() + static_cast<std::ptrdiff_t>(offset),
+                           packet.begin() + static_cast<std::ptrdiff_t>(offset + fragmentSize));
+            offset += fragmentSize;
+            const bool continuesNext = (i + 1 == count && y);
+            if (!continuesNext) {
+                if (partial.empty() || (partial[0] & 0x83u) != 0) return false;
+                const size_t headerBytes = (partial[0] & 0x04u) ? 2u : 1u;
+                if (partial.size() < headerBytes) return false;
+                out.push_back(static_cast<uint8_t>(partial[0] | 0x02u));
+                if (headerBytes == 2) out.push_back(partial[1]);
+                size_t n = partial.size() - headerBytes;
+                do {
+                    uint8_t b = static_cast<uint8_t>(n & 0x7fu);
+                    n >>= 7;
+                    out.push_back(static_cast<uint8_t>(b | (n ? 0x80u : 0u)));
+                } while (n != 0);
+                out.insert(out.end(), partial.begin() + static_cast<std::ptrdiff_t>(headerBytes),
+                           partial.end());
+                partial.clear();
+            }
+        }
+        if (offset != packet.size()) return false;
         awaitingContinuation = y;
-        if (y) continue;
-        if (partial.empty() || (partial[0] & 0x83u) != 0) return false;
-        const size_t headerBytes = (partial[0] & 0x04u) ? 2u : 1u;
-        if (partial.size() < headerBytes) return false;
-        out.push_back(static_cast<uint8_t>(partial[0] | 0x02u));
-        if (headerBytes == 2) out.push_back(partial[1]);
-        size_t size = partial.size() - headerBytes;
-        do {
-            uint8_t b = static_cast<uint8_t>(size & 0x7fu);
-            size >>= 7;
-            out.push_back(static_cast<uint8_t>(b | (size ? 0x80u : 0u)));
-        } while (size != 0);
-        out.insert(out.end(), partial.begin() + static_cast<std::ptrdiff_t>(headerBytes),
-                   partial.end());
-        partial.clear();
     }
     if (awaitingContinuation || !partial.empty()) { out.clear(); return false; }
     return !out.empty();
@@ -112,10 +135,13 @@ int main(int argc, char** argv) {
             ++encoded;
             if (p.keyframe) ++keyframes;
             hi5::Av1RtpPayloads rtp;
-            if (!hi5::BuildAv1RtpPayloads(p.bytes, 1100, rtp, &err)) {
+            if (!hi5::BuildAv1WebRtcCompatibleRtpPayloads(
+                p.bytes, 1100, p.keyframe, rtp, &err)) {
                 std::cerr << "AV1 emitted unsupported RTP bitstream: " << err << "\n";
                 return 2;
             }
+            if (p.keyframe && rtp.hasSequenceHeader && (rtp.packets.front().front() & 0x08u) == 0)
+                return 2; // Coded-video-sequence flag must accompany a keyframe.
             std::vector<uint8_t> assembled;
             if (!Reassemble(rtp, assembled)) {
                 std::cerr << "AV1 RTP reassembly failed\n";
@@ -170,7 +196,7 @@ int main(int argc, char** argv) {
     const double p95BudgetMs = fps >= 30 ? budgetMs * 0.75 : 35.0;
     const double worstBudgetMs = fps >= 30 ? budgetMs * 1.50 : 50.0;
     const bool realtime = p95 <= p95BudgetMs && steadyWorst <= worstBudgetMs;
-    std::cout << "LIBAOM_SYNTHETIC_AV1_DECODE_RTP_RECOVERY_PASS"
+    std::cout << "LIBAOM_WEBRTC_COMPAT_AV1_DECODE_RTP_RECOVERY_PASS"
               << " resolution=" << width << "x" << height
               << " target_fps=" << fps
               << " budget_ms=" << budgetMs

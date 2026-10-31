@@ -5,6 +5,7 @@ on:
     paths:
       - 'Agent/chatpass_agent/src/encoding/av1_software_encoder_experimental.*'
       - 'Agent/chatpass_agent/src/encoding/av1_rtp_payload_experimental.h'
+      - 'Agent/chatpass_agent/src/encoding/av1_rtp_webrtc_compatible.h'
       - 'Agent/chatpass_agent/tests/av1_software_encoder_test.cpp'
       - '.github/workflows/windows-av1-lenovo-qualification.yml'
   workflow_dispatch:
