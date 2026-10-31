@@ -102,5 +102,19 @@ int main() {
  assert(chooseForConnection(true,"auto","vp8",viewer,{av1},link,true).mode=="vp8");
  Viewer missing;
  assert(chooseForConnection(true,"auto","vp9_sw",missing,{intel},link,true).mode=="vp9_sw");
- std::cout<<"UNIVERSAL_CONNECTION_SELECTION_TESTS_PASSED\n";
+ // Browser-supported AV1 and HEVC alone must NEVER cause unsupported SDP.
+ assert(normalizeCodec(" HEVC ")=="h265");
+ assert(normalizeCodec("H265")=="h265");
+ assert(normalizeCodec(" Av1 ")=="av1");
+ auto hevc=intel;hevc.codec="h265";hevc.backend="Intel HEVC";
+ auto av1Live=intel;av1Live.codec="av1";av1Live.backend="libaom";
+ Viewer five;five.receiveCodecs={"vp8","vp9","h264","av1","h265"};
+ const auto guarded=chooseForConnection(true,"auto","vp8",five,
+     {hevc,av1Live},link,true);
+ assert(guarded.mode=="vp8" && !guarded.qualified);
+ Viewer onlyFuture;onlyFuture.receiveCodecs={"av1","h265"};
+ const auto noSender=chooseForConnection(true,"auto","vp8",onlyFuture,
+     {hevc,av1Live},link,true);
+ assert(!noSender.compatible && noSender.mode.empty());
+  std::cout<<"UNIVERSAL_CONNECTION_SELECTION_TESTS_PASSED\n";
 }
