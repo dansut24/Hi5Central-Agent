@@ -141,5 +141,22 @@ int main() {
  const auto noSender=chooseForConnection(true,"auto","vp8",onlyFuture,
      {hevc,av1Live},link,true);
  assert(!noSender.compatible && noSender.mode.empty());
+ // Viewer hardware preference must never bypass the decoded/RTP proof gate.
+ // Software-only is a real opt-out, and hardware-on is only a scoring hint.
+ Viewer receiver;receiver.receiveCodecs={"vp8","h264"};receiver.h264Level4=true;
+ auto hw=intel;hw.decodedFrames=true;
+ auto sw=hw;sw.hardware=false;sw.backend="h264_sw";
+ sw.p95EncodeMs=9;sw.worstEncodeMs=20;
+ assert(chooseForConnection(true,"auto","vp8",receiver,
+     {hw,sw},link,true,false,-1).mode=="h264_sw");
+ assert(chooseForConnection(true,"auto","vp8",receiver,
+     {hw,sw},link,true,false,1).mode=="h264_hw");
+ assert(chooseForConnection(true,"auto","vp8",receiver,
+     {hw},link,true,false,-1).mode=="vp8");
+ hw.decodedFrames=false;
+ assert(chooseForConnection(true,"auto","vp8",receiver,
+     {hw},link,true,false,1).mode=="vp8");
+ assert(chooseForConnection(true,"auto","vp8",receiver,
+     {sw},link,true,false,1).mode=="h264_sw");
   std::cout<<"UNIVERSAL_CONNECTION_SELECTION_TESTS_PASSED\n";
 }
