@@ -10,12 +10,15 @@
 #include <mfreadwrite.h>
 #include <mftransform.h>
 #include <mferror.h>
+#include <codecapi.h>
+#include <icodecapi.h>
 #include <wrl/client.h>
 #include "mf_async_pilot_events.h"
 
 #include <algorithm>
 #include <cstring>
 #include <sstream>
+#include <iostream>
 #include <comdef.h>
 
 #pragma comment(lib, "mf.lib")
@@ -30,6 +33,22 @@ namespace {
     // Windows Media Foundation HEVC = FOURCC 'HEVC' in the MF subtype GUID.
     // Device/OS availability is determined at runtime via MFTEnumEx.
     const GUID kHevcSubtype{0x43564548,0x0000,0x0010,{0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71}};
+
+    // HEVC access-unit flags must reflect actual coded NAL units, not a
+    // requested keyframe. A false IDR claim can mask a frozen decoder.
+    static bool ContainsHevcIrap(const std::vector<uint8_t>& annexB) {
+        for (size_t i = 0; i + 5 < annexB.size(); ++i) {
+            const size_t prefix =
+                annexB[i] == 0 && annexB[i + 1] == 0 && annexB[i + 2] == 1 ? 3 :
+                annexB[i] == 0 && annexB[i + 1] == 0 &&
+                annexB[i + 2] == 0 && annexB[i + 3] == 1 ? 4 : 0;
+            if (!prefix || i + prefix + 1 >= annexB.size()) continue;
+            const unsigned int nalType = (annexB[i + prefix] >> 1) & 0x3fu;
+            if (nalType >= 16 && nalType <= 23) return true;
+            i += prefix - 1;
+        }
+        return false;
+    }
 
     static std::string HrToString(HRESULT hr) {
         std::ostringstream oss;
@@ -109,6 +128,7 @@ namespace {
 
 struct H265MfEncoder::Impl {
     ComPtr<IMFTransform> transform;
+    ComPtr<ICodecAPI> codecApi;
     bool asynchronous = false;
     MfAsyncPilotEvents events;
     MFT_OUTPUT_STREAM_INFO outputInfo{};
@@ -238,6 +258,10 @@ bool H265MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
         return false;
     }
 
+    // Hardware HEVC transforms often expose ICodecAPI for IDR recovery.
+    // If absent, leave the encoder functional but report the limitation.
+    (void)m_impl->transform.As(&m_impl->codecApi);
+
     {
         ComPtr<IMFAttributes> attrs;
         UINT32 asyncFlag = FALSE;
@@ -297,7 +321,6 @@ bool H265MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool p
 }
 
 bool H265MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H265EncodedFrame& out, std::string* error) {
-    (void)forceKeyframe;
 
     out = {};
 
@@ -373,6 +396,21 @@ bool H265MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H265Encod
     // frame. Consume the encoder's NeedInput event before submitting a sample.
     if (m_impl->asynchronous &&
         !m_impl->events.waitFor(true, 750, error)) return false;
+
+    if (forceKeyframe && m_impl->codecApi) {
+        // Microsoft specifies that this setting applies to the NEXT
+        // ProcessInput sample and resets after it. Do not infer that the
+        // hardware honoured it: the output NAL types prove actual IRAP.
+        VARIANT request{};
+        request.vt = VT_UI4;
+        request.ulVal = 1;
+        const HRESULT forceHr = m_impl->codecApi->SetValue(
+            &CODECAPI_AVEncVideoForceKeyFrame, &request);
+        if (FAILED(forceHr)) {
+            std::cout << "[h265] hardware IDR request unavailable hr="
+                      << HrToString(forceHr) << "\n";
+        }
+    }
 
     hr = m_impl->transform->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) {
@@ -480,7 +518,7 @@ bool H265MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, H265Encod
             out.timestamp90k =
                 static_cast<uint32_t>((m_frameIndex * 90000ULL) / static_cast<uint64_t>(m_fps));
 
-            out.keyframe = forceKeyframe || m_frameIndex <= 2;
+            out.keyframe = ContainsHevcIrap(out.data);
             return true;
         }
     }
