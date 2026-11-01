@@ -4,6 +4,7 @@
 // intentionally has no platform dependencies so it can be regression tested.
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 
 namespace hi5 {
 // Input-first pilot shortens the wait before the capture helper notices a
@@ -12,6 +13,13 @@ inline std::chrono::milliseconds CaptureInputPollInterval(
     bool enabled, bool recentlyInput) {
     if (!enabled) return std::chrono::milliseconds(25);
     return std::chrono::milliseconds(recentlyInput ? 6 : 12);
+}
+// Fast mouse position updates are cheap and must not wake an otherwise idle
+// desktop. During a real held-button drag, however, ignoring those updates
+// lets the capture loop drop back to 2 FPS midway through moving a window.
+// The bit mask is maintained from authenticated MouseButton input events.
+inline bool FastMouseDragNeedsCapture(bool fastMouseUpdated, std::uint8_t buttonsDown) {
+    return fastMouseUpdated && (buttonsDown & 0x07u) != 0u;
 }
 struct CaptureFrameRateDecision {
     int targetFps = 2;
