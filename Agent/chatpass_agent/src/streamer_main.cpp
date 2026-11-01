@@ -826,6 +826,8 @@ namespace hi5 {
         const int idleFps = std::min(activeFps, ReadEnvInt("HI5_STREAM_IDLE_FPS", 2, 1, 15));
         const int motionFps = std::min(requestedMaxFps, ReadEnvInt("HI5_STREAM_MOTION_FPS", 30, 1, 60));
         const auto activeHold = std::chrono::milliseconds(ReadEnvInt("HI5_STREAM_ACTIVE_HOLD_MS", 900, 100, 5000));
+        // Opt-in: improve input-to-capture wake latency, no encoder changes.
+        const bool inputFirstCapture = ReadEnvInt("HI5_INPUT_FIRST_CAPTURE", 0, 0, 1) == 1;
         const auto statsEvery = std::chrono::seconds(ReadEnvInt("HI5_STREAM_STATS_SECONDS", 5, 1, 60));
         auto nextCaptureAt = std::chrono::steady_clock::now();
         auto nextStatsAt = std::chrono::steady_clock::now() + statsEvery;
@@ -836,6 +838,10 @@ namespace hi5 {
         uint64_t skippedFrames = 0;
         uint64_t writtenFrames = 0;
         uint64_t inputEvents = 0;
+        bool pendingInputReaction = false;
+        uint64_t inputReactionSamples = 0;
+        double inputReactionTotalMs = 0.0;
+        double inputReactionMaxMs = 0.0;
         uint64_t fastMouseApplied = 0;
         uint64_t fastMouseLastSeq = 0;
         uint64_t cursorOnlyFrames = 0; // intentionally disabled; keep log field at 0
@@ -928,6 +934,7 @@ namespace hi5 {
                 if (hadInput) {
                     ++inputEvents;
                     lastInputAt = std::chrono::steady_clock::now();
+                    pendingInputReaction = true;
                     nextCaptureAt = lastInputAt;
                 }
             }
@@ -1047,7 +1054,23 @@ namespace hi5 {
                     // genuine compositor updates discards real small motion.
                     const bool changedThisCapture =
                         hi5::ShouldPublishDesktopFrame(captured, sampledDesktopMotion);
-                    if (changedThisCapture) lastChangedFrameAt = now;
+                    if (changedThisCapture) {
+                        lastChangedFrameAt = now;
+                        // Capture-side response after a queued command; not
+                        // network RTT or decoder latency. Never log key data.
+                        if (inputFirstCapture && pendingInputReaction &&
+                            now >= lastInputAt && now - lastInputAt <= activeHold) {
+                            const double delayMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - lastInputAt).count();
+                            ++inputReactionSamples;
+                            inputReactionTotalMs += delayMs;
+                            inputReactionMaxMs = std::max(inputReactionMaxMs, delayMs);
+                            pendingInputReaction = false;
+                        }
+                    }
+                    if (pendingInputReaction && now >= lastInputAt &&
+                        now - lastInputAt > activeHold)
+                        pendingInputReaction = false;
                     const auto motionHold = std::chrono::milliseconds(
                         ReadEnvInt("HI5_STREAM_MOTION_HOLD_MS", 300, 100, 2000));
                     const auto rate = hi5::SelectCaptureFrameRate(
@@ -1181,6 +1204,11 @@ namespace hi5 {
                     " skipped=" + std::to_string(skippedFrames) +
                     " written=" + std::to_string(writtenFrames) +
                     " input=" + std::to_string(inputEvents) +
+                    " input_first_poll=" + std::to_string(inputFirstCapture ? 1 : 0) +
+                    " input_to_changed_samples=" + std::to_string(inputReactionSamples) +
+                    " input_to_changed_avg_ms=" + std::to_string(
+                        inputReactionTotalMs / std::max<uint64_t>(1, inputReactionSamples)) +
+                    " input_to_changed_max_ms=" + std::to_string(inputReactionMaxMs) +
                     " fps=" + std::to_string(lastTargetFps) +
                     " mode=" + std::string(StreamModeName(lastStreamMode)) +
                     " capture_avg_ms=" + std::to_string(captureTotalMs / std::max<uint64_t>(1, measuredCaptures)) +
@@ -1244,6 +1272,9 @@ namespace hi5 {
                 skippedFrames = 0;
                 writtenFrames = 0;
                 inputEvents = 0;
+                inputReactionSamples = 0;
+                inputReactionTotalMs = 0.0;
+                inputReactionMaxMs = 0.0;
                 resetCount = 0;
                 measuredCaptures = 0;
                 measuredWrites = 0;
@@ -1265,7 +1296,13 @@ namespace hi5 {
                 wgcPacer.Release();
                 wgcTimerStatusLogged = false;
             }
-            const auto sleepUntil = std::min(nextCaptureAt, currentTime + std::chrono::milliseconds(25));
+            const bool recentInput = inputFirstCapture &&
+                lastInputAt.time_since_epoch().count() != 0 &&
+                currentTime >= lastInputAt &&
+                currentTime - lastInputAt <= activeHold;
+            const auto inputPollInterval = hi5::CaptureInputPollInterval(
+                inputFirstCapture, recentInput);
+            const auto sleepUntil = std::min(nextCaptureAt, currentTime + inputPollInterval);
             if (sleepUntil > currentTime) {
                 // The scoped 1ms fallback must be limited to an explicit
                 // 15/30/45/60 FPS WGC selection. Automatic, secure desktop,

@@ -6,6 +6,13 @@
 #include <chrono>
 
 namespace hi5 {
+// Input-first pilot shortens the wait before the capture helper notices a
+// new command. It never forces duplicate video or changes codec/bitrate/FPS.
+inline std::chrono::milliseconds CaptureInputPollInterval(
+    bool enabled, bool recentlyInput) {
+    if (!enabled) return std::chrono::milliseconds(25);
+    return std::chrono::milliseconds(recentlyInput ? 6 : 12);
+}
 struct CaptureFrameRateDecision {
     int targetFps = 2;
     int mode = 0; // 0 idle, 1 changed desktop, 2 recent remote input
