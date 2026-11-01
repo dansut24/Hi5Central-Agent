@@ -2012,7 +2012,7 @@ function nativeViewerCodecQuery() {
 }
 
 function startSession(params) {
-  console.log("[viewer] startSession params:", params);
+  console.log("[viewer] starting authorized session");
 
   disconnect(undefined, { silent: true });
 
@@ -2024,7 +2024,7 @@ function startSession(params) {
   const wssUrl = params.wss_url || params.wssUrl || params.signaling_url || params.signalingUrl || "";
 
   if (!sessionId || !deviceId || !token || !wssUrl) {
-    console.error("[viewer] invalid connect params:", params);
+    console.error("[viewer] invalid connection parameters");
     disconnect("Invalid connection parameters");
     return;
   }
@@ -2061,7 +2061,7 @@ function startSession(params) {
     (token ? `&token=${encodeURIComponent(token)}` : "") +
     nativeViewerCodecQuery() +
     '&hw_accel=' + encodeURIComponent(hardwarePreference(deviceId));
-  console.log("[viewer] websocket url:", url);
+  // Do not log the signaling URL: it contains a short-lived Viewer token.
 
   ws = new WebSocket(url);
 
