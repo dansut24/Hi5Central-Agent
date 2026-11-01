@@ -1058,21 +1058,21 @@ void WebRtcSender::createPeerConnection() {
         const int paceKbps = readEnvInt("HI5_VP9_RTP_PACING_KBPS", 0, 0, 30000);
         if (paceKbps > 0) {
             const int tickMs = readEnvInt("HI5_VP9_RTP_PACING_MS", 5, 2, 20);
-            const int queuePackets = readEnvInt(
-                "HI5_VP9_RTP_MAX_QUEUE_PACKETS", 512, 128, 4096);
             try {
+                // Windows vcpkg currently pins libdatachannel's legacy
+                // two-argument PacingHandler. Unlike newer releases it
+                // provides neither a queue-length limit nor onOverflow().
+                // Do not imply the internal queue is bounded: a long-lived
+                // congestion backlog would add delay, so this remains a
+                // single-device, opt-in codec experiment only.
                 auto pacer = std::make_shared<rtc::PacingHandler>(
                     static_cast<double>(paceKbps) * 1000.0,
-                    std::chrono::milliseconds(tickMs),
-                    static_cast<size_t>(queuePackets));
-                // The pinned Windows libdatachannel PacingHandler does not
-                // expose onOverflow(). Keep its constructor queue limit;
-                // the handler itself owns bounded RTP pacing.
+                    std::chrono::milliseconds(tickMs));
                 m_track->chainMediaHandler(pacer);
                 LogInfo("[vp9] outgoing RTP pacing enabled session=" + m_sessionId +
                     " kbps=" + std::to_string(paceKbps) +
                     " interval_ms=" + std::to_string(tickMs) +
-                    " max_queued_packets=" + std::to_string(queuePackets));
+                    " queue_limit=unsupported_by_pinned_libdatachannel");
             }
             catch (const std::exception& e) {
                 LogWarn("[vp9] pacing unavailable; reverting to unpaced VP9 session=" +
