@@ -158,5 +158,29 @@ int main() {
      {hw},link,true,false,1).mode=="vp8");
  assert(chooseForConnection(true,"auto","vp8",receiver,
      {sw},link,true,false,1).mode=="h264_sw");
+ // Live Intel Iris Xe Agent 1.0.305 qualified HEVC cache:
+ // h265_hw, 244 encoded+decoded frames, recovered keyframes, p95=22.7519ms.
+ // These are fixture values only. The real selection still reloads a
+ // build+driver-bound cache on each authenticated Viewer connection.
+ {
+  Viewer tested;tested.receiveCodecs={"vp8","vp9","av1","h264","h265"};
+  tested.h264Level4=false;
+  Candidate intelHevc{};intelHevc.codec="h265";intelHevc.backend="h265_hw";
+  intelHevc.hardware=true;intelHevc.emittedFrames=true;
+  intelHevc.decodedFrames=true;intelHevc.keyframeRecovery=true;
+  intelHevc.packetizationVerified=true;intelHevc.testedFrames=244;
+  intelHevc.maxWidth=1280;intelHevc.maxHeight=720;
+  intelHevc.p95EncodeMs=22.7519;intelHevc.worstEncodeMs=36.6522;
+  auto normal=chooseForConnection(true,"auto","vp8",tested,{intelHevc},link,false,true,0);
+  auto preferGpu=chooseForConnection(true,"auto","vp8",tested,{intelHevc},link,false,true,1);
+  auto software=chooseForConnection(true,"auto","vp8",tested,{intelHevc},link,false,true,-1);
+  assert(normal.mode=="h265_hw" && normal.qualified);
+  assert(preferGpu.mode=="h265_hw" && preferGpu.qualified);
+  assert(software.mode=="vp8" && !software.qualified);
+  Viewer noHevcViewer=tested;noHevcViewer.receiveCodecs={"vp8","av1"};
+  assert(chooseForConnection(true,"auto","vp8",noHevcViewer,{intelHevc},link,false,true,1).mode=="vp8");
+  intelHevc.keyframeRecovery=false;
+  assert(chooseForConnection(true,"auto","vp8",tested,{intelHevc},link,false,true,1).mode=="vp8");
+ }
   std::cout<<"UNIVERSAL_CONNECTION_SELECTION_TESTS_PASSED\n";
 }
