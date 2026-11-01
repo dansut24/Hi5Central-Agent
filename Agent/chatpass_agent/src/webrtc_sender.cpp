@@ -12,6 +12,7 @@
 #include "util/log.h"
 
 #include <rtc/rtc.hpp>
+#include <rtc/pacinghandler.hpp>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -1046,6 +1047,39 @@ void WebRtcSender::createPeerConnection() {
     media.setBitrate(m_bitrateKbps * 1000);
 
     m_track = m_pc->addTrack(media);
+
+    // Opt-in pacing ONLY for experimental VP9. Sending every fragment of a
+    // 1080p VP9 keyframe in one synchronous burst causes RTP loss/recovery
+    // storms on some mobile links, even when the average bitrate is low.
+    // libdatachannel's asynchronous media handler smooths the outgoing
+    // packets without sleeping in the capture/input-first/encode thread.
+    // Preserve the exact AV1/VP8/H264/H265 track pipelines.
+    if (m_videoCodec == VideoCodec::VP9) {
+        const int paceKbps = readEnvInt("HI5_VP9_RTP_PACING_KBPS", 0, 0, 30000);
+        if (paceKbps > 0) {
+            const int tickMs = readEnvInt("HI5_VP9_RTP_PACING_MS", 5, 2, 20);
+            try {
+                // Windows vcpkg currently pins libdatachannel's legacy
+                // two-argument PacingHandler. Unlike newer releases it
+                // provides neither a queue-length limit nor onOverflow().
+                // Do not imply the internal queue is bounded: a long-lived
+                // congestion backlog would add delay, so this remains a
+                // single-device, opt-in codec experiment only.
+                auto pacer = std::make_shared<rtc::PacingHandler>(
+                    static_cast<double>(paceKbps) * 1000.0,
+                    std::chrono::milliseconds(tickMs));
+                m_track->chainMediaHandler(pacer);
+                LogInfo("[vp9] outgoing RTP pacing enabled session=" + m_sessionId +
+                    " kbps=" + std::to_string(paceKbps) +
+                    " interval_ms=" + std::to_string(tickMs) +
+                    " queue_limit=unsupported_by_pinned_libdatachannel");
+            }
+            catch (const std::exception& e) {
+                LogWarn("[vp9] pacing unavailable; reverting to unpaced VP9 session=" +
+                    m_sessionId + " reason=" + e.what());
+            }
+        }
+    }
 
     createInputDataChannel();
 
