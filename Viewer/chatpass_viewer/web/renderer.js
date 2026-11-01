@@ -45,6 +45,7 @@ const elDiagFrames = document.getElementById("diag-frames");
 const elDiagPacketsLost = document.getElementById("diag-packets-lost");
 const elDiagRtt = document.getElementById("diag-rtt");
 const elDiagIceServers = document.getElementById("diag-ice-servers");
+const elHardwareAccelerationPref = document.getElementById("hardware-acceleration-pref");
 
 if (elVideo) {
   elVideo.autoplay = true;
@@ -62,6 +63,32 @@ let pc = null;
 let inputDc = null;
 
 let currentSession = null;
+const HARDWARE_PREFS_KEY = 'hi5central.viewer.hardware-acceleration.v1';
+let hardwarePrefs = {};
+try { const raw = JSON.parse(localStorage.getItem(HARDWARE_PREFS_KEY) || '{}');
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) hardwarePrefs = raw;
+} catch {}
+function hardwarePreference(deviceId) {
+  const value = hardwarePrefs[String(deviceId || '')];
+  return ['on', 'off'].includes(value) ? value : 'auto';
+}
+function updateHardwarePreferenceUi() {
+  if (elHardwareAccelerationPref)
+    elHardwareAccelerationPref.value = hardwarePreference(currentSession?.deviceId);
+}
+elHardwareAccelerationPref?.addEventListener('change', () => {
+  if (!currentSession?.deviceId) return;
+  const selected = ['on','off'].includes(elHardwareAccelerationPref.value)
+    ? elHardwareAccelerationPref.value : 'auto';
+  hardwarePrefs[String(currentSession.deviceId)] = selected;
+  try { localStorage.setItem(HARDWARE_PREFS_KEY, JSON.stringify(hardwarePrefs)); } catch {}
+});
+// Native file-based WebView storage may be disabled; keep Viewer functional.
+try {
+  if (new URLSearchParams(location.search).get('diagnostics') === '1' ||
+      localStorage.getItem('hi5central.viewer.showDiagnostics') === '1')
+    document.documentElement.dataset.viewerDiagnostics = 'on';
+} catch {}
 let remoteDescSet = false;
 let pendingRemoteIce = [];
 
@@ -1962,8 +1989,30 @@ async function onSignalMessage(raw) {
   }
 }
 
+// Advertise only RTCRtpReceiver-confirmed codecs. The Agent independently
+// requires runtime encoder proof, matching Viewer decode and RTP keyframes.
+function nativeViewerCodecQuery() {
+  try {
+    const offered = RTCRtpReceiver.getCapabilities?.('video')?.codecs || [];
+    const codecs = ['vp8','vp9','h264','av1','h265'].filter(codec =>
+      offered.some(c => {
+        const mime = String(c.mimeType || '').toLowerCase();
+        return mime === 'video/' + codec ||
+          (codec === 'h265' && mime === 'video/hevc');
+      }));
+    if (!codecs.length) return '';
+    const level4 = offered.some(c => {
+      if (String(c.mimeType || '').toLowerCase() !== 'video/h264') return false;
+      const match = String(c.sdpFmtpLine || '').match(/(?:^|;)\s*profile-level-id=([0-9a-f]{6})(?:;|$)/i);
+      return Boolean(match && parseInt(match[1].slice(4),16) >= 0x28);
+    });
+    return '&codec_caps_v1=1&video_codecs=' + encodeURIComponent(codecs.join(',')) +
+      '&h264_level4=' + (level4 ? '1' : '0');
+  } catch { return ''; }
+}
+
 function startSession(params) {
-  console.log("[viewer] startSession params:", params);
+  console.log("[viewer] starting authorized session");
 
   disconnect(undefined, { silent: true });
 
@@ -1975,7 +2024,7 @@ function startSession(params) {
   const wssUrl = params.wss_url || params.wssUrl || params.signaling_url || params.signalingUrl || "";
 
   if (!sessionId || !deviceId || !token || !wssUrl) {
-    console.error("[viewer] invalid connect params:", params);
+    console.error("[viewer] invalid connection parameters");
     disconnect("Invalid connection parameters");
     return;
   }
@@ -1986,6 +2035,7 @@ function startSession(params) {
     deviceId,
     wssUrl
   };
+  updateHardwarePreferenceUi();
 
   remoteMonitors = [];
   currentMonitorIndex = 0;
@@ -2008,8 +2058,10 @@ function startSession(params) {
   const url =
     `${wssUrl}?session_id=${encodeURIComponent(sessionId)}` +
     `&device_id=${encodeURIComponent(deviceId)}` +
-    (token ? `&token=${encodeURIComponent(token)}` : "");
-  console.log("[viewer] websocket url:", url);
+    (token ? `&token=${encodeURIComponent(token)}` : "") +
+    nativeViewerCodecQuery() +
+    '&hw_accel=' + encodeURIComponent(hardwarePreference(deviceId));
+  // Do not log the signaling URL: it contains a short-lived Viewer token.
 
   ws = new WebSocket(url);
 

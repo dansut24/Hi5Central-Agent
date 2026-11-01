@@ -2856,6 +2856,14 @@ LogI(
                                 ReadConfigInt("HI5_EXPERIMENTAL_LIVE_CODECS", 0, 0, 1) == 1;
                             const bool asyncHw = ReadConfigInt(
                                 "HI5_H264_ASYNC_HW", 0, 0, 1) == 1;
+                            // Signed-in Viewer choice applies only to this
+                            // connection's automatic, already-qualified codecs.
+                            // It does not force hardware availability, override
+                            // a manual Agent codec or bypass recovery proof.
+                            const std::string hwPref = msg.value(
+                                "viewer_hw_accel",std::string("auto"));
+                            const int hardwarePreference =
+                                hwPref == "off" ? -1 : hwPref == "on" ? 1 : 0;
                             const bool viewerVp8 =
                                 hi5::universal_codec::supports(viewer, "vp8");
                             const bool viewerVp9 =
@@ -2891,7 +2899,7 @@ LogI(
                                     "vp8", // Only a proven cached codec can override.
                                     viewer, candidates,
                                     hi5::universal_codec::Link{}, asyncHw,
-                                    allowFiveCodecs);
+                                    allowFiveCodecs, hardwarePreference);
                             if (!selection.compatible) {
                                 LogW("[codec-universal] rejecting incompatible " +
                                     std::string("Viewer before SDP: ") +
@@ -2924,6 +2932,9 @@ LogI(
                                 " viewer_h264=" + (viewerH264 ? "1" : "0") +
                                 " viewer_av1=" + (viewerAv1 ? "1" : "0") +
                                 " viewer_h265=" + (viewerH265 ? "1" : "0") +
+                                " hardware_preference=" +
+                                    (hardwarePreference < 0 ? "off" :
+                                      hardwarePreference > 0 ? "on" : "auto") +
                                 " av1_h265_auto_gate=" +
                                     (allowFiveCodecs ? "1" : "0") +
                                 " viewer_h264_level4=" +

@@ -28,7 +28,8 @@ inline ConnectionSelection chooseForConnection(
     const std::vector<Candidate>& cachedQualifications,
     const Link& link,
     bool asyncHardwareH264Ready,
-    bool endToEndFiveCodecPilot = false) {
+    bool endToEndFiveCodecPilot = false,
+    int hardwarePreference = 0) {
     // An explicit operator choice always overrides the experiment. The
     // WebRtcSender must still fail closed if its encoder cannot initialise.
     if (operatorMode != "auto")
@@ -53,7 +54,7 @@ inline ConnectionSelection chooseForConnection(
                    c.codec != "h264") continue;
         supported.push_back(c);
     }
-    const Choice c=select(supported,viewer,link);
+    const Choice c=select(supported,viewer,link,1920,1080,20,hardwarePreference);
     if(c.qualified) {
         if (c.codec == "av1") return {c.backend,true,true,
             "qualified AV1 encoder, browser decoder, RTP and recovered keyframe"};
