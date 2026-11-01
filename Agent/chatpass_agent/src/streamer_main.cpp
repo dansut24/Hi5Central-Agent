@@ -623,7 +623,8 @@ namespace {
         DesktopFrameSource* source,
         int& currentDisplay,
         const std::string& sessionId,
-        int* manualCaptureFps = nullptr) {
+        int* manualCaptureFps = nullptr,
+        std::uint8_t* remoteButtonsDown = nullptr) {
         // Low-latency input: mouse movement is latest-state only. Collapse
         // runs of MouseMove commands so clicks/keys are not delayed behind a
         // backlog of stale pointer locations.
@@ -668,6 +669,11 @@ namespace {
                 break;
             case hi5::InputCmdType::MouseButton:
                 SendMouseButton(cmd.mouseButton.button, cmd.mouseButton.down != 0);
+                if (remoteButtonsDown && cmd.mouseButton.button < 3) {
+                    const auto bit = static_cast<std::uint8_t>(1u << cmd.mouseButton.button);
+                    if (cmd.mouseButton.down) *remoteButtonsDown |= bit;
+                    else *remoteButtonsDown &= static_cast<std::uint8_t>(~bit);
+                }
                 break;
             case hi5::InputCmdType::MouseWheel:
                 SendMouseWheel(cmd.mouseWheel.deltaX, cmd.mouseWheel.deltaY);
@@ -845,6 +851,8 @@ namespace hi5 {
         uint64_t fastMouseApplied = 0;
         uint64_t fastMouseLastSeq = 0;
         uint64_t cursorOnlyFrames = 0; // intentionally disabled; keep log field at 0
+        std::uint8_t remoteButtonsDown = 0;
+        uint64_t fastMouseDragWakes = 0;
         std::chrono::steady_clock::time_point fastMouseNextLog{};
         const int cursorRefreshFps = 0; // disabled: mouse movement must not force video frames
         uint64_t resetCount = 0;
@@ -924,11 +932,14 @@ namespace hi5 {
                     ApplyFastMouseTarget(fastTarget, args.sessionId, fastMouseNextLog, fastMouseApplied);
                 }
 
-                hadInput = HandleInputPipe(inputPipe, &source, currentDisplay, args.sessionId, &manualCaptureFps);
-                if (hadFastMouse) {
-                    // Fast mouse movement is applied directly in the interactive streamer.
-                    // Do not treat mouse-only movement as video activity: forcing captures
-                    // for cursor motion was the main reason CPU climbed after the cursor experiments.
+                hadInput = HandleInputPipe(inputPipe, &source, currentDisplay, args.sessionId,
+                    &manualCaptureFps, &remoteButtonsDown);
+                // Ignore ordinary pointer movement, but a held-button window
+                // drag is real desktop activity. Keep capture responsive while
+                // dragging without burning CPU on cursor-only idle movement.
+                if (hi5::FastMouseDragNeedsCapture(hadFastMouse, remoteButtonsDown)) {
+                    hadInput = true;
+                    ++fastMouseDragWakes;
                 }
 
                 if (hadInput) {
@@ -1201,6 +1212,7 @@ namespace hi5 {
                     " attempts=" + std::to_string(captureAttempts) +
                     " changed=" + std::to_string(changedFrames) +
                     " cursor_only=" + std::to_string(cursorOnlyFrames) +
+                    " fast_mouse_drag_wakes=" + std::to_string(fastMouseDragWakes) +
                     " skipped=" + std::to_string(skippedFrames) +
                     " written=" + std::to_string(writtenFrames) +
                     " input=" + std::to_string(inputEvents) +
