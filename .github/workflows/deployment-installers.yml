@@ -122,6 +122,43 @@ jobs:
           Copy-Item $built "$payloadDir/Hi5CentralAgentSetup.exe"
           Write-Host "Current Agent setup size: $((Get-Item $built).Length) bytes"
 
+      # The tenant template is a bootstrap launcher, NOT the direct Inno Setup
+      # executable. Publishing the template as an in-place Agent upgrade caused
+      # Agent 1.0.296 to hang with the service stopped (1 Nov 2026). Expose the
+      # actual compiled Inno installer separately so controlled upgrades can
+      # select the correct artifact without PE resource extraction.
+      - name: Preserve direct Windows Agent in-place installer
+        shell: pwsh
+        run: |
+          $built = 'Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe'
+          if (-not (Test-Path -LiteralPath $built)) { throw 'Real Inno Setup installer missing.' }
+          $out = 'dist/windows-agent-inplace'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $target = Join-Path $out 'Hi5CentralAgentSetup.exe'
+          Copy-Item -LiteralPath $built -Destination $target -Force
+          $bytes = [System.IO.File]::ReadAllBytes($target)
+          if ($bytes.Length -lt 1000000 -or $bytes.Length -gt 50000000 -or
+              $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+            throw 'Native Agent installer failed PE size/header validation.'
+          }
+          $manifest = [ordered]@{
+            kind = 'native-inno-setup-not-tenant-bootstrap'
+            agent_version = '1.0.${{ github.run_number }}'
+            commit = '${{ github.sha }}'
+            exe = 'Hi5CentralAgentSetup.exe'
+            exe_size = $bytes.Length
+            exe_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant()
+          }
+          $manifest | ConvertTo-Json | Set-Content -Path (Join-Path $out 'manifest.json') -Encoding utf8
+          Write-Host "Native direct installer preserved (SHA256=$($manifest.exe_sha256))"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-Windows-Agent-InPlace-Installer
+          path: dist/windows-agent-inplace/
+          retention-days: 30
+          if-no-files-found: error
+
       # The PR #60/Agent 1.0.77 WGC crash had only module+offset data because
       # CI discarded the matching Release PDB. Retain exe+PDB from ONE build.
       # Never include this PDB in the customer-facing installer.

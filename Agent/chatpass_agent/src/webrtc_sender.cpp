@@ -1053,7 +1053,7 @@ void WebRtcSender::createPeerConnection() {
     // storms on some mobile links, even when the average bitrate is low.
     // libdatachannel's asynchronous media handler smooths the outgoing
     // packets without sleeping in the capture/input-first/encode thread.
-    // Preserve the exact AV1/VP8/H264/H265 track pipelines.
+    // AV1/VP8/H265 remain unchanged; H.264 pacing is opt-in separately.
     if (m_videoCodec == VideoCodec::VP9) {
         const int paceKbps = readEnvInt("HI5_VP9_RTP_PACING_KBPS", 0, 0, 30000);
         if (paceKbps > 0) {
@@ -1076,6 +1076,32 @@ void WebRtcSender::createPeerConnection() {
             }
             catch (const std::exception& e) {
                 LogWarn("[vp9] pacing unavailable; reverting to unpaced VP9 session=" +
+                    m_sessionId + " reason=" + e.what());
+            }
+        }
+    }
+    else if (m_videoCodec == VideoCodec::H264) {
+        // H.264 packets are currently sent synchronously in FU-A bursts.
+        // Test the same libdatachannel RTP pacer proven by VP9, but only
+        // when explicitly requested on one test Agent. Keep the hardware
+        // encoder, input-first, capture and VP9 paths unchanged.
+        const int paceKbps = readEnvInt("HI5_H264_RTP_PACING_KBPS", 0, 0, 30000);
+        if (paceKbps > 0) {
+            const int tickMs = readEnvInt("HI5_H264_RTP_PACING_MS", 5, 2, 20);
+            try {
+                // Pinned Windows libdatachannel supports exactly two args
+                // and exposes neither a queue limit nor an overflow event.
+                auto pacer = std::make_shared<rtc::PacingHandler>(
+                    static_cast<double>(paceKbps) * 1000.0,
+                    std::chrono::milliseconds(tickMs));
+                m_track->chainMediaHandler(pacer);
+                LogInfo("[h264] outgoing RTP pacing enabled session=" + m_sessionId +
+                    " kbps=" + std::to_string(paceKbps) +
+                    " interval_ms=" + std::to_string(tickMs) +
+                    " queue_limit=unsupported_by_pinned_libdatachannel");
+            }
+            catch (const std::exception& e) {
+                LogWarn("[h264] pacing unavailable; reverting to unpaced H264 session=" +
                     m_sessionId + " reason=" + e.what());
             }
         }
@@ -2510,15 +2536,15 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         bool h264Scaled = false;
         const I420Frame h264Frame = scaleI420ForH264WebRtc(frame, &h264Scaled);
         const bool sizeChangedH264 = h264Frame.width != m_externalEncoderWidth || h264Frame.height != m_externalEncoderHeight;
-        const bool profileChangedH264 = profile.fps != m_externalConfiguredFps ||
-            profile.bitrateKbps != m_externalConfiguredBitrateKbps;
+        // Bitrate-only profile changes do not reconfigure the MF encoder.
+        // Avoid repeated IDRs until the next genuine encoder restart.
+        const bool fpsChangedH264 = profile.fps != m_externalConfiguredFps;
 
         // Media Foundation's nominal frame rate is set at encoder
         // creation. Reinitialise on an explicit rate change so asking for
         // 30/45/60 does not keep the old 20 FPS encoder configuration.
         // This is one swap per user change, not a new encoder per frame.
-        if (!m_h264Encoder || sizeChangedH264 ||
-            profile.fps != m_externalConfiguredFps) {
+        if (!m_h264Encoder || sizeChangedH264 || fpsChangedH264) {
             m_externalEncoderWidth = h264Frame.width;
             m_externalEncoderHeight = h264Frame.height;
             m_externalConfiguredFps = profile.fps;
@@ -2561,7 +2587,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 const auto encodeStart = std::chrono::steady_clock::now();
                 H264EncodedFrame encoded{};
                 std::string h264Err;
-                const bool h264Keyframe = keyframe || sizeChangedH264 || profileChangedH264;
+                const bool h264Keyframe = keyframe || sizeChangedH264 || fpsChangedH264;
                 if (!m_h264Encoder->encode(h264Frame, h264Keyframe, encoded, &h264Err)) {
                     LogInfo(
                         "[h264] encode failed session=" + m_sessionId +
