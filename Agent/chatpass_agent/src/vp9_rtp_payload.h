@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <vector>
 
-// RFC 7741: one spatial layer, flexible-free VP9 RTP payload descriptor.
+// RFC 9628: one spatial layer, non-flexible VP9 RTP payload descriptor.
 // Every fragment carries a stable 15-bit Picture ID. A keyframe carries
 // spatial layer resolution so the receiver can initialize its decoder.
 // Never replace a keyframe flag with a claim unsupported by the encoder.
