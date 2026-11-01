@@ -30,6 +30,8 @@ public:
 private:
     struct Impl;
     Impl* m_impl = nullptr;
+    struct VpxImpl;
+    VpxImpl* m_vpx = nullptr;  // software VP9; bypasses unreliable Windows MFT
 
     bool m_open = false;
     int m_width = 0;
