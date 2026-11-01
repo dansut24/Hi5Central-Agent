@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstring>
 #include <sstream>
+#include <iostream>
 #include <comdef.h>
 
 #pragma comment(lib, "mf.lib")
