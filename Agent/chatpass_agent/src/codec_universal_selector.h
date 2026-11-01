@@ -95,7 +95,8 @@ inline Choice select(
     const Link& link,
     int desiredWidth = 1920,
     int desiredHeight = 1080,
-    int targetFps = 20) {
+    int targetFps = 20,
+    int hardwarePreference = 0) {
     Choice fallback;
     if (!supports(viewer, "vp8")) {
         // No universal-compatible receiver was supplied. The caller MUST
@@ -110,6 +111,9 @@ inline Choice select(
     Choice best = fallback;
     for (const Candidate& c : qualifications) {
         if (!proven(c, targetFps) || !supports(viewer, c.codec)) continue;
+        // A Viewer can opt out of remote GPU encoding, but cannot make an
+        // unqualified hardware encoder eligible just by toggling a setting.
+        if (hardwarePreference < 0 && c.hardware) continue;
         if (c.codec == "h264" && !viewer.h264Level4) {
             // L3.1 is valid only for up to 720p at our 20fps target.
             if (c.maxWidth <= 0 || c.maxHeight <= 0) continue;
@@ -128,7 +132,7 @@ inline Choice select(
         // benefit for verified hardware when competing choices are similar.
         const double area = static_cast<double>(w) * h;
         const double score = 100.0 * area / (1920.0 * 1080.0) +
-            (c.hardware ? 10.0 : 0.0) -
+            (c.hardware ? (hardwarePreference > 0 ? 26.0 : 10.0) : 0.0) -
             c.p95EncodeMs * 1.1 -
             c.worstEncodeMs * 0.15 -
             (link.lossFraction > 0.03 ? requiredKbps(c.codec,w,h) / 400.0 : 0.0) -
