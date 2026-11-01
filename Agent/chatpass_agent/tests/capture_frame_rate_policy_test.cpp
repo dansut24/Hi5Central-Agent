@@ -30,6 +30,12 @@ int main() {
     assert(hi5::SelectManualSessionCeilingFps(40) == 30);
     assert(hi5::SelectManualSessionCeilingFps(20) == 15);
     assert(hi5::SelectManualSessionCeilingFps(15) == 15);
+    // All codecs share capture scheduling. Default must be unchanged.
+    assert(hi5::CaptureInputPollInterval(false, false) == 25ms);
+    assert(hi5::CaptureInputPollInterval(false, true) == 25ms);
+    assert(hi5::CaptureInputPollInterval(true, false) == 12ms);
+    assert(hi5::CaptureInputPollInterval(true, true) == 6ms);
+    assert(decide(origin, old, old, false).targetFps == 2);
     // Explicit viewer rates must reach the capture helper (not just SDP),
     // while Automatic and static desktop retain low-CPU behaviour.
     for (int requested : {15, 30, 45, 60}) {
