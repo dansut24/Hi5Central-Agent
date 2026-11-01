@@ -2536,15 +2536,15 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
         bool h264Scaled = false;
         const I420Frame h264Frame = scaleI420ForH264WebRtc(frame, &h264Scaled);
         const bool sizeChangedH264 = h264Frame.width != m_externalEncoderWidth || h264Frame.height != m_externalEncoderHeight;
-        const bool profileChangedH264 = profile.fps != m_externalConfiguredFps ||
-            profile.bitrateKbps != m_externalConfiguredBitrateKbps;
+        // Bitrate-only profile changes do not reconfigure the MF encoder.
+        // Avoid repeated IDRs until the next genuine encoder restart.
+        const bool fpsChangedH264 = profile.fps != m_externalConfiguredFps;
 
         // Media Foundation's nominal frame rate is set at encoder
         // creation. Reinitialise on an explicit rate change so asking for
         // 30/45/60 does not keep the old 20 FPS encoder configuration.
         // This is one swap per user change, not a new encoder per frame.
-        if (!m_h264Encoder || sizeChangedH264 ||
-            profile.fps != m_externalConfiguredFps) {
+        if (!m_h264Encoder || sizeChangedH264 || fpsChangedH264) {
             m_externalEncoderWidth = h264Frame.width;
             m_externalEncoderHeight = h264Frame.height;
             m_externalConfiguredFps = profile.fps;
@@ -2587,7 +2587,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 const auto encodeStart = std::chrono::steady_clock::now();
                 H264EncodedFrame encoded{};
                 std::string h264Err;
-                const bool h264Keyframe = keyframe || sizeChangedH264 || profileChangedH264;
+                const bool h264Keyframe = keyframe || sizeChangedH264 || fpsChangedH264;
                 if (!m_h264Encoder->encode(h264Frame, h264Keyframe, encoded, &h264Err)) {
                     LogInfo(
                         "[h264] encode failed session=" + m_sessionId +
