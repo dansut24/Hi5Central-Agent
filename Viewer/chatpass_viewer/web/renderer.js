@@ -83,9 +83,12 @@ elHardwareAccelerationPref?.addEventListener('change', () => {
   hardwarePrefs[String(currentSession.deviceId)] = selected;
   try { localStorage.setItem(HARDWARE_PREFS_KEY, JSON.stringify(hardwarePrefs)); } catch {}
 });
-if (new URLSearchParams(location.search).get('diagnostics') === '1' ||
-    localStorage.getItem('hi5central.viewer.showDiagnostics') === '1')
-  document.documentElement.dataset.viewerDiagnostics = 'on';
+// Native file-based WebView storage may be disabled; keep Viewer functional.
+try {
+  if (new URLSearchParams(location.search).get('diagnostics') === '1' ||
+      localStorage.getItem('hi5central.viewer.showDiagnostics') === '1')
+    document.documentElement.dataset.viewerDiagnostics = 'on';
+} catch {}
 let remoteDescSet = false;
 let pendingRemoteIce = [];
 
@@ -2000,7 +2003,7 @@ function nativeViewerCodecQuery() {
     if (!codecs.length) return '';
     const level4 = offered.some(c => {
       if (String(c.mimeType || '').toLowerCase() !== 'video/h264') return false;
-      const match = String(c.sdpFmtpLine || '').match(/(?:^|;)\\s*profile-level-id=([0-9a-f]{6})(?:;|$)/i);
+      const match = String(c.sdpFmtpLine || '').match(/(?:^|;)\s*profile-level-id=([0-9a-f]{6})(?:;|$)/i);
       return Boolean(match && parseInt(match[1].slice(4),16) >= 0x28);
     });
     return '&codec_caps_v1=1&video_codecs=' + encodeURIComponent(codecs.join(',')) +
