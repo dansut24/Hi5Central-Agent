@@ -142,6 +142,7 @@ private:
 
     uint32_t m_ssrc = 0;
     uint16_t m_sequence = 0;
+    uint16_t m_vp9PictureId = 0;
     RtpVideoWallClock m_videoRtpClock; // Actual frame delivery cadence, shared across codecs.
     int m_payloadType = 96;
 

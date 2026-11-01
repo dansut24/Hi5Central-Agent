@@ -1,4 +1,5 @@
 #include "webrtc_sender.h"
+#include "vp9_rtp_payload.h"
 #include "codec_auto_fps.h"
 #include "frame_source.h"
 #include "frame_scale_bilinear.h"
@@ -1430,47 +1431,11 @@ void WebRtcSender::sendVp8PayloadPackets(const std::vector<std::vector<uint8_t>>
 
 
 std::vector<std::vector<uint8_t>> WebRtcSender::packetizeVp9(const Vp9EncodedFrame& frame) {
-    constexpr size_t maxPayload = 1200;
-    std::vector<std::vector<uint8_t>> packets;
-
-    if (frame.data.empty()) {
-        return packets;
-    }
-
-    size_t offset = 0;
-    bool first = true;
-
-    while (offset < frame.data.size()) {
-        const size_t remaining = frame.data.size() - offset;
-        const size_t chunk = std::min(remaining, maxPayload - 1);
-
-        std::vector<uint8_t> payload;
-        payload.reserve(1 + chunk);
-
-        /*
-          Minimal VP9 RTP payload descriptor:
-          - I=0, P=0, L=0, F=0, B/E set by packet boundary.
-          - This is enough for a first WebRTC VP9 validation path with one spatial layer.
-        */
-        uint8_t descriptor = 0x00;
-        if (first) {
-            descriptor |= 0x08; // B: beginning of frame
-        }
-        if (chunk == remaining) {
-            descriptor |= 0x04; // E: end of frame
-        }
-
-        payload.push_back(descriptor);
-        payload.insert(payload.end(),
-            frame.data.begin() + static_cast<std::ptrdiff_t>(offset),
-            frame.data.begin() + static_cast<std::ptrdiff_t>(offset + chunk));
-
-        packets.push_back(std::move(payload));
-        offset += chunk;
-        first = false;
-    }
-
-    return packets;
+    // All fragments carry the same Picture ID. Only genuine encoder-reported
+    // keyframes announce the spatial-layer resolution.
+    const uint16_t pictureId = m_vp9PictureId++;
+    return hi5::vp9_rtp::packetize(frame.data, frame.keyframe,
+        m_externalEncoderWidth, m_externalEncoderHeight, pictureId);
 }
 
 void WebRtcSender::sendRtpVideoPayloadPackets(const std::vector<std::vector<uint8_t>>& vp9Payloads,
@@ -2074,7 +2039,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                         " error=" + vp9Err);
 
                     const bool hardwareInputUnsupported =
-                        m_codecMode == "vp9_hw" &&
+                        (m_codecMode == "vp9_hw" || m_codecMode == "vp9") &&
                         vp9Err.find("0xc00d36b5") != std::string::npos;
 
                     if (hardwareInputUnsupported) {

@@ -1,5 +1,8 @@
 #include "vp9_mf_encoder.h"
 
+#include <vpx/vpx_encoder.h>
+#include <vpx/vp8cx.h>
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -110,6 +113,15 @@ struct Vp9MfEncoder::Impl {
     bool mfStarted = false;
 };
 
+// The software VP9 experiment uses the same libvpx library already proven by
+// the production VP8 sender.  MF VP9VideoExtensionEncoder can return data
+// without producing a browser-decodable WebRTC stream on some Windows hosts.
+struct Vp9MfEncoder::VpxImpl {
+    vpx_codec_ctx_t codec{};
+    vpx_codec_enc_cfg_t config{};
+    bool initialized = false;
+};
+
 Vp9MfEncoder::Vp9MfEncoder() = default;
 
 Vp9MfEncoder::~Vp9MfEncoder() {
@@ -117,6 +129,11 @@ Vp9MfEncoder::~Vp9MfEncoder() {
 }
 
 void Vp9MfEncoder::shutdown() {
+    if (m_vpx) {
+        if (m_vpx->initialized) vpx_codec_destroy(&m_vpx->codec);
+        delete m_vpx;
+        m_vpx = nullptr;
+    }
     if (m_impl) {
         if (m_impl->transform) {
             m_impl->transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
@@ -134,9 +151,64 @@ void Vp9MfEncoder::shutdown() {
 bool Vp9MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool preferHardware, std::string* error) {
     shutdown();
 
-    if (width <= 0 || height <= 0) {
-        if (error) *error = "invalid size";
+    if (width <= 0 || height <= 0 || (width & 1) || (height & 1)) {
+        if (error) *error = "invalid VP9 I420 dimensions";
         return false;
+    }
+
+    // Software-only VP9 is deliberately libvpx, not another Media
+    // Foundation MFT that can silently return an unusable bitstream.
+    if (!preferHardware) {
+        auto software = std::make_unique<VpxImpl>();
+        const auto* iface = vpx_codec_vp9_cx();
+        if (!iface || vpx_codec_enc_config_default(iface, &software->config, 0) != VPX_CODEC_OK) {
+            if (error) *error = "libvpx VP9 encoder not available";
+            return false;
+        }
+        auto& cfg = software->config;
+        cfg.g_w = static_cast<unsigned int>(width);
+        cfg.g_h = static_cast<unsigned int>(height);
+        cfg.g_timebase.num = 1;
+        cfg.g_timebase.den = 90000;
+        cfg.g_threads = 4;
+        cfg.g_lag_in_frames = 0;
+        cfg.g_pass = VPX_RC_ONE_PASS;
+        cfg.rc_end_usage = VPX_CBR;
+        cfg.rc_target_bitrate = static_cast<unsigned int>(std::max(300, bitrateKbps));
+        cfg.rc_resize_allowed = 0;
+        cfg.rc_dropframe_thresh = 0;
+        cfg.rc_min_quantizer = 8;
+        cfg.rc_max_quantizer = 48;
+        cfg.rc_buf_initial_sz = 200;
+        cfg.rc_buf_optimal_sz = 350;
+        cfg.rc_buf_sz = 600;
+        cfg.kf_mode = VPX_KF_AUTO;
+        cfg.kf_min_dist = 0;
+        cfg.kf_max_dist = std::max(30, fps * 5);
+#ifdef VPX_ERROR_RESILIENT_DEFAULT
+        cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
+#endif
+        if (vpx_codec_enc_init(&software->codec, iface, &cfg, 0) != VPX_CODEC_OK) {
+            if (error) *error = "libvpx VP9 encoder initialization failed";
+            return false;
+        }
+        software->initialized = true;
+        vpx_codec_control(&software->codec, VP8E_SET_CPUUSED, 8);
+#ifdef VP9E_SET_TILE_COLUMNS
+        vpx_codec_control(&software->codec, VP9E_SET_TILE_COLUMNS, 1);
+#endif
+#ifdef VP9E_SET_ROW_MT
+        vpx_codec_control(&software->codec, VP9E_SET_ROW_MT, 1);
+#endif
+        m_width = width;
+        m_height = height;
+        m_fps = std::max(1, fps);
+        m_bitrateKbps = std::max(300, bitrateKbps);
+        m_frameIndex = 0;
+        m_encoderName = "libvpx VP9 realtime software";
+        m_vpx = software.release();
+        m_open = true;
+        return true;
     }
 
     HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
@@ -283,6 +355,19 @@ bool Vp9MfEncoder::init(int width, int height, int fps, int bitrateKbps, bool pr
 }
 
 bool Vp9MfEncoder::setTargetBitrateKbps(int bitrateKbps, std::string* error) {
+    if (m_vpx && m_vpx->initialized) {
+        const int requested = std::max(300, std::min(20000, bitrateKbps));
+        if (requested == m_bitrateKbps) return true;
+        auto next = m_vpx->config;
+        next.rc_target_bitrate = static_cast<unsigned int>(requested);
+        if (vpx_codec_enc_config_set(&m_vpx->codec, &next) != VPX_CODEC_OK) {
+            if (error) *error = "libvpx VP9 bitrate reconfigure failed";
+            return false;
+        }
+        m_vpx->config = next;
+        m_bitrateKbps = requested;
+        return true;
+    }
     if (!m_open || !m_impl || !m_impl->transform) {
         if (error) *error = "encoder not open";
         return false;
@@ -311,9 +396,53 @@ bool Vp9MfEncoder::setTargetBitrateKbps(int bitrateKbps, std::string* error) {
 }
 
 bool Vp9MfEncoder::encode(const I420Frame& frame, bool forceKeyframe, Vp9EncodedFrame& out, std::string* error) {
-    (void)forceKeyframe;
-
     out = {};
+    if (m_vpx && m_vpx->initialized) {
+        if (!m_open || frame.width != m_width || frame.height != m_height ||
+            frame.y.size() < static_cast<size_t>(m_width) * m_height ||
+            frame.u.size() < static_cast<size_t>(m_width / 2) * (m_height / 2) ||
+            frame.v.size() < static_cast<size_t>(m_width / 2) * (m_height / 2)) {
+            if (error) *error = "invalid software VP9 I420 frame";
+            return false;
+        }
+        vpx_image_t image{};
+        image.fmt = VPX_IMG_FMT_I420;
+        image.w = image.d_w = static_cast<unsigned int>(m_width);
+        image.h = image.d_h = static_cast<unsigned int>(m_height);
+        image.x_chroma_shift = image.y_chroma_shift = 1;
+        image.bps = 12;
+        image.planes[VPX_PLANE_Y] = const_cast<unsigned char*>(frame.y.data());
+        image.planes[VPX_PLANE_U] = const_cast<unsigned char*>(frame.u.data());
+        image.planes[VPX_PLANE_V] = const_cast<unsigned char*>(frame.v.data());
+        image.stride[VPX_PLANE_Y] = m_width;
+        image.stride[VPX_PLANE_U] = image.stride[VPX_PLANE_V] = m_width / 2;
+        const auto pts = static_cast<vpx_codec_pts_t>(m_frameIndex * 90000ULL / m_fps);
+        const auto duration = static_cast<unsigned long>(std::max(1, 90000 / m_fps));
+        const auto flags = forceKeyframe ? VPX_EFLAG_FORCE_KF : 0;
+        const auto status = vpx_codec_encode(
+            &m_vpx->codec, &image, pts, duration, flags, VPX_DL_REALTIME);
+        if (status != VPX_CODEC_OK) {
+            if (error) *error = std::string("libvpx VP9 encode failed: ") +
+                vpx_codec_err_to_string(status);
+            return false;
+        }
+        ++m_frameIndex;
+        vpx_codec_iter_t iter = nullptr;
+        const vpx_codec_cx_pkt_t* packet = nullptr;
+        while ((packet = vpx_codec_get_cx_data(&m_vpx->codec, &iter)) != nullptr) {
+            if (packet->kind != VPX_CODEC_CX_FRAME_PKT) continue;
+            const auto* ptr = static_cast<const uint8_t*>(packet->data.frame.buf);
+            if (!ptr || packet->data.frame.sz == 0) continue;
+            if (out.data.empty()) {
+                out.keyframe = (packet->data.frame.flags & VPX_FRAME_IS_KEY) != 0;
+                out.timestamp90k = static_cast<uint32_t>(packet->data.frame.pts);
+            }
+            out.data.insert(out.data.end(), ptr, ptr + packet->data.frame.sz);
+        }
+        // An encoder may buffer an output frame; the caller already accepts
+        // an empty sample and will continue without sending empty RTP.
+        return true;
+    }
 
     if (!m_open || !m_impl || !m_impl->transform) {
         if (error) *error = "encoder not open";
