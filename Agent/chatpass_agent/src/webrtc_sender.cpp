@@ -1053,7 +1053,7 @@ void WebRtcSender::createPeerConnection() {
     // storms on some mobile links, even when the average bitrate is low.
     // libdatachannel's asynchronous media handler smooths the outgoing
     // packets without sleeping in the capture/input-first/encode thread.
-    // AV1/VP8/H265 remain unchanged; H.264 pacing is opt-in separately.
+    // AV1/VP8 remain unchanged; H.264 and HEVC pacing are separate opt-ins.
     if (m_videoCodec == VideoCodec::VP9) {
         const int paceKbps = readEnvInt("HI5_VP9_RTP_PACING_KBPS", 0, 0, 30000);
         if (paceKbps > 0) {
@@ -1102,6 +1102,28 @@ void WebRtcSender::createPeerConnection() {
             }
             catch (const std::exception& e) {
                 LogWarn("[h264] pacing unavailable; reverting to unpaced H264 session=" +
+                    m_sessionId + " reason=" + e.what());
+            }
+        }
+    }
+    else if (m_videoCodec == VideoCodec::H265) {
+        // Experimental HEVC only: smooth RFC 7798 packets/IRAP fragments
+        // without delaying capture or changing the working codec pipelines.
+        // This older libdatachannel has NO queue bound/overflow callback.
+        const int paceKbps = readEnvInt("HI5_H265_RTP_PACING_KBPS", 0, 0, 30000);
+        if (paceKbps > 0) {
+            const int tickMs = readEnvInt("HI5_H265_RTP_PACING_MS", 5, 2, 20);
+            try {
+                m_track->chainMediaHandler(std::make_shared<rtc::PacingHandler>(
+                    static_cast<double>(paceKbps) * 1000.0,
+                    std::chrono::milliseconds(tickMs)));
+                LogInfo("[h265] outgoing RTP pacing enabled session=" + m_sessionId +
+                    " kbps=" + std::to_string(paceKbps) +
+                    " interval_ms=" + std::to_string(tickMs) +
+                    " queue_limit=unsupported_by_pinned_libdatachannel");
+            }
+            catch (const std::exception& e) {
+                LogWarn("[h265] pacing unavailable; keeping unpaced HEVC session=" +
                     m_sessionId + " reason=" + e.what());
             }
         }
@@ -2380,7 +2402,10 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             // this codec qualified based solely on the requested flag.
             if (isHevc) {
                 H265EncodedFrame encoded{};
-                ok = m_h265Encoder->encode(input, keyframe, encoded, &reason);
+                // The first buffered MF sample must also request an IRAP,
+                // even if the Viewer requested recovery before track open.
+                ok = m_h265Encoder->encode(input,
+                    keyframe || initialEncoderKeyframe, encoded, &reason);
                 accessUnit = std::move(encoded.data);
                 actualKeyframe = encoded.keyframe;
 #ifdef HI5_ENABLE_LIBAOM_AV1
