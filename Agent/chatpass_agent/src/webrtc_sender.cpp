@@ -1065,15 +1065,9 @@ void WebRtcSender::createPeerConnection() {
                     static_cast<double>(paceKbps) * 1000.0,
                     std::chrono::milliseconds(tickMs),
                     static_cast<size_t>(queuePackets));
-                const auto session = m_sessionId;
-                const auto overflowCount = std::make_shared<std::atomic<uint64_t>>(0);
-                pacer->onOverflow([session, overflowCount]() {
-                    const uint64_t n = ++(*overflowCount);
-                    if (n <= 3 || (n % 50) == 0) {
-                        LogWarn("[vp9] rtp pacer queue overflow session=" +
-                            session + " count=" + std::to_string(n));
-                    }
-                });
+                // The pinned Windows libdatachannel PacingHandler does not
+                // expose onOverflow(). Keep its constructor queue limit;
+                // the handler itself owns bounded RTP pacing.
                 m_track->chainMediaHandler(pacer);
                 LogInfo("[vp9] outgoing RTP pacing enabled session=" + m_sessionId +
                     " kbps=" + std::to_string(paceKbps) +
