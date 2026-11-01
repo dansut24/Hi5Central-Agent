@@ -30,6 +30,15 @@ int main() {
     assert(hi5::SelectManualSessionCeilingFps(40) == 30);
     assert(hi5::SelectManualSessionCeilingFps(20) == 15);
     assert(hi5::SelectManualSessionCeilingFps(15) == 15);
+    // Fast mouse updates do not wake an idle desktop unless the technician
+    // is holding a mouse button to drag a window or other screen content.
+    assert(!hi5::FastMouseDragNeedsCapture(false, 0u));
+    assert(!hi5::FastMouseDragNeedsCapture(true, 0u));
+    assert(!hi5::FastMouseDragNeedsCapture(false, 1u));
+    assert(hi5::FastMouseDragNeedsCapture(true, 1u)); // left drag
+    assert(hi5::FastMouseDragNeedsCapture(true, 2u)); // middle drag
+    assert(hi5::FastMouseDragNeedsCapture(true, 4u)); // right drag
+    assert(!hi5::FastMouseDragNeedsCapture(true, 8u)); // invalid button
     // All codecs share capture scheduling. Default must be unchanged.
     assert(hi5::CaptureInputPollInterval(false, false) == 25ms);
     assert(hi5::CaptureInputPollInterval(false, true) == 25ms);
