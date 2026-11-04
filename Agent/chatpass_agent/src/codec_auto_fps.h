@@ -85,4 +85,16 @@ inline FrameRateChoice selectAutomaticFps(
     }
     return result;
 }
+// An established RTP decoder does not need a new keyframe simply because
+// the source returned from a quiet desktop. Default OFF avoids an expensive
+// forced IDR exactly at first input. Only VP8 can opt back into the legacy
+// behaviour; other four codecs are never affected by a VP8-specific flag.
+inline constexpr bool kForceVp8WakeKeyframeDefault = false;
+inline bool shouldForceWakeKeyframe(
+    bool isVp8, int previousMode, int effectiveMode,
+    bool vp8WakeKeyframeEnabled = kForceVp8WakeKeyframeDefault) {
+    return isVp8 && vp8WakeKeyframeEnabled &&
+           previousMode <= 0 && effectiveMode > 0;
+}
+
 } // namespace hi5::universal_codec
