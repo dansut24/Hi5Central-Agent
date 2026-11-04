@@ -63,6 +63,37 @@ int main() {
     same=a;same.agentBuild="1.0.171";
     assert(!cacheValid(a,same,1020));
     assert(!cacheValid(a,a,1000 + 8*86400));
+    // A background registry-key write must not revoke a fully proven H.265
+    // codec when the same driver version and hardware IDs are still installed.
+    // This exact class of event made an Agent 1.0.305 fall back to VP8.
+    CacheIdentity proven{"1.0.305", "Windows-build-26200",
+        R"(PCI\\VEN_8086&DEV_9A49@32.0.101.7088|01dd68bd00902f09;Root\\MttVDD@11.30.4.434|01dd52aaaeb03ae1;)",
+        "universal-connection-v1", 1000};
+    auto registryWrite = proven;
+    registryWrite.gpuAndDriver =
+        R"(PCI\\VEN_8086&DEV_9A49@32.0.101.7088|01dd6a4e97cee43f;Root\\MttVDD@11.30.4.434|01dd6a4e98c15947;)";
+    assert(cacheValid(proven, registryWrite, 1100));
+    auto driverChange = registryWrite;
+    driverChange.gpuAndDriver =
+        R"(PCI\\VEN_8086&DEV_9A49@32.0.101.7089|01dd6a4e97cee43f;Root\\MttVDD@11.30.4.434|01dd6a4e98c15947;)";
+    assert(!cacheValid(proven, driverChange, 1100));
+    driverChange = registryWrite;
+    driverChange.gpuAndDriver =
+        R"(PCI\\VEN_8086&DEV_9A50@32.0.101.7088|01dd6a4e97cee43f;Root\\MttVDD@11.30.4.434|01dd6a4e98c15947;)";
+    assert(!cacheValid(proven, driverChange, 1100));
+    // Unversioned display fingerprints must remain invalidated on timestamp
+    // changes because there is no stable driver version to compare.
+    auto unversioned = proven;
+    unversioned.gpuAndDriver = R"(PCI\\VEN_8086&DEV_9A49@01dd68bd00902f09;)";
+    auto unversionedChanged = unversioned;
+    unversionedChanged.gpuAndDriver =
+        R"(PCI\\VEN_8086&DEV_9A49@01dd6a4e97cee43f;)";
+    assert(!cacheValid(unversioned, unversionedChanged, 1100));
+    auto expiredProof = registryWrite;
+    assert(!cacheValid(proven, expiredProof, 1000 + 8*86400));
+    expiredProof = registryWrite;
+    expiredProof.agentBuild = "1.0.306";
+    assert(!cacheValid(proven, expiredProof, 1100));
     const auto cache = std::filesystem::temp_directory_path() /
         "hi5central-universal-codec-qualification-test.cache";
     std::filesystem::remove(cache);
