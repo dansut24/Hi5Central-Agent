@@ -1841,7 +1841,17 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
     }
     m_externalEffectiveMode = effectiveMode;
 
-    if (previousEffectiveMode <= 0 && effectiveMode > 0 && readEnvInt("HI5_VP8_FORCE_KEYFRAME_ON_WAKE", 1, 0, 1) == 1) {
+    // The old default forced a full IDR on every idle-to-motion wake for ALL
+    // five codecs. This can stall software VP8 (especially at 1080p) just
+    // when an input should be shown immediately. The negotiated decoder
+    // remains valid across idle periods; explicit keyframe requests, first
+    // frames, resizes and desktop transitions still use their normal paths.
+    // Legacy VP8 wake IDRs remain available as an explicit diagnostic opt-in.
+    if (hi5::universal_codec::shouldForceWakeKeyframe(
+            m_videoCodec == VideoCodec::VP8,
+            previousEffectiveMode,
+            effectiveMode,
+            readEnvInt("HI5_VP8_FORCE_KEYFRAME_ON_WAKE", 0, 0, 1) == 1)) {
         forceKeyframe = true;
     }
 
