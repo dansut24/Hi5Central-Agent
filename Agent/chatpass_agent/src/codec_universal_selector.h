@@ -151,6 +151,44 @@ inline Choice select(
     return best;
 }
 
+// Windows' display-class registry keys are often touched without a driver
+// change (e.g. by a display-setting or installer). The 16-hex FILETIME after
+// a *versioned* class fingerprint is not a reliable codec invalidation signal.
+// Compare hardware ID + DriverVersion, never blindly trust a timestamp.
+// Unversioned/attached-display fingerprints remain strict: they cannot safely
+// distinguish a benign registry write from a driver replacement.
+inline std::string stableDriverFingerprint(std::string fingerprint) {
+    std::string normalized;
+    std::size_t from = 0;
+    while (from < fingerprint.size()) {
+        const std::size_t end = fingerprint.find(';', from);
+        const bool complete = end != std::string::npos;
+        std::string part = fingerprint.substr(from,
+            complete ? end - from : std::string::npos);
+        const auto bar = part.rfind('|');
+        if (bar != std::string::npos && part.size() - bar - 1 == 16 &&
+            std::all_of(part.begin() + bar + 1, part.end(),
+                [](unsigned char c) { return std::isxdigit(c) != 0; })) {
+            const auto at = part.rfind('@', bar);
+            if (at != std::string::npos) {
+                const std::string version = part.substr(at + 1, bar - at - 1);
+                const bool numericVersion = !version.empty() &&
+                    std::count(version.begin(), version.end(), '.') >= 2 &&
+                    std::all_of(version.begin(), version.end(),
+                        [](unsigned char c) {
+                            return std::isdigit(c) != 0 || c == '.';
+                        });
+                if (numericVersion) part.resize(bar);
+            }
+        }
+        normalized += part;
+        if (!complete) break;
+        normalized += ';';
+        from = end + 1;
+    }
+    return normalized;
+}
+
 // Persisted qualifications must be invalidated when any part of the machine
 // environment changes that can affect the encoder. Do not cache SDP/browser
 // capabilities: those must always be checked per Viewer connection.
@@ -171,7 +209,8 @@ inline bool cacheValid(const CacheIdentity& saved, const CacheIdentity& current,
         !saved.operatingSystem.empty() &&
         saved.operatingSystem == current.operatingSystem &&
         !saved.gpuAndDriver.empty() &&
-        saved.gpuAndDriver == current.gpuAndDriver &&
+        stableDriverFingerprint(saved.gpuAndDriver) ==
+            stableDriverFingerprint(current.gpuAndDriver) &&
         !saved.encoderConfigVersion.empty() &&
         saved.encoderConfigVersion == current.encoderConfigVersion;
 }
