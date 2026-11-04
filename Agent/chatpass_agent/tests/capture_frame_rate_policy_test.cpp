@@ -91,6 +91,16 @@ int main() {
     assert(!staleWgc.hasFrame && !staleWgc.changed);
     assert(!hi5::ShouldPublishDesktopFrame(staleWgc, motion));
     assert(std::string(DesktopCaptureBackendName(staleWgc.backend)) == "wgc");
+    // No automatic wake IDR. The existing decoder can continue from the
+    // previous inter-frame; initial/explicit recovery keyframes are separate.
+    using hi5::universal_codec::shouldForceWakeKeyframe;
+    static_assert(!hi5::universal_codec::kForceVp8WakeKeyframeDefault);
+    assert(!shouldForceWakeKeyframe(true, 0, 2)); // normal VP8 wake
+    assert(!shouldForceWakeKeyframe(false, 0, 2, true)); // H.264/H.265/VP9/AV1
+    assert(!shouldForceWakeKeyframe(true, 2, 1, true)); // active -> active
+    assert(!shouldForceWakeKeyframe(true, 1, 0, true)); // active -> idle
+    assert(shouldForceWakeKeyframe(true, 0, 2, true)); // explicit VP8 opt-in
+    assert(shouldForceWakeKeyframe(true, -1, 3, true)); // idle -> wake
     // Regression: no changed pixels over two idle periods -> low CPU idle.
     assert(decide(origin+2500ms,old,origin,false).mode == 0);
     std::cout << "CAPTURE_RATE_POLICY_TESTS_PASSED idle=2 changed=20 input=30 no_idle_lock=1\n";
