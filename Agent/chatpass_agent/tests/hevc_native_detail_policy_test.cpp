@@ -42,6 +42,17 @@ int main() {
     auto bounded = ChooseHevcNativeDetailProfile(true, -1, -1, 1920, 1080,
                                                   60, 60, 99999, 99999);
     assert(bounded.bitrateKbps == 8000 && bounded.encoderFps == 60);
+    // An encoder initiated at 20 FPS must honour an actual Viewer switch
+    // to 30/45/60, but MUST NOT churn on every subsequent frame.
+    assert(hi5::quality::ShouldRestartHevcForFps(true, true, 30, 20));
+    assert(hi5::quality::ShouldRestartHevcForFps(true, true, 45, 30));
+    assert(hi5::quality::ShouldRestartHevcForFps(true, true, 60, 45));
+    assert(hi5::quality::ShouldRestartHevcForFps(true, true, 20, 60));
+    assert(!hi5::quality::ShouldRestartHevcForFps(true, true, 30, 30));
+    assert(!hi5::quality::ShouldRestartHevcForFps(true, false, 30, 20));
+    assert(!hi5::quality::ShouldRestartHevcForFps(false, true, 30, 20));
+    assert(!hi5::quality::ShouldRestartHevcForFps(true, true, 0, 20));
+    assert(!hi5::quality::ShouldRestartHevcForFps(true, true, 20, 0));
     std::cout << "HEVC_NATIVE_1080P_POLICY_PASSED baseline=720p "
                  "native=1080p bitrate=bounded manual_fps=bounded "
                  "auto_fps=20 viewer720p=honoured\n";
