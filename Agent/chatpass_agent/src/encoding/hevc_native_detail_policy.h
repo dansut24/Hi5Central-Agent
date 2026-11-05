@@ -45,4 +45,15 @@ inline HevcNativeDetailProfile ChooseHevcNativeDetailProfile(
     p.bitrateKbps = std::clamp(requestedBitrate, 1500, 8000);
     return p;
 }
+// An already-open hardware MFT retains the frame-rate negotiated at
+// initialization. A Viewer change from 20 to 30/45/60 must not leave its
+// nominal encoder cadence stuck at 20. Restart ONCE when this explicit
+// frame-rate preference changes; bitrate-only feedback never calls for a
+// destructive encoder recreation.
+inline bool ShouldRestartHevcForFps(bool hevc, bool encoderExists,
+                                   int requestedFps, int appliedFps) {
+    return hevc && encoderExists && requestedFps > 0 && appliedFps > 0 &&
+           requestedFps != appliedFps;
+}
+
 } // namespace hi5::quality
