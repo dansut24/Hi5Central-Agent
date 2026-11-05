@@ -2320,6 +2320,13 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             &scaled, true);
         int encodeFps = isHevc ? hevcDetail.encoderFps :
             std::max(1, std::min(m_fps, 20));
+        // Hardware HEVC must use the rate requested by the authenticated
+        // Viewer, including a later manual FPS change. Media Foundation
+        // captures its nominal FPS at init time; only a true FPS change
+        // warrants a one-time restart. This never changes the RTP codec.
+        const bool hevcFpsChanged = hi5::quality::ShouldRestartHevcForFps(
+            isHevc, static_cast<bool>(m_h265Encoder), encodeFps,
+            m_externalConfiguredFps);
         const bool softwareAv1DynamicRate = softwareAv1 &&
             readEnvInt("HI5_UNIVERSAL_ADAPTIVE_QUALITY",0,0,1) == 1;
         int bitrate = isHevc ? hevcDetail.bitrateKbps :
@@ -2327,6 +2334,7 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 softwareAv1DynamicRate, av1TextDetail.enabled,
                 av1TextDetail.bitrateKbps, m_viewerTargetBitrateKbps.load());
         if ((isHevc && !m_h265Encoder) ||
+            hevcFpsChanged ||
             (!isHevc && !softwareAv1 && !m_av1Encoder) ||
 #ifdef HI5_ENABLE_LIBAOM_AV1
             (!isHevc && softwareAv1 && !m_av1SoftwareEncoder) ||
@@ -2397,6 +2405,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                     " mode=" + m_codecMode + " reason=" + reason);
                 m_experimentalFailed = true;
                 return; // A negotiated RTP payload type must never change.
+            }
+            if (isHevc && hevcFpsChanged) {
+                LogInfo("[hevc] explicit Viewer FPS preference applied " +
+                    std::to_string(encodeFps) +
+                    " session=" + m_sessionId +
+                    " encoder_recreated_once=1 negotiated_codec_unchanged=1");
             }
             LogInfo("[codec-pilot] encoder initialised session=" + m_sessionId +
                 " codec=" + m_codecMode +
