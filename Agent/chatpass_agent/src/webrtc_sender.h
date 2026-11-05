@@ -164,6 +164,7 @@ private:
     std::unique_ptr<hi5::SoftwareAv1EncoderExperiment> m_av1SoftwareEncoder;
 #endif
     bool m_experimentalFailed = false;
+    bool m_hevcNativeDetailRejected = false; // per-session safe 720p fallback
     bool m_experimentalPrimed = false;
     bool m_vp9Failed = false;
     bool m_vp9NativeFailed = false; // Only downgrade native resolution, never discard the stream.

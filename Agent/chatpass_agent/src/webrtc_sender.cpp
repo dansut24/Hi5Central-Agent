@@ -8,6 +8,7 @@
 #include "encoding/av1_rtp_payload_experimental.h"
 #include "encoding/av1_rtp_webrtc_compatible.h"
 #include "encoding/av1_text_detail_policy.h"
+#include "encoding/hevc_native_detail_policy.h"
 #include "encoding/av1_mf_output_adapter.h"
 #include "util/log.h"
 
@@ -2302,17 +2303,38 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
             softwareAv1 && readEnvInt("HI5_AV1_DETAIL_PILOT", 0, 0, 1) == 1,
             m_viewerMaxWidth.load(), m_viewerMaxHeight.load(),
             m_bitrateKbps, m_viewerTargetBitrateKbps.load());
+        // Chromium-style native desktop fidelity: do not use the AV1 720p
+        // software profile to silently downscale *hardware HEVC*.
+        // Opt-in is isolated to HEVC and retains all other codec pipelines.
+        const auto hevcDetail = hi5::quality::ChooseHevcNativeDetailProfile(
+            isHevc && !m_hevcNativeDetailRejected &&
+                readEnvInt("HI5_H265_NATIVE_DETAIL_1080P", 0, 0, 1) == 1,
+            m_viewerMaxWidth.load(), m_viewerMaxHeight.load(),
+            frame.width, frame.height, m_fps, m_viewerManualFps.load(),
+            m_bitrateKbps, m_viewerTargetBitrateKbps.load());
         bool initialEncoderKeyframe = false;
         bool scaled = false;
-        const I420Frame input = scaleI420ToWebRtcBounds(
-            frame, av1TextDetail.maxWidth, av1TextDetail.maxHeight, &scaled, true);
-        const int encodeFps = std::max(1, std::min(m_fps, 20));
+        I420Frame input = scaleI420ToWebRtcBounds(
+            frame, isHevc ? hevcDetail.maxWidth : av1TextDetail.maxWidth,
+            isHevc ? hevcDetail.maxHeight : av1TextDetail.maxHeight,
+            &scaled, true);
+        int encodeFps = isHevc ? hevcDetail.encoderFps :
+            std::max(1, std::min(m_fps, 20));
+        // Hardware HEVC must use the rate requested by the authenticated
+        // Viewer, including a later manual FPS change. Media Foundation
+        // captures its nominal FPS at init time; only a true FPS change
+        // warrants a one-time restart. This never changes the RTP codec.
+        const bool hevcFpsChanged = hi5::quality::ShouldRestartHevcForFps(
+            isHevc, static_cast<bool>(m_h265Encoder), encodeFps,
+            m_externalConfiguredFps);
         const bool softwareAv1DynamicRate = softwareAv1 &&
             readEnvInt("HI5_UNIVERSAL_ADAPTIVE_QUALITY",0,0,1) == 1;
-        const int bitrate = hi5::quality::ChooseAdaptiveAv1Bitrate(
-            softwareAv1DynamicRate, av1TextDetail.enabled,
-            av1TextDetail.bitrateKbps, m_viewerTargetBitrateKbps.load());
+        int bitrate = isHevc ? hevcDetail.bitrateKbps :
+            hi5::quality::ChooseAdaptiveAv1Bitrate(
+                softwareAv1DynamicRate, av1TextDetail.enabled,
+                av1TextDetail.bitrateKbps, m_viewerTargetBitrateKbps.load());
         if ((isHevc && !m_h265Encoder) ||
+            hevcFpsChanged ||
             (!isHevc && !softwareAv1 && !m_av1Encoder) ||
 #ifdef HI5_ENABLE_LIBAOM_AV1
             (!isHevc && softwareAv1 && !m_av1SoftwareEncoder) ||
@@ -2337,6 +2359,30 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 auto enc = std::make_unique<H265MfEncoder>();
                 ok = enc->init(input.width, input.height, encodeFps,
                     bitrate, true, &reason);
+                if (!ok && hevcDetail.enabled) {
+                    // Intel MFT may support 720p but reject 1080p on some
+                    // drivers or remote desktop modes. Revert once inside the
+                    // same negotiated HEVC session; never spin/recreate on
+                    // every frame or switch the negotiated RTP payload type.
+                    const std::string nativeError = reason;
+                    m_hevcNativeDetailRejected = true;
+                    input = scaleI420ToWebRtcBounds(
+                        frame, 1280, 720, &scaled, true);
+                    encodeFps = std::max(1, std::min(m_fps, 20));
+                    bitrate = std::clamp(m_bitrateKbps, 500, 4500);
+                    m_externalEncoderWidth = input.width;
+                    m_externalEncoderHeight = input.height;
+                    m_externalConfiguredFps = encodeFps;
+                    m_externalConfiguredBitrateKbps = bitrate;
+                    enc = std::make_unique<H265MfEncoder>();
+                    reason.clear();
+                    ok = enc->init(input.width, input.height, encodeFps,
+                        bitrate, true, &reason);
+                    LogWarn("[h265] native 1080p encoder rejected; " +
+                        std::string(ok ? "restored safe 720p" : "720p failed") +
+                        " session=" + m_sessionId + " native_error=" +
+                        nativeError + (ok ? "" : " fallback_error=" + reason));
+                }
                 if (ok) m_h265Encoder = std::move(enc);
 #ifdef HI5_ENABLE_LIBAOM_AV1
             } else if (softwareAv1) {
@@ -2360,6 +2406,12 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 m_experimentalFailed = true;
                 return; // A negotiated RTP payload type must never change.
             }
+            if (isHevc && hevcFpsChanged) {
+                LogInfo("[hevc] explicit Viewer FPS preference applied " +
+                    std::to_string(encodeFps) +
+                    " session=" + m_sessionId +
+                    " encoder_recreated_once=1 negotiated_codec_unchanged=1");
+            }
             LogInfo("[codec-pilot] encoder initialised session=" + m_sessionId +
                 " codec=" + m_codecMode +
                 " size=" + std::to_string(input.width) + "x" +
@@ -2367,6 +2419,8 @@ void WebRtcSender::sendExternalRawI420(const I420Frame& frame, bool forceKeyfram
                 " fps=" + std::to_string(encodeFps) +
                 " bitrate_kbps=" + std::to_string(bitrate) +
                 " av1_detail_1080p=" + (av1TextDetail.enabled ? "1" : "0") +
+                " hevc_native_detail_1080p=" +
+                    (isHevc && hevcDetail.enabled && !m_hevcNativeDetailRejected ? "1" : "0") +
                 " scaled=" + (scaled ? "1" : "0"));
         }
         // CBR reconfiguration happens on the same encode thread. Never
