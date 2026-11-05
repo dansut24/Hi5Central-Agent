@@ -29,6 +29,21 @@ void Check(int width, int height, int rowPadding) {
         assert(baseline.u == out.u);
         assert(baseline.v == out.v);
     }
+    // Explicit DXGI-only preference is byte-identical to serial, and
+    // too-small/odd frames correctly decline the parallel path.
+    {
+        hi5::WgcAdaptiveI420Converter dxgiPreferred;
+        for (int i = 0; i < 8; ++i) {
+            I420Frame out;
+            assert(dxgiPreferred.Convert(bgra.data(), stride, width, height,
+                                         out, true, true));
+            assert(out.y == baseline.y && out.u == baseline.u &&
+                   out.v == baseline.v);
+            const bool supportsTwoStrips = width >= 1920 && height >= 1080 &&
+                !(height & 1) && std::thread::hardware_concurrency() >= 4;
+            assert(dxgiPreferred.ParallelLast() == supportsTwoStrips);
+        }
+    }
     std::cout << "WGC_I420_PIXEL_EQUAL width=" << width << " height=" << height
               << " stride=" << stride
               << " selected=" << (parallelConverter.UsingParallel() ? "two_strip" : "serial")

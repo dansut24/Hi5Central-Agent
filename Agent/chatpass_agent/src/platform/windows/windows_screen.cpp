@@ -54,6 +54,19 @@ namespace {
         }();
         return enabled;
     }
+    static bool Hi5DxgiPreferTwoStripsEnabled() {
+        // Dell-only A/B opt-in. The measured adaptive trial sometimes selected
+        // serial from eight noisy startup frames even when the live two-strip
+        // path subsequently halved conversion time. Fail closed by default.
+        static const bool enabled = []() {
+            char value[8]{};
+            const DWORD n = GetEnvironmentVariableA(
+                "HI5_DXGI_PREFER_TWO_STRIPS", value,
+                static_cast<DWORD>(sizeof(value)));
+            return n == 1 && value[0] == '1';
+        }();
+        return enabled;
+    }
     static bool Hi5CompositeCursorEnabled() {
         static const bool enabled = []() {
             char buf[16]{};
@@ -1537,7 +1550,8 @@ struct DesktopFrameSource::Impl {
             // two strips only when >=10% faster. No queued frames or new
             // frame-ordering path; safe normal-DXGI experiment only.
             if (!dxgiI420Converter.Convert(
-                    dxgiBgraBuffer.data(), rowPitch, width, height, out, true)) {
+                    dxgiBgraBuffer.data(), rowPitch, width, height, out,
+                    true, Hi5DxgiPreferTwoStripsEnabled())) {
                 // Never drop a frame merely because the opt-in parallel
                 // experiment failed. Re-run the established serial conversion.
                 LogWarn("[capture] DXGI adaptive conversion failed; retrying proven serial path");
@@ -1592,6 +1606,8 @@ struct DesktopFrameSource::Impl {
                 " cursor_avg_ms=" + std::to_string(dxgiCursorTotalMs / count) +
                 " convert_avg_ms=" + std::to_string(dxgiConvertTotalMs / count) +
                 " adaptive_enabled=" + std::string(Hi5DxgiAdaptiveI420Enabled() ? "1" : "0") +
+                " prefer_two_strips=" + std::string(Hi5DxgiAdaptiveI420Enabled() &&
+                    Hi5DxgiPreferTwoStripsEnabled() ? "1" : "0") +
                 " adaptive_mode=" + std::string(Hi5DxgiAdaptiveI420Enabled() && dxgiI420Converter.ParallelLast() ? "two_strip" : "serial") +
                 " adaptive_qualified=" + std::string(dxgiI420Converter.Qualified() ? "1" : "0") +
                 " cache_copy_avg_ms=" + std::to_string(dxgiCacheCopyTotalMs / count) +

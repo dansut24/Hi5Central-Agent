@@ -60,7 +60,8 @@ public:
     // The single-threaded path is always available. Adaptive trials are
     // WGC-only; other capture providers retain the existing function.
     bool Convert(const uint8_t* src, int stride, int width, int height,
-        I420Frame& dst, bool enableParallel = true) {
+        I420Frame& dst, bool enableParallel = true,
+        bool preferTwoStrips = false) {
         dst.width = width;
         dst.height = height;
         const int uvWidth = (width + 1) / 2;
@@ -72,6 +73,17 @@ public:
             height >= 1080 && !(height & 1) &&
             std::thread::hardware_concurrency() >= 4;
         if (!qualified) {
+            parallelLast_ = false;
+            return ConvertBgraToI420Serial(src,stride,width,height,dst) == 0;
+        }
+        // A separately authorised DXGI device can prefer two strips after
+        // real-world evidence proved the start-up sample unreliable. This
+        // never affects WGC, other devices, or the byte-identical serial
+        // fallback. No new frame queue or codec changes.
+        if (preferTwoStrips) {
+            parallelLast_ = true;
+            if (ConvertBgraToI420TwoStrips(src,stride,width,height,dst) == 0)
+                return true;
             parallelLast_ = false;
             return ConvertBgraToI420Serial(src,stride,width,height,dst) == 0;
         }
