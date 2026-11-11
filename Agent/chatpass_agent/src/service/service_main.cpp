@@ -5600,6 +5600,20 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 if (ctx.focusHelperProcess || ctx.backstageMode || ctx.uacRequested ||
                     !ctx.normalStreamerProcess || !ctx.normalStopEvent) return false;
 
+                // Isolate the normal-desktop black-screen regression first.
+                // Keep native focus code available, but require an explicit
+                // per-endpoint registry opt-in until capture is proven stable.
+                DWORD enabled = 0;
+                DWORD bytes = sizeof(enabled);
+                const LONG rc = RegGetValueA(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Hi5Central\\Agent", "RemoteFocusTrial",
+                    RRF_RT_REG_DWORD, nullptr, &enabled, &bytes);
+                if (rc != ERROR_SUCCESS || enabled != 1) {
+                    LogI("isolated focus helper disabled (RemoteFocusTrial=0), "
+                         "preserving normal capture session=" + ctx.sessionId);
+                    return false;
+                }
+
                 char exePath[MAX_PATH]{};
                 GetModuleFileNameA(nullptr, exePath, MAX_PATH);
                 const std::string cmdLine =
