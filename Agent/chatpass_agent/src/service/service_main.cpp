@@ -1694,6 +1694,9 @@ namespace hi5 {
             HANDLE secureStopEvent = nullptr;
 
             HANDLE normalStreamerProcess = nullptr;
+            // Isolated focus probe; never shares a process with the video capture helper.
+            HANDLE focusHelperProcess = nullptr;
+            bool focusHelperLaunchAttempted = false;
             HANDLE secureStreamerProcess = nullptr;
             HANDLE backstageHostProcess = nullptr;
             bool backstageMode = false;
@@ -5581,6 +5584,43 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " requested=" + std::to_string(requested));
             }
 
+            void StopFocusHelper(SessionContext& ctx) {
+                if (!ctx.focusHelperProcess) return;
+                const DWORD waitRc = WaitForSingleObject(ctx.focusHelperProcess, 750);
+                if (waitRc == WAIT_TIMEOUT) {
+                    TerminateProcess(ctx.focusHelperProcess, 0);
+                    WaitForSingleObject(ctx.focusHelperProcess, 500);
+                    LogW("stopped unresponsive isolated focus helper session=" + ctx.sessionId);
+                }
+                CloseHandle(ctx.focusHelperProcess);
+                ctx.focusHelperProcess = nullptr;
+            }
+
+            bool LaunchFocusHelper(SessionContext& ctx) {
+                if (ctx.focusHelperProcess || ctx.backstageMode || ctx.uacRequested ||
+                    !ctx.normalStreamerProcess || !ctx.normalStopEvent) return false;
+
+                char exePath[MAX_PATH]{};
+                GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+                const std::string cmdLine =
+                    "--mode focus-probe"
+                    " --session " + ctx.sessionId +
+                    " --input-pipe " + ctx.normalInputPipeName +
+                    " --stop-event " + ctx.normalStopEventName;
+
+                ctx.focusHelperProcess = LaunchInElevatedDefaultSession(
+                    std::string(exePath), cmdLine);
+                if (!ctx.focusHelperProcess) {
+                    LogW("isolated focus helper launch failed; video continues session=" +
+                        ctx.sessionId);
+                    return false;
+                }
+                LogI("isolated keyboard focus helper launched after video started session=" +
+                    ctx.sessionId + " pid=" +
+                    std::to_string(GetProcessId(ctx.focusHelperProcess)));
+                return true;
+            }
+
             bool LaunchNormalStreamer(SessionContext& ctx) {
                 const DWORD consoleSession = ActiveConsoleSessionId();
                 if (consoleSession == 0xFFFFFFFF) {
@@ -5608,6 +5648,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
 
                 LogI("launch normal streamer [NORMAL_SHMEM_EXPECTED_NO_UAC] session=" + ctx.sessionId + " cmd=" + cmdLine);
 
+                ctx.focusHelperLaunchAttempted = false;
                 ctx.normalStreamerProcess = LaunchInElevatedDefaultSession(std::string(exePath), cmdLine);
                 if (!ctx.normalStreamerProcess) {
                     LogE("launch normal streamer FAILED session=" + ctx.sessionId);
@@ -5790,6 +5831,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 if (ctx.normalStopEvent) {
                     SetEvent(ctx.normalStopEvent);
                 }
+                StopFocusHelper(ctx);
+                ctx.focusHelperLaunchAttempted = false;
 
                 if (ctx.normalStreamerProcess) {
                     const DWORD waitRc = WaitForSingleObject(ctx.normalStreamerProcess, 2500);
@@ -5993,6 +6036,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t framesForwarded = 0;
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
+                uint64_t lastRemoteFocusSeq = 0;
+                int lastReportedFocus = -1;
+                auto nextFocusPoll = std::chrono::steady_clock::now();
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                 ctx.lastNormalLaunchAttempt = std::chrono::steady_clock::now();
                 ctx.lastSecureLaunchAttempt = {};
@@ -6045,6 +6091,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 " exitCode=" + std::to_string(exitCode));
                             CloseHandle(ctx.normalStreamerProcess);
                             ctx.normalStreamerProcess = nullptr;
+                            StopFocusHelper(ctx);
+                            ctx.focusHelperLaunchAttempted = false;
                             ctx.lastNormalFrameAt = {};
 
                             if (!ctx.handoffStateAnnounced) {
@@ -6240,6 +6288,51 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         sent = true;
                     }
 
+                    // Only start UI Automation after the real desktop has
+                    // produced multiple video frames. Its COM activity is
+                    // confined to a separate OS process.
+                    if (framesForwarded >= 5 &&
+                        !ctx.focusHelperLaunchAttempted &&
+                        ctx.normalStreamerProcess &&
+                        !ctx.uacRequested &&
+                        !ctx.backstageMode) {
+                        ctx.focusHelperLaunchAttempted = true;
+                        LaunchFocusHelper(ctx);
+                    }
+
+                    if (now >= nextFocusPoll) {
+                        uint64_t seq = 0;
+                        int kind = 0;
+                        if (ctx.normalInputPipe.ReadRemoteFocus(lastRemoteFocusSeq, seq, kind)) {
+                            lastRemoteFocusSeq = seq;
+                            kind = std::clamp(kind, 0, 3);
+                            if (!ctx.uacRequested && ctx.activeMode != DesktopMode::Secure &&
+                                kind != lastReportedFocus && signaling_) {
+                                lastReportedFocus = kind;
+                                json focus = {
+                                    {"type", "remote_focus_state"},
+                                    {"session_id", ctx.sessionId},
+                                    {"editable", kind != 0},
+                                    {"keyboard_kind", kind == 2 ? "url" :
+                                        (kind == 3 ? "password" : "text")}
+                                };
+                                signaling_->send(focus.dump());
+                            }
+                        }
+                        if ((ctx.uacRequested || ctx.activeMode == DesktopMode::Secure) &&
+                            lastReportedFocus > 0 && signaling_) {
+                            lastReportedFocus = 0;
+                            json focus = {
+                                {"type", "remote_focus_state"},
+                                {"session_id", ctx.sessionId},
+                                {"editable", false},
+                                {"keyboard_kind", "text"}
+                            };
+                            signaling_->send(focus.dump());
+                        }
+                        nextFocusPoll = now + std::chrono::milliseconds(250);
+                    }
+
                     if (now >= nextDiagnosticsPoll) {
                         hi5::StreamStats stats{};
                         if (ctx.normalInputPipe.ReadStreamStats(lastNormalStatsSeq, stats)) {
@@ -6322,6 +6415,8 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 if (ctx->framePumpThread.joinable()) {
                     ctx->framePumpThread.join();
                 }
+
+                StopFocusHelper(*ctx);
 
                 if (ctx->backstageHostProcess) {
                     const DWORD waitRc = WaitForSingleObject(ctx->backstageHostProcess, 3000);
