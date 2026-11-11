@@ -1,0 +1,92 @@
+name: Windows Native iOS Keyboard Agent (Video-Safe)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/rmm-ios-auto-keyboard-isolated
+    paths:
+      - 'Agent/chatpass_agent/src/**'
+      - 'Agent/chatpass_agent/CMakeLists.txt'
+      - '.github/workflows/windows-ios-native-keyboard-video-safe.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rmm-ios-native-keyboard-testing
+  cancel-in-progress: true
+
+jobs:
+  test-agent:
+    runs-on: windows-2025
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify current multi-codec Agent source
+        shell: pwsh
+        run: |
+          $required = @(
+            'Agent/chatpass_agent/src/av1_mf_encoder.cpp',
+            'Agent/chatpass_agent/src/h265_mf_encoder.cpp',
+            'Agent/chatpass_agent/src/codec_policy.cpp',
+            'Agent/chatpass_agent/src/ipc/encoded_frame_ring.h',
+            'Agent/chatpass_agent/src/platform/windows/windows_wgc_capture.cpp',
+            'Agent/chatpass_agent/src/remote_focus_probe.h'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) { throw "Missing current RMM Agent capability: $path" }
+          }
+          Write-Host 'Current multi-codec RMM Agent source verified; not the Platform legacy copy.'
+      - name: Install Windows build dependencies
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          nuget install Microsoft.Web.WebView2 -OutputDirectory Agent/chatpass_agent/external -NonInteractive
+          $vcpkg = 'C:\vcpkg\vcpkg.exe'
+          if (-not (Test-Path $vcpkg)) { throw 'Runner vcpkg missing.' }
+          & $vcpkg install openssl:x64-windows-static nlohmann-json:x64-windows-static libvpx:x64-windows-static libyuv:x64-windows-static 'libdatachannel[srtp,ws]:x64-windows-static'
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg installation failed." }
+          $ports = & $vcpkg list
+          if ($LASTEXITCODE -ne 0 -or -not ($ports -match 'libdatachannel\[srtp\]:x64-windows-static')) {
+            throw 'SRTP/media support missing; refusing a data-only WebRTC build.'
+          }
+      - name: Compile current Windows Agent and package installer
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Windows C++ tools missing' }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $root = (Resolve-Path 'Agent/chatpass_agent').Path
+          $script = Join-Path $root 'installer\windows\Build-AgentInstaller.ps1'
+          $version = '1.0.503'
+          Write-Host "Building CORRECT Hi5Central-Agent version $version with isolated focus-helper"
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Clean -Generator "Visual Studio 18 2026" -Platform x64 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows-static -LibDataChannelRoot C:\vcpkg\installed\x64-windows-static -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" -AgentVersion "' + $version + '"'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Current Agent build failed: $LASTEXITCODE." }
+          $installer = 'Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe'
+          if (-not (Test-Path $installer)) { throw 'Installer missing.' }
+          $agent = 'Agent/chatpass_agent/build/Release/Hi5CentralAgent.exe'
+          if (-not (Test-Path $agent)) { throw 'Current Agent executable missing.' }
+          $manifest = [ordered]@{
+            product = 'Hi5Central RMM Windows Agent'
+            version = $version
+            source_repository = 'dansut24/Hi5Central-Agent'
+            commit = $env:GITHUB_SHA
+            source_branch = $env:GITHUB_REF_NAME
+            feature = 'Native iOS editable-focus helper isolated from WebRTC/capture'
+            installer_sha256 = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+            installer_bytes = (Get-Item $installer).Length
+          }
+          New-Item -ItemType Directory -Path 'dist/ios-keyboard-agent' -Force | Out-Null
+          Copy-Item $installer 'dist/ios-keyboard-agent/Hi5CentralAgentSetup.exe'
+          $manifest | ConvertTo-Json | Set-Content 'dist/ios-keyboard-agent/build-manifest.json' -Encoding utf8
+          Write-Host "Current Agent installer SHA256: $($manifest.installer_sha256)"
+      - name: Upload video-safe keyboard test installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-Windows-Agent-v1.0.503-VideoSafe-Keyboard
+          path: dist/ios-keyboard-agent/
+          retention-days: 14
+          if-no-files-found: error
