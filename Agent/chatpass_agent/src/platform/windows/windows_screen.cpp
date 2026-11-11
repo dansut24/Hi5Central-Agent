@@ -1067,9 +1067,10 @@ struct DesktopFrameSource::Impl {
         const int dxgiBright = brightPixelSamples(bgra, rowPitch, width, height);
         if (dxgiBright <= 1) {
             ++dxgiDarkFrameCount;
-            // Avoid switching on a single transient black frame during an
-            // ordinary desktop transition or at video startup.
-            if (dxgiDarkFrameCount >= 2) {
+            // Check immediately: some failed DXGI streams produce only
+            // one black frame followed by endless WAIT_TIMEOUT responses.
+            // Switch only if GDI independently sees a visible desktop.
+            if (dxgiDarkFrameCount >= 1) {
                 std::vector<uint8_t> gdiReference;
                 int gdiStride = 0;
                 if (captureRectBgraGdi(d.x, d.y, d.width, d.height,
