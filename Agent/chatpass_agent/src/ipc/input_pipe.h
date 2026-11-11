@@ -209,6 +209,10 @@ struct InputRingHeader {
     std::atomic<uint64_t> clipboardResponseSeq;
     std::atomic<uint32_t> clipboardResponseLen;
     std::atomic<int32_t>  clipboardResponseOk;
+    // Focus metadata, published only by an isolated interactive UI helper.
+    // Values: 0=non-editable, 1=text, 2=URL, 3=password.
+    std::atomic<uint64_t> remoteFocusSeq;
+    std::atomic<int32_t>  remoteFocusKind;
     uint8_t _pad[4];
 };
 
@@ -294,6 +298,8 @@ public:
         hdr->clipboardResponseSeq.store(0);
         hdr->clipboardResponseLen.store(0);
         hdr->clipboardResponseOk.store(0);
+        hdr->remoteFocusSeq.store(0);
+        hdr->remoteFocusKind.store(0);
         return true;
     }
 
@@ -335,6 +341,16 @@ public:
     bool GetUACActive() const {
         if (!base_) return false;
         return header()->uacActive.load(std::memory_order_acquire) != 0;
+    }
+
+    bool ReadRemoteFocus(uint64_t since, uint64_t& seq, int& kind) const {
+        if (!base_) return false;
+        auto* hdr = header();
+        const uint64_t value = hdr->remoteFocusSeq.load(std::memory_order_acquire);
+        if (value == 0 || value <= since) return false;
+        seq = value;
+        kind = hdr->remoteFocusKind.load(std::memory_order_acquire);
+        return true;
     }
 
     bool PublishFastMouseTarget(int32_t x, int32_t y, int32_t monitorIndex, uint64_t seq, uint64_t clientTsMs) {
@@ -489,6 +505,16 @@ public:
 
         lastSeq = seq;
         return true;
+    }
+
+    void PublishRemoteFocus(int kind) {
+        if (!base_) return;
+        auto* hdr = header();
+        kind = (kind >= 0 && kind <= 3) ? kind : 0;
+        if (hdr->remoteFocusSeq.load(std::memory_order_acquire) > 0 &&
+            hdr->remoteFocusKind.load(std::memory_order_relaxed) == kind) return;
+        hdr->remoteFocusKind.store(kind, std::memory_order_release);
+        hdr->remoteFocusSeq.fetch_add(1, std::memory_order_release);
     }
 
     void PublishStreamStats(const StreamStats& stats) {

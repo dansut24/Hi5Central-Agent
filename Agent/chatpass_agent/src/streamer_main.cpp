@@ -1,6 +1,7 @@
 #include "frame_source.h"
 #include "ipc/shmem_ring.h"
 #include "ipc/input_pipe.h"
+#include "remote_focus_probe.h"
 #include "util/log.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1058,6 +1059,40 @@ namespace hi5 {
     // No screen capture, stream buffers, network access or WebRTC here.
     // Only the Agent-owned command ring is consumed. The capture helper has
     // a SEPARATE ring for display information/monitor switching.
+    // Separate process: Windows UI Automation must never run in the
+    // video capture helper. A crash, COM hang or incompatible application
+    // accessibility provider cannot block frame delivery or WebRTC.
+    int RunFocusProbeMain(int argc, char** argv) {
+        const Args args = ParseArgs(argc, argv);
+        if (args.sessionId.empty() || args.inputPipeName.empty() || args.stopEventName.empty()) {
+            LogError("[focus-helper] incomplete session context");
+            return 1;
+        }
+        HANDLE stopEvent = OpenEventA(SYNCHRONIZE, FALSE, args.stopEventName.c_str());
+        if (!stopEvent) {
+            LogError("[focus-helper] stop event unavailable");
+            return 1;
+        }
+        hi5::InputPipeReader pipe;
+        if (!pipe.Open(args.inputPipeName)) {
+            LogError("[focus-helper] IPC unavailable");
+            CloseHandle(stopEvent);
+            return 1;
+        }
+        LogInfo("[focus-helper] started isolated Windows focus detection");
+        RemoteFocusProbe focus;
+        focus.Start(pipe);
+        while (WaitForSingleObject(stopEvent, 200) == WAIT_TIMEOUT) {
+            // The COM/UIAutomation worker is independent of the main video
+            // capture and input-injection processes.
+        }
+        focus.Stop();
+        pipe.Close();
+        CloseHandle(stopEvent);
+        LogInfo("[focus-helper] stopped");
+        return 0;
+    }
+
     int RunInputInjectorMain(int argc, char** argv) {
         const Args args = ParseArgs(argc, argv);
         if (args.sessionId.empty() || args.inputPipeName.empty() ||

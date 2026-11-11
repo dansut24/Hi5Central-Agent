@@ -33,6 +33,7 @@ using json = nlohmann::json;
 namespace hi5 {
     int RunStreamerMain(int argc, char** argv);
     int RunInputInjectorMain(int argc, char** argv);
+    int RunFocusProbeMain(int argc, char** argv);
     int RunChatOverlayMain(int argc, char** argv);
     int RunNativeBannerMain(int argc, char** argv);
     int RunBackstageHostMain(int argc, char** argv);
@@ -327,6 +328,11 @@ int main(int argc, char** argv) {
             if (next == "streamer") {
                 std::cout << "[main] mode=streamer\n";
                 return hi5::RunStreamerMain(argc, argv);
+            }
+
+            if (next == "focus-probe") {
+                // UI Automation is isolated from WebRTC capture and encoding.
+                return hi5::RunFocusProbeMain(argc, argv);
             }
 
             if (next == "input-injector") {
