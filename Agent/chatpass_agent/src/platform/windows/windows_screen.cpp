@@ -458,6 +458,11 @@ struct DesktopFrameSource::Impl {
     bool wgcAttempted = false;
     bool wgcReceivedFrame = false;
     std::chrono::steady_clock::time_point wgcStarted{};
+    // DXGI can return a valid but black frame on an interactive desktop.
+    // Once GDI proves it can see real desktop pixels, do not retry the
+    // defective DXGI path for this session.
+    bool dxgiBlankFallback = false;
+    uint64_t dxgiDarkFrameCount = 0;
 
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -552,7 +557,8 @@ struct DesktopFrameSource::Impl {
 
     // Called only while the DesktopFrameSource mutex is held.
     void retryDxgiIfDueLocked() {
-        if (!allowDxgiRecovery || requestedIndex < 0 || currentIndex != -1) return;
+        if (!allowDxgiRecovery || dxgiBlankFallback ||
+            requestedIndex < 0 || currentIndex != -1) return;
         const auto now = std::chrono::steady_clock::now();
         if (lastDxgiRetry.time_since_epoch().count() != 0 &&
             now - lastDxgiRetry < std::chrono::seconds(30)) return;
@@ -1037,6 +1043,54 @@ struct DesktopFrameSource::Impl {
 
         const DisplayInfo d = currentDisplayInfoLocked();
         compositeCursorBgra(d.x, d.y, width, height, bgra, rowPitch);
+
+        // A successful DXGI duplication call does not guarantee useful
+        // desktop pixels. Some GPUs return almost entirely black BGRA while
+        // the user's Default desktop remains visible through GDI. Compare
+        // capture providers before accepting those pixels as valid video.
+        auto brightPixelSamples = [](const std::vector<uint8_t>& pixels,
+                                     int stride, int w, int h) -> int {
+            if (w <= 0 || h <= 0 || stride < w * 4 ||
+                pixels.size() < static_cast<size_t>(stride) * h) return 0;
+            int bright = 0;
+            for (int yIndex = 0; yIndex < 10; ++yIndex) {
+                const int sy = ((2 * yIndex + 1) * h) / 20;
+                for (int xIndex = 0; xIndex < 16; ++xIndex) {
+                    const int sx = ((2 * xIndex + 1) * w) / 32;
+                    const auto* px = pixels.data() +
+                        static_cast<size_t>(sy) * stride + sx * 4;
+                    if (std::max({px[0], px[1], px[2]}) > 24) ++bright;
+                }
+            }
+            return bright;
+        };
+        const int dxgiBright = brightPixelSamples(bgra, rowPitch, width, height);
+        if (dxgiBright <= 1) {
+            ++dxgiDarkFrameCount;
+            // Avoid switching on a single transient black frame during an
+            // ordinary desktop transition or at video startup.
+            if (dxgiDarkFrameCount >= 2) {
+                std::vector<uint8_t> gdiReference;
+                int gdiStride = 0;
+                if (captureRectBgraGdi(d.x, d.y, d.width, d.height,
+                                       width, height, gdiReference, gdiStride)) {
+                    const int gdiBright = brightPixelSamples(
+                        gdiReference, gdiStride, width, height);
+                    if (gdiBright > 14) {
+                        LogWarn("[capture] DXGI black output with visible GDI desktop; "
+                            "switching capture provider permanently for session "
+                            "dxgi_bright=" + std::to_string(dxgiBright) +
+                            " gdi_bright=" + std::to_string(gdiBright));
+                        dxgiBlankFallback = true;
+                        useGdiFallbackLocked();
+                        lastDxgiRetry = std::chrono::steady_clock::now();
+                        return captureAllMonitorsGdiLocked();
+                    }
+                }
+            }
+        } else {
+            dxgiDarkFrameCount = 0;
+        }
 
         I420Frame out;
         bgraToI420(bgra.data(), rowPitch, width, height, out);
