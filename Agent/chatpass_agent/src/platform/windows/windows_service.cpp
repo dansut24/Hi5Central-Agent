@@ -2249,6 +2249,10 @@ namespace hi5 {
             HANDLE secureStopEvent = nullptr;
 
             HANDLE normalStreamerProcess = nullptr;
+            // Isolated, opt-in Windows UI Automation process. It never runs
+            // inside the video capture helper or WebRTC encoder.
+            HANDLE focusHelperProcess = nullptr;
+            bool focusHelperLaunchAttempted = false;
             HANDLE elevatedNormalInputProcess = nullptr;
             // Single-session, opt-in DXGI access test. A failed interactive
             // helper reverts to the unchanged elevated normal helper.
@@ -6510,6 +6514,62 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     " requested=" + std::to_string(requested));
             }
 
+            void StopFocusHelper(SessionContext& ctx) {
+                if (!ctx.focusHelperProcess) return;
+                // The normal stop event is shared with the existing capture
+                // helper. Do not signal it just to stop a focus process:
+                // forcibly end only this separate, optional helper instead.
+                if (WaitForSingleObject(ctx.focusHelperProcess, 0) == WAIT_TIMEOUT) {
+                    TerminateProcess(ctx.focusHelperProcess, 0);
+                    WaitForSingleObject(ctx.focusHelperProcess, 500);
+                }
+                CloseHandle(ctx.focusHelperProcess);
+                ctx.focusHelperProcess = nullptr;
+                ctx.focusHelperLaunchAttempted = false;
+                LogI("[focus-helper] stopped isolated helper session=" + ctx.sessionId);
+            }
+
+            bool LaunchFocusHelper(SessionContext& ctx) {
+                if (ctx.focusHelperProcess || ctx.backstageMode || ctx.uacRequested ||
+                    ctx.secureStateAnnounced || ctx.activeMode != DesktopMode::Normal ||
+                    !ctx.normalStreamerProcess || !ctx.normalStopEvent ||
+                    WaitForSingleObject(ctx.normalStopEvent, 0) == WAIT_OBJECT_0)
+                    return false;
+
+                DWORD enabled = 0;
+                DWORD bytes = sizeof(enabled);
+                const LSTATUS rc = RegGetValueA(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Hi5Central\\Agent", "RemoteFocusTrial",
+                    RRF_RT_REG_DWORD, nullptr, &enabled, &bytes);
+                if (rc != ERROR_SUCCESS || enabled != 1) {
+                    LogI("[focus-helper] disabled: RemoteFocusTrial not set to 1");
+                    return false;
+                }
+
+                char exePath[MAX_PATH]{};
+                GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+                const std::string args =
+                    "--mode focus-probe"
+                    " --session " + ctx.sessionId +
+                    " --input-pipe " + ctx.normalInputPipeName +
+                    " --stop-event " + ctx.normalStopEventName;
+                ctx.focusHelperProcess = LaunchInElevatedDefaultSession(
+                    std::string(exePath), args);
+                if (!ctx.focusHelperProcess) {
+                    LogW("[focus-helper] launch failed; video unaffected session=" + ctx.sessionId);
+                    return false;
+                }
+                if (WaitForSingleObject(ctx.focusHelperProcess, 100) == WAIT_OBJECT_0) {
+                    CloseHandle(ctx.focusHelperProcess);
+                    ctx.focusHelperProcess = nullptr;
+                    LogW("[focus-helper] exited during startup session=" + ctx.sessionId);
+                    return false;
+                }
+                LogI("[focus-helper] launched isolated process session=" + ctx.sessionId +
+                     " pid=" + std::to_string(GetProcessId(ctx.focusHelperProcess)));
+                return true;
+            }
+
             // This is only enabled on explicitly opted-in test machines via
             // HKLM\SOFTWARE\Hi5Central\Agent\InteractiveCaptureTrial=1.
             // Reading at launch makes the switch reversible without an Agent
@@ -6790,6 +6850,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
             }
 
             void StopNormalStreamer(SessionContext& ctx) {
+                StopFocusHelper(ctx);
                 if (ctx.normalStopEvent) {
                     SetEvent(ctx.normalStopEvent);
                 }
@@ -7047,6 +7108,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                 uint64_t lastNormalStatsSeq = 0;
                 uint64_t lastSecureStatsSeq = 0;
                 auto nextDiagnosticsPoll = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                auto nextFocusPoll = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+                uint64_t lastRemoteFocusSeq = 0;
+                int lastReportedFocus = 0;
                 auto nextPipelineHealthLog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                 uint64_t pipelineFrames = 0;
                 double rawDeliveryAgeTotalMs = 0.0;
@@ -7147,6 +7211,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 LogW("[capture-test] user-token helper exited; reverting to elevated next launch session=" +
                                     ctx.sessionId);
                             }
+                            StopFocusHelper(ctx);
                             CloseHandle(ctx.normalStreamerProcess);
                             ctx.normalStreamerProcess = nullptr;
                             ctx.lastNormalFrameAt = {};
@@ -7260,6 +7325,10 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             }
 
                             if (ctx.uacRequested) {
+                                // On CAD/UAC do not probe password fields or
+                                // allow a UI Automation helper onto the secure
+                                // desktop. Keep screen capture handoff unchanged.
+                                StopFocusHelper(ctx);
                                 if (!ctx.secureStateAnnounced) {
                                     SendSessionState(ctx.sessionId, "secure_desktop_entering");
                                     ctx.secureStateAnnounced = true;
@@ -7469,6 +7538,56 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         nextPipelineHealthLog = now + std::chrono::seconds(5);
                     }
 
+                    // Launch focus detection only after normal video has
+                    // delivered multiple frames. The helper has its own
+                    // OS process, so a slow UIA provider cannot stall RTP.
+                    const bool stableNormalForFocus =
+                        framesForwarded >= 5 && !ctx.backstageMode &&
+                        !ctx.uacRequested && !ctx.secureStateAnnounced &&
+                        ctx.activeMode == DesktopMode::Normal &&
+                        ctx.normalStreamerProcess != nullptr &&
+                        ctx.lastNormalFrameAt.time_since_epoch().count() != 0 &&
+                        now - ctx.lastNormalFrameAt < std::chrono::seconds(2);
+                    if (stableNormalForFocus && !ctx.focusHelperLaunchAttempted) {
+                        ctx.focusHelperLaunchAttempted = true;
+                        LaunchFocusHelper(ctx);
+                    }
+                    if (now >= nextFocusPoll) {
+                        uint64_t seq = 0;
+                        int kind = 0;
+                        if (ctx.focusHelperProcess &&
+                            ctx.normalInputPipe.ReadRemoteFocus(lastRemoteFocusSeq, seq, kind)) {
+                            lastRemoteFocusSeq = seq;
+                            kind = std::clamp(kind, 0, 3);
+                            if (stableNormalForFocus && kind != lastReportedFocus && signaling_) {
+                                lastReportedFocus = kind;
+                                const json focus = {
+                                    {"type", "session_state"},
+                                    {"session_id", ctx.sessionId},
+                                    {"state", kind > 0 ? "input_focus_editable" : "input_focus_cleared"},
+                                    {"editable", kind > 0},
+                                    {"keyboard_kind", kind == 2 ? "url" :
+                                        (kind == 3 ? "password" : "text")}
+                                };
+                                signaling_->send(focus.dump());
+                                LogI("[focus-helper] state changed kind=" + std::to_string(kind) +
+                                     " session=" + ctx.sessionId);
+                            }
+                        }
+                        if ((!stableNormalForFocus || !ctx.focusHelperProcess) &&
+                            lastReportedFocus != 0 && signaling_) {
+                            lastReportedFocus = 0;
+                            signaling_->send(json{
+                                {"type", "session_state"},
+                                {"session_id", ctx.sessionId},
+                                {"state", "input_focus_cleared"},
+                                {"editable", false},
+                                {"keyboard_kind", "text"}
+                            }.dump());
+                        }
+                        nextFocusPoll = now + std::chrono::milliseconds(250);
+                    }
+
                     if (now >= nextDiagnosticsPoll) {
                         hi5::StreamStats stats{};
                         if (ctx.normalInputPipe.ReadStreamStats(lastNormalStatsSeq, stats)) {
@@ -7551,6 +7670,7 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                     ctx->framePumpThread.join();
                 }
 
+                StopFocusHelper(*ctx);
                 if (ctx->backstageHostProcess) {
                     const DWORD waitRc = WaitForSingleObject(ctx->backstageHostProcess, 3000);
                     if (waitRc == WAIT_TIMEOUT) {
