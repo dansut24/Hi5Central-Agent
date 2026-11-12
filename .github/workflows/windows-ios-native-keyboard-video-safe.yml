@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - feature/rmm-ios-auto-keyboard-isolated
+      - feature/rmm-ios-v0515-focus-state-signal
     paths:
       - 'Agent/chatpass_agent/src/**'
       - 'Agent/chatpass_agent/CMakeLists.txt'
@@ -60,7 +60,7 @@ jobs:
           $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
           $root = (Resolve-Path 'Agent/chatpass_agent').Path
           $script = Join-Path $root 'installer\windows\Build-AgentInstaller.ps1'
-          $version = '1.0.504'
+          $version = '1.0.505'
           Write-Host "Building CORRECT Hi5Central-Agent version $version with isolated focus-helper"
           $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Clean -Generator "Visual Studio 18 2026" -Platform x64 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows-static -LibDataChannelRoot C:\vcpkg\installed\x64-windows-static -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" -AgentVersion "' + $version + '"'
           cmd.exe /d /s /c $cmd
@@ -75,7 +75,7 @@ jobs:
             source_repository = 'dansut24/Hi5Central-Agent'
             commit = $env:GITHUB_SHA
             source_branch = $env:GITHUB_REF_NAME
-            feature = 'Normal DXGI black frame recovery to GDI; focus helper remains opt-in during isolation'
+            feature = 'Isolated, registry-opt-in Windows UI Automation; allowlisted session_state signals; preserve video capture'
             installer_sha256 = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
             installer_bytes = (Get-Item $installer).Length
           }
@@ -86,7 +86,7 @@ jobs:
       - name: Upload video-safe keyboard test installer
         uses: actions/upload-artifact@v4
         with:
-          name: Hi5Central-Windows-Agent-v1.0.504-VideoRecovery-Test
+          name: Hi5Central-Windows-Agent-v1.0.505-NativeFocus-Test
           path: dist/ios-keyboard-agent/
           retention-days: 14
           if-no-files-found: error
