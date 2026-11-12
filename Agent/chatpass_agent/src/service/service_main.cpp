@@ -6314,6 +6314,11 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                         LaunchFocusHelper(ctx);
                     }
 
+                    // The existing RMM websocket gateway allowlists
+                    // session_state, while its generic remote_focus_state type
+                    // is not forwarded to native viewers. Reuse the proven
+                    // session_state envelope rather than changing the server,
+                    // authentication or streaming pipeline.
                     if (now >= nextFocusPoll) {
                         uint64_t seq = 0;
                         int kind = 0;
@@ -6324,8 +6329,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                                 kind != lastReportedFocus && signaling_) {
                                 lastReportedFocus = kind;
                                 json focus = {
-                                    {"type", "remote_focus_state"},
+                                    {"type", "session_state"},
                                     {"session_id", ctx.sessionId},
+                                    {"state", "input_focus_editable"},
                                     {"editable", kind != 0},
                                     {"keyboard_kind", kind == 2 ? "url" :
                                         (kind == 3 ? "password" : "text")}
@@ -6337,8 +6343,9 @@ $drives = Get-PSDrive -PSProvider FileSystem | Sort-Object Name | ForEach-Object
                             lastReportedFocus > 0 && signaling_) {
                             lastReportedFocus = 0;
                             json focus = {
-                                {"type", "remote_focus_state"},
+                                {"type", "session_state"},
                                 {"session_id", ctx.sessionId},
+                                {"state", "input_focus_cleared"},
                                 {"editable", false},
                                 {"keyboard_kind", "text"}
                             };
