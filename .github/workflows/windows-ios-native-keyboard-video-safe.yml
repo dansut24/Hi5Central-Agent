@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - feature/rmm-ios-v0515-focus-state-signal
+      - fix/rmm-agent-v1506-compiled-focus-service
     paths:
       - 'Agent/chatpass_agent/src/**'
       - 'Agent/chatpass_agent/CMakeLists.txt'
@@ -60,7 +60,7 @@ jobs:
           $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
           $root = (Resolve-Path 'Agent/chatpass_agent').Path
           $script = Join-Path $root 'installer\windows\Build-AgentInstaller.ps1'
-          $version = '1.0.505'
+          $version = '1.0.506'
           Write-Host "Building CORRECT Hi5Central-Agent version $version with isolated focus-helper"
           $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && powershell -NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Clean -Generator "Visual Studio 18 2026" -Platform x64 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows-static -LibDataChannelRoot C:\vcpkg\installed\x64-windows-static -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" -AgentVersion "' + $version + '"'
           cmd.exe /d /s /c $cmd
@@ -69,13 +69,33 @@ jobs:
           if (-not (Test-Path $installer)) { throw 'Installer missing.' }
           $agent = 'Agent/chatpass_agent/build/Release/Hi5CentralAgent.exe'
           if (-not (Test-Path $agent)) { throw 'Current Agent executable missing.' }
+          # Last green build silently omitted the focus launch: it modified
+          # src/service/service_main.cpp, which CMake does not compile.
+          # Reject an installer unless the REAL Windows service executable
+          # contains the active feature flags and session_state constants.
+          $serviceSource = Get-Content 'Agent/chatpass_agent/src/platform/windows/windows_service.cpp' -Raw
+          if ($serviceSource -notmatch 'LaunchFocusHelper\(SessionContext&' -or
+              $serviceSource -notmatch 'ReadRemoteFocus\(') {
+            throw 'Compiled Windows service source is missing focus lifecycle/readback.'
+          }
+          $binaryAscii = [System.Text.Encoding]::ASCII.GetString(
+            [System.IO.File]::ReadAllBytes((Resolve-Path $agent).Path)
+          )
+          foreach ($required in @('RemoteFocusTrial', 'input_focus_editable',
+                                  '[focus-helper] launched isolated process',
+                                  '--mode focus-probe')) {
+            if (-not $binaryAscii.Contains($required)) {
+              throw "Compiled Agent executable missing expected focus symbol: $required"
+            }
+          }
+          Write-Host 'Verified compiled Windows service owns focus startup and allowed signalling.'
           $manifest = [ordered]@{
             product = 'Hi5Central RMM Windows Agent'
             version = $version
             source_repository = 'dansut24/Hi5Central-Agent'
             commit = $env:GITHUB_SHA
             source_branch = $env:GITHUB_REF_NAME
-            feature = 'Isolated, registry-opt-in Windows UI Automation; allowlisted session_state signals; preserve video capture'
+            feature = 'Actual windows_service.cpp compiled focus launch/readback; opt-in isolated UIA with allowlisted session_state; unchanged codecs/video capture'
             installer_sha256 = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
             installer_bytes = (Get-Item $installer).Length
           }
@@ -86,7 +106,7 @@ jobs:
       - name: Upload video-safe keyboard test installer
         uses: actions/upload-artifact@v4
         with:
-          name: Hi5Central-Windows-Agent-v1.0.505-NativeFocus-Test
+          name: Hi5Central-Windows-Agent-v1.0.506-CompiledFocus-Service-Test
           path: dist/ios-keyboard-agent/
           retention-days: 14
           if-no-files-found: error
