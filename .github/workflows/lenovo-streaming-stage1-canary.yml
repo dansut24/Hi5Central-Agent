@@ -1,0 +1,102 @@
+name: Lenovo streaming Stage 1 Windows canary
+
+on:
+  pull_request:
+    branches:
+      - feature/dxgi-parallel-stable-20261105
+    paths:
+      - .github/workflows/lenovo-streaming-stage1-canary.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-canary:
+    runs-on: windows-2025
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore SHA256-pinned Stage 1 Agent sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://downloads.hi5central.com/rmm-codec-review/hi5central-streaming-latency-stage1-review-20261115.zip'
+          $expected = 'f944fe25ab90ab1892b6a10beafac0e0df17919ef1df002117947a97b2610f8e'
+          $zip = Join-Path $env:RUNNER_TEMP 'stage1.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'stage1-unpack'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Canary source archive hash mismatch: $actual" }
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir
+          $src = Join-Path $dir 'changed-files\Hi5Central-Agent'
+          $files = @(Get-ChildItem -LiteralPath $src -File -Recurse)
+          if ($files.Count -ne 13) { throw "Expected 13 Agent files, got $($files.Count)" }
+          foreach ($file in $files) {
+            $relative = $file.FullName.Substring($src.Length + 1)
+            $dest = Join-Path (Get-Location).Path $relative
+            New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
+            Copy-Item -LiteralPath $file.FullName -Destination $dest -Force
+          }
+          Write-Host "Applied verified Stage 1 source changes ($($files.Count) files)"
+
+      - name: Install Windows build dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup install failed' }
+          nuget install Microsoft.Web.WebView2 -OutputDirectory Agent/chatpass_agent/external -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw 'WebView2 restore failed' }
+          & C:\vcpkg\vcpkg.exe install openssl:x64-windows-static nlohmann-json:x64-windows-static libvpx:x64-windows-static libyuv:x64-windows-static aom:x64-windows-static 'libdatachannel[srtp,ws]:x64-windows-static'
+          if ($LASTEXITCODE -ne 0) { throw 'WebRTC dependency restore failed' }
+
+      - name: Windows unit tests for recovery, IPC wake and latest-frame mailbox
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'MSVC not installed' }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          foreach ($test in @('rtc_keyframe_recovery_gate_test', 'latest_video_frame_mailbox_test', 'shmem_frame_ready_signal_win_test')) {
+            $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cl /nologo /std:c++17 /EHsc /MT /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I Agent/chatpass_agent/src Agent/chatpass_agent/tests/' + $test + '.cpp /Fe:dist\' + $test + '.exe /link advapi32.lib && dist\' + $test + '.exe'
+            cmd.exe /d /s /c $cmd
+            if ($LASTEXITCODE -ne 0) { throw "Stage 1 Windows unit test failed: $test" }
+          }
+
+      - name: Build test-only Windows Agent installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $version = & $vswhere -latest -products * -property installationVersion
+          $generator = if ($version -match '^18\.') { 'Visual Studio 18 2026' } else { 'Visual Studio 17 2022' }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $script = (Resolve-Path 'Agent/chatpass_agent/installer/windows/Build-AgentInstaller.ps1').Path
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Clean -Generator "' + $generator + '" -Platform x64 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows-static -LibDataChannelRoot C:\vcpkg\installed\x64-windows-static -InnoSetupCompiler "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" -AgentVersion "1.0.511"'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw 'Agent build failed' }
+          $exe = 'Agent/chatpass_agent/dist/installer/Hi5CentralAgentSetup.exe'
+          if (-not (Test-Path $exe) -or (Get-Item $exe).Length -lt 1000000) { throw 'Native installer missing/invalid' }
+          New-Item -ItemType Directory -Force dist/lenovo-canary | Out-Null
+          Copy-Item -LiteralPath $exe -Destination dist/lenovo-canary/Hi5CentralAgentSetup.exe
+          $manifest = [ordered]@{
+            test_only = $true
+            no_auto_deployment = $true
+            version = '1.0.511'
+            base_commit = '3a75a4ab9d9e99e78aa961ceead68fa4aea7c2d5'
+            stage_source_sha256 = 'f944fe25ab90ab1892b6a10beafac0e0df17919ef1df002117947a97b2610f8e'
+            installer_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          }
+          $manifest | ConvertTo-Json | Set-Content dist/lenovo-canary/manifest.json -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: Hi5Central-Lenovo-Stage1-Agent-TEST-ONLY
+          path: dist/lenovo-canary/
+          retention-days: 14
+          if-no-files-found: error
