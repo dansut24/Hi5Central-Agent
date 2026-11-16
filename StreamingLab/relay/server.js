@@ -92,7 +92,7 @@ function receive(ws,data) {
   }
   const room=ws.labRoom;
   if (!room || room.viewer!==ws) return fail(ws,"Pairing required");
-  if (["webrtc_answer","ice_candidate","stop"].includes(data.type)) send(room.host,data);
+  if (["webrtc_answer","ice_candidate","start","stop"].includes(data.type)) send(room.host,data);
 }
 function cleanup(ws) {
   const room=ws.labRoom;
