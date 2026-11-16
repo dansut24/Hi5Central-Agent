@@ -10,6 +10,8 @@
 #include <vpx/vpx_encoder.h>
 #include <vpx/vp8cx.h>
 #include <libyuv/convert.h>
+#include <libyuv/scale_argb.h>
+#include "dxgi_capture.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
@@ -29,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <cmath>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -87,7 +90,8 @@ struct GdiCapture {
     HBITMAP bitmap = nullptr, original = nullptr;
     uint8_t* bgra = nullptr;
     int w=0,h=0;
-    GdiCapture() {
+    bool layered=false;
+    explicit GdiCapture(bool includeLayered=false):layered(includeLayered) {
         SetProcessDPIAware();
         w = GetSystemMetrics(SM_CXSCREEN);
         h = GetSystemMetrics(SM_CYSCREEN);
@@ -115,20 +119,29 @@ struct GdiCapture {
         if (dc) DeleteDC(dc);
         if (desktop) ReleaseDC(nullptr,desktop);
     }
-    bool capture() { return BitBlt(dc,0,0,w,h,desktop,0,0,SRCCOPY|CAPTUREBLT) != FALSE; }
+    bool capture() { return BitBlt(dc,0,0,w,h,desktop,0,0,SRCCOPY|(layered?CAPTUREBLT:0)) != FALSE; }
 };
 struct I420 {
     int w=0,h=0;
-    std::vector<uint8_t> pixels;
+    std::vector<uint8_t> pixels, scaled;
     uint8_t *y=nullptr,*u=nullptr,*v=nullptr;
     explicit I420(int width, int height):w(width),h(height) {
         const size_t planeY=size_t(w)*h;
         const size_t planeUV=size_t(w/2)*(h/2);
         pixels.resize(planeY+2*planeUV);
         y=pixels.data(); u=y+planeY; v=u+planeUV;
+        scaled.resize(static_cast<size_t>(w)*h*4);
     }
-    bool convert(const GdiCapture& src) {
-        return libyuv::ARGBToI420(src.bgra, src.w*4, y,w,u,w/2,v,w/2,w,h)==0;
+    bool convert(const uint8_t* bgra,int srcW,int srcH,int srcStride) {
+        if(!bgra || srcW<2 || srcH<2)return false;
+        const uint8_t* src=bgra;
+        int stride=srcStride;
+        if(srcW!=w || srcH!=h) {
+            if(libyuv::ARGBScale(bgra,srcStride,srcW,srcH,
+                scaled.data(),w*4,w,h,libyuv::kFilterBox)!=0)return false;
+            src=scaled.data();stride=w*4;
+        }
+        return libyuv::ARGBToI420(src,stride,y,w,u,w/2,v,w/2,w,h)==0;
     }
 };
 class Vp8 {
@@ -183,10 +196,16 @@ public:
 };
 struct AccumStats {
     uint64_t captured=0, encoded=0, sent=0, dropped=0, missedDeadlines=0;
+    uint64_t unchanged=0, captureFailures=0;
     double captureSum=0,convertSum=0,encodeSum=0,sendSum=0;
     double lastAge=0,maxAge=0,lastCapture=0,lastConvert=0,lastEncode=0;
+    double lastSecondFps=0;
+    uint64_t priorSent=0;
+    Clock::time_point fpsWindowStart=Clock::now();
     Clock::time_point start=Clock::now();
-    int width=0,height=0,fps=30,kbps=8000;
+    std::string captureBackend="initialising",fallbackReason="";
+    std::deque<double> lastFrameMs;
+    int sourceWidth=0,sourceHeight=0,width=0,height=0,fps=30,kbps=8000;
 };
 class Session {
     std::mutex eventMu, statsMu;
@@ -199,7 +218,8 @@ class Session {
     uint32_t ssrc=0;
     uint16_t sequence=0;
     std::atomic<bool> forceKeyframe{true};
-    int fps=30,kbps=8000;
+    int fps=30,kbps=8000,maxWidth=1920;
+    std::string mode="auto";
     TurnConfig turn;
     AccumStats stats;
     void push(const json& event) {
@@ -229,30 +249,101 @@ class Session {
     }
     void stream() {
         try {
-            GdiCapture capture;
-            I420 i420(capture.w,capture.h);
-            Vp8 encoder(capture.w,capture.h,fps,kbps);
+            std::unique_ptr<lab::DxgiCapture> dxgi;
+            std::unique_ptr<GdiCapture> gdi;
+            std::string backend="GDI fast", reason;
+            const bool legacy=(mode=="gdi-legacy");
+            if(mode=="auto") {
+                try {
+                    dxgi=std::make_unique<lab::DxgiCapture>();
+                    backend="DXGI interactive";
+                }catch(const std::exception& ex) {
+                    reason=ex.what();
+                    push({{"type","diagnostic"},{"message",std::string("DXGI unavailable, GDI fast fallback: ")+reason}});
+                }
+            }
+            if(!dxgi) {
+                gdi=std::make_unique<GdiCapture>(legacy);
+                backend=legacy?"GDI legacy CAPTUREBLT":"GDI fast SRCCOPY";
+            }
+            const int srcW=dxgi?dxgi->width():gdi->w;
+            const int srcH=dxgi?dxgi->height():gdi->h;
+            const int targetW=(maxWidth==0)?srcW:std::min(srcW,maxWidth);
+            const int outW=std::max(2,targetW&~1);
+            const int outH=std::max(2,(int(std::round(double(srcH)*outW/srcW)))&~1);
+            I420 i420(outW,outH);
+            Vp8 encoder(outW,outH,fps,kbps);
             {
                 std::lock_guard<std::mutex> lock(statsMu);
-                stats.width=capture.w;stats.height=capture.h;stats.start=Clock::now();
+                stats.sourceWidth=srcW;stats.sourceHeight=srcH;
+                stats.width=outW;stats.height=outH;
+                stats.captureBackend=backend;stats.fallbackReason=reason;
+                stats.start=Clock::now();stats.fpsWindowStart=stats.start;
             }
-            push({{"type","capture_started"},{"width",capture.w},{"height",capture.h}});
+            push({{"type","capture_started"},{"width",outW},{"height",outH},
+                  {"sourceWidth",srcW},{"sourceHeight",srcH},{"backend",backend},
+                  {"message",reason}});
             const auto frameDuration=std::chrono::nanoseconds(1000000000LL/fps);
             auto deadline=Clock::now();
+            const auto epoch=deadline;
             uint64_t missed=0;
-            const auto epoch=Clock::now();
+            auto updateSecond=[&]{
+                const auto tick=Clock::now();
+                std::lock_guard<std::mutex> lock(statsMu);
+                const auto dt=ms(stats.fpsWindowStart,tick)/1000.0;
+                if(dt>=1.0) {
+                    stats.lastSecondFps=(stats.sent-stats.priorSent)/dt;
+                    stats.priorSent=stats.sent;
+                    stats.fpsWindowStart=tick;
+                }
+            };
             while(running && ready && gRunning) {
                 auto now=Clock::now();
                 if(now<deadline) std::this_thread::sleep_until(deadline);
                 else if(now>deadline+frameDuration) {
                     const auto late=std::chrono::duration_cast<std::chrono::nanoseconds>(now-deadline).count();
                     missed+=static_cast<uint64_t>(late/frameDuration.count());
-                    deadline=now;
+                    deadline=now; // Never build a backlog of stale frames.
                 }
                 const auto t0=Clock::now();
-                if(!capture.capture()) {std::lock_guard<std::mutex> lock(statsMu);++stats.dropped;deadline+=frameDuration;continue;}
+                const uint8_t* src=nullptr;
+                int srcStride=srcW*4;
+                bool fresh=false;
+                if(dxgi) {
+                    auto status=dxgi->capture();
+                    if(status==lab::FrameStatus::Fresh) {
+                        src=dxgi->data();srcStride=dxgi->stride();fresh=true;
+                    } else if(status==lab::FrameStatus::Unchanged) {
+                        std::lock_guard<std::mutex> lock(statsMu);++stats.unchanged;
+                    } else {
+                        reason="DXGI frame access failed; switched to GDI fast";
+                        push({{"type","diagnostic"},{"message",reason}});
+                        dxgi.reset();
+                        gdi=std::make_unique<GdiCapture>(false);
+                        if(gdi->w!=srcW || gdi->h!=srcH)
+                            throw std::runtime_error("DXGI/GDI desktop sizes differ; restart session");
+                        backend="GDI fast SRCCOPY";
+                        {std::lock_guard<std::mutex> lock(statsMu);
+                         stats.captureBackend=backend;stats.fallbackReason=reason;
+                         ++stats.captureFailures;}
+                    }
+                }
+                if(gdi && gdi->capture()) {
+                    src=gdi->bgra;srcStride=gdi->w*4;fresh=true;
+                } else if(gdi) {
+                    std::lock_guard<std::mutex> lock(statsMu);++stats.captureFailures;
+                }
                 const auto t1=Clock::now();
-                if(!i420.convert(capture)) {std::lock_guard<std::mutex> lock(statsMu);++stats.dropped;deadline+=frameDuration;continue;}
+                if(!fresh) {
+                    if(gdi) {std::lock_guard<std::mutex> lock(statsMu);++stats.dropped;}
+                    deadline+=frameDuration;
+                    updateSecond();
+                    continue;
+                }
+                if(!i420.convert(src,srcW,srcH,srcStride)) {
+                    {std::lock_guard<std::mutex> lock(statsMu);++stats.dropped;}
+                    deadline+=frameDuration;updateSecond();continue;
+                }
                 const auto t2=Clock::now();
                 const auto elapsedUs=std::chrono::duration_cast<std::chrono::microseconds>(t0-epoch).count();
                 const auto pts=static_cast<uint64_t>(std::max<int64_t>(0,elapsedUs))*90ULL/1000ULL;
@@ -260,21 +351,27 @@ class Session {
                 const auto t3=Clock::now();
                 bool delivered=false;
                 if(!encoded.data.empty() && ready && track && track->isOpen()) {
-                    try {pushVp8(encoded);delivered=true;} catch (const std::exception&) {}
+                    try{pushVp8(encoded);delivered=true;}
+                    catch(const std::exception& ex){
+                        push({{"type","diagnostic"},{"message",std::string("RTP send failed: ")+ex.what()}});
+                    }
                 }
                 const auto t4=Clock::now();
                 {
                     std::lock_guard<std::mutex> lock(statsMu);
                     ++stats.captured;
-                    if(!encoded.data.empty()) ++stats.encoded;
-                    if(delivered) ++stats.sent; else ++stats.dropped;
+                    if(!encoded.data.empty())++stats.encoded;
+                    if(delivered)++stats.sent;else ++stats.dropped;
                     stats.missedDeadlines=missed;
                     stats.lastCapture=ms(t0,t1);stats.lastConvert=ms(t1,t2);stats.lastEncode=ms(t2,t3);
                     stats.captureSum+=stats.lastCapture;stats.convertSum+=stats.lastConvert;
                     stats.encodeSum+=stats.lastEncode;stats.sendSum+=ms(t3,t4);
                     stats.lastAge=ms(t0,t4);stats.maxAge=std::max(stats.maxAge,stats.lastAge);
+                    stats.lastFrameMs.push_back(stats.lastAge);
+                    if(stats.lastFrameMs.size()>240)stats.lastFrameMs.pop_front();
                 }
                 deadline+=frameDuration;
+                updateSecond();
             }
         } catch(const std::exception& ex) {
             push({{"type","error"},{"message",ex.what()}});
@@ -282,7 +379,8 @@ class Session {
         }
     }
 public:
-    Session(int rate,int bitrate,TurnConfig t):fps(rate),kbps(bitrate),turn(std::move(t)){
+    Session(int rate,int bitrate,TurnConfig t,int widthLimit=1920,std::string captureMode="auto"):
+        fps(rate),kbps(bitrate),maxWidth(widthLimit),mode(std::move(captureMode)),turn(std::move(t)){
         std::random_device rd;ssrc=(uint32_t(rd())<<16)^uint32_t(rd());
         stats.fps=fps;stats.kbps=kbps;
     }
@@ -349,17 +447,24 @@ public:
         std::lock_guard<std::mutex> lock(statsMu);
         auto n=std::max<uint64_t>(stats.captured,1);
         auto elapsed=std::max(0.001,ms(stats.start,Clock::now())/1000.);
+        auto sorted=std::vector<double>(stats.lastFrameMs.begin(),stats.lastFrameMs.end());
+        std::sort(sorted.begin(),sorted.end());
+        const auto p95=sorted.empty()?0.0:sorted[std::min(sorted.size()-1,
+            static_cast<size_t>(std::ceil(sorted.size()*0.95))-1)];
         return {
             {"active",ready.load()},{"codec","VP8 software"},{"configuredFps",stats.fps},
             {"bitrateKbps",stats.kbps},{"width",stats.width},{"height",stats.height},
+            {"sourceWidth",stats.sourceWidth},{"sourceHeight",stats.sourceHeight},
+            {"captureBackend",stats.captureBackend},{"fallbackReason",stats.fallbackReason},
             {"seconds",elapsed},{"captured",stats.captured},{"encoded",stats.encoded},
             {"sent",stats.sent},{"dropped",stats.dropped},{"missedDeadlines",stats.missedDeadlines},
-            {"fpsMeasured",stats.sent/elapsed},
+            {"unchangedDesktopFrames",stats.unchanged},{"captureFailures",stats.captureFailures},
+            {"fpsMeasured",stats.sent/elapsed},{"lastSecondFps",stats.lastSecondFps},
             {"captureMsAvg",stats.captureSum/n},{"convertMsAvg",stats.convertSum/n},
             {"encodeMsAvg",stats.encodeSum/n},{"sendMsAvg",stats.sendSum/n},
             {"captureMsLast",stats.lastCapture},{"convertMsLast",stats.lastConvert},
             {"encodeMsLast",stats.lastEncode},{"lastFrameAgeMs",stats.lastAge},
-            {"maxFrameAgeMs",stats.maxAge}
+            {"frameAgeP95Ms",p95},{"maxFrameAgeMs",stats.maxAge}
         };
     }
 };
@@ -467,7 +572,13 @@ static void handle(SOCKET client) {
             if((fps!=15 && fps!=30 && fps!=45 && fps!=60) || kbps<500 || kbps>30000){
                 respond(client,400,R"({"error":"invalid fps or bitrate"})");return;
             }
-            auto replacement=std::make_shared<Session>(fps,kbps,gTurn);
+            const int widthLimit=j.value("maxWidth",1920);
+            const std::string mode=j.value("captureMode",std::string("auto"));
+            if((widthLimit!=0 && widthLimit!=1280 && widthLimit!=1600 && widthLimit!=1920) ||
+                (mode!="auto" && mode!="gdi-fast" && mode!="gdi-legacy")){
+                respond(client,400,R"({"error":"invalid capture profile"})");return;
+            }
+            auto replacement=std::make_shared<Session>(fps,kbps,gTurn,widthLimit,mode);
             std::lock_guard<std::mutex> lock(gSessionMu);
             if(gSession)gSession->stop();
             gSession=replacement;
@@ -502,7 +613,7 @@ static void handle(SOCKET client) {
    No Windows input channel, service, RMM API or persistent host identity. */
 static int runRemote(const std::string& endpoint) {
     std::cout << "\n=== Hi5Central Streaming Lab / Web Viewer ===\n"
-              << "Webpage: https://hi5central.com/streamlab\n"
+              << "Webpage: https://streamlab.hi5central.com/\n"
               << "Only accept a pairing code while YOU are testing.\n"
               << "Press Ctrl+C to terminate desktop sharing and pairing.\n\n";
     while (gRunning) {
@@ -591,12 +702,18 @@ static int runRemote(const std::string& endpoint) {
                         sendJson({{"type","error"},{"message","Invalid frame rate or bitrate"}});
                         continue;
                     }
+                    const int widthLimit=msg.value("maxWidth",1920);
+                    const std::string captureMode=msg.value("captureMode",std::string("auto"));
+                    if((widthLimit!=0 && widthLimit!=1280 && widthLimit!=1600 && widthLimit!=1920) ||
+                       (captureMode!="auto" && captureMode!="gdi-fast" && captureMode!="gdi-legacy")){
+                        sendJson({{"type","error"},{"message","Invalid capture profile"}});continue;
+                    }
                     if(session){session->stop();session.reset();}
                     lastEvent=0;
                     hasAnswer=false;
                     pendingIce.clear();
                     try {
-                        session=std::make_shared<Session>(fps,kbps,turn);
+                        session=std::make_shared<Session>(fps,kbps,turn,widthLimit,captureMode);
                         session->start();
                         nextStats=Clock::now();
                         std::cout << "[lab] Started independent VP8 session " << fps
