@@ -8,6 +8,10 @@ on:
       - '.github/workflows/streaming-lab-windows.yml'
   workflow_dispatch:
 
+concurrency:
+  group: streaming-lab-windows-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -35,12 +39,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'MSVC Streaming Lab configure/compile/link failed' }
           if (-not (Test-Path StreamingLab/build/dist/Hi5StreamingLab.exe)) { throw 'Missing Streaming Lab EXE' }
           Copy-Item StreamingLab/viewer.html StreamingLab/build/dist/viewer.html
+          Copy-Item StreamingLab/Start-Hi5StreamingLab.cmd StreamingLab/build/dist/Start-Hi5StreamingLab.cmd
           Get-FileHash StreamingLab/build/dist/Hi5StreamingLab.exe -Algorithm SHA256 | Format-List
+      - name: Validate website/relay JavaScript
+        shell: pwsh
+        run: |
+          node --check StreamingLab/relay/server.js
+          if ($LASTEXITCODE -ne 0) { throw 'Relay JS syntax failed' }
+          $html = Get-Content StreamingLab/relay/remote-viewer.html -Raw
+          if ($html -notmatch '(?s)<script>(.*?)</script>') { throw 'Remote viewer script missing' }
+          $js = Join-Path $env:RUNNER_TEMP 'streaming-lab-remote-viewer.js'
+          Set-Content $js -Value $Matches[1] -Encoding utf8
+          node --check $js
+          if ($LASTEXITCODE -ne 0) { throw 'Remote viewer JS syntax failed' }
       - name: Validate distribution files and local-only source policy
         shell: pwsh
         run: |
           $root='StreamingLab/build/dist'
-          foreach($name in @('Hi5StreamingLab.exe','viewer.html')) {
+          foreach($name in @('Hi5StreamingLab.exe','viewer.html','Start-Hi5StreamingLab.cmd')) {
             if(-not (Test-Path (Join-Path $root $name))) { throw "Missing $name" }
           }
           $text = Get-Content StreamingLab/native/main.cpp -Raw
@@ -52,7 +68,7 @@ jobs:
           Write-Host 'Isolation checks passed'
       - uses: actions/upload-artifact@v4
         with:
-          name: Hi5StreamingLab-Windows
+          name: Hi5StreamingLab-Remote-Windows
           path: StreamingLab/build/dist/
           retention-days: 14
           if-no-files-found: error

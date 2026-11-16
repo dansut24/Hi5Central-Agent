@@ -1,42 +1,53 @@
-# Hi5Central Streaming Lab — isolated experimental harness
+# Hi5Central Streaming Lab — isolated cross-device remote streaming test
 
-This is **not the Hi5Central RMM agent**. It is a separate Windows console process and browser viewer, built only for capture/encode/transport benchmarking. It must never enrol into RMM, call RMM APIs, or install a Windows service.
+**Status:** VP8 standalone Windows sender + browser viewer + one-time pairing + short-lived TURN credentials. **This is not the RMM agent.** It never enrols a device, runs privileged background service code, injects user input, or uses RMM API/database/session infrastructure.
 
-## Stage 1 (VP8 local baseline)
-- Native Windows EXE: persistent GDI/BitBlt capture, libyuv BGRA→I420, libvpx VP8, RTP over libdatachannel WebRTC
-- Loopback-only HTTP signalling and standalone HTML viewer at `http://127.0.0.1:8787`
-- FPS selection: 15/30/45/60. No adaptive FPS or quality changes hidden from the tester.
-- Frame age and capture/convert/encode/send times, dropped-before-send frames, browser WebRTC stats
-- No user input injection. No credentials or privileged service needed. Stop the EXE to stop sharing.
-- Optional external TURN supplied via environment variables only. No RMM backend, database, production session signalling or other VPS services.
+## Use it now
 
-**Important:** The first milestone is local (same-machine) diagnostic streaming. This is deliberate: public remote access needs a separate authenticated signalling mechanism; the development lab must **not** expose an unauthenticated desktop to the internet. TURN alone does not supply session signalling.
+1. On the **feature/streaming-core** GitHub Actions run, download the green **Hi5StreamingLab-Remote-Windows** build artifact (not the older "Hi5StreamingLab-Windows" localhost release).
+2. Extract all files into the same folder on the Lenovo/Dell Windows desktop.
+3. Double-click **Start-Hi5StreamingLab.cmd** (or run \`Hi5StreamingLab.exe --remote\` from a console).
+4. Wait for the EXE to display its **eight-digit one-time code**, valid for 10 minutes. Keep the console open.
+5. On your iPhone, Android or another PC, open **https://hi5central.com/streamlab**, enter that code and press **Pair device**.
+6. Select software VP8, 30 FPS, 8 Mbps and **Start VP8 test**. Repeat at 45 then 60 FPS where the hardware can sustain it.
+7. Export diagnostic JSON from the browser. The host console and browser event log report signalling/SDP/ICE failures instead of silently hanging.
 
-## Run
-1. Download the `Hi5StreamingLab-Windows` artifact from GitHub Actions on this branch.
-2. Extract `Hi5StreamingLab.exe` and `viewer.html` into one directory.
-3. Run `Hi5StreamingLab.exe` on a Windows user desktop (not as a Windows service).
-4. Open `http://127.0.0.1:8787` in Edge or Chrome on the *same machine*. Press **Start VP8 test**.
-5. Change FPS with the browser controls (requires a new lab session), move windows, scroll, run 2-5 minutes, download metrics JSON, and compare with Chrome Remote Desktop on the same PC.
+**Security:** Every pairing code is random, single use and short-lived. Only the paired viewer can trigger capture. The lab has no mouse or keyboard control, remote shell, file transfer or unattended access. Stop with Ctrl+C or by closing the EXE. Viewers on mobile data reach the public page over HTTPS, but the actual stream is end-to-end WebRTC media (TURN relay only when needed).
 
-**Optional TURN configuration** (not needed for localhost): set `HI5_LAB_TURN_URL` to `turn:turn.hi5central.com:3478`, `HI5_LAB_TURN_USER` and `HI5_LAB_TURN_PASS` using short-lived credentials. Never put secrets in Git, console logs or issue screenshots. Windows env vars apply to the running process and can be cleared after tests.
+## Architecture
 
-## Scope and benchmarks
-- Stage 1: stable VP8 capture→decode at 1080p/30, then 60 where feasible, with per-stage timings
-- Stage 2: VP9 and software H.264, AV1/H.265 and hardware H.264 *only after capability-specific implementation and negotiation*. Do not pretend the browser decodes a codec we haven't implemented.
-- Stage 3: separate authenticated cross-network lab signalling with TURN relay, input controls and secure-desktop validation
-- Keep a strict frame-age budget: never accumulate a multi-frame encode queue.
-- If capture+convert or encoder consistently exceed 16.7ms at 60fps, diagnose that first rather than masking by auto-dropping resolution.
+- \`native/main.cpp\`: Windows GDI/BitBlt capture → libyuv BGRA/I420 → software libvpx VP8 → RTP → libdatachannel WebRTC.
+- \`relay/server.js\`: isolated pairing & SDP/ICE exchange on the original VPS, exposed only at \`https://hi5central.com/streamlab\` and \`wss://hi5central.com/streamlab/ws\`. No production RMM services are used.
+- \`relay/remote-viewer.html\`: standalone iOS/Android/desktop browser viewer with bitrate/FPS controls and host/browser metrics.
+- \`Start-Hi5StreamingLab.cmd\`: normal-user Windows console launcher. No installer or scheduled task.
+- The relay issues TURN REST credentials with a short lifetime from the VPS's **existing coturn shared secret**, which stays on the VPS. Nothing secret is bundled into the app. The TURN server and RMM services are unchanged.
+- **Optional legacy local diagnostic**: \`Hi5StreamingLab.exe --local\` then \`http://127.0.0.1:8787\` on that same Windows computer, using bundled \`viewer.html\`. This mode does not use public pairing.
 
-## Safety
-- Listener is hardcoded to loopback. No LAN/WAN bind option. This lab is diagnostic-only and must not become an unattended access component.
-- The EXE streams the primary user's desktop when the local viewer presses Start. Do not run on a machine showing sensitive content.
-- No uploads or telemetry collection. Metrics remain local and can be exported manually.
-- The RMM platform and its production TURN configuration remain unchanged.
+## Test plan
 
-## Build (Windows, vcpkg)
-Install `libdatachannel[srtp]:x64-windows-static`, `libvpx:x64-windows-static`, `libyuv:x64-windows-static`, then:
-```pwsh
-cmake -S StreamingLab -B StreamingLab/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static
+1. Verify the Windows EXE displays a code and the webpage shows "Paired — ready".
+2. Verify a live desktop frame appears and VP8 is reported in browser WebRTC stats.
+3. Test the same workload at 30/45/60 FPS and export JSON (capture, convert, encode, send, browser decode, jitter, RTT, dropped frames).
+4. Repeat on the iPhone over Wi-Fi, then mobile data with relay candidates where required.
+5. Qualify VP9, AV1, H.264 (software + hardware), and H.265 incrementally only after the VP8 pipeline is proven. They are **not yet implemented in this standalone lab**.
+6. In the next release, add a diagnostic connection summary for relay vs direct ICE and monitor codec/latency over reconnects.
+
+## Limits
+
+- The current EXE captures the primary Windows desktop in an interactive user session. It does not support UAC, Session 0 or secure-desktop capture yet.
+- This is a controlled diagnostic tool, not an unattended remote-support application.
+- Real-world WebRTC is not fully verified just because GitHub compiles. Only actual on-device streaming confirms runtime behaviour.
+- TURN is relay infrastructure, not signalling: the isolated, short-lived pairing relay is necessary for browser-to-host connection establishment.
+
+## Build locally
+
+Use Visual Studio's x64 Developer Command Prompt, CMake/Ninja and vcpkg with \`libdatachannel[srtp]\`, \`libvpx\`, \`libyuv\` and \`nlohmann-json\` in \`x64-windows-static\`. Then:
+
+\`\`\`cmd
+cmake -S StreamingLab -B StreamingLab/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static -DCMAKE_CXX_COMPILER=cl
 cmake --build StreamingLab/build --config Release
-```
+\`\`\`
+
+## Changes / rollback
+
+The lab source is on \`feature/streaming-core\`; no merge into \`main\`. The webpage is a separate Docker service, routed through a narrow existing Caddy marketing-host path. Rollback: remove the isolated Caddy path block, reload Caddy, stop/remove the \`hi5central-streamlab\` container. Existing production routes and services remain unaffected.
