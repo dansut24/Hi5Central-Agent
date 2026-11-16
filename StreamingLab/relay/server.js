@@ -116,13 +116,26 @@ const server=http.createServer((req,res)=>{
   res.setHeader("Referrer-Policy","no-referrer");
   res.setHeader("X-Frame-Options","DENY");
   res.setHeader("Content-Security-Policy","default-src 'none'; connect-src 'self' wss://hi5central.com; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; media-src blob:; base-uri 'none'; form-action 'none'");
-  if (req.method==="GET" && [PREFIX,PREFIX+"/",PREFIX+"/index.html"].includes(req.url)) {
-    res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"});res.end(html);return;
+  // iOS in-app browsers and link previews may issue HEAD before GET.
+  // Return the same status, content type and length for both; never hand iOS a
+  // 9-byte 404 response that it interprets as an unknown downloadable file.
+  const isHead = req.method==="HEAD";
+  if ((req.method==="GET" || isHead) &&
+      [PREFIX,PREFIX+"/",PREFIX+"/index.html"].includes(req.url)) {
+    res.writeHead(200,{
+      "Content-Type":"text/html; charset=utf-8",
+      "Content-Length":Buffer.byteLength(html),
+      "Content-Disposition":"inline"
+    });
+    res.end(isHead ? undefined : html);return;
   }
-  if (req.method==="GET" && req.url===PREFIX+"/health") {
-    res.writeHead(200,{"Content-Type":"application/json"});res.end('{"ok":true,"service":"hi5-streaming-lab","version":2}');return;
+  if ((req.method==="GET" || isHead) && req.url===PREFIX+"/health") {
+    const data='{"ok":true,"service":"hi5-streaming-lab","version":2}';
+    res.writeHead(200,{"Content-Type":"application/json","Content-Length":Buffer.byteLength(data)});
+    res.end(isHead ? undefined : data);return;
   }
-  res.writeHead(404);res.end("Not found");
+  res.writeHead(404,{"Content-Type":"text/plain; charset=utf-8"});
+  res.end(isHead ? undefined : "Not found");
 });
 const wss=new WebSocketServer({noServer:true,maxPayload:128*1024,perMessageDeflate:false});
 server.on("upgrade",(req,socket,head)=>{
