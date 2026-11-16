@@ -79,7 +79,7 @@ pre{margin:0;white-space:pre-wrap;font:12px/1.6 ui-monospace,Consolas,monospace;
 const TOKEN="__LAB_TOKEN__";
 const byId=id=>document.getElementById(id);
 let peer=null,pollTimer=null,statsTimer=null,lastEvent=0,lastHostStats=null,lastBrowserStats=null;
-let sessionActive=false,latestExport={};
+let sessionActive=false,latestExport={},answerSubmitted=false,queuedLocalIce=[],polling=false;
 const headers={"Content-Type":"application/json","X-Lab-Token":TOKEN};
 const log=message=>{
  const el=byId("log"),stamp=new Date().toLocaleTimeString();
@@ -114,6 +114,9 @@ async function events(){
    const answer=await peer.createAnswer();
    await peer.setLocalDescription(answer);
    await call("/signal","POST",{type:"answer",sdp:peer.localDescription.sdp});
+   answerSubmitted=true;
+   for(const queued of queuedLocalIce)await call("/signal","POST",queued);
+   queuedLocalIce=[];
   }else if(e.type==="ice_candidate"){
    await peer.addIceCandidate({candidate:e.candidate,sdpMid:e.sdpMid});
   }else if(e.type==="capture_started"){
@@ -171,9 +174,10 @@ async function start(){
    byId("empty").hidden=true;log("Browser received video track");
   };
   peer.onicecandidate=e=>{
-   if(e.candidate&&sessionActive)call("/signal","POST",{
-    type:"ice_candidate",candidate:e.candidate.candidate,sdpMid:e.candidate.sdpMid
-   }).catch(err=>log("Candidate send: "+err.message));
+   if(!e.candidate||!sessionActive)return;
+   const candidate={type:"ice_candidate",candidate:e.candidate.candidate,sdpMid:e.candidate.sdpMid};
+   if(!answerSubmitted){queuedLocalIce.push(candidate);return;}
+   call("/signal","POST",candidate).catch(err=>log("Candidate send: "+err.message));
   };
   peer.onconnectionstatechange=()=>{
    state(peer.connectionState,peer.connectionState==="connected");
@@ -181,13 +185,14 @@ async function start(){
   };
   peer.oniceconnectionstatechange=()=>log("ICE state: "+peer.iceConnectionState);
   const fps=Number(byId("fps").value),bitrateKbps=Number(byId("kbps").value);
-  lastEvent=0;lastHostStats=null;lastBrowserStats=null;sessionActive=true;
+  lastEvent=0;lastHostStats=null;lastBrowserStats=null;answerSubmitted=false;queuedLocalIce=[];sessionActive=true;
   await call("/start","POST",{fps,bitrateKbps});
   log("Started VP8 software test at "+fps+" FPS, "+bitrateKbps+" kbps");
   // Sequential polling avoids concurrent offers/candidates being applied out of order.
   const poll=async()=>{
-   if(!sessionActive)return;
-   try{await events();}catch(err){log("Signalling: "+err.message)}
+   if(!sessionActive||polling)return;
+   polling=true;
+   try{await events();}catch(err){log("Signalling: "+err.message)}finally{polling=false}
   };
   await poll();
   pollTimer=setInterval(poll,200);

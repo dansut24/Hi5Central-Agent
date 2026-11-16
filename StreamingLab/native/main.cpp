@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
+#include <iterator>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -132,6 +134,7 @@ class Vp8 {
     vpx_codec_ctx_t ctx{};
     bool initialized=false;
     uint64_t frameNumber=0;
+    uint64_t lastPts=0;
     int fps=30;
 public:
     Vp8(int w,int h,int rate,int kbps):fps(rate) {
@@ -152,18 +155,18 @@ public:
     }
     ~Vp8(){if(initialized) vpx_codec_destroy(&ctx);}
     struct Output {std::vector<uint8_t> data;uint32_t timestamp=0;bool key=false;};
-    Output encode(const I420& input) {
+    Output encode(const I420& input, uint64_t requestedPts, bool forceKeyframe=false) {
         vpx_image_t img{};
         if (!vpx_img_wrap(&img,VPX_IMG_FMT_I420,input.w,input.h,1,nullptr))
             throw std::runtime_error("VP8 image wrap failed");
         img.planes[0]=input.y; img.planes[1]=input.u; img.planes[2]=input.v;
         img.stride[0]=input.w; img.stride[1]=input.w/2; img.stride[2]=input.w/2;
-        const uint64_t ts=frameNumber*90000ULL/static_cast<uint64_t>(fps);
-        const uint64_t tsNext=(frameNumber+1)*90000ULL/static_cast<uint64_t>(fps);
+        const uint64_t ts=frameNumber==0 ? 0 : std::max(lastPts+1,requestedPts);
+        lastPts=ts;
         ++frameNumber;
-        const int flags=(frameNumber==1)?VPX_EFLAG_FORCE_KF:0;
+        const int flags=(frameNumber==1 || forceKeyframe)?VPX_EFLAG_FORCE_KF:0;
         if (vpx_codec_encode(&ctx,&img,static_cast<vpx_codec_pts_t>(ts),
-            static_cast<unsigned long>(tsNext-ts),flags,VPX_DL_REALTIME)!=VPX_CODEC_OK)
+            static_cast<unsigned long>(90000/fps),flags,VPX_DL_REALTIME)!=VPX_CODEC_OK)
             throw std::runtime_error("VP8 encoding failed");
         Output out; out.timestamp=static_cast<uint32_t>(ts);
         vpx_codec_iter_t it=nullptr;
@@ -194,6 +197,7 @@ class Session {
     std::atomic<bool> running{true}, ready{false};
     uint32_t ssrc=0;
     uint16_t sequence=0;
+    std::atomic<bool> forceKeyframe{true};
     int fps=30,kbps=8000;
     TurnConfig turn;
     AccumStats stats;
@@ -235,6 +239,7 @@ class Session {
             const auto frameDuration=std::chrono::nanoseconds(1000000000LL/fps);
             auto deadline=Clock::now();
             uint64_t missed=0;
+            const auto epoch=Clock::now();
             while(running && ready && gRunning) {
                 auto now=Clock::now();
                 if(now<deadline) std::this_thread::sleep_until(deadline);
@@ -248,7 +253,9 @@ class Session {
                 const auto t1=Clock::now();
                 if(!i420.convert(capture)) {std::lock_guard<std::mutex> lock(statsMu);++stats.dropped;deadline+=frameDuration;continue;}
                 const auto t2=Clock::now();
-                auto encoded=encoder.encode(i420);
+                const auto elapsedUs=std::chrono::duration_cast<std::chrono::microseconds>(t0-epoch).count();
+                const auto pts=static_cast<uint64_t>(std::max<int64_t>(0,elapsedUs))*90ULL/1000ULL;
+                auto encoded=encoder.encode(i420,pts,forceKeyframe.exchange(false));
                 const auto t3=Clock::now();
                 bool delivered=false;
                 if(!encoded.data.empty() && ready && track && track->isOpen()) {
@@ -288,7 +295,6 @@ public:
     void start(){
         rtc::Configuration c;
         c.forceMediaTransport=true;
-        c.iceServers.emplace_back("stun:stun.l.google.com:19302");
         if(turn.configured())c.iceServers.emplace_back(turn.hostUri());
         pc=std::make_shared<rtc::PeerConnection>(c);
         pc->onLocalDescription([this](rtc::Description d){
@@ -306,6 +312,15 @@ public:
         rtc::Description::Video m("video",rtc::Description::Direction::SendOnly);
         m.addVP8Codec(96);m.addSSRC(ssrc,"lab-video");m.setBitrate(kbps*1000);
         track=pc->addTrack(m);
+        // Keep RTP packets for NACK retransmission and request encoder keyframes on PLI.
+        try {
+            auto nack=std::make_shared<rtc::RtcpNackResponder>(2048);
+            nack->addToChain(std::make_shared<rtc::PliHandler>(
+                [this](){forceKeyframe=true;}));
+            track->setMediaHandler(nack);
+        } catch(const std::exception& e) {
+            push({{"type","error"},{"message",std::string("RTCP recovery disabled: ")+e.what()}});
+        }
         track->onOpen([this]{
             ready=true;
             if(!worker.joinable())worker=std::thread([this]{stream();});
@@ -439,7 +454,7 @@ static void handle(SOCKET client) {
         }
         if(r.method=="GET" && r.path=="/config"){
             json j={{"fps",gDefaultFps},{"bitrateKbps",gDefaultKbps},{"turnConfigured",gTurn.configured()}};
-            j["iceServers"]=json::array({{{"urls","stun:stun.l.google.com:19302"}}});
+            j["iceServers"]=json::array();
             if(gTurn.configured())j["iceServers"].push_back({
                 {"urls",gTurn.url},{"username",gTurn.username},{"credential",gTurn.password}});
             respond(client,200,j.dump());return;

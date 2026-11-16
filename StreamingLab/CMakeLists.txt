@@ -14,7 +14,7 @@ find_path(LIBYUV_INCLUDE_DIR libyuv/convert.h REQUIRED)
 find_library(LIBYUV_LIBRARY NAMES yuv libyuv REQUIRED)
 add_executable(Hi5StreamingLab native/main.cpp)
 target_include_directories(Hi5StreamingLab PRIVATE ${VPX_INCLUDE_DIR} ${LIBYUV_INCLUDE_DIR})
-target_compile_definitions(Hi5StreamingLab PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 RTC_ENABLE_MEDIA=1)
+target_compile_definitions(Hi5StreamingLab PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 RTC_ENABLE_MEDIA=1 RTC_STATIC)
 target_link_libraries(Hi5StreamingLab PRIVATE
   LibDataChannel::LibDataChannel
   nlohmann_json::nlohmann_json
