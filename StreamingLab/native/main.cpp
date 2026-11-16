@@ -89,14 +89,16 @@ struct GdiCapture {
     HDC desktop = nullptr, dc = nullptr;
     HBITMAP bitmap = nullptr, original = nullptr;
     uint8_t* bgra = nullptr;
-    int w=0,h=0;
+    int w=0,h=0,screenW=0,screenH=0;
     bool layered=false;
-    explicit GdiCapture(bool includeLayered=false):layered(includeLayered) {
+    explicit GdiCapture(bool includeLayered=false,int widthLimit=0):layered(includeLayered) {
         SetProcessDPIAware();
-        w = GetSystemMetrics(SM_CXSCREEN);
-        h = GetSystemMetrics(SM_CYSCREEN);
-        if (w < 2 || h < 2) throw std::runtime_error("Invalid screen dimensions");
-        w &= ~1; h &= ~1;
+        screenW = GetSystemMetrics(SM_CXSCREEN);
+        screenH = GetSystemMetrics(SM_CYSCREEN);
+        if (screenW < 2 || screenH < 2) throw std::runtime_error("Invalid screen dimensions");
+        const int wanted=(widthLimit>0)?std::min(screenW,widthLimit):screenW;
+        w = std::max(2,wanted&~1);
+        h = std::max(2,(int(std::round(double(screenH)*w/screenW)))&~1);
         desktop = GetDC(nullptr);
         if (!desktop) throw std::runtime_error("GetDC failed");
         dc = CreateCompatibleDC(desktop);
@@ -119,7 +121,15 @@ struct GdiCapture {
         if (dc) DeleteDC(dc);
         if (desktop) ReleaseDC(nullptr,desktop);
     }
-    bool capture() { return BitBlt(dc,0,0,w,h,desktop,0,0,SRCCOPY|(layered?CAPTUREBLT:0)) != FALSE; }
+    bool capture() {
+        const DWORD mode=SRCCOPY|(layered?CAPTUREBLT:0);
+        if(w==screenW && h==screenH)
+            return BitBlt(dc,0,0,w,h,desktop,0,0,mode)!=FALSE;
+        // Low-latency GPU→CPU readback at the requested output size, instead
+        // of copying the full native frame then scaling it in software.
+        SetStretchBltMode(dc,COLORONCOLOR);
+        return StretchBlt(dc,0,0,w,h,desktop,0,0,screenW,screenH,mode)!=FALSE;
+    }
 };
 struct I420 {
     int w=0,h=0;
@@ -263,11 +273,13 @@ class Session {
                 }
             }
             if(!dxgi) {
-                gdi=std::make_unique<GdiCapture>(legacy);
-                backend=legacy?"GDI legacy CAPTUREBLT":"GDI fast SRCCOPY";
+                gdi=std::make_unique<GdiCapture>(legacy,maxWidth);
+                backend=legacy?"GDI legacy CAPTUREBLT":"GDI fast scaled SRCCOPY";
             }
             const int srcW=dxgi?dxgi->width():gdi->w;
             const int srcH=dxgi?dxgi->height():gdi->h;
+            const int nativeW=dxgi?srcW:gdi->screenW;
+            const int nativeH=dxgi?srcH:gdi->screenH;
             const int targetW=(maxWidth==0)?srcW:std::min(srcW,maxWidth);
             const int outW=std::max(2,targetW&~1);
             const int outH=std::max(2,(int(std::round(double(srcH)*outW/srcW)))&~1);
@@ -275,13 +287,13 @@ class Session {
             Vp8 encoder(outW,outH,fps,kbps);
             {
                 std::lock_guard<std::mutex> lock(statsMu);
-                stats.sourceWidth=srcW;stats.sourceHeight=srcH;
+                stats.sourceWidth=nativeW;stats.sourceHeight=nativeH;
                 stats.width=outW;stats.height=outH;
                 stats.captureBackend=backend;stats.fallbackReason=reason;
                 stats.start=Clock::now();stats.fpsWindowStart=stats.start;
             }
             push({{"type","capture_started"},{"width",outW},{"height",outH},
-                  {"sourceWidth",srcW},{"sourceHeight",srcH},{"backend",backend},
+                  {"sourceWidth",nativeW},{"sourceHeight",nativeH},{"backend",backend},
                   {"message",reason}});
             const auto frameDuration=std::chrono::nanoseconds(1000000000LL/fps);
             auto deadline=Clock::now();
