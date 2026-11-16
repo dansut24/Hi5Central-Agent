@@ -8,7 +8,7 @@ const { WebSocketServer, WebSocket } = require("ws");
 
 const PORT = 8080;
 const PREFIX = "/streamlab";
-const ORIGIN = "https://hi5central.com";
+const ALLOWED_ORIGINS = new Set(["https://hi5central.com", "https://streamlab.hi5central.com"]);
 const CODE_TTL_MS = 10 * 60_000;
 const ROOM_LIMIT = 12;
 const TURN_TTL_SECS = 20 * 60;
@@ -115,13 +115,18 @@ const server=http.createServer((req,res)=>{
   res.setHeader("X-Content-Type-Options","nosniff");
   res.setHeader("Referrer-Policy","no-referrer");
   res.setHeader("X-Frame-Options","DENY");
-  res.setHeader("Content-Security-Policy","default-src 'none'; connect-src 'self' wss://hi5central.com; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; media-src blob:; base-uri 'none'; form-action 'none'");
+  res.setHeader("Content-Security-Policy","default-src 'none'; connect-src 'self' wss://hi5central.com wss://streamlab.hi5central.com; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; media-src blob:; base-uri 'none'; form-action 'none'");
   // iOS in-app browsers and link previews may issue HEAD before GET.
   // Return the same status, content type and length for both; never hand iOS a
   // 9-byte 404 response that it interprets as an unknown downloadable file.
   const isHead = req.method==="HEAD";
+  // Never compare raw req.url: mobile link handlers can append tracking/query parameters.
+  // A 9-byte 404 made iOS treat the URL as a downloadable file.
+  let pathname;
+  try { pathname = new URL(req.url, "http://localhost").pathname; }
+  catch { res.writeHead(400); res.end(); return; }
   if ((req.method==="GET" || isHead) &&
-      [PREFIX,PREFIX+"/",PREFIX+"/index.html"].includes(req.url)) {
+      ["/","/index.html",PREFIX,PREFIX+"/",PREFIX+"/index.html"].includes(pathname)) {
     res.writeHead(200,{
       "Content-Type":"text/html; charset=utf-8",
       "Content-Length":Buffer.byteLength(html),
@@ -129,7 +134,7 @@ const server=http.createServer((req,res)=>{
     });
     res.end(isHead ? undefined : html);return;
   }
-  if ((req.method==="GET" || isHead) && req.url===PREFIX+"/health") {
+  if ((req.method==="GET" || isHead) && (pathname===PREFIX+"/health" || pathname==="/health")) {
     const data='{"ok":true,"service":"hi5-streaming-lab","version":2}';
     res.writeHead(200,{"Content-Type":"application/json","Content-Length":Buffer.byteLength(data)});
     res.end(isHead ? undefined : data);return;
@@ -144,8 +149,8 @@ server.on("upgrade",(req,socket,head)=>{
   const viewer=role==="viewer";
   const host=role==="host";
   const origin=req.headers.origin || "";
-  if (url.pathname!==PREFIX+"/ws" || (!viewer&&!host) ||
-      (viewer&&origin!==ORIGIN) || (host&&origin&&origin!==ORIGIN)) {
+  if (!([PREFIX+"/ws","/ws"].includes(url.pathname)) || (!viewer&&!host) ||
+      (viewer&&!ALLOWED_ORIGINS.has(origin)) || (host&&origin&&!ALLOWED_ORIGINS.has(origin))) {
     socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");socket.destroy();return;
   }
   wss.handleUpgrade(req,socket,head,ws=>{
