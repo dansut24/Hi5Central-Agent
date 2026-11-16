@@ -41,6 +41,16 @@ jobs:
           Copy-Item StreamingLab/viewer.html StreamingLab/build/dist/viewer.html
           Copy-Item StreamingLab/Start-Hi5StreamingLab.cmd StreamingLab/build/dist/Start-Hi5StreamingLab.cmd
           Get-FileHash StreamingLab/build/dist/Hi5StreamingLab.exe -Algorithm SHA256 | Format-List
+      - name: Ensure DXGI probe remains independent from production services
+        shell: pwsh
+        run: |
+          $h = Get-Content StreamingLab/native/dxgi_capture.h -Raw
+          if ($h -notmatch 'DuplicateOutput' -or $h -notmatch 'DXGI_ERROR_WAIT_TIMEOUT') {
+            throw 'Interactive DXGI capture probe missing'
+          }
+          if ($h -match 'OpenInputDesktop|SetThreadDesktop|CreateService|Hi5CentralAgent') {
+            throw 'Standalone DXGI capture must not manipulate security desktops or services'
+          }
       - name: Validate website/relay JavaScript
         shell: pwsh
         run: |
