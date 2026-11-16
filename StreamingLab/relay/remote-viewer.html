@@ -167,7 +167,8 @@ $("connect").onclick=()=>{
  if(sock){try{sock.close()}catch{}}
  paired=false;resetVideo();
  $("connect").disabled=true;label("Pairing…");
- sock=new WebSocket("wss://hi5central.com/streamlab/ws?role=viewer");
+ const wsPath=location.hostname==="streamlab.hi5central.com"?"/ws":"/streamlab/ws";
+ sock=new WebSocket("wss://"+location.host+wsPath+"?role=viewer");
  sock.onopen=()=>{send({type:"join",code});log("Pairing request sent")};
  sock.onmessage=e=>{try{onMessage(JSON.parse(e.data)).catch(err=>log("Message: "+err.message))}catch(err){log("Signal parse: "+err.message)}};
  sock.onclose=()=>{paired=false;resetVideo();$("connect").disabled=false;label("Disconnected");log("Pairing socket closed")};
