@@ -8,7 +8,7 @@
 2. Extract all files into the same folder on the Lenovo/Dell Windows desktop.
 3. Double-click **Start-Hi5StreamingLab.cmd** (or run \`Hi5StreamingLab.exe --remote\` from a console).
 4. Wait for the EXE to display its **eight-digit one-time code**, valid for 10 minutes. Keep the console open.
-5. On your iPhone, Android or another PC, open **https://hi5central.com/streamlab**, enter that code and press **Pair device**.
+5. On your iPhone, Android or another PC, open **https://streamlab.hi5central.com/**, enter that code and press **Pair device**.
 6. Select software VP8, 30 FPS, 8 Mbps and **Start VP8 test**. Repeat at 45 then 60 FPS where the hardware can sustain it.
 7. Export diagnostic JSON from the browser. The host console and browser event log report signalling/SDP/ICE failures instead of silently hanging.
 
@@ -17,7 +17,7 @@
 ## Architecture
 
 - \`native/main.cpp\`: Windows GDI/BitBlt capture → libyuv BGRA/I420 → software libvpx VP8 → RTP → libdatachannel WebRTC.
-- \`relay/server.js\`: isolated pairing & SDP/ICE exchange on the original VPS, exposed only at \`https://hi5central.com/streamlab\` and \`wss://hi5central.com/streamlab/ws\`. No production RMM services are used.
+- \`relay/server.js\`: isolated pairing & SDP/ICE exchange on the original VPS, exposed only at \`https://streamlab.hi5central.com/\` and \`wss://streamlab.hi5central.com/ws\` (the existing Windows EXE may continue using \`wss://hi5central.com/streamlab/ws\`). No production RMM services are used.
 - \`relay/remote-viewer.html\`: standalone iOS/Android/desktop browser viewer with bitrate/FPS controls and host/browser metrics.
 - \`Start-Hi5StreamingLab.cmd\`: normal-user Windows console launcher. No installer or scheduled task.
 - The relay issues TURN REST credentials with a short lifetime from the VPS's **existing coturn shared secret**, which stays on the VPS. Nothing secret is bundled into the app. The TURN server and RMM services are unchanged.
