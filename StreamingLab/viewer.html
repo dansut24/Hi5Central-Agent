@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hi5Central Streaming Lab</title>
+<style>
+:root {color-scheme: dark; font: 14px/1.5 ui-sans-serif,system-ui,Segoe UI,Arial; background:#0b101b; color:#ecf3ff}
+*{box-sizing:border-box} body{margin:0; min-height:100vh}
+header{display:flex; align-items:center; gap:12px; padding:18px 30px; border-bottom:1px solid #253044; background:#101929}
+mark{background:#307bf6;color:#fff;padding:5px 10px;border-radius:8px;font-weight:800;font-size:18px}
+h1{font-size:19px;margin:0} small,.hint{color:#93a3bb} .right{margin-left:auto}
+main{padding:22px 30px;max-width:1600px;margin:auto}
+.panel{background:#141f30;border:1px solid #2b3a50;border-radius:12px;padding:18px;margin-bottom:20px}
+.controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap}
+label{display:block;font-size:12px;color:#a9b9d1;margin-bottom:6px}
+select,button{border:1px solid #3b4d68;border-radius:8px;background:#1b2a40;color:#fff;font-size:14px;padding:11px 14px}
+button{cursor:pointer;font-weight:600}button:hover{border-color:#6ea6ff}button.primary{background:#2569ea;border-color:#317bf7}
+button:disabled{opacity:.45;cursor:default}
+.status{display:flex;align-items:center;gap:7px;color:#bfcbda;margin-left:auto}
+.dot{width:9px;height:9px;background:#d89d55;border-radius:50%}.dot.live{background:#4cdb9f}
+.viewer{aspect-ratio:16/9;background:#05070b;border:1px solid #32445f;border-radius:10px;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}
+video{width:100%;height:100%;object-fit:contain;background:#020409}
+#empty{position:absolute;pointer-events:none;text-align:center;color:#6c819e;font-size:16px}
+.metrics{display:grid;grid-template-columns:repeat(6,minmax(110px,1fr));gap:12px}
+.metric{background:#101827;padding:12px;border-radius:9px;border:1px solid #2a3a50}
+.metric strong{display:block;font-size:22px;font-weight:700;letter-spacing:-.5px}
+.metric span{font-size:11px;color:#9badc5}
+.section-head{display:flex;justify-content:space-between;align-items:center;margin:0 0 14px}
+h2{font-size:15px;margin:0}
+pre{margin:0;white-space:pre-wrap;font:12px/1.6 ui-monospace,Consolas,monospace;color:#a9b9cc;max-height:200px;overflow:auto}
+@media(max-width:950px){.metrics{grid-template-columns:repeat(3,1fr)}header,main{padding:15px}}
+@media(max-width:500px){.metrics{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header>
+<mark>H5</mark><div><h1>Streaming Lab</h1><small>Standalone Windows capture & WebRTC diagnostics · Stage 1</small></div>
+<div class="right"><small>Localhost only · Not connected to RMM</small></div>
+</header>
+<main>
+<section class="panel controls">
+<div><label for="codec">Codec</label><select id="codec"><option>VP8 (software)</option></select></div>
+<div><label for="fps">Target FPS</label><select id="fps"><option value="15">15</option><option value="30" selected>30</option><option value="45">45</option><option value="60">60</option></select></div>
+<div><label for="kbps">Target bitrate</label><select id="kbps"><option value="4000">4 Mbps</option><option value="8000" selected>8 Mbps</option><option value="12000">12 Mbps</option><option value="16000">16 Mbps</option></select></div>
+<button class="primary" id="start">Start VP8 test</button>
+<button id="stop" disabled>Stop</button>
+<div class="status"><i id="dot" class="dot"></i><span id="state">Not connected</span></div>
+</section>
+<section class="panel">
+<div class="section-head"><h2>Live desktop stream</h2><small id="resolution">Waiting for capture</small></div>
+<div class="viewer"><video id="video" autoplay muted playsinline></video><div id="empty">Start a session to measure VP8 streaming performance</div></div>
+<p class="hint">This is the primary desktop on this Windows computer. No input is injected. Move a window or scroll locally to create a repeatable motion workload.</p>
+</section>
+<section class="panel">
+<div class="section-head"><h2>Host pipeline diagnostics</h2><button id="export">Export metrics JSON</button></div>
+<div class="metrics">
+<div class="metric"><strong id="fpsOut">—</strong><span>Host delivered FPS</span></div>
+<div class="metric"><strong id="frameAge">—</strong><span>Capture-to-RTP age (ms)</span></div>
+<div class="metric"><strong id="captureMs">—</strong><span>Screen capture avg (ms)</span></div>
+<div class="metric"><strong id="convertMs">—</strong><span>BGRA → I420 avg (ms)</span></div>
+<div class="metric"><strong id="encodeMs">—</strong><span>VP8 encode avg (ms)</span></div>
+<div class="metric"><strong id="sendMs">—</strong><span>RTP enqueue avg (ms)</span></div>
+<div class="metric"><strong id="captured">—</strong><span>Host captured frames</span></div>
+<div class="metric"><strong id="dropped">—</strong><span>Host unsent frames</span></div>
+<div class="metric"><strong id="missed">—</strong><span>Missed frame deadlines</span></div>
+<div class="metric"><strong id="browserFps">—</strong><span>Browser decoded FPS</span></div>
+<div class="metric"><strong id="browserDrops">—</strong><span>Browser dropped frames</span></div>
+<div class="metric"><strong id="jitter">—</strong><span>Jitter buffer avg (ms)</span></div>
+</div>
+</section>
+<section class="panel">
+<div class="section-head"><h2>Connection & diagnostic events</h2><small id="turn">Checking TURN configuration</small></div>
+<pre id="log">Ready. This lab binds to 127.0.0.1 and does not use any RMM APIs.</pre>
+</section>
+</main>
+<script>
+"use strict";
+const TOKEN="__LAB_TOKEN__";
+const byId=id=>document.getElementById(id);
+let peer=null,pollTimer=null,statsTimer=null,lastEvent=0,lastHostStats=null,lastBrowserStats=null;
+let sessionActive=false,latestExport={};
+const headers={"Content-Type":"application/json","X-Lab-Token":TOKEN};
+const log=message=>{
+ const el=byId("log"),stamp=new Date().toLocaleTimeString();
+ el.textContent+= "\n["+stamp+"] "+message;
+ el.scrollTop=el.scrollHeight;
+};
+async function call(path, method="GET", body) {
+ const res=await fetch(path,{method,headers,body:body===undefined?undefined:JSON.stringify(body),cache:"no-store"});
+ const out=await res.json();
+ if(!res.ok)throw new Error(out.error||"HTTP "+res.status);
+ return out;
+}
+function state(value,live=false){
+ byId("state").textContent=value;
+ byId("dot").classList.toggle("live",live);
+}
+function controls(running){
+ byId("start").disabled=running;byId("stop").disabled=!running;
+ byId("fps").disabled=running;byId("kbps").disabled=running;
+}
+function fmt(v,digits=1){return Number.isFinite(Number(v))?Number(v).toFixed(digits):"—";}
+function show(el,val){byId(el).textContent=val;}
+async function events(){
+ if(!sessionActive)return;
+ const list=await call("/events?after="+lastEvent);
+ for(const item of list.events||[]){
+  lastEvent=item.id;
+  const e=item.event;
+  if(e.type==="webrtc_offer"){
+   log("Received VP8 offer; creating browser answer");
+   await peer.setRemoteDescription({type:"offer",sdp:e.sdp});
+   const answer=await peer.createAnswer();
+   await peer.setLocalDescription(answer);
+   await call("/signal","POST",{type:"answer",sdp:peer.localDescription.sdp});
+  }else if(e.type==="ice_candidate"){
+   await peer.addIceCandidate({candidate:e.candidate,sdpMid:e.sdpMid});
+  }else if(e.type==="capture_started"){
+   show("resolution",e.width+" × "+e.height+" native capture");
+   log("Capture started: "+e.width+" × "+e.height);
+  }else if(e.type==="error"){log("HOST ERROR: "+e.message)}
+  else if(e.type==="peer_state")log("Host WebRTC state: "+e.state);
+ }
+}
+async function statistics(){
+ if(!sessionActive||!peer)return;
+ const s=await call("/stats");lastHostStats=s;
+ show("fpsOut",fmt(s.fpsMeasured));show("frameAge",fmt(s.lastFrameAgeMs));
+ show("captureMs",fmt(s.captureMsAvg));show("convertMs",fmt(s.convertMsAvg));
+ show("encodeMs",fmt(s.encodeMsAvg));show("sendMs",fmt(s.sendMsAvg));
+ show("captured",s.captured);show("dropped",s.dropped);show("missed",s.missedDeadlines);
+ const report=await peer.getStats();
+ let incoming=null,transport=null;
+ for(const item of report.values()){
+  if(item.type==="inbound-rtp"&&(item.kind==="video"||item.mediaType==="video")&&!item.isRemote)incoming=item;
+  if(item.type==="candidate-pair"&&item.state==="succeeded"&&item.nominated)transport=item;
+ }
+ if(incoming){
+  lastBrowserStats={
+   decoded:incoming.framesDecoded,dropped:incoming.framesDropped,
+   fps:incoming.framesPerSecond,packetsLost:incoming.packetsLost,
+   jitterBufferMs: incoming.jitterBufferEmittedCount>0
+       ?1000*incoming.jitterBufferDelay/incoming.jitterBufferEmittedCount:null
+  };
+  show("browserFps",fmt(incoming.framesPerSecond));show("browserDrops",incoming.framesDropped??"—");
+  show("jitter",fmt(lastBrowserStats.jitterBufferMs));
+ }
+ latestExport={timestamp:new Date().toISOString(),host:s,browser:lastBrowserStats,
+  peerState:peer.connectionState,selectedCandidatePair:transport?{
+  currentRoundTripTime:transport.currentRoundTripTime,
+  bytesSent:transport.bytesSent,bytesReceived:transport.bytesReceived}:null};
+}
+async function stop(){
+ sessionActive=false;
+ clearInterval(pollTimer);clearInterval(statsTimer);
+ pollTimer=null;statsTimer=null;
+ try{await call("/stop","POST",{});}catch(e){log("Host stop: "+e.message)}
+ if(peer){peer.close();peer=null;}
+ byId("video").srcObject=null;byId("empty").hidden=false;
+ controls(false);state("Stopped");log("Session stopped");
+}
+async function start(){
+ if(sessionActive)return;
+ controls(true);state("Connecting");
+ try{
+  const config=await call("/config");
+  peer=new RTCPeerConnection({iceServers:config.iceServers,bundlePolicy:"max-bundle"});
+  peer.ontrack=e=>{
+   byId("video").srcObject=e.streams[0]||new MediaStream([e.track]);
+   byId("empty").hidden=true;log("Browser received video track");
+  };
+  peer.onicecandidate=e=>{
+   if(e.candidate&&sessionActive)call("/signal","POST",{
+    type:"ice_candidate",candidate:e.candidate.candidate,sdpMid:e.candidate.sdpMid
+   }).catch(err=>log("Candidate send: "+err.message));
+  };
+  peer.onconnectionstatechange=()=>{
+   state(peer.connectionState,peer.connectionState==="connected");
+   log("Browser connection: "+peer.connectionState);
+  };
+  peer.oniceconnectionstatechange=()=>log("ICE state: "+peer.iceConnectionState);
+  const fps=Number(byId("fps").value),bitrateKbps=Number(byId("kbps").value);
+  lastEvent=0;lastHostStats=null;lastBrowserStats=null;sessionActive=true;
+  await call("/start","POST",{fps,bitrateKbps});
+  log("Started VP8 software test at "+fps+" FPS, "+bitrateKbps+" kbps");
+  // Sequential polling avoids concurrent offers/candidates being applied out of order.
+  const poll=async()=>{
+   if(!sessionActive)return;
+   try{await events();}catch(err){log("Signalling: "+err.message)}
+  };
+  await poll();
+  pollTimer=setInterval(poll,200);
+  statsTimer=setInterval(()=>statistics().catch(err=>log("Stats: "+err.message)),1000);
+ }catch(err){
+  log("START FAILED: "+err.message);
+  await stop();
+ }
+}
+byId("start").addEventListener("click",start);
+byId("stop").addEventListener("click",stop);
+byId("export").addEventListener("click",()=>{
+ const record=Object.keys(latestExport).length?latestExport:{
+  timestamp:new Date().toISOString(),message:"No recorded session yet"};
+ const blob=new Blob([JSON.stringify(record,null,2)],{type:"application/json"});
+ const url=URL.createObjectURL(blob),a=document.createElement("a");
+ a.href=url;a.download="hi5-streaming-lab-"+new Date().toISOString().replace(/[:.]/g,"-")+".json";
+ document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+});
+call("/config").then(c=>{
+ byId("fps").value=String(c.fps);byId("kbps").value=String(c.bitrateKbps);
+ show("turn",c.turnConfigured?"TURN configured · VPS":"TURN not configured · local ICE");
+}).catch(e=>log("Configuration: "+e.message));
+</script>
+</body>
+</html>
