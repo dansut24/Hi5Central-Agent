@@ -22,16 +22,17 @@ jobs:
         run: |
           & C:\vcpkg\vcpkg.exe install "libdatachannel[srtp]:x64-windows-static" "libvpx:x64-windows-static" "libyuv:x64-windows-static" "nlohmann-json:x64-windows-static"
           if ($LASTEXITCODE -ne 0) { throw 'vcpkg streaming dependencies failed' }
-      - name: Configure standalone streaming project
+      - name: Configure and build explicitly with MSVC (never MinGW)
         shell: pwsh
         run: |
-          cmake -S StreamingLab -B StreamingLab/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static
-          if ($LASTEXITCODE -ne 0) { throw 'Streaming Lab CMake configure failed' }
-      - name: Build Hi5StreamingLab.exe
-        shell: pwsh
-        run: |
-          cmake --build StreamingLab/build --config Release --parallel 2
-          if ($LASTEXITCODE -ne 0) { throw 'Streaming Lab compile/link failed' }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual C++ compiler unavailable" }
+          $devcmd = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          if (-not (Test-Path $devcmd)) { throw "VsDevCmd.bat missing" }
+          $cmd = 'call "' + $devcmd + '" -arch=x64 -host_arch=x64 && cmake -S StreamingLab -B StreamingLab/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static -DCMAKE_CXX_COMPILER=cl && cmake --build StreamingLab/build --config Release --parallel 2'
+          cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC Streaming Lab configure/compile/link failed' }
           if (-not (Test-Path StreamingLab/build/dist/Hi5StreamingLab.exe)) { throw 'Missing Streaming Lab EXE' }
           Copy-Item StreamingLab/viewer.html StreamingLab/build/dist/viewer.html
           Get-FileHash StreamingLab/build/dist/Hi5StreamingLab.exe -Algorithm SHA256 | Format-List
