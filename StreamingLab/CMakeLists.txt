@@ -7,6 +7,7 @@ if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 find_package(LibDataChannel CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
 find_path(VPX_INCLUDE_DIR vpx/vpx_encoder.h REQUIRED)
 find_library(VPX_LIBRARY NAMES vpx libvpx REQUIRED)
 find_path(LIBYUV_INCLUDE_DIR libyuv/convert.h REQUIRED)
@@ -16,6 +17,7 @@ target_include_directories(Hi5StreamingLab PRIVATE ${VPX_INCLUDE_DIR} ${LIBYUV_I
 target_compile_definitions(Hi5StreamingLab PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 RTC_ENABLE_MEDIA=1)
 target_link_libraries(Hi5StreamingLab PRIVATE
   LibDataChannel::LibDataChannel
+  nlohmann_json::nlohmann_json
   ${VPX_LIBRARY} ${LIBYUV_LIBRARY}
   ws2_32 user32 gdi32 bcrypt
 )
