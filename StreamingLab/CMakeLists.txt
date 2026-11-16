@@ -19,7 +19,7 @@ target_link_libraries(Hi5StreamingLab PRIVATE
   LibDataChannel::LibDataChannel
   nlohmann_json::nlohmann_json
   ${VPX_LIBRARY} ${LIBYUV_LIBRARY}
-  ws2_32 user32 gdi32 bcrypt
+  ws2_32 user32 gdi32 bcrypt d3d11 dxgi
 )
 set_target_properties(Hi5StreamingLab PROPERTIES
   OUTPUT_NAME "Hi5StreamingLab"
