@@ -513,6 +513,8 @@ static int runRemote(const std::string& endpoint) {
         std::shared_ptr<Session> session;
         bool paired=false;
         uint64_t lastEvent=0;
+        bool hasAnswer=false;
+        std::deque<json> pendingIce;
         TurnConfig turn;
         auto nextStats=Clock::now();
         auto sendJson=[&](const json& data) {
@@ -591,6 +593,8 @@ static int runRemote(const std::string& endpoint) {
                     }
                     if(session){session->stop();session.reset();}
                     lastEvent=0;
+                    hasAnswer=false;
+                    pendingIce.clear();
                     try {
                         session=std::make_shared<Session>(fps,kbps,turn);
                         session->start();
@@ -604,11 +608,17 @@ static int runRemote(const std::string& endpoint) {
                 } else if(type=="webrtc_answer" && session) {
                     try{
                         session->signal({{"type","answer"},{"sdp",msg.at("sdp")}});
+                        hasAnswer=true;
+                        for(const auto& ice:pendingIce) {
+                            try{session->signal(ice);}catch(...){}
+                        }
+                        pendingIce.clear();
                         std::cout << "[lab] Applied browser SDP answer.\n";
                     }catch(const std::exception& e){
                         sendJson({{"type","error"},{"message",std::string("SDP rejected: ")+e.what()}});
                     }
                 } else if(type=="ice_candidate" && session) {
+                    if(!hasAnswer){if(pendingIce.size()<100)pendingIce.push_back(msg);continue;}
                     try{session->signal(msg);}
                     catch(const std::exception& e){
                         std::cerr << "[lab] Candidate error: " << e.what() << "\n";
