@@ -1,0 +1,57 @@
+name: Isolated Streaming Lab Windows build
+
+on:
+  push:
+    branches: [feature/streaming-core]
+    paths:
+      - 'StreamingLab/**'
+      - '.github/workflows/streaming-lab-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-lab:
+    runs-on: windows-2025
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native streaming dependencies (static Windows)
+        shell: pwsh
+        run: |
+          & C:\vcpkg\vcpkg.exe install "libdatachannel[srtp]:x64-windows-static" "libvpx:x64-windows-static" "libyuv:x64-windows-static" "nlohmann-json:x64-windows-static"
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg streaming dependencies failed' }
+      - name: Configure standalone streaming project
+        shell: pwsh
+        run: |
+          cmake -S StreamingLab -B StreamingLab/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static
+          if ($LASTEXITCODE -ne 0) { throw 'Streaming Lab CMake configure failed' }
+      - name: Build Hi5StreamingLab.exe
+        shell: pwsh
+        run: |
+          cmake --build StreamingLab/build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Streaming Lab compile/link failed' }
+          if (-not (Test-Path StreamingLab/build/dist/Hi5StreamingLab.exe)) { throw 'Missing Streaming Lab EXE' }
+          Copy-Item StreamingLab/viewer.html StreamingLab/build/dist/viewer.html
+          Get-FileHash StreamingLab/build/dist/Hi5StreamingLab.exe -Algorithm SHA256 | Format-List
+      - name: Validate distribution files and local-only source policy
+        shell: pwsh
+        run: |
+          $root='StreamingLab/build/dist'
+          foreach($name in @('Hi5StreamingLab.exe','viewer.html')) {
+            if(-not (Test-Path (Join-Path $root $name))) { throw "Missing $name" }
+          }
+          $text = Get-Content StreamingLab/native/main.cpp -Raw
+          if($text -notmatch 'INADDR_LOOPBACK') { throw 'Lab is not bound to localhost' }
+          if($text -match 'INADDR_ANY') { throw 'Unexpected public bind in lab source' }
+          if($text -match 'api\.hi5central\.com|remote-sessions|device/enroll') {
+            throw 'Unexpected production RMM dependency in lab source'
+          }
+          Write-Host 'Isolation checks passed'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hi5StreamingLab-Windows
+          path: StreamingLab/build/dist/
+          retention-days: 14
+          if-no-files-found: error
