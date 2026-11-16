@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <variant>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -495,10 +496,172 @@ static void handle(SOCKET client) {
         respond(client,400,json({{"error",e.what()}}).dump());
     }
 }
-int main(){
+
+/* Public lab relay mode. All session signalling is outbound over authenticated TLS.
+   Pairing requires an eight-digit code displayed locally on the Windows console.
+   No Windows input channel, service, RMM API or persistent host identity. */
+static int runRemote(const std::string& endpoint) {
+    std::cout << "\n=== Hi5Central Streaming Lab / Web Viewer ===\n"
+              << "Webpage: https://hi5central.com/streamlab\n"
+              << "Only accept a pairing code while YOU are testing.\n"
+              << "Press Ctrl+C to terminate desktop sharing and pairing.\n\n";
+    while (gRunning) {
+        std::atomic<bool> connected{false}, disconnected{false};
+        std::mutex inboxMu;
+        std::deque<json> inbox;
+        std::shared_ptr<rtc::WebSocket> ws=std::make_shared<rtc::WebSocket>();
+        std::shared_ptr<Session> session;
+        bool paired=false;
+        uint64_t lastEvent=0;
+        TurnConfig turn;
+        auto nextStats=Clock::now();
+        auto sendJson=[&](const json& data) {
+            if (!connected.load()) return;
+            try { ws->send(data.dump()); }
+            catch(const std::exception& e) {
+                std::cerr << "[lab] websocket send error: " << e.what() << "\n";
+            }
+        };
+        ws->onOpen([&]{
+            connected=true;
+            std::cout << "[lab] Secure relay connected. Requesting pairing code...\n";
+            sendJson({{"type","hello"}});
+        });
+        ws->onClosed([&]{disconnected=true;connected=false;});
+        ws->onError([&](std::string error){
+            std::cerr << "[lab] Signalling error: " << error << "\n";
+            disconnected=true;connected=false;
+        });
+        ws->onMessage([&](rtc::message_variant msg){
+            if(const auto* text=std::get_if<std::string>(&msg)) {
+                const auto parsed=json::parse(*text,nullptr,false);
+                if(!parsed.is_discarded()) {
+                    std::lock_guard<std::mutex> lock(inboxMu);
+                    inbox.push_back(parsed);
+                    if(inbox.size()>300)inbox.pop_front();
+                }
+            }
+        });
+        try { ws->open(endpoint); }
+        catch(const std::exception& e) {
+            std::cerr << "[lab] Unable to open relay: " << e.what() << "\n";
+            disconnected=true;
+        }
+        while(gRunning && !disconnected.load()) {
+            std::deque<json> localMessages;
+            {
+                std::lock_guard<std::mutex> lock(inboxMu);
+                localMessages.swap(inbox);
+            }
+            for(const auto& msg:localMessages) {
+                if(!msg.is_object()) continue;
+                const std::string type=msg.value("type",std::string());
+                if(type=="registered") {
+                    std::cout << "\n--------------------------------------\n"
+                              << "  WEB VIEWER: https://hi5central.com/streamlab\n"
+                              << "  ONE-TIME PAIRING CODE: "<<msg.value("code",std::string("unknown"))
+                              << "\n  Code valid for 10 minutes.\n"
+                              << "--------------------------------------\n\n";
+                } else if(type=="paired") {
+                    paired=true;
+                    if(session) {session->stop();session.reset();}
+                    turn={};
+                    const auto ice=msg.value("iceServers",json::array());
+                    if(ice.is_array())for(const auto& item:ice) {
+                        if(!item.is_object())continue;
+                        const std::string url=item.value("urls",std::string());
+                        if(url.rfind("turn:",0)==0 && item.contains("credential")) {
+                            turn.url=url;
+                            turn.username=item.value("username",std::string());
+                            turn.password=item.value("credential",std::string());
+                            break;
+                        }
+                    }
+                    if(!turn.configured()){
+                        std::cerr << "[lab] TURN credentials unavailable. Refusing remote stream.\n";
+                        sendJson({{"type","error"},{"message","TURN unavailable"}});
+                        paired=false;
+                    } else std::cout << "[lab] Browser paired; waiting for Start on web page.\n";
+                } else if(type=="start" && paired) {
+                    const int fps=msg.value("fps",30);
+                    const int kbps=msg.value("bitrateKbps",8000);
+                    if((fps!=15 && fps!=30 && fps!=45 && fps!=60) || kbps<500 || kbps>30000){
+                        sendJson({{"type","error"},{"message","Invalid frame rate or bitrate"}});
+                        continue;
+                    }
+                    if(session){session->stop();session.reset();}
+                    lastEvent=0;
+                    try {
+                        session=std::make_shared<Session>(fps,kbps,turn);
+                        session->start();
+                        nextStats=Clock::now();
+                        std::cout << "[lab] Started independent VP8 session " << fps
+                                  << " FPS @ " << kbps << " kbps. Awaiting browser WebRTC answer.\n";
+                    }catch(const std::exception& e){
+                        session.reset();
+                        sendJson({{"type","error"},{"message",std::string("Host start failed: ")+e.what()}});
+                    }
+                } else if(type=="webrtc_answer" && session) {
+                    try{
+                        session->signal({{"type","answer"},{"sdp",msg.at("sdp")}});
+                        std::cout << "[lab] Applied browser SDP answer.\n";
+                    }catch(const std::exception& e){
+                        sendJson({{"type","error"},{"message",std::string("SDP rejected: ")+e.what()}});
+                    }
+                } else if(type=="ice_candidate" && session) {
+                    try{session->signal(msg);}
+                    catch(const std::exception& e){
+                        std::cerr << "[lab] Candidate error: " << e.what() << "\n";
+                    }
+                } else if(type=="stop" || type=="viewer_left") {
+                    if(session){session->stop();session.reset();}
+                    if(type=="viewer_left")paired=false;
+                    else sendJson({{"type","stopped"}});
+                    std::cout << "[lab] Stream stopped: " << type << "\n";
+                } else if(type=="error") {
+                    std::cout << "[lab] Signalling: "<<msg.value("message",std::string("error"))<<"\n";
+                }
+            }
+            if(session){
+                auto polling=session->poll(lastEvent);
+                lastEvent=polling.value("last",lastEvent);
+                for(const auto& item:polling.value("events",json::array())){
+                    if(!item.is_object() || !item.contains("event"))continue;
+                    json event=item["event"];
+                    if(event.is_object())sendJson(event);
+                }
+                if(Clock::now()>=nextStats){
+                    sendJson({{"type","stats"},{"stats",session->snapshot()}});
+                    nextStats=Clock::now()+std::chrono::seconds(1);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+        if(session){session->stop();session.reset();}
+        connected=false;
+        try{ws->close();}catch(...){}
+        // Give outstanding libdatachannel callbacks time to finish before their captures expire.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if(gRunning){
+            std::cout << "[lab] Relay disconnected. Retrying in three seconds...\n";
+            for(int i=0;i<30 && gRunning;++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    return 0;
+}
+
+int main(int argc,char** argv){
     WSADATA wsa{};
     if(WSAStartup(MAKEWORD(2,2),&wsa)!=0)return 1;
     SetConsoleCtrlHandler(onConsole,TRUE);
+    if(argc==1 || std::string(argv[1])!="--local") {
+        const auto url=env("HI5_LAB_RELAY_URL").empty() ?
+            "wss://hi5central.com/streamlab/ws?role=host" : env("HI5_LAB_RELAY_URL");
+        const int code=runRemote(url);
+        WSACleanup();
+        return code;
+    }
     try {
         gToken=randomToken();
         gTurn={env("HI5_LAB_TURN_URL"),env("HI5_LAB_TURN_USER"),env("HI5_LAB_TURN_PASS")};
