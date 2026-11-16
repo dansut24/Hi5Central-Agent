@@ -12,6 +12,8 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
