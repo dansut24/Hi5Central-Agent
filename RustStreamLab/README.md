@@ -38,3 +38,9 @@ Compare C++, Go and Rust sequentially on the same Lenovo device in the same netw
 
 ## Build manually
 Use Rust MSVC stable, libvpx headers/import libs (e.g. vcpkg `libvpx:x64-windows`), LLVM/libclang for generated bindgen and environment variables `VPX_LIB_DIR`, `VPX_INCLUDE_DIR`, `VPX_VERSION` (label), and `VPX_DYNAMIC=1`. Build with `cargo build --release --locked --manifest-path RustStreamLab/Cargo.toml`. Bundle the matching `vpx.dll` with executable.
+
+## 2026-11-17 Safari black-screen diagnostic and fix
+
+The initial viewer export showed Safari rejecting remote ICE candidates (each candidate was assigned a fabricated sdpMid "video") and staying in ICE state "new". The webrtc-rs 0.13 library returns an empty MID but sdpMLineIndex=0 in candidate JSON. The revised agent forwards the m-line index and never invents a MID; the viewer likewise consumes the index and queues early candidates. The Rust agent must be recompiled for the signalling fix. The viewer JS is deployed independently on rust-streamlab.hi5central.com.
+
+GDI capture baseline: BitBlt with CAPTUREBLT averaged ~157ms at 1706x1066 and could only generate ~5.9 FPS. New Windows build defaults to plain SRCCOPY without CAPTUREBLT to test the lower-overhead capture path. For A/B or layered-window compatibility, launch PowerShell with `$env:HI5_RUST_CAPTUREBLT='1'; .\hi5-rust-streamlab.exe`. This is experimental until measured on the Lenovo. Use a fresh viewer JSON after upgrading the EXE.
