@@ -1,0 +1,169 @@
+//! Windows GDI/BitBlt capture. Never touches the system agent or services.
+#![cfg(windows)]
+use std::{
+    ffi::c_void,
+    ptr::{null, null_mut},
+    slice,
+};
+
+type Hdc = *mut c_void;
+type Hbitmap = *mut c_void;
+type Handle = *mut c_void;
+
+#[repr(C)]
+struct BitmapInfoHeader {
+    size: u32,
+    width: i32,
+    height: i32,
+    planes: u16,
+    bit_count: u16,
+    compression: u32,
+    size_image: u32,
+    xppm: i32,
+    yppm: i32,
+    clr_used: u32,
+    clr_important: u32,
+}
+#[repr(C)]
+struct BitmapInfo {
+    header: BitmapInfoHeader,
+    color: [u32; 1],
+}
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn CreateCompatibleDC(hdc: Hdc) -> Hdc;
+    fn DeleteDC(hdc: Hdc) -> i32;
+    fn CreateDIBSection(
+        hdc: Hdc,
+        info: *const BitmapInfo,
+        usage: u32,
+        bits: *mut *mut c_void,
+        section: Handle,
+        offset: u32,
+    ) -> Hbitmap;
+    fn SelectObject(hdc: Hdc, object: Handle) -> Handle;
+    fn DeleteObject(object: Handle) -> i32;
+    fn BitBlt(
+        dst: Hdc,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        src: Hdc,
+        src_x: i32,
+        src_y: i32,
+        rop: u32,
+    ) -> i32;
+}
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetDC(window: Handle) -> Hdc;
+    fn ReleaseDC(window: Handle, hdc: Hdc) -> i32;
+    fn GetSystemMetrics(index: i32) -> i32;
+}
+
+pub struct GdiCapture {
+    screen: Hdc,
+    memory: Hdc,
+    bitmap: Hbitmap,
+    previous: Handle,
+    bits: *const u8,
+    pub width: usize,
+    pub height: usize,
+}
+impl GdiCapture {
+    pub fn new() -> Result<Self, String> {
+        unsafe {
+            let width = GetSystemMetrics(0);
+            let height = GetSystemMetrics(1);
+            if width <= 0 || height <= 0 {
+                return Err("No interactive desktop".into());
+            }
+            // I420 requires even dimensions; capture the even rectangle.
+            let w = width & !1;
+            let h = height & !1;
+            let screen = GetDC(null_mut());
+            if screen.is_null() {
+                return Err("GetDC failed".into());
+            }
+            let memory = CreateCompatibleDC(screen);
+            if memory.is_null() {
+                ReleaseDC(null_mut(), screen);
+                return Err("CreateCompatibleDC failed".into());
+            }
+            let info = BitmapInfo {
+                header: BitmapInfoHeader {
+                    size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                    width: w,
+                    height: -h,
+                    planes: 1,
+                    bit_count: 32,
+                    compression: 0,
+                    size_image: 0,
+                    xppm: 0,
+                    yppm: 0,
+                    clr_used: 0,
+                    clr_important: 0,
+                },
+                color: [0],
+            };
+            let mut bits: *mut c_void = null_mut();
+            let bitmap = CreateDIBSection(screen, &info, 0, &mut bits, null_mut(), 0);
+            if bitmap.is_null() || bits.is_null() {
+                DeleteDC(memory);
+                ReleaseDC(null_mut(), screen);
+                return Err("CreateDIBSection failed".into());
+            }
+            let previous = SelectObject(memory, bitmap);
+            if previous.is_null() {
+                DeleteObject(bitmap);
+                DeleteDC(memory);
+                ReleaseDC(null_mut(), screen);
+                return Err("SelectObject failed".into());
+            }
+            Ok(Self {
+                screen,
+                memory,
+                bitmap,
+                previous,
+                bits: bits as *const u8,
+                width: w as usize,
+                height: h as usize,
+            })
+        }
+    }
+    pub fn grab(&mut self) -> Result<&[u8], String> {
+        // The DIB buffer belongs to the capture instance and stays valid until drop.
+        unsafe {
+            if BitBlt(
+                self.memory,
+                0,
+                0,
+                self.width as i32,
+                self.height as i32,
+                self.screen,
+                0,
+                0,
+                0x00CC0020 | 0x40000000,
+            ) == 0
+            {
+                return Err("BitBlt failed: desktop locked or not available".into());
+            }
+            Ok(slice::from_raw_parts(
+                self.bits,
+                self.width * self.height * 4,
+            ))
+        }
+    }
+}
+impl Drop for GdiCapture {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.memory, self.previous);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.memory);
+            ReleaseDC(null_mut(), self.screen);
+        }
+    }
+}

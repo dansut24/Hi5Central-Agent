@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hi5Central Rust Video Lab</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,Segoe UI,Arial,sans-serif;color:#eaf2fe;background:#0b1220}
+*{box-sizing:border-box}body{margin:0}header{padding:18px 24px;background:#111d31;border-bottom:1px solid #273b58;display:flex;align-items:center;gap:12px}
+.logo{background:#2879f6;border-radius:10px;font-weight:900;font-size:21px;padding:8px 13px}h1{font-size:19px;margin:0}p{margin:6px 0;color:#a5b7d2;font-size:13px}
+main{padding:22px;max-width:1300px;margin:auto}section{background:#142137;border:1px solid #2b405e;padding:17px;border-radius:12px;margin-bottom:17px}
+.controls{display:flex;flex-wrap:wrap;align-items:end;gap:12px}
+label{font-size:12px;color:#a5b8d1;display:block;margin-bottom:5px}
+input,select,button{border:1px solid #435b7b;border-radius:9px;background:#1d304c;color:white;padding:11px 13px;font:inherit;min-height:43px}
+input{font-size:18px;letter-spacing:3px;max-width:165px}button{cursor:pointer;font-weight:700}button.primary{background:#246fec;border-color:#377dfa}button:disabled{opacity:.5;cursor:default}
+.status{margin-left:auto;display:flex;gap:7px;align-items:center;color:#b1c6df;font-size:13px}
+.dot{width:9px;height:9px;border-radius:50%;background:#e3a34e}.dot.on{background:#46d79a}
+video{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;background:#02040a;border-radius:9px;max-height:75vh}
+.metrics{display:grid;grid-template-columns:repeat(6,minmax(115px,1fr));gap:10px}
+.metric{background:#0e1b2c;border:1px solid #2b425e;border-radius:9px;padding:11px}
+.metric strong{display:block;font-size:22px}.metric span{font-size:11px;color:#a5b8d2}
+h2{font-size:15px;margin:0 0 14px}pre{white-space:pre-wrap;font-size:11px;color:#adc0d8;max-height:180px;overflow:auto;margin:0}
+@media(max-width:900px){.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:600px){header{padding:13px}main{padding:10px}section{padding:12px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.status{margin-left:0}.controls{gap:8px}}
+</style>
+</head><body>
+<header><div class="logo">H5</div><div><h1>Rust Video Lab · v0.1.2</h1><p>Native Rust GDI + libvpx + WebRTC · VP8 / VP9 video · Browser/mobile</p></div></header>
+<main>
+<section>
+<h2>Connect to your Windows test EXE</h2>
+<div class="controls">
+<div><label for="code">Eight-digit pairing code</label><input id="code" maxlength="8" inputmode="numeric" placeholder="12345678" autocomplete="off"></div>
+<button id="connect" class="primary">Pair device</button>
+<div class="status"><span class="dot" id="dot"></span><span id="status">Not paired</span></div>
+</div><p>The code appears in the Hi5CentralRustStreamLab.exe console on the Windows device. Codes expire after 10 minutes. This read-only pilot is separate from the RMM platform. No RMM credentials are needed.</p>
+</section>
+<section><div class="controls">
+<div><label for="codec">Codec</label><select id="codec"><option value="vp8">VP8 · software video</option><option value="vp9">VP9 · software video</option><option value="jpeg" disabled>JPEG · optional future diagnostic</option></select></div>
+<div><label for="fps">Target FPS</label><select id="fps"><option>15</option><option selected>30</option><option>45</option><option>60</option></select></div>
+<div><label for="maxWidth">Output resolution</label><select id="maxWidth">
+<option value="1920" selected>Balanced · up to 1920px</option>
+<option value="1600">Smooth · up to 1600px</option>
+<option value="1280">Fast · up to 1280px</option>
+<option value="0">Native · maximum clarity</option></select></div>
+<div><label for="captureMode">Capture backend</label><select id="captureMode">
+<option value="rust-gdi" selected>Native Rust GDI / BitBlt</option>
+<option value="rust-synthetic">Synthetic moving pattern · codec/RTP diagnostic</option>
+</select></div>
+<div><label for="kbps">Bitrate</label><select id="kbps"><option value="4000">4 Mbps</option><option value="8000" selected>8 Mbps</option><option value="12000">12 Mbps</option><option value="16000">16 Mbps</option></select></div>
+<button id="start" class="primary" disabled>Start video test</button><button id="stop" disabled>Stop stream</button>
+</div></section>
+<section><h2>Live remote desktop</h2><video autoplay muted playsinline id="video"></video><p>Read-only Native Rust video test (no FFmpeg): mouse and keyboard input are not forwarded to Windows. Use a separate person or local action to generate desktop movement.</p></section>
+<section><h2>End-to-end performance</h2><div class="metrics">
+<div class="metric"><strong id="targetFps">—</strong><span>Selected FPS target</span></div>
+<div class="metric"><strong id="hostFps">—</strong><span>Rust encoded FPS · last second</span></div>
+<div class="metric"><strong id="hostAverageFps">—</strong><span>Host FPS · session avg</span></div>
+<div class="metric"><strong id="browserFps">—</strong><span>Browser decoded FPS</span></div>
+<div class="metric"><strong id="age">—</strong><span>Capture→send latency ms</span></div>
+<div class="metric"><strong id="capture">—</strong><span>Capture time ms</span></div>
+<div class="metric"><strong id="convert">—</strong><span>Conversion time ms</span></div>
+<div class="metric"><strong id="encode">—</strong><span>VP8/VP9 encoding avg ms</span></div>
+<div class="metric"><strong id="backend">—</strong><span>Capture backend</span></div>
+<div class="metric"><strong id="p95">—</strong><span>Frame processing P95 ms</span></div>
+<div class="metric"><strong id="idle">—</strong><span>DXGI unchanged frames</span></div>
+<div class="metric"><strong id="missed">—</strong><span>Missed host deadlines</span></div>
+<div class="metric"><strong id="keyframes">—</strong><span>Rust encoder keyframes</span></div>
+<div class="metric"><strong id="largestFrame">—</strong><span>Largest encoded frame · KB</span></div>
+<div class="metric"><strong id="decodedKeys">—</strong><span>Browser decoded keyframes</span></div>
+<div class="metric"><strong id="pli">—</strong><span>Decoder PLI requests</span></div>
+<div class="metric"><strong id="lost">—</strong><span>Packets lost</span></div>
+<div class="metric"><strong id="drops">—</strong><span>Browser dropped frames</span></div>
+<div class="metric"><strong id="jitter">—</strong><span>Jitter buffer ms</span></div>
+<div class="metric"><strong id="resolution">—</strong><span>Native source</span></div>
+<div class="metric"><strong id="rtt">—</strong><span>Network RTT ms</span></div>
+</div>
+<p id="perfNote">FPS is measured from successfully delivered/decoded frames, not the selected target. Host FPS is measured from actual encoded VP8/VP9 frames. Move or scroll windows during the test.</p>
+</section>
+<section><h2>FPS history (last 3 minutes)</h2><canvas id="fpsChart" width="950" height="170" style="display:block;width:100%;height:160px;background:#0c182a;border-radius:9px" aria-label="Host and browser FPS timeline"></canvas>
+<p id="historySummary">No session samples yet. Export will include a second-by-second time series, loss deltas, capture backend and latency.</p></section>
+<section><div class="controls"><h2>Diagnostic event log</h2><button style="margin-left:auto" id="export">Export JSON</button></div><pre id="log">Ready. Enter the short-lived code displayed by your Windows EXE.</pre></section>
+</main>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+let sock=null,peer=null,iceServers=[],paired=false,streaming=false,statsTimer=null,exportData={},queuedRemoteIce=[],awaitingOffer=false,seenFrame=false,sessionError=null;
+let lastHost=null,samples=[],logEvents=[],previousDecoded=null,previousDecodedAt=0,previousPacketLoss=null,previousBytes=null,previousSampleAt=0;
+const log=s=>{
+ const x=$("log"),when=new Date();
+ x.textContent+="\n"+when.toLocaleTimeString()+" "+s;x.scrollTop=x.scrollHeight;
+ logEvents.push({at:when.toISOString(),message:s});if(logEvents.length>300)logEvents.shift();
+};
+const label=(s,ok)=>{$("status").textContent=s;$("dot").classList.toggle("on",!!ok)};
+const send=data=>{if(sock?.readyState===WebSocket.OPEN)sock.send(JSON.stringify(data))};
+const n=(val,d=1)=>Number.isFinite(Number(val))?Number(val).toFixed(d):"—";
+function resetVideo() {
+ streaming=false;seenFrame=false;awaitingOffer=false;queuedRemoteIce=[];
+ if(statsTimer)clearInterval(statsTimer);statsTimer=null;
+ if(peer){peer.close();peer=null}
+ $("video").srcObject=null;$("stop").disabled=true;$("start").disabled=!paired;
+}
+function initializePeer() {
+ resetVideo();
+ samples=[];lastHost=null;previousDecoded=null;previousDecodedAt=0;
+ previousPacketLoss=null;previousBytes=null;previousSampleAt=0;
+ drawFpsChart();
+ peer=new RTCPeerConnection({iceServers,iceTransportPolicy:"all",bundlePolicy:"max-bundle"});
+ peer.ontrack=e=>{
+  $("video").srcObject=e.streams[0]||new MediaStream([e.track]);
+  $("video").play().catch(err=>log("Video playback blocked: "+err.message));
+  log("Remote video track received; awaiting decoded frames");
+ };
+ peer.onicecandidate=e=>{
+  if(e.candidate)send({type:"ice_candidate",candidate:e.candidate.candidate,
+      sdpMid:e.candidate.sdpMid??null,sdpMLineIndex:e.candidate.sdpMLineIndex??0});
+ };
+ peer.onconnectionstatechange=()=>{
+  if(!peer)return;
+  label("WebRTC: "+peer.connectionState,peer.connectionState==="connected");
+  log("WebRTC: "+peer.connectionState);
+ };
+ peer.oniceconnectionstatechange=()=>{
+   log("ICE: "+peer.iceConnectionState);
+   if(peer.iceConnectionState==="failed")log("ICE failed: candidate MID/index or TURN connectivity");
+ };
+ peer.onicegatheringstatechange=()=>log("ICE gathering: "+peer.iceGatheringState);
+}
+async function onMessage(msg){
+ switch(msg.type) {
+ case "ready":log("Secure pairing service connected");break;
+ case "paired":
+   paired=true;iceServers=msg.iceServers||[];
+   $("connect").disabled=true;$("start").disabled=false;
+   label("Paired — ready",true);log("Paired; "+iceServers.length+" TURN ICE options provided");
+   break;
+ case "webrtc_offer":
+   if(!peer) {log("Offer received before Start; accepting");initializePeer()}
+   try {
+    log("Remote video offer received ("+(msg.sdp||"").length+" characters)");
+    await peer.setRemoteDescription({type:"offer",sdp:msg.sdp});
+    for(const c of queuedRemoteIce){
+      try{await peer.addIceCandidate(c)}catch(e){log("ICE candidate rejected (queued): "+e.message)}
+    }
+    queuedRemoteIce=[];
+    const ans=await peer.createAnswer();await peer.setLocalDescription(ans);
+    send({type:"webrtc_answer",sdp:peer.localDescription.sdp});
+    log("Browser answer sent; connecting ICE");
+   }catch(e){log("SDP/answer error: "+e.message);sessionError=e.message}
+   break;
+ case "ice_candidate":
+   if(!peer)return;
+   try{
+    if(typeof msg.candidate!=="string" || !msg.candidate.startsWith("candidate:"))return;
+    const c={candidate:msg.candidate};
+    if(typeof msg.sdpMid==="string" && msg.sdpMid.length)c.sdpMid=msg.sdpMid;
+    const idx=Number(msg.sdpMLineIndex);
+    if(Number.isInteger(idx)&&idx>=0)c.sdpMLineIndex=idx;
+    else if(!c.sdpMid)c.sdpMLineIndex=0;
+    if(!peer.remoteDescription)queuedRemoteIce.push(c);
+    else await peer.addIceCandidate(c);
+   }catch(e){log("ICE candidate error: "+e.message)}
+   break;
+ case "stats":
+   exportData.host=msg.stats;
+   const s=msg.stats||{}; lastHost=s;
+   $("targetFps").textContent=s.configuredFps??"—";
+   $("hostFps").textContent=n(s.lastSecondFps??s.fpsMeasured);
+   $("hostAverageFps").textContent=n(s.fpsMeasured);
+   $("backend").textContent=s.captureBackend??"GDI legacy";
+   $("p95").textContent=n(s.frameAgeP95Ms);
+   $("idle").textContent=s.unchangedDesktopFrames??"—";
+   $("age").textContent=n(s.lastFrameAgeMs);
+   $("capture").textContent=n(s.captureMsAvg);
+   $("convert").textContent=n(s.convertMsAvg);
+   $("encode").textContent=n(s.encodeMsAvg);
+   $("missed").textContent=s.missedDeadlines??"—";
+   $("keyframes").textContent=s.encodedKeyframes??"—";
+   $("largestFrame").textContent=s.largestEncodedFrameBytes
+     ?(s.largestEncodedFrameBytes/1024).toFixed(1):"—";
+   $("resolution").textContent=s.width? s.width+"×"+s.height+
+     (s.sourceWidth&&s.sourceWidth!==s.width?" from "+s.sourceWidth+"×"+s.sourceHeight:""):"—";
+   break;
+ case "capture_started":
+   log("Windows capture started: "+msg.width+" × "+msg.height+
+       " from "+(msg.sourceWidth||msg.width)+" × "+(msg.sourceHeight||msg.height)+
+       " using "+(msg.backend||"legacy GDI"));
+   if(msg.message)log("Capture fallback: "+msg.message);
+   break;
+ case "diagnostic":log("HOST: "+msg.message);break;
+ case "stopped":
+   log("Windows stream stopped");resetVideo();label("Paired — ready",true);break;
+ case "error":
+   log("ERROR: "+msg.message);sessionError=msg.message;break;
+ default:log("Signal: "+msg.type);
+ }
+}
+function drawFpsChart() {
+ const canvas=$("fpsChart"),ctx=canvas.getContext("2d");
+ if(!ctx)return;
+ const w=canvas.width,h=canvas.height;
+ ctx.clearRect(0,0,w,h);ctx.font="13px system-ui";ctx.fillStyle="#b3c5df";
+ for(const fps of [0,15,30,45,60]){
+   const y=h-15-(fps/60)*(h-30);
+   ctx.strokeStyle="#263a56";ctx.beginPath();ctx.moveTo(40,y);ctx.lineTo(w-8,y);ctx.stroke();
+   ctx.fillText(String(fps),8,y+4);
+ }
+ const recent=samples.slice(-180);
+ if(recent.length<1)return;
+ const draw=(key,color)=>{
+   ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=2;
+   recent.forEach((p,i)=>{
+     const v=Number(p[key]);if(!Number.isFinite(v))return;
+     const x=40+(i/Math.max(179,recent.length-1))*(w-50);
+     const y=h-15-(Math.max(0,Math.min(60,v))/60)*(h-30);
+     if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+   });ctx.stroke();
+ };
+ draw("hostFps","#4d9cff");draw("browserFps","#49d69c");
+ ctx.fillStyle="#4d9cff";ctx.fillText("Host",w-125,18);
+ ctx.fillStyle="#49d69c";ctx.fillText("Browser",w-75,18);
+}
+async function sample(){
+ if(!peer)return;
+ try{
+ const now=performance.now();
+ const report=await peer.getStats();
+ let incoming=null,transport=null,selectedCandidatePair=null;
+ report.forEach(x=>{
+  if(x.type==="inbound-rtp"&&(x.kind==="video"||x.mediaType==="video")&&!x.isRemote)incoming=x;
+  if(x.type==="candidate-pair"&&x.nominated&&x.state==="succeeded")transport=x;
+ });
+ let browserFps=null,lossDelta=null,receivedKbps=null,decoderMs=null;
+ if(incoming){
+   const decoded=Number(incoming.framesDecoded);
+   // Prefer independently measured decoded-frame deltas: Safari often reports
+   // stale/rounded framesPerSecond, especially with 0-FPS idle suppression.
+   if(Number.isFinite(decoded)&&previousDecoded!==null&&previousDecodedAt>0){
+     browserFps=Math.max(0,(decoded-previousDecoded)*1000/(now-previousDecodedAt));
+   } else if(Number.isFinite(Number(incoming.framesPerSecond))){
+     browserFps=Number(incoming.framesPerSecond);
+   }
+   if(Number.isFinite(decoded)){previousDecoded=decoded;previousDecodedAt=now;}
+   const lost=Number(incoming.packetsLost);
+   if(Number.isFinite(lost)&&previousPacketLoss!==null)lossDelta=Math.max(0,lost-previousPacketLoss);
+   if(Number.isFinite(lost))previousPacketLoss=lost;
+   const bytes=Number(incoming.bytesReceived);
+   if(Number.isFinite(bytes)&&previousBytes!==null&&previousSampleAt>0){
+     receivedKbps=Math.max(0,(bytes-previousBytes)*8/(now-previousSampleAt));
+   }
+   if(Number.isFinite(bytes))previousBytes=bytes;
+   previousSampleAt=now;
+   if(incoming.framesDecoded>0&&!seenFrame){seenFrame=true;log("Browser decoded its first video frame")}
+   $("browserFps").textContent=n(browserFps);
+   $("decodedKeys").textContent=incoming.keyFramesDecoded??"—";
+   $("pli").textContent=incoming.pliCount??"—";
+   $("lost").textContent=incoming.packetsLost??"—";
+   $("drops").textContent=incoming.framesDropped??"—";
+   $("jitter").textContent=incoming.jitterBufferEmittedCount ?
+       n(1000*incoming.jitterBufferDelay/incoming.jitterBufferEmittedCount):"—";
+   if(incoming.totalDecodeTime&&decoded)decoderMs=1000*incoming.totalDecodeTime/decoded;
+   exportData.browser={
+     fpsMeasuredFromDeltas:browserFps,reportedFps:incoming.framesPerSecond,
+     framesDecoded:incoming.framesDecoded,framesDropped:incoming.framesDropped,
+     packetsLost:incoming.packetsLost,packetsReceived:incoming.packetsReceived,
+     keyFramesDecoded:incoming.keyFramesDecoded,nackCount:incoming.nackCount,pliCount:incoming.pliCount,
+     framesReceived:incoming.framesReceived,
+     receivedKbps,jitterBufferDelay:incoming.jitterBufferDelay,
+     jitterBufferEmittedCount:incoming.jitterBufferEmittedCount,
+     decoderAvgMs:decoderMs
+   };
+ }
+ if(transport){
+   const ms=Number(transport.currentRoundTripTime)*1000;
+   $("rtt").textContent=n(ms);
+   exportData.transport={rttMs:ms,bytesReceived:transport.bytesReceived,
+     localCandidateId:transport.localCandidateId,remoteCandidateId:transport.remoteCandidateId};
+ }
+ const s=lastHost||{};
+ const point={
+   at:new Date().toISOString(),seconds:s.seconds??null,
+   targetFps:s.configuredFps??Number($("fps").value),
+   hostFps:s.lastSecondFps??s.fpsMeasured??null,
+   hostAverageFps:s.fpsMeasured??null,browserFps,
+   sourceWidth:s.sourceWidth??null,sourceHeight:s.sourceHeight??null,
+   width:s.width??null,height:s.height??null,captureBackend:s.captureBackend??null,
+   captureMs:s.captureMsLast??null,convertMs:s.convertMsLast??null,
+   encodeMs:s.encodeMsLast??null,frameAgeMs:s.lastFrameAgeMs??null,
+   frameAgeP95Ms:s.frameAgeP95Ms??null,
+   missedDeadlines:s.missedDeadlines??null,
+   hostDropped:s.dropped??null,unchangedDesktopFrames:s.unchangedDesktopFrames??null,
+   encodedKeyframes:s.encodedKeyframes??null,largestEncodedFrameBytes:s.largestEncodedFrameBytes??null,
+   browserKeyframesDecoded:incoming?.keyFramesDecoded??null,
+   browserPliCount:incoming?.pliCount??null,
+   packetsLostTotal:incoming?.packetsLost??null,packetsLostThisSecond:lossDelta,
+   packetsReceived:incoming?.packetsReceived??null,
+   browserDroppedTotal:incoming?.framesDropped??null,
+   browserDecodedTotal:incoming?.framesDecoded??null,
+   receivedKbps,rttMs:transport?Number(transport.currentRoundTripTime)*1000:null,
+   decoderAvgMs:decoderMs,iceState:peer.iceConnectionState
+ };
+ samples.push(point);if(samples.length>600)samples.shift();
+ $("historySummary").textContent=samples.length+" samples · Host "+n(point.hostFps)+
+   " FPS / browser "+n(point.browserFps)+" FPS · capture "+n(point.captureMs)+
+   "ms · encoding "+n(point.encodeMs)+"ms · "+(point.captureBackend||"unknown")+" capture";
+ drawFpsChart();
+ }catch(e){log("getStats: "+e.message)}
+}
+$("connect").onclick=()=>{
+ const code=$("code").value.replace(/\D/g,"");
+ if(code.length!==8){log("Enter the eight-digit EXE code");return}
+ if(sock){try{sock.close()}catch{}}
+ paired=false;resetVideo();
+ $("connect").disabled=true;label("Pairing…");
+ const wsPath=location.hostname==="rust-streamlab.hi5central.com"?"/ws":"/rust-streamlab/ws";
+ sock=new WebSocket("wss://"+location.host+wsPath+"?role=viewer");
+ sock.onopen=()=>{send({type:"join",code});log("Pairing request sent")};
+ sock.onmessage=e=>{try{onMessage(JSON.parse(e.data)).catch(err=>log("Message: "+err.message))}catch(err){log("Signal parse: "+err.message)}};
+ sock.onclose=()=>{paired=false;resetVideo();$("connect").disabled=false;label("Disconnected");log("Pairing socket closed")};
+ sock.onerror=()=>log("Signalling connection error; check URL and network");
+};
+$("start").onclick=()=>{
+ if(!paired)return;
+ initializePeer();streaming=true;
+ $("start").disabled=true;$("stop").disabled=false;
+ const fps=Number($("fps").value),bitrateKbps=Number($("kbps").value);
+ const maxWidth=Number($("maxWidth").value),captureMode=$("captureMode").value;
+ log("Requesting "+$("codec").value.toUpperCase()+" software video "+fps+" FPS, "+bitrateKbps+"kbps, width "+
+    (maxWidth||"native")+" backend "+captureMode);
+ send({type:"start",codec:$("codec").value,fps,bitrateKbps,maxWidth,captureMode});
+ statsTimer=setInterval(sample,1000);
+};
+$("stop").onclick=()=>{send({type:"stop"});resetVideo();log("Stop requested")};
+$("export").onclick=()=>{
+ const content=JSON.stringify({
+   schemaVersion:3,exportedAt:new Date().toISOString(),browserUA:navigator.userAgent,
+   settings:{fps:Number($("fps").value),bitrateKbps:Number($("kbps").value),
+      maxWidth:Number($("maxWidth").value),captureMode:$("captureMode").value},
+   ...exportData,lastError:sessionError,
+   sampleIntervalMs:1000,samples,events:logEvents,
+   notes:"Samples are locally recorded browser observations, not server-side replay. The host reports compressed-video frames, the browser measures independently decoded frames."
+ },null,2);
+ const blob=new Blob([content],{type:"application/json"}),href=URL.createObjectURL(blob);
+ const a=document.createElement("a");a.href=href;a.download="hi5-rust-streamlab-"+Date.now()+".json";
+ document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(href),1000);
+};
+</script></body></html>

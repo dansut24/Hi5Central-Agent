@@ -1,0 +1,12 @@
+{
+  "name": "hi5central-rust-streamlab-relay",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Isolated, short-lived WebRTC pairing service for Hi5Central Streaming Lab",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "8.18.3"
+  }
+}

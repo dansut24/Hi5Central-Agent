@@ -1,0 +1,19 @@
+[package]
+name = "hi5-rust-agent-lab"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Isolated Hi5Central Rust agent streaming performance prototype"
+
+[features]
+default = []
+vpx = ["dep:env-libvpx-sys", "env-libvpx-sys/generate"]
+
+[dependencies]
+# Direct libvpx controls ensure VP8=CPUUSED 8 and VP9=CPUUSED 6/row-mt.
+env-libvpx-sys = { version = "=5.1.3", optional = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

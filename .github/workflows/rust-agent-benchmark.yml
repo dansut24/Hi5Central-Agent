@@ -1,0 +1,46 @@
+name: Rust Agent Lab (isolated)
+on:
+  push:
+    branches:
+      - 'experiment/rust-agent-*'
+    paths:
+      - 'RustAgent/**'
+      - '.github/workflows/rust-agent-benchmark.yml'
+  pull_request:
+    branches:
+      - 'feature/streaming-core'
+    paths:
+      - 'RustAgent/**'
+      - '.github/workflows/rust-agent-benchmark.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: rust-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: RustAgent
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Unit tests (no native video library)
+        run: cargo test --locked --no-default-features
+      - name: Build Windows x64 EXE
+        run: cargo build --release --locked --no-default-features
+      - name: Synthetic motion smoke test (not a video result)
+        shell: pwsh
+        run: |
+          .\target\release\hi5-rust-agent-lab.exe bench --source synthetic --codec none --width 640 --height 360 --fps 60 --seconds 3 --json rust-agent-smoke.json
+      - name: Upload isolated EXE and metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: hi5-rust-agent-lab-windows-smoke
+          path: |
+            RustAgent/target/release/hi5-rust-agent-lab.exe
+            RustAgent/rust-agent-smoke.json
