@@ -16,7 +16,7 @@ use webrtc::{
     peer_connection::{configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState,
         sdp::session_description::RTCSessionDescription, RTCPeerConnection},
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
-    track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
+    track::track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocal},
 };
 
 const DEFAULT_RELAY: &str = "wss://rust-streamlab.hi5central.com/rust-streamlab/ws?role=host";
@@ -25,7 +25,7 @@ type Outbound = mpsc::UnboundedSender<Message>;
 #[derive(Debug, Deserialize)]
 struct IceServer { urls: Value, username: Option<String>, credential: Option<String> }
 #[derive(Clone, Debug)]
-struct Settings { codec: String, fps: u32, max_width: u32, kbps: u32 }
+struct Settings { codec: String, fps: u32, max_width: u32, kbps: u32, capture_mode: String }
 impl Settings {
     fn parse(v: &Value) -> Result<Self, String> {
         let codec=v.get("codec").and_then(Value::as_str).unwrap_or("").to_lowercase();
@@ -36,7 +36,11 @@ impl Settings {
         if ![15,30,45,60].contains(&fps) {return Err("FPS must be 15/30/45/60".into())}
         if ![0,1280,1600,1920].contains(&max_width) {return Err("Unsupported width".into())}
         if !(1000..=20000).contains(&kbps) {return Err("Bitrate out of range".into())}
-        Ok(Self {codec,fps,max_width,kbps})
+        let capture_mode=v.get("captureMode").and_then(Value::as_str).unwrap_or("rust-gdi").to_string();
+        if !["rust-gdi","rust-synthetic"].contains(&capture_mode.as_str()) {
+            return Err("Unsupported capture mode".into())
+        }
+        Ok(Self {codec,fps,max_width,kbps,capture_mode})
     }
 }
 fn tell(tx:&Outbound, v:Value) {let _=tx.send(Message::Text(v.to_string().into()));}
@@ -61,7 +65,7 @@ fn parse_ice(v:&Value)->Result<Vec<RTCIceServer>,String>{
     }).collect()
 }
 use native::produce;
-struct Active {pc:Arc<RTCPeerConnection>, track:Arc<TrackLocalStaticSample>,
+struct Active {pc:Arc<RTCPeerConnection>, track:Arc<TrackLocalStaticRTP>,
     pending:Vec<RTCIceCandidateInit>, settings:Settings,
     video:Option<JoinHandle<()>>}
 impl Active {
@@ -78,7 +82,7 @@ async fn offer(settings:Settings, ice:&[RTCIceServer], tx:&Outbound)->Result<Act
         ice_servers:ice.to_vec(),..Default::default()
     }).await.map_err(|e|e.to_string())?);
     let mime=if settings.codec=="vp8" {MIME_TYPE_VP8} else {MIME_TYPE_VP9};
-    let track=Arc::new(TrackLocalStaticSample::new(
+    let track=Arc::new(TrackLocalStaticRTP::new(
         RTCRtpCodecCapability {mime_type:mime.to_owned(),..Default::default()},
         "video".to_owned(), "hi5-rust-streamlab".to_owned()));
     let sender=pc.add_track(track.clone() as Arc<dyn TrackLocal + Send + Sync>)
@@ -182,7 +186,27 @@ async fn run() -> Result<(),String> {
                     let video_tx=tx.clone();
                     let config=a.settings.clone();
                     let video_track=a.track.clone();
+                    let pc=a.pc.clone();
                     a.video=Some(tokio::spawn(async move{
+                        // Important: an early keyframe sent before DTLS is connected
+                        // can be dropped silently, leaving Safari unable to decode deltas.
+                        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(20);
+                        loop {
+                            match pc.connection_state() {
+                                RTCPeerConnectionState::Connected=>break,
+                                RTCPeerConnectionState::Failed|RTCPeerConnectionState::Closed=>{
+                                    status(&video_tx,"error","WebRTC connection failed before first keyframe");
+                                    return;
+                                }
+                                _=>{}
+                            }
+                            if tokio::time::Instant::now()>=deadline {
+                                status(&video_tx,"error","WebRTC DTLS connection timeout");
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        status(&video_tx,"diagnostic","WebRTC connected; transmitting paced video from a fresh keyframe");
                         let frames=Arc::new(AtomicU64::new(0));
                         let bytes=Arc::new(AtomicU64::new(0));
                         if let Err(e)=produce(config,video_track,video_tx.clone(),frames,bytes).await{
