@@ -52,8 +52,8 @@ function turnConfig() {
   const username = expiry+":hi5lab-"+crypto.randomBytes(5).toString("hex");
   const credential = crypto.createHmac("sha1",turnSecret).update(username).digest("base64");
   return [
-    {urls:"turn:"+TURN_HOST+":3478?transport=udp",username,credential},
-    {urls:"turn:"+TURN_HOST+":3478?transport=tcp",username,credential}
+    {urls:["turn:"+TURN_HOST+":3478?transport=udp"],username,credential},
+    {urls:["turn:"+TURN_HOST+":3478?transport=tcp"],username,credential}
   ];
 }
 function attempt(ip) {
