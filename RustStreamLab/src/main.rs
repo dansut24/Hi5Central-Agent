@@ -93,8 +93,11 @@ async fn offer(settings:Settings, ice:&[RTCIceServer], tx:&Outbound)->Result<Act
         Box::pin(async move{
             if let Some(c)=candidate {
                 if let Ok(v)=c.to_json(){
+                    // webrtc-rs 0.13 supplies Some("") as the candidate MID.
+                    // An invented MID like "video" is rejected by Safari.
                     tell(&out,json!({"type":"ice_candidate","candidate":v.candidate,
-                        "sdpMid":v.sdp_mid.unwrap_or_else(||"video".into())}));
+                        "sdpMid":v.sdp_mid.filter(|mid|!mid.is_empty()),
+                        "sdpMLineIndex":v.sdp_mline_index.unwrap_or(0)}));
                 }
             }
         })
@@ -193,7 +196,10 @@ async fn run() -> Result<(),String> {
                     if let Some(s)=v.get("candidate").and_then(Value::as_str) {
                         let init=RTCIceCandidateInit {
                             candidate:s.into(),
-                            sdp_mid:v.get("sdpMid").and_then(Value::as_str).map(str::to_string),
+                            sdp_mid:v.get("sdpMid").and_then(Value::as_str)
+                                .filter(|s|!s.is_empty()).map(str::to_string),
+                            sdp_mline_index:v.get("sdpMLineIndex").and_then(Value::as_u64)
+                                .and_then(|x|u16::try_from(x).ok()),
                             ..Default::default()
                         };
                         if a.pc.remote_description().await.is_some(){
