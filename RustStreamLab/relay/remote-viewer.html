@@ -102,14 +102,19 @@ function initializePeer() {
   log("Remote video track received; awaiting decoded frames");
  };
  peer.onicecandidate=e=>{
-  if(e.candidate)send({type:"ice_candidate",candidate:e.candidate.candidate,sdpMid:e.candidate.sdpMid});
+  if(e.candidate)send({type:"ice_candidate",candidate:e.candidate.candidate,
+      sdpMid:e.candidate.sdpMid??null,sdpMLineIndex:e.candidate.sdpMLineIndex??0});
  };
  peer.onconnectionstatechange=()=>{
   if(!peer)return;
   label("WebRTC: "+peer.connectionState,peer.connectionState==="connected");
   log("WebRTC: "+peer.connectionState);
  };
- peer.oniceconnectionstatechange=()=>log("ICE: "+peer.iceConnectionState);
+ peer.oniceconnectionstatechange=()=>{
+   log("ICE: "+peer.iceConnectionState);
+   if(peer.iceConnectionState==="failed")log("ICE failed: candidate MID/index or TURN connectivity");
+ };
+ peer.onicegatheringstatechange=()=>log("ICE gathering: "+peer.iceGatheringState);
 }
 async function onMessage(msg){
  switch(msg.type) {
@@ -124,7 +129,9 @@ async function onMessage(msg){
    try {
     log("Remote video offer received ("+(msg.sdp||"").length+" characters)");
     await peer.setRemoteDescription({type:"offer",sdp:msg.sdp});
-    for(const c of queuedRemoteIce)await peer.addIceCandidate(c);
+    for(const c of queuedRemoteIce){
+      try{await peer.addIceCandidate(c)}catch(e){log("ICE candidate rejected (queued): "+e.message)}
+    }
     queuedRemoteIce=[];
     const ans=await peer.createAnswer();await peer.setLocalDescription(ans);
     send({type:"webrtc_answer",sdp:peer.localDescription.sdp});
@@ -134,7 +141,12 @@ async function onMessage(msg){
  case "ice_candidate":
    if(!peer)return;
    try{
-    const c={candidate:msg.candidate,sdpMid:msg.sdpMid||"video"};
+    if(typeof msg.candidate!=="string" || !msg.candidate.startsWith("candidate:"))return;
+    const c={candidate:msg.candidate};
+    if(typeof msg.sdpMid==="string" && msg.sdpMid.length)c.sdpMid=msg.sdpMid;
+    const idx=Number(msg.sdpMLineIndex);
+    if(Number.isInteger(idx)&&idx>=0)c.sdpMLineIndex=idx;
+    else if(!c.sdpMid)c.sdpMLineIndex=0;
     if(!peer.remoteDescription)queuedRemoteIce.push(c);
     else await peer.addIceCandidate(c);
    }catch(e){log("ICE candidate error: "+e.message)}
