@@ -10,6 +10,11 @@ fn check(status: vpx::vpx_codec_err_t, action: &str) -> Result<(), String> {
         Err(format!("libvpx {action} failed: {status:?}"))
     }
 }
+#[derive(Clone,Debug)]
+pub struct EncodedVideoFrame {
+    pub payload: Vec<u8>,
+    pub is_keyframe: bool,
+}
 pub struct SoftwareEncoder {
     ctx: vpx::vpx_codec_ctx_t,
     width: usize,
@@ -52,7 +57,7 @@ impl SoftwareEncoder {
             cfg.g_error_resilient = 1;
             cfg.rc_resize_allowed = 0;
             cfg.rc_dropframe_thresh = 0;
-            cfg.kf_max_dist = fps * 3;
+            cfg.kf_max_dist = fps; // Faster decoder recovery than 3-second baseline.
             let mut ctx = mem::MaybeUninit::<vpx::vpx_codec_ctx_t>::zeroed();
             check(
                 vpx::vpx_codec_enc_init_ver(
@@ -89,7 +94,7 @@ impl SoftwareEncoder {
             Ok(Self { ctx, width, height })
         }
     }
-    fn packets(&mut self) -> (u64, u64, Vec<Vec<u8>>) {
+    fn packets(&mut self) -> (u64, u64, Vec<EncodedVideoFrame>) {
         let mut count = 0;
         let mut bytes = 0;
         let mut payloads = Vec::new();
@@ -105,13 +110,17 @@ impl SoftwareEncoder {
                     count += 1;
                     bytes += frame.sz as u64;
                     let payload = std::slice::from_raw_parts(frame.buf as *const u8, frame.sz as usize);
-                    payloads.push(payload.to_vec());
+                    payloads.push(EncodedVideoFrame {
+                        payload:payload.to_vec(),
+                        is_keyframe: (frame.flags & vpx::VPX_FRAME_IS_KEY) != 0,
+                    });
                 }
             }
         }
         (count, bytes, payloads)
     }
-    pub fn encode(&mut self, pts: i64, data: &[u8]) -> Result<(u64, u64, Vec<Vec<u8>>), String> {
+    pub fn encode(&mut self, pts: i64, data: &[u8], force_keyframe: bool)
+        -> Result<(u64, u64, Vec<EncodedVideoFrame>), String> {
         if data.len() < self.width * self.height * 3 / 2 {
             return Err("I420 too small".into());
         }
@@ -134,7 +143,7 @@ impl SoftwareEncoder {
                     wrapped,
                     pts,
                     1,
-                    0,
+                    if force_keyframe {vpx::VPX_EFLAG_FORCE_KF as _} else {0},
                     vpx::VPX_DL_REALTIME as c_ulong,
                 ),
                 "encode",
@@ -142,7 +151,7 @@ impl SoftwareEncoder {
         }
         Ok(self.packets())
     }
-    pub fn finish(&mut self) -> Result<(u64, u64, Vec<Vec<u8>>), String> {
+    pub fn finish(&mut self) -> Result<(u64, u64, Vec<EncodedVideoFrame>), String> {
         unsafe {
             check(
                 vpx::vpx_codec_encode(
@@ -165,4 +174,81 @@ impl Drop for SoftwareEncoder {
             vpx::vpx_codec_destroy(&mut self.ctx);
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn vp8_keyframe_is_decodable_by_libvpx() {
+        let (w,h)=(320usize,180usize);
+        let frame=vec![128_u8;w*h*3/2];
+        let mut encoder=SoftwareEncoder::new(w,h,30,4000,false).expect("VP8 encoder");
+        let (_,_,packets)=encoder.encode(0,&frame,true).expect("encode");
+        assert!(!packets.is_empty(),"no frame produced");
+        let first=&packets[0];
+        assert!(first.is_keyframe,"first frame must be keyframe");
+        assert_eq!(first.payload[0]&1,0,"VP8 keyframe header");
+        unsafe {
+            let mut ctx=mem::MaybeUninit::<vpx::vpx_codec_ctx_t>::zeroed();
+            check(vpx::vpx_codec_dec_init_ver(
+                ctx.as_mut_ptr(),
+                vpx::vpx_codec_vp8_dx(),
+                ptr::null(),
+                0,
+                vpx::VPX_DECODER_ABI_VERSION as i32,
+            ),"VP8 decoder init").unwrap();
+            let mut ctx=ctx.assume_init();
+            check(vpx::vpx_codec_decode(
+                &mut ctx,
+                first.payload.as_ptr(),
+                first.payload.len() as u32,
+                ptr::null_mut(),
+                0
+            ),"local VP8 decode").unwrap();
+            let mut it:vpx::vpx_codec_iter_t=ptr::null();
+            let img=vpx::vpx_codec_get_frame(&mut ctx,&mut it);
+            assert!(!img.is_null(),"libvpx returned no decoded frame");
+            assert_eq!((*img).d_w as usize,w);
+            assert_eq!((*img).d_h as usize,h);
+            let _=vpx::vpx_codec_destroy(&mut ctx);
+        }
+    }
+    #[test]
+    fn vp8_rtp_fragmentation_reassembles_valid_keyframe() {
+        use bytes::Bytes;
+        use rtp::{
+            codecs::vp8::{Vp8Packet,Vp8Payloader},
+            packetizer::{new_packetizer,Packetizer,Depacketizer},
+            sequence::new_fixed_sequencer,
+        };
+        let (w,h)=(640usize,360usize);
+        let mut i420=vec![128u8;w*h*3/2];
+        for (i,y) in i420[..w*h].iter_mut().enumerate(){
+            *y=((i/8^i/w*7)&255) as u8;
+        }
+        let mut encoder=SoftwareEncoder::new(w,h,30,4000,false).expect("VP8 encoder");
+        let (_,_,encoded)=encoder.encode(0,&i420,true).expect("VP8 frame");
+        assert!(!encoded.is_empty());
+        let f=&encoded[0];
+        assert!(f.is_keyframe);
+        let mut vp8=Vp8Payloader::default();
+        vp8.enable_picture_id=true;
+        let mut packetizer=new_packetizer(1200,96,12345,
+            Box::new(vp8),
+            Box::new(new_fixed_sequencer(1)),90000);
+        let packets=packetizer.packetize(&Bytes::copy_from_slice(&f.payload),3000)
+            .expect("packetize");
+        assert!(packets.len()>1,"test must exercise fragmentation");
+        assert!(packets.last().unwrap().header.marker);
+        assert!(packets[..packets.len()-1].iter().all(|p|!p.header.marker));
+        let mut reassembled=Vec::new();
+        for p in packets {
+            let mut depay=Vp8Packet::default();
+            let chunk=depay.depacketize(&p.payload).expect("VP8 depacketize");
+            reassembled.extend_from_slice(&chunk);
+        }
+        assert_eq!(reassembled,f.payload);
+    }
+
 }
