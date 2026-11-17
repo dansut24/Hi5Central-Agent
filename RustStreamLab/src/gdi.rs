@@ -69,6 +69,7 @@ pub struct GdiCapture {
     bitmap: Hbitmap,
     previous: Handle,
     bits: *const u8,
+    raster_op: u32,
     pub width: usize,
     pub height: usize,
 }
@@ -128,10 +129,18 @@ impl GdiCapture {
                 bitmap,
                 previous,
                 bits: bits as *const u8,
+                // Default fast SRCCOPY; CAPTUREBLT is optional for layered windows.
+                raster_op: if std::env::var("HI5_RUST_CAPTUREBLT").as_deref()==Ok("1") {
+                    0x00CC0020 | 0x40000000
+                } else { 0x00CC0020 },
                 width: w as usize,
                 height: h as usize,
             })
         }
+    }
+    pub fn mode(&self)->&'static str{
+        if self.raster_op & 0x40000000 != 0 {"GDI CAPTUREBLT (compatibility mode)"}
+        else {"GDI SRCCOPY (fast mode)"}
     }
     pub fn grab(&mut self) -> Result<&[u8], String> {
         // The DIB buffer belongs to the capture instance and stays valid until drop.
@@ -145,7 +154,7 @@ impl GdiCapture {
                 self.screen,
                 0,
                 0,
-                0x00CC0020 | 0x40000000,
+                self.raster_op,
             ) == 0
             {
                 return Err("BitBlt failed: desktop locked or not available".into());
