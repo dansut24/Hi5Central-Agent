@@ -56,7 +56,7 @@ fn worker(settings:Settings, sender:mpsc::Sender<EncodedFrame>, tx:Outbound)
     tell(&tx,serde_json::json!({
         "type":"capture_started","codec":settings.codec,
         "width":dw,"height":dh,"sourceWidth":sw,"sourceHeight":sh,
-        "backend":"Rust GDI/BitBlt -> Rust I420 -> native libvpx -> Rust WebRTC"
+         "backend":format!("Rust {} -> I420 -> native libvpx -> Rust WebRTC",capture.mode())
     }));
     let start=Instant::now();
     let mut next_slot=0_u64;
@@ -113,7 +113,7 @@ fn worker(settings:Settings, sender:mpsc::Sender<EncodedFrame>, tx:Outbound)
                 "configuredFps":settings.fps,
                 "lastSecondFps":window_total as f64/elapsed,
                 "fpsMeasured":encoded_total as f64/start.elapsed().as_secs_f64().max(0.001),
-                "captureBackend":"Rust GDI + I420 + libvpx",
+                "captureBackend":format!("Rust {} + I420 + libvpx",capture.mode()),
                 "sourceWidth":sw,"sourceHeight":sh,"width":dw,"height":dh,
                 "captureMsAvg":avg(&capture_ms),
                 "convertMsAvg":avg(&convert_ms),
