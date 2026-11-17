@@ -6,7 +6,17 @@ on:
     paths:
       - 'RustAgent/**'
       - '.github/workflows/rust-agent-benchmark.yml'
+  pull_request:
+    branches:
+      - 'feature/streaming-core'
+    paths:
+      - 'RustAgent/**'
+      - '.github/workflows/rust-agent-benchmark.yml'
   workflow_dispatch:
+
+concurrency:
+  group: rust-agent-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust-windows-smoke:
