@@ -44,6 +44,9 @@ unsafe extern "system" {
     ) -> Hbitmap;
     fn SelectObject(hdc: Hdc, object: Handle) -> Handle;
     fn DeleteObject(object: Handle) -> i32;
+    fn StretchBlt(dst:Hdc, x:i32, y:i32, w:i32, h:i32,
+        src:Hdc, src_x:i32, src_y:i32, src_w:i32, src_h:i32, rop:u32)->i32;
+    fn SetStretchBltMode(dc:Hdc, mode:i32)->i32;
     fn BitBlt(
         dst: Hdc,
         x: i32,
@@ -72,9 +75,12 @@ pub struct GdiCapture {
     raster_op: u32,
     pub width: usize,
     pub height: usize,
+    pub source_width:usize,
+    pub source_height:usize,
 }
 impl GdiCapture {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, String> { Self::new_with_max_width(0) }
+    pub fn new_with_max_width(max_width:u32) -> Result<Self, String> {
         unsafe {
             let width = GetSystemMetrics(0);
             let height = GetSystemMetrics(1);
@@ -82,8 +88,10 @@ impl GdiCapture {
                 return Err("No interactive desktop".into());
             }
             // I420 requires even dimensions; capture the even rectangle.
-            let w = width & !1;
-            let h = height & !1;
+            let source_w=width & !1;
+            let source_h=height & !1;
+            let w=if max_width>0 && source_w>max_width as i32 {max_width as i32&!1}else{source_w};
+            let h=(((source_h as f64*w as f64/source_w as f64).round() as i32)&!1).max(2);
             let screen = GetDC(null_mut());
             if screen.is_null() {
                 return Err("GetDC failed".into());
@@ -116,6 +124,7 @@ impl GdiCapture {
                 ReleaseDC(null_mut(), screen);
                 return Err("CreateDIBSection failed".into());
             }
+            let _=SetStretchBltMode(memory,3); // COLORONCOLOR, fast fixed-function scaling
             let previous = SelectObject(memory, bitmap);
             if previous.is_null() {
                 DeleteObject(bitmap);
@@ -135,29 +144,31 @@ impl GdiCapture {
                 } else { 0x00CC0020 },
                 width: w as usize,
                 height: h as usize,
+                source_width:source_w as usize,
+                source_height:source_h as usize,
             })
         }
     }
     pub fn mode(&self)->&'static str{
         if self.raster_op & 0x40000000 != 0 {"GDI CAPTUREBLT (compatibility mode)"}
-        else {"GDI SRCCOPY (fast mode)"}
+        else if self.width!=self.source_width {"GDI StretchBlt SRCCOPY (scaled readback)"}
+        else {"GDI BitBlt SRCCOPY (full readback)"}
     }
     pub fn grab(&mut self) -> Result<&[u8], String> {
         // The DIB buffer belongs to the capture instance and stays valid until drop.
         unsafe {
-            if BitBlt(
-                self.memory,
-                0,
-                0,
-                self.width as i32,
-                self.height as i32,
-                self.screen,
-                0,
-                0,
-                self.raster_op,
-            ) == 0
-            {
-                return Err("BitBlt failed: desktop locked or not available".into());
+            let ok = if self.width==self.source_width && self.height==self.source_height {
+                BitBlt(self.memory,0,0,self.width as i32,self.height as i32,
+                    self.screen,0,0,self.raster_op)
+            } else {
+                // GDI scales while blitting, rather than reading full-resolution
+                // pixels back from the display and then scaling in Rust.
+                StretchBlt(self.memory,0,0,self.width as i32,self.height as i32,
+                    self.screen,0,0,self.source_width as i32,self.source_height as i32,
+                    self.raster_op)
+            };
+            if ok==0 {
+                return Err("GDI capture failed: desktop locked or not available".into());
             }
             Ok(slice::from_raw_parts(
                 self.bits,
