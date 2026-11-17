@@ -21,7 +21,7 @@ h2{font-size:15px;margin:0 0 14px}pre{white-space:pre-wrap;font-size:11px;color:
 @media(max-width:600px){header{padding:13px}main{padding:10px}section{padding:12px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.status{margin-left:0}.controls{gap:8px}}
 </style>
 </head><body>
-<header><div class="logo">H5</div><div><h1>Rust Video Lab</h1><p>Native Rust GDI + libvpx + WebRTC · VP8 / VP9 video · Browser/mobile</p></div></header>
+<header><div class="logo">H5</div><div><h1>Rust Video Lab · v0.1.2</h1><p>Native Rust GDI + libvpx + WebRTC · VP8 / VP9 video · Browser/mobile</p></div></header>
 <main>
 <section>
 <h2>Connect to your Windows test EXE</h2>
@@ -41,6 +41,7 @@ h2{font-size:15px;margin:0 0 14px}pre{white-space:pre-wrap;font-size:11px;color:
 <option value="0">Native · maximum clarity</option></select></div>
 <div><label for="captureMode">Capture backend</label><select id="captureMode">
 <option value="rust-gdi" selected>Native Rust GDI / BitBlt</option>
+<option value="rust-synthetic">Synthetic moving pattern · codec/RTP diagnostic</option>
 </select></div>
 <div><label for="kbps">Bitrate</label><select id="kbps"><option value="4000">4 Mbps</option><option value="8000" selected>8 Mbps</option><option value="12000">12 Mbps</option><option value="16000">16 Mbps</option></select></div>
 <button id="start" class="primary" disabled>Start video test</button><button id="stop" disabled>Stop stream</button>
@@ -59,6 +60,10 @@ h2{font-size:15px;margin:0 0 14px}pre{white-space:pre-wrap;font-size:11px;color:
 <div class="metric"><strong id="p95">—</strong><span>Frame processing P95 ms</span></div>
 <div class="metric"><strong id="idle">—</strong><span>DXGI unchanged frames</span></div>
 <div class="metric"><strong id="missed">—</strong><span>Missed host deadlines</span></div>
+<div class="metric"><strong id="keyframes">—</strong><span>Rust encoder keyframes</span></div>
+<div class="metric"><strong id="largestFrame">—</strong><span>Largest encoded frame · KB</span></div>
+<div class="metric"><strong id="decodedKeys">—</strong><span>Browser decoded keyframes</span></div>
+<div class="metric"><strong id="pli">—</strong><span>Decoder PLI requests</span></div>
 <div class="metric"><strong id="lost">—</strong><span>Packets lost</span></div>
 <div class="metric"><strong id="drops">—</strong><span>Browser dropped frames</span></div>
 <div class="metric"><strong id="jitter">—</strong><span>Jitter buffer ms</span></div>
@@ -97,8 +102,8 @@ function initializePeer() {
  drawFpsChart();
  peer=new RTCPeerConnection({iceServers,iceTransportPolicy:"all",bundlePolicy:"max-bundle"});
  peer.ontrack=e=>{
-  seenFrame=true;
   $("video").srcObject=e.streams[0]||new MediaStream([e.track]);
+  $("video").play().catch(err=>log("Video playback blocked: "+err.message));
   log("Remote video track received; awaiting decoded frames");
  };
  peer.onicecandidate=e=>{
@@ -165,6 +170,9 @@ async function onMessage(msg){
    $("convert").textContent=n(s.convertMsAvg);
    $("encode").textContent=n(s.encodeMsAvg);
    $("missed").textContent=s.missedDeadlines??"—";
+   $("keyframes").textContent=s.encodedKeyframes??"—";
+   $("largestFrame").textContent=s.largestEncodedFrameBytes
+     ?(s.largestEncodedFrameBytes/1024).toFixed(1):"—";
    $("resolution").textContent=s.width? s.width+"×"+s.height+
      (s.sourceWidth&&s.sourceWidth!==s.width?" from "+s.sourceWidth+"×"+s.sourceHeight:""):"—";
    break;
@@ -239,6 +247,8 @@ async function sample(){
    previousSampleAt=now;
    if(incoming.framesDecoded>0&&!seenFrame){seenFrame=true;log("Browser decoded its first video frame")}
    $("browserFps").textContent=n(browserFps);
+   $("decodedKeys").textContent=incoming.keyFramesDecoded??"—";
+   $("pli").textContent=incoming.pliCount??"—";
    $("lost").textContent=incoming.packetsLost??"—";
    $("drops").textContent=incoming.framesDropped??"—";
    $("jitter").textContent=incoming.jitterBufferEmittedCount ?
@@ -248,6 +258,8 @@ async function sample(){
      fpsMeasuredFromDeltas:browserFps,reportedFps:incoming.framesPerSecond,
      framesDecoded:incoming.framesDecoded,framesDropped:incoming.framesDropped,
      packetsLost:incoming.packetsLost,packetsReceived:incoming.packetsReceived,
+     keyFramesDecoded:incoming.keyFramesDecoded,nackCount:incoming.nackCount,pliCount:incoming.pliCount,
+     framesReceived:incoming.framesReceived,
      receivedKbps,jitterBufferDelay:incoming.jitterBufferDelay,
      jitterBufferEmittedCount:incoming.jitterBufferEmittedCount,
      decoderAvgMs:decoderMs
@@ -272,6 +284,9 @@ async function sample(){
    frameAgeP95Ms:s.frameAgeP95Ms??null,
    missedDeadlines:s.missedDeadlines??null,
    hostDropped:s.dropped??null,unchangedDesktopFrames:s.unchangedDesktopFrames??null,
+   encodedKeyframes:s.encodedKeyframes??null,largestEncodedFrameBytes:s.largestEncodedFrameBytes??null,
+   browserKeyframesDecoded:incoming?.keyFramesDecoded??null,
+   browserPliCount:incoming?.pliCount??null,
    packetsLostTotal:incoming?.packetsLost??null,packetsLostThisSecond:lossDelta,
    packetsReceived:incoming?.packetsReceived??null,
    browserDroppedTotal:incoming?.framesDropped??null,
@@ -321,7 +336,7 @@ $("export").onclick=()=>{
    notes:"Samples are locally recorded browser observations, not server-side replay. The host reports compressed-video frames, the browser measures independently decoded frames."
  },null,2);
  const blob=new Blob([content],{type:"application/json"}),href=URL.createObjectURL(blob);
- const a=document.createElement("a");a.href=href;a.download="hi5-go-streamlab-"+Date.now()+".json";
+ const a=document.createElement("a");a.href=href;a.download="hi5-rust-streamlab-"+Date.now()+".json";
  document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(href),1000);
 };
 </script></body></html>
