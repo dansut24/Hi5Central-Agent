@@ -101,24 +101,24 @@ try {
         Write-Host "WDK stampinf.exe was not found. WDK NuGet restore did not expose the required build tools."
         throw "WDK stamping tool missing: no driver was compiled. A complete WDK environment is required."
     }
-    # WDK INF verification task P/Invokes a relative x86/InfVerif.dll.
+    # x64 MSBuild must load x64/InfVerif.dll, supplied by the official WDK.
     # Copy the official Microsoft NuGet tool directory to the MSBuild working
     # directory so verification remains ENABLED and can run in isolated CI.
     $verifiers = @(Get-ChildItem (Join-Path $src "packages") -Recurse -File -Filter "InfVerif.dll" -ErrorAction SilentlyContinue)
     Write-Host ("Found InfVerif libraries: " + ($verifiers | ForEach-Object FullName | Out-String))
-    $verifier = @($verifiers | Where-Object { $_.Directory.Name -ieq "x86" } | Select-Object -First 1)
+    $verifier = @($verifiers | Where-Object { $_.Directory.Name -ieq "x64" -and $_.FullName -like "*WDK.x64*" } | Select-Object -First 1)
     if ($verifier.Count) {
         $toolDir = $verifier[0].DirectoryName
-        Copy-Item $toolDir (Join-Path $src "x86") -Recurse -Force
+        Copy-Item $toolDir (Join-Path $src "x64") -Recurse -Force
         Write-Host "Staged official INF verifier beside MSBuild working directory."
     } else {
         Write-Warning "INF verification DLL missing from kit; build may fail. INF verification was NOT disabled."
     }
-    & msbuild (Join-Path $base "Hi5VirtualDisplay.sln") /m /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off /verbosity:minimal
+    & msbuild (Join-Path $base "Hi5VirtualDisplay.sln") /m /p:Configuration=Release /p:Platform=x64 /p:PreferredToolArchitecture=x64 /p:SignMode=Off /verbosity:minimal
     if ($LASTEXITCODE -ne 0) { throw "WDK build failed" }
 } finally { Pop-Location }
 foreach ($name in @("Hi5VirtualDisplay.dll","Hi5VirtualDisplay.inf","Hi5VirtualDisplay.cat","Hi5DisplayHost.exe")) {
-    $matches = @(Get-ChildItem $base -Recurse -File -Filter $name | Where-Object { $_.FullName -notmatch '[\\/]obj[\\/]' -and $_.FullName -notmatch '[\\/]artifacts[\\/]' })
+    $matches = @(Get-ChildItem $base -Recurse -File -Filter $name | Where-Object { $_.FullName -match '[\\/]x64[\\/]Release[\\/]' -and $_.FullName -notmatch '[\\/]obj[\\/]' })
     if ($matches.Count -gt 0) {
         Copy-Item $matches[0].FullName (Join-Path $out $name)
         Write-Host "Collected: $name"
