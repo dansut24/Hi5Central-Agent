@@ -1,0 +1,31 @@
+name: Build Hi5Central Virtual Display (canary)
+on:
+  push:
+    branches:
+      - canary/hi5-virtual-display-20261122
+    paths:
+      - .github/workflows/build-hi5-virtual-display.yml
+      - drivers/virtual-display/**
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out Hi5Central Agent
+        uses: actions/checkout@v4
+      - name: Add MSBuild
+        uses: microsoft/setup-msbuild@v3
+      - name: Build unsigned canary IDD (Windows x64)
+        shell: pwsh
+        run: ./drivers/virtual-display/build.ps1
+      - name: Upload unsigned test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hi5Central-VirtualDisplay-v0.1-UNSIGNED
+          path: drivers/virtual-display/artifacts/
+          if-no-files-found: warn
+          retention-days: 7
