@@ -38,3 +38,7 @@ The script checks the exact upstream commit; if that commit changes, the build r
 - The virtual driver does not keep a sleeping, hibernating or powered-off machine running.
 - The initial driver does not automatically activate on lid closure and does not replace the existing capture engine. A signed canary can be installed with `Install-Canary.ps1` (manual service start); `Uninstall-Canary.ps1` stops/removes only the host service.
 - The upstream IddCx sample processes and releases swap-chain frames but is not a full production display driver. Profiling, crash recovery and lifecycle integration are outstanding.
+
+### StreamCore integration finding (22 November 2026)
+
+The current native GDI capture constructor reads only `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)` and captures via `GetDC(nullptr)`; `host/display_windows.go` similarly reports the primary monitor. Thus a 60 Hz virtual output added as a **secondary** display does not guarantee any StreamCore FPS improvement. Before Lenovo testing, implement a canary screen-selection policy (virtual as the active primary display on headless devices, or monitor-aware capture with matching input-coordinate mapping). Preserve the existing physical display on lid reopening. Do not change the production agent until the 60-FPS canary is measured and qualified.

@@ -76,6 +76,23 @@ Push-Location $src
 try {
     & nuget restore "packages.config" -PackagesDirectory "packages" -NonInteractive
     if ($LASTEXITCODE -ne 0) { throw "NuGet WDK/SDK restore failed" }
+    # CI images may not expose NuGet-provided WDK tool binaries in their PATH.
+    # Resolve the actual WDK tools rather than disabling INF stamping/code integrity.
+    $kitRoots = @((Join-Path $src "packages"), "${env:ProgramFiles(x86)}\Windows Kits\10\bin")
+    $foundTools = @()
+    foreach ($kitRoot in $kitRoots) {
+        if (Test-Path $kitRoot) {
+            $foundTools += @(Get-ChildItem -Path $kitRoot -Recurse -File -Filter "stampinf.exe" -ErrorAction SilentlyContinue)
+        }
+    }
+    Write-Host ("Found stampinf tool(s): " + ($foundTools | ForEach-Object FullName | Out-String))
+    foreach ($tool in $foundTools) {
+        $env:PATH = "$($tool.DirectoryName);$env:PATH"
+    }
+    if ($foundTools.Count -eq 0) {
+        Write-Host "WDK stampinf.exe was not found. WDK NuGet restore did not expose the required build tools."
+        throw "WDK stamping tool missing: no driver was compiled. A complete WDK environment is required."
+    }
     & msbuild (Join-Path $base "Hi5VirtualDisplay.sln") /m /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off /verbosity:minimal
     if ($LASTEXITCODE -ne 0) { throw "WDK build failed" }
 } finally { Pop-Location }
