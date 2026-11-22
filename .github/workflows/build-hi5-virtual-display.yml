@@ -26,11 +26,14 @@ jobs:
       - name: Build unsigned canary IDD (Windows x64)
         shell: pwsh
         run: ./drivers/virtual-display/build.ps1
-      - name: Upload unsigned test artifacts
+      - name: Self-sign development test catalog
+        shell: pwsh
+        run: ./drivers/virtual-display/Sign-DevCanary.ps1
+      - name: Upload development-signed test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Hi5Central-VirtualDisplay-v0.1-UNSIGNED
+          name: Hi5Central-VirtualDisplay-v0.1-DEV-SIGNED
           path: drivers/virtual-display/artifacts/
           if-no-files-found: warn
           retention-days: 7
