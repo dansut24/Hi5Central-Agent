@@ -44,6 +44,8 @@ $manifest = [ordered]@{
  publicCertificateSha256=(Get-FileHash $public -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $artifacts 'DEV-TEST-MANIFEST.json') -Encoding utf8
+Copy-Item -LiteralPath (Join-Path $root 'Install-Canary.ps1') -Destination (Join-Path $artifacts 'Install-Canary.ps1') -Force
+Copy-Item -LiteralPath (Join-Path $root 'Uninstall-Canary.ps1') -Destination (Join-Path $artifacts 'Uninstall-Canary.ps1') -Force
 Get-ChildItem $artifacts -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object Name | ForEach-Object {
   "$($_.Name) $((Get-FileHash -Algorithm SHA256 -Path $_.FullName).Hash.ToLowerInvariant())"
 } | Set-Content (Join-Path $artifacts 'SHA256SUMS.txt') -Encoding ascii
