@@ -7,6 +7,9 @@ on:
       - .github/workflows/build-hi5-virtual-display.yml
       - drivers/virtual-display/**
   workflow_dispatch:
+concurrency:
+  group: hi5-virtual-display-canary
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: windows-2025-vs2026
