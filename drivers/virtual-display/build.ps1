@@ -59,6 +59,7 @@ if (-not $appCode.Contains($marker)) { throw "Upstream host wait block changed" 
 $insertion = '    // Canary headless mode: SwDeviceCreate handle remains alive until host exits.' + [Environment]::NewLine +
              '    if (argc > 1 && wcscmp(argv[1], L"--headless") == 0) { for (;;) Sleep(10000); }' + [Environment]::NewLine
 $appCode = $appCode.Replace($marker, $insertion + $marker)
+$appCode = $appCode.Replace("int __cdecl main(", "int wmain(")
 [IO.File]::WriteAllText($appFile, $appCode)
 # Rename project and INF filenames after updating content references.
 Rename-Item (Join-Path $driverDir "IddSampleDriver.vcxproj") "Hi5VirtualDisplay.vcxproj"
@@ -68,6 +69,11 @@ Rename-Item (Join-Path $driverDir "IddSampleDriver.rc") "Hi5VirtualDisplay.rc"
 Rename-Item (Join-Path $appDir "IddSampleApp.vcxproj") "Hi5DisplayHost.vcxproj"
 Rename-Item (Join-Path $appDir "IddSampleApp.vcxproj.filters") "Hi5DisplayHost.vcxproj.filters"
 Rename-Item (Join-Path $base "IddSampleDriver.sln") "Hi5VirtualDisplay.sln"
+# Solution project references were rebranded too: match the on-disk directory names.
+Rename-Item $driverDir "Hi5VirtualDisplay"
+Rename-Item $appDir "Hi5DisplayHost"
+$driverDir = Join-Path $base "Hi5VirtualDisplay"
+$appDir = Join-Path $base "Hi5DisplayHost"
 # The host executable is an interactive canary helper, NOT yet a Windows service.
 # No driver installation, code-integrity bypass, or change to an existing display is performed.
 Copy-Item (Join-Path $driverDir "Hi5VirtualDisplay.inf") (Join-Path $out "Hi5VirtualDisplay.inf.source")
