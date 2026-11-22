@@ -2,7 +2,9 @@
 // Controls a software PnP device backed by the Hi5VirtualDisplay IddCx UMDF driver.
 // The virtual display is present while this service is running and is removed on stop.
 // No driver signing or code-integrity settings are modified.
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <swdevice.h>
 #include <cwchar>
